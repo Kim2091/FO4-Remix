@@ -255,38 +255,203 @@ static bool ReadbackTexture(ID3D11Device* device, ID3D11Texture2D* tex2D,
 }
 
 // ---------------------------------------------------------------------------
-// Walk the shader property chain on a BSTriShape to extract the diffuse texture
+// BC1/BC3 decode helpers — decompress a 4x4 block to RGBA8
 // ---------------------------------------------------------------------------
-static uint64_t ExtractDiffuseTexture(BSTriShape* shape, ID3D11Device* device,
-                                      std::vector<ExtractedTexture>& newTextures)
+static void DecodeBC1ColorBlock(const uint8_t* block, uint8_t out[4][4][4])
 {
-    if (!shape) return 0;
+    uint16_t c0 = block[0] | (block[1] << 8);
+    uint16_t c1 = block[2] | (block[3] << 8);
 
-    // BSGeometry::shaderProperty is NiPointer<NiProperty>
-    NiProperty* prop = shape->shaderProperty;
-    if (!prop) return 0;
+    uint8_t colors[4][3];
+    colors[0][0] = ((c0 >> 11) & 0x1F) * 255 / 31;
+    colors[0][1] = ((c0 >>  5) & 0x3F) * 255 / 63;
+    colors[0][2] = ( c0        & 0x1F) * 255 / 31;
+    colors[1][0] = ((c1 >> 11) & 0x1F) * 255 / 31;
+    colors[1][1] = ((c1 >>  5) & 0x3F) * 255 / 63;
+    colors[1][2] = ( c1        & 0x1F) * 255 / 31;
 
-    BSShaderProperty* shaderProp = static_cast<BSShaderProperty*>(prop);
-    BSShaderMaterial* material = shaderProp->shaderMaterial;
-    if (!material) return 0;
+    if (c0 > c1) {
+        for (int i = 0; i < 3; i++) {
+            colors[2][i] = (2 * colors[0][i] + colors[1][i] + 1) / 3;
+            colors[3][i] = (colors[0][i] + 2 * colors[1][i] + 1) / 3;
+        }
+    } else {
+        for (int i = 0; i < 3; i++) {
+            colors[2][i] = (colors[0][i] + colors[1][i]) / 2;
+            colors[3][i] = 0;
+        }
+    }
 
-    // GetFeature() == 2 means lighting shader material
-    if (material->GetFeature() != 2) return 0;
+    uint32_t indices = block[4] | (block[5] << 8) | (block[6] << 16) | (block[7] << 24);
+    for (int y = 0; y < 4; y++) {
+        for (int x = 0; x < 4; x++) {
+            int idx = indices & 3;
+            indices >>= 2;
+            out[y][x][0] = colors[idx][0];
+            out[y][x][1] = colors[idx][1];
+            out[y][x][2] = colors[idx][2];
+            out[y][x][3] = 255;
+        }
+    }
+}
 
-    BSLightingShaderMaterialBase* lightingMat =
-        static_cast<BSLightingShaderMaterialBase*>(material);
+static void DecodeBC3AlphaBlock(const uint8_t* block, uint8_t alphas[4][4])
+{
+    uint8_t a0 = block[0], a1 = block[1];
+    uint8_t palette[8];
+    palette[0] = a0;
+    palette[1] = a1;
+    if (a0 > a1) {
+        for (int i = 1; i <= 6; i++)
+            palette[i + 1] = ((7 - i) * a0 + i * a1 + 3) / 7;
+    } else {
+        for (int i = 1; i <= 4; i++)
+            palette[i + 1] = ((5 - i) * a0 + i * a1 + 2) / 5;
+        palette[6] = 0;
+        palette[7] = 255;
+    }
 
-    NiTexture* diffuseTex = lightingMat->spDiffuseTexture;
-    if (!diffuseTex) return 0;
+    uint64_t bits = 0;
+    for (int i = 2; i < 8; i++)
+        bits |= (uint64_t)block[i] << ((i - 2) * 8);
 
-    BSRenderData* renderData = diffuseTex->rendererData;
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            alphas[y][x] = palette[bits & 7];
+            bits >>= 3;
+        }
+}
+
+// Decompress a BC-compressed texture to R8G8B8A8 and invert RGB (smoothness → roughness)
+static bool DecompressAndInvert(ExtractedTexture& tex)
+{
+    bool isBC1 = (tex.dxgiFormat == DXGI_FORMAT_BC1_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC1_UNORM_SRGB ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC1_TYPELESS);
+    bool isBC3 = (tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM_SRGB ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC3_TYPELESS);
+    bool isBC5 = (tex.dxgiFormat == DXGI_FORMAT_BC5_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC5_SNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC5_TYPELESS);
+
+    if (!isBC1 && !isBC3 && !isBC5) return false;
+
+    uint32_t bw = (tex.width + 3) / 4;
+    uint32_t bh = (tex.height + 3) / 4;
+    uint32_t blockSize = isBC1 ? 8 : 16;
+
+    std::vector<uint8_t> rgba(tex.width * tex.height * 4);
+    const uint8_t* src = tex.pixels.data();
+
+    for (uint32_t by = 0; by < bh; by++) {
+        for (uint32_t bx = 0; bx < bw; bx++) {
+            uint8_t block[4][4][4]; // [y][x][rgba]
+
+            if (isBC5) {
+                // BC5: two independent alpha-style blocks for R and G channels
+                uint8_t rChan[4][4], gChan[4][4];
+                DecodeBC3AlphaBlock(src, rChan);
+                DecodeBC3AlphaBlock(src + 8, gChan);
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++) {
+                        block[y][x][0] = rChan[y][x];
+                        block[y][x][1] = gChan[y][x];
+                        block[y][x][2] = 0;
+                        block[y][x][3] = 255;
+                    }
+            } else if (isBC3) {
+                uint8_t alphas[4][4];
+                DecodeBC3AlphaBlock(src, alphas);
+                DecodeBC1ColorBlock(src + 8, block);
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++)
+                        block[y][x][3] = alphas[y][x];
+            } else {
+                DecodeBC1ColorBlock(src, block);
+            }
+            src += blockSize;
+
+            // Write decoded + inverted pixels
+            for (int y = 0; y < 4; y++) {
+                uint32_t py = by * 4 + y;
+                if (py >= tex.height) continue;
+                for (int x = 0; x < 4; x++) {
+                    uint32_t px = bx * 4 + x;
+                    if (px >= tex.width) continue;
+                    uint32_t offset = (py * tex.width + px) * 4;
+                    rgba[offset + 0] = 255 - block[y][x][0]; // invert R
+                    rgba[offset + 1] = 255 - block[y][x][1]; // invert G
+                    rgba[offset + 2] = 255 - block[y][x][2]; // invert B
+                    rgba[offset + 3] = block[y][x][3];       // keep A
+                }
+            }
+        }
+    }
+
+    tex.pixels = std::move(rgba);
+    tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    return true;
+}
+
+// Invert an uncompressed RGBA texture in-place (smoothness → roughness)
+static void InvertUncompressed(ExtractedTexture& tex)
+{
+    for (uint32_t i = 0; i < tex.width * tex.height; i++) {
+        tex.pixels[i * 4 + 0] = 255 - tex.pixels[i * 4 + 0];
+        tex.pixels[i * 4 + 1] = 255 - tex.pixels[i * 4 + 1];
+        tex.pixels[i * 4 + 2] = 255 - tex.pixels[i * 4 + 2];
+        // leave alpha
+    }
+}
+
+// Convert FO4 smoothness/spec mask → Remix roughness by inverting RGB
+static void SmoothnessToRoughness(ExtractedTexture& tex)
+{
+    switch (tex.dxgiFormat) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            InvertUncompressed(tex);
+            break;
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC1_UNORM_SRGB:
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_BC3_UNORM_SRGB:
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM:
+        case DXGI_FORMAT_BC5_SNORM:
+        case DXGI_FORMAT_BC5_TYPELESS:
+            DecompressAndInvert(tex);
+            break;
+        default:
+            // BC7/other: can't easily invert, leave as-is
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic texture extraction from any NiTexture slot
+// ---------------------------------------------------------------------------
+static uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
+                                       ID3D11Device* device,
+                                       std::vector<ExtractedTexture>& newTextures,
+                                       bool invertRGB = false)
+{
+    if (!tex) return 0;
+
+    BSRenderData* renderData = tex->rendererData;
     if (!renderData) return 0;
 
     ID3D11Resource* resource = renderData->resource;
     if (!resource) return 0;
 
-    // Compute hash from resource pointer
+    // Compute hash from resource pointer — include inversion in hash so the
+    // inverted variant doesn't collide with the raw texture in the cache
     uint64_t hash = (uintptr_t)resource * 0x9E3779B97F4A7C15ULL;
+    if (invertRGB) hash ^= 0xA3F1D7B200000001ULL;
 
     // Check cache first
     auto it = g_textureCache.find(hash);
@@ -306,18 +471,33 @@ static uint64_t ExtractDiffuseTexture(BSTriShape* shape, ID3D11Device* device,
 
     if (!ok) return 0;
 
-    // Log the texture name for debugging
-    const char* texName = diffuseTex->name.c_str();
-    _MESSAGE("FO4RemixPlugin: Extracted diffuse texture \"%s\" %ux%u fmt=%u hash=0x%016llX",
-             texName ? texName : "<null>",
-             extracted.width, extracted.height,
-             (unsigned)extracted.dxgiFormat, hash);
+    if (invertRGB) {
+        SmoothnessToRoughness(extracted);
+    }
 
-    // Store in cache and output list
-    g_textureCache[hash] = extracted; // copy into cache
+    const char* texName = tex->name.c_str();
+    _MESSAGE("FO4RemixPlugin: Extracted %s texture \"%s\" %ux%u fmt=%u hash=0x%016llX%s",
+             slotName, texName ? texName : "<null>",
+             extracted.width, extracted.height,
+             (unsigned)extracted.dxgiFormat, hash,
+             invertRGB ? " (inverted)" : "");
+
+    g_textureCache[hash] = extracted;
     newTextures.push_back(std::move(extracted));
 
     return hash;
+}
+
+// Get the BSLightingShaderMaterialBase from a shape, or nullptr
+static BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape)
+{
+    if (!shape) return nullptr;
+    NiProperty* prop = shape->shaderProperty;
+    if (!prop) return nullptr;
+    BSShaderProperty* shaderProp = static_cast<BSShaderProperty*>(prop);
+    BSShaderMaterial* material = shaderProp->shaderMaterial;
+    if (!material || material->GetFeature() != 2) return nullptr;
+    return static_cast<BSLightingShaderMaterialBase*>(material);
 }
 
 // ---------------------------------------------------------------------------
@@ -495,9 +675,11 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
                  shape->numVertices, shape->numTriangles);
     }
 
-    // Extract diffuse texture
-    mesh.diffuseTextureHash = ExtractDiffuseTexture(shape, device, newTextures);
-    mesh.normalTextureHash  = 0; // future
+    // Extract textures from the lighting material
+    BSLightingShaderMaterialBase* lightingMat = GetLightingMaterial(shape);
+    mesh.diffuseTextureHash   = lightingMat ? ExtractMaterialTexture(lightingMat->spDiffuseTexture, "diffuse", device, newTextures) : 0;
+    mesh.normalTextureHash    = lightingMat ? ExtractMaterialTexture(lightingMat->spNormalTexture, "normal", device, newTextures) : 0;
+    mesh.roughnessTextureHash = lightingMat ? ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, true) : 0;
 
     out.push_back(std::move(mesh));
     return true;
@@ -645,8 +827,18 @@ ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
 
     auto lights = LightExtractor::ExtractPlayerCellLights();
 
-    _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - extracted %u meshes, %zu new textures (%zu cached), %zu lights from %u objects",
-             meshCount, newTextures.size(), g_textureCache.size(), lights.size(), objectList.count);
+    // Count texture types per mesh
+    uint32_t hasDiffuse = 0, hasNormal = 0, hasRoughness = 0;
+    for (auto& m : result) {
+        if (m.diffuseTextureHash)   hasDiffuse++;
+        if (m.normalTextureHash)    hasNormal++;
+        if (m.roughnessTextureHash) hasRoughness++;
+    }
+
+    _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - %u meshes (%u diffuse, %u normal, %u roughness), "
+             "%zu new textures (%zu cached), %zu lights from %u objects",
+             meshCount, hasDiffuse, hasNormal, hasRoughness,
+             newTextures.size(), g_textureCache.size(), lights.size(), objectList.count);
 
     return { std::move(result), std::move(newTextures), std::move(lights) };
 }

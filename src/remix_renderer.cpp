@@ -163,36 +163,53 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
     _MESSAGE("FO4RemixPlugin: Textures - uploaded %u, failed %u, skipped %u",
              texCreated, texFailed, texSkipped);
 
-    // ----- Create materials (one per unique diffuseTextureHash) -----
-    std::unordered_set<uint64_t> materialHashes;
+    // ----- Create materials (one per unique texture combination) -----
+    // Key materials by a combined hash of diffuse+normal+roughness so meshes
+    // with different PBR maps get separate materials.
+    struct MaterialKey {
+        uint64_t diffuse;
+        uint64_t normal;
+        uint64_t roughness;
+        uint64_t combined() const {
+            uint64_t h = diffuse;
+            h ^= normal  * 0x517CC1B727220A95ULL;
+            h ^= roughness * 0x6C62272E07BB0142ULL;
+            return h;
+        }
+    };
+
+    std::unordered_map<uint64_t, MaterialKey> materialKeys;
     for (auto& mesh : result.meshes) {
-        if (mesh.diffuseTextureHash != 0)
-            materialHashes.insert(mesh.diffuseTextureHash);
+        if (mesh.diffuseTextureHash == 0) continue;
+        MaterialKey key { mesh.diffuseTextureHash, mesh.normalTextureHash, mesh.roughnessTextureHash };
+        materialKeys.emplace(key.combined(), key);
     }
 
     uint32_t matCreated = 0, matFailed = 0;
 
-    for (uint64_t diffHash : materialHashes) {
-        std::wstring hashPath = HashToPath(diffHash);
+    for (auto& [combinedHash, key] : materialKeys) {
+        std::wstring diffPath = HashToPath(key.diffuse);
+        std::wstring normalPath = key.normal ? HashToPath(key.normal) : L"";
+        std::wstring roughPath = key.roughness ? HashToPath(key.roughness) : L"";
 
         remixapi_MaterialInfoOpaqueEXT opaqueExt = {};
         opaqueExt.sType             = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
         opaqueExt.pNext             = nullptr;
-        opaqueExt.roughnessTexture  = nullptr;
+        opaqueExt.roughnessTexture  = key.roughness ? roughPath.c_str() : nullptr;
         opaqueExt.metallicTexture   = nullptr;
         opaqueExt.heightTexture     = nullptr;
         opaqueExt.albedoConstant    = { 1.0f, 1.0f, 1.0f };
         opaqueExt.opacityConstant   = 1.0f;
-        opaqueExt.roughnessConstant = 0.5f;
+        opaqueExt.roughnessConstant = key.roughness ? 0.5f : 0.8f;
         opaqueExt.metallicConstant  = 0.0f;
-        opaqueExt.alphaTestType     = 7; // AlphaTestType::kAlways - 0 is kNever which discards all pixels!
+        opaqueExt.alphaTestType     = 7; // AlphaTestType::kAlways
 
         remixapi_MaterialInfo matInfo = {};
         matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
         matInfo.pNext              = &opaqueExt;
-        matInfo.hash               = diffHash;
-        matInfo.albedoTexture      = hashPath.c_str();
-        matInfo.normalTexture      = nullptr;
+        matInfo.hash               = combinedHash;
+        matInfo.albedoTexture      = diffPath.c_str();
+        matInfo.normalTexture      = key.normal ? normalPath.c_str() : nullptr;
         matInfo.tangentTexture     = nullptr;
         matInfo.emissiveTexture    = nullptr;
         matInfo.emissiveIntensity  = 0.0f;
@@ -207,13 +224,13 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
         remixapi_MaterialHandle handle = nullptr;
         remixapi_ErrorCode status = api->CreateMaterial(&matInfo, &handle);
         if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            _MESSAGE("FO4RemixPlugin: Failed to create material for texture 0x%llX (error %d)",
-                     (unsigned long long)diffHash, (int)status);
+            _MESSAGE("FO4RemixPlugin: Failed to create material 0x%llX (error %d)",
+                     (unsigned long long)combinedHash, (int)status);
             matFailed++;
             continue;
         }
 
-        g_materialHandles[diffHash] = handle;
+        g_materialHandles[combinedHash] = handle;
         matCreated++;
     }
 
@@ -225,10 +242,13 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
     for (auto& mesh : result.meshes) {
         if (mesh.vertices.empty()) continue;
 
-        // Look up material handle for this mesh's diffuse texture
+        // Look up material handle by combined texture hash
         remixapi_MaterialHandle matHandle = nullptr;
         if (mesh.diffuseTextureHash != 0) {
-            auto it = g_materialHandles.find(mesh.diffuseTextureHash);
+            uint64_t combinedHash = mesh.diffuseTextureHash;
+            combinedHash ^= mesh.normalTextureHash    * 0x517CC1B727220A95ULL;
+            combinedHash ^= mesh.roughnessTextureHash * 0x6C62272E07BB0142ULL;
+            auto it = g_materialHandles.find(combinedHash);
             if (it != g_materialHandles.end())
                 matHandle = it->second;
         }
