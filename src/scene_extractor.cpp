@@ -173,14 +173,15 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     // Negate X and Z axes to mirror the world into Remix's LH coordinate system
     const NiTransform& xf = shape->m_worldTransform;
     float scale = xf.scale;
+    // Swap X and Y columns in rotation to match camera coordinate swap
     for (int r = 0; r < 3; r++) {
-        for (int c = 0; c < 3; c++) {
-            mesh.worldTransform[r][c] = xf.rot.data[r][c] * scale;
-        }
+        mesh.worldTransform[r][0] = xf.rot.data[r][1] * scale;
+        mesh.worldTransform[r][1] = xf.rot.data[r][0] * scale;
+        mesh.worldTransform[r][2] = xf.rot.data[r][2] * scale;
     }
-    // No axis negation — testing clean baseline
-    mesh.worldTransform[0][3] = xf.pos.x;
-    mesh.worldTransform[1][3] = xf.pos.y;
+    // Swap X and Y in translation too
+    mesh.worldTransform[0][3] = xf.pos.y;
+    mesh.worldTransform[1][3] = xf.pos.x;
     mesh.worldTransform[2][3] = xf.pos.z;
 
     // Log first few shapes' vertex data for debugging
