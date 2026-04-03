@@ -20,9 +20,8 @@ static constexpr uint8_t   FORM_TYPE_LIGH       = 34;
 static constexpr uintptr_t OFF_FORM_TYPE        = 0x1A;
 
 // TESObjectLIGH DATA subrecord offset from base form pointer.
-// This is an estimate from the inheritance chain. If lights have
-// wrong colors/radii, adjust this offset and check the discovery log.
-static constexpr uintptr_t OFF_LIGH_DATA = 0x160;
+// Verified via memory scan: radius=256 at +0x14C, color=0x00FFFFFF at +0x150.
+static constexpr uintptr_t OFF_LIGH_DATA = 0x148;
 
 // DATA subrecord internal layout
 static constexpr uintptr_t OFF_DATA_RADIUS  = 0x04;
@@ -35,8 +34,10 @@ static constexpr uintptr_t OFF_LIGH_FADE = OFF_LIGH_DATA + 0x38;
 
 static constexpr uint32_t LIGH_FLAG_SPOTLIGHT = 0x100;
 
-// Intensity tuning constant: converts FO4 light into Remix HDR radiance
-static constexpr float kIntensityScale = 50.0f;
+// Intensity tuning constant: converts FO4 light into Remix HDR radiance.
+// Scales by radius to ensure lights are visible at their intended range
+// given Bethesda-unit scene distances (~70 units/meter).
+static constexpr float kIntensityScale = 10.0f;
 
 std::vector<ExtractedLight> LightExtractor::ExtractPlayerCellLights()
 {
@@ -82,7 +83,7 @@ std::vector<ExtractedLight> LightExtractor::ExtractPlayerCellLights()
         float spotFOV      = *reinterpret_cast<float*>(dataBase + OFF_DATA_FOV);
         float fade         = *reinterpret_cast<float*>(baseForm + OFF_LIGH_FADE);
 
-        // Offset discovery: log first few lights so we can verify against xEdit
+        // Log first few lights for verification
         if (!s_loggedDiscovery && lightCount < 5) {
             _MESSAGE("FO4RemixPlugin: Light REFR=0x%llX baseForm=0x%llX "
                      "pos=(%.1f, %.1f, %.1f) rot=(%.2f, %.2f, %.2f) "
@@ -102,7 +103,7 @@ std::vector<ExtractedLight> LightExtractor::ExtractPlayerCellLights()
         float g = ((rawColor >> 8) & 0xFF) / 255.0f;
         float b = ((rawColor >> 16) & 0xFF) / 255.0f;
 
-        float intensity = fade * kIntensityScale;
+        float intensity = fade * kIntensityScale * (float)rawRadius;
 
         ExtractedLight light = {};
         light.hash = refrPtr * 0x9E3779B97F4A7C15ULL;

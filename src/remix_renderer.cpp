@@ -6,6 +6,7 @@
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
 
+#include <algorithm>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -271,7 +272,9 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
         sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
         sphere.pNext = nullptr;
         sphere.position = { light.position[0], light.position[1], light.position[2] };
-        sphere.radius = 0.1f; // Small emitter sphere (not the attenuation range)
+        // Emitter sphere scales with FO4 radius so the path tracer can sample it
+        // at scene distances (Bethesda units, ~70 per meter)
+        sphere.radius = (std::max)(light.radius * 0.025f, 0.5f);
         sphere.volumetricRadianceScale = 1.0f;
 
         if (light.isSpotLight && light.spotFOV > 0.0f) {
