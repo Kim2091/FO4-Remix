@@ -36,7 +36,7 @@ static HWND CreateRemixWindow(int width, int height) {
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        WS_EX_APPWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+        WS_EX_APPWINDOW,
         wc.lpszClassName,
         L"Fallout 4 - RTX Remix",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -44,7 +44,7 @@ static HWND CreateRemixWindow(int width, int height) {
         nullptr, nullptr, hInst, nullptr);
 
     if (hwnd) {
-        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        ShowWindow(hwnd, SW_SHOW);
         UpdateWindow(hwnd);
     }
 

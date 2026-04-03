@@ -13,6 +13,8 @@
 #include "f4se/NiTextures.h"
 
 #include <d3d11.h>
+#include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <unordered_map>
@@ -456,20 +458,37 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     mesh.worldTransform[1][3] = xf.pos.x;
     mesh.worldTransform[2][3] = xf.pos.z;
 
+    // Compute local-space bounding extent for diagnostics
+    float minPos[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+    float maxPos[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
+    for (uint16_t i = 0; i < shape->numVertices; i++) {
+        for (int j = 0; j < 3; j++) {
+            if (mesh.vertices[i].position[j] < minPos[j]) minPos[j] = mesh.vertices[i].position[j];
+            if (mesh.vertices[i].position[j] > maxPos[j]) maxPos[j] = mesh.vertices[i].position[j];
+        }
+    }
+    float extentX = (maxPos[0] - minPos[0]) * scale;
+    float extentY = (maxPos[1] - minPos[1]) * scale;
+    float extentZ = (maxPos[2] - minPos[2]) * scale;
+    float maxExtent = extentX;
+    if (extentY > maxExtent) maxExtent = extentY;
+    if (extentZ > maxExtent) maxExtent = extentZ;
+
+    const char* shapeName = shape->m_name.c_str();
+
+    // Log shapes with large world extent to help identify unwanted geometry
+    if (maxExtent > 500.0f) {
+        _MESSAGE("FO4RemixPlugin: LARGE shape \"%s\" extent=(%.0f, %.0f, %.0f) maxExt=%.0f "
+                 "worldPos=(%.1f, %.1f, %.1f) verts=%u tris=%u",
+                 shapeName ? shapeName : "<null>",
+                 extentX, extentY, extentZ, maxExtent,
+                 xf.pos.x, xf.pos.y, xf.pos.z,
+                 shape->numVertices, shape->numTriangles);
+    }
+
     // Extract diffuse texture
     mesh.diffuseTextureHash = ExtractDiffuseTexture(shape, device, newTextures);
     mesh.normalTextureHash  = 0; // future
-
-    // Log first few shapes' vertex data for debugging
-    if (s_loggedShapes < 3 && !mesh.vertices.empty()) {
-        auto& v0 = mesh.vertices[0];
-        _MESSAGE("FO4RemixPlugin:   vert[0] pos=(%.2f, %.2f, %.2f) normal=(%.2f, %.2f, %.2f)",
-                 v0.position[0], v0.position[1], v0.position[2],
-                 v0.normal[0], v0.normal[1], v0.normal[2]);
-        _MESSAGE("FO4RemixPlugin:   worldTransform pos=(%.1f, %.1f, %.1f) scale=%.2f",
-                 xf.pos.x, xf.pos.y, xf.pos.z, xf.scale);
-        s_loggedShapes++;
-    }
 
     out.push_back(std::move(mesh));
     return true;
@@ -489,6 +508,20 @@ static void WalkNode(NiAVObject* obj, uint64_t baseHash,
     // Skip invisible nodes
     if (obj->flags & NiAVObject::kFlagNotVisible)
         return;
+
+    // Skip non-renderable geometry by node name
+    const char* nodeName = obj->m_name.c_str();
+    if (nodeName && nodeName[0]) {
+        if (strstr(nodeName, "RoomMarker") ||
+            strstr(nodeName, "Portal") ||
+            strstr(nodeName, "EditorMarker") ||
+            strstr(nodeName, "Trigger") ||
+            strstr(nodeName, "MultiBound") ||
+            strstr(nodeName, "Collision") ||
+            strstr(nodeName, "bhk")) {
+            return;
+        }
+    }
 
     // Check if this is a BSTriShape
     BSTriShape* tri = obj->GetAsBSTriShape();

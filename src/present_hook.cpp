@@ -42,8 +42,19 @@ static constexpr int kMaxRetryDelay = 600;         // ~10 seconds
 static constexpr int kMaxExtractionAttempts = 15;
 static constexpr uint32_t kMinExpectedMeshes = 5;
 
+static void PumpMessages() {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
 static void RemixThreadFunc() {
     _MESSAGE("FO4RemixPlugin: Remix thread started");
+
+    // Prevent Windows from ghosting this thread's window when Present() blocks
+    DisableProcessWindowsGhosting();
 
     if (!RemixAPI::Initialize(nullptr)) {
         _MESSAGE("FO4RemixPlugin: ERROR - Remix API init failed on remix thread");
@@ -81,14 +92,13 @@ static void RemixThreadFunc() {
             cam = g_sharedCamera;
         }
 
+        // Pump messages before rendering so input is processed even when frames are slow
+        PumpMessages();
+
         RemixRenderer::OnFrame(cam);
 
-        // Pump window messages for the Remix window
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
+        // Pump again after rendering
+        PumpMessages();
 
         // ~60fps cap to avoid spinning
         Sleep(16);
