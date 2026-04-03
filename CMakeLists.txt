@@ -52,6 +52,8 @@ add_library(FO4RemixPlugin SHARED
     src/remix_renderer.cpp
     src/camera.h
     src/camera.cpp
+    src/scene_extractor.h
+    src/scene_extractor.cpp
     src/f4se_compat.h
 )
 

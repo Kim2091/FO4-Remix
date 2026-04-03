@@ -2,6 +2,7 @@
 #include "remix_api.h"
 #include "remix_renderer.h"
 #include "camera.h"
+#include "scene_extractor.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -9,6 +10,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <vector>
 
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
@@ -23,6 +25,12 @@ static std::atomic<bool> g_remixReady { false };
 static std::mutex g_cameraMutex;
 static CameraState g_sharedCamera = {};
 
+// Scene extraction state — main thread produces, remix thread consumes
+static std::mutex g_sceneMutex;
+static std::vector<ExtractedMesh> g_pendingScene;
+static std::atomic<bool> g_sceneReady { false };
+static std::atomic<bool> g_sceneExtracted { false };
+
 static void RemixThreadFunc() {
     _MESSAGE("FO4RemixPlugin: Remix thread started");
 
@@ -36,11 +44,24 @@ static void RemixThreadFunc() {
         _MESSAGE("FO4RemixPlugin: ERROR - Renderer init failed on remix thread");
         return;
     }
-    _MESSAGE("FO4RemixPlugin: Renderer initialized, test triangle created");
 
     g_remixReady = true;
 
     while (g_remixRunning) {
+        // Check for pending scene data from main thread
+        if (g_sceneReady) {
+            std::vector<ExtractedMesh> scene;
+            {
+                std::lock_guard<std::mutex> lock(g_sceneMutex);
+                scene = std::move(g_pendingScene);
+                g_sceneReady = false;
+            }
+            if (!scene.empty()) {
+                _MESSAGE("FO4RemixPlugin: Remix thread loading %zu meshes", scene.size());
+                RemixRenderer::LoadSceneMeshes(std::move(scene));
+            }
+        }
+
         // Grab latest camera from main thread
         CameraState cam;
         {
@@ -85,6 +106,20 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         CameraState cam = Camera::Get();
         std::lock_guard<std::mutex> lock(g_cameraMutex);
         g_sharedCamera = cam;
+    }
+
+    // Extract scene geometry once the remix thread is ready and game is loaded
+    // Wait a few frames after remix is ready to ensure game state is stable
+    if (g_remixReady && !g_sceneExtracted && g_presentCallCount > 60) {
+        _MESSAGE("FO4RemixPlugin: Starting scene extraction on main thread...");
+        g_sceneExtracted = true;
+
+        auto meshes = SceneExtractor::ExtractPlayerCell();
+        if (!meshes.empty()) {
+            std::lock_guard<std::mutex> lock(g_sceneMutex);
+            g_pendingScene = std::move(meshes);
+            g_sceneReady = true;
+        }
     }
 
     return g_originalPresent(swapChain, syncInterval, flags);
