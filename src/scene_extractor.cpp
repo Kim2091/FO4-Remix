@@ -1,4 +1,5 @@
 #include "scene_extractor.h"
+#include "light_extractor.h"
 
 #include "f4se_common/f4se_version.h"
 #include "f4se_common/Relocation.h"
@@ -642,10 +643,12 @@ ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
         meshCount += (uint32_t)(result.size() - before);
     }
 
-    _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - extracted %u meshes, %zu new textures (%zu cached) from %u objects",
-             meshCount, newTextures.size(), g_textureCache.size(), objectList.count);
+    auto lights = LightExtractor::ExtractPlayerCellLights();
 
-    return { std::move(result), std::move(newTextures) };
+    _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - extracted %u meshes, %zu new textures (%zu cached), %zu lights from %u objects",
+             meshCount, newTextures.size(), g_textureCache.size(), lights.size(), objectList.count);
+
+    return { std::move(result), std::move(newTextures), std::move(lights) };
 }
 
 // ---------------------------------------------------------------------------
