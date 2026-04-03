@@ -9,6 +9,17 @@ static bool g_initialized = false;
 static HWND g_remixWindow = nullptr;
 
 static LRESULT CALLBACK RemixWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        // CRITICAL: Must handle WM_PAINT or Windows marks window as frozen
+        PAINTSTRUCT ps;
+        BeginPaint(hwnd, &ps);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    case WM_ERASEBKGND:
+        return 1;
+    }
     return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
@@ -25,7 +36,7 @@ static HWND CreateRemixWindow(int width, int height) {
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        WS_EX_APPWINDOW,
+        WS_EX_APPWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
         wc.lpszClassName,
         L"Fallout 4 - RTX Remix",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
@@ -33,7 +44,7 @@ static HWND CreateRemixWindow(int width, int height) {
         nullptr, nullptr, hInst, nullptr);
 
     if (hwnd) {
-        ShowWindow(hwnd, SW_SHOW);
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         UpdateWindow(hwnd);
     }
 

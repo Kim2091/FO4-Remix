@@ -50,16 +50,23 @@ CameraState Camera::Get() {
     state.position[1] = xform.pos.y;
     state.position[2] = xform.pos.z;
 
+    // NiMatrix43 is row-major: M * v uses rows as dot-product vectors.
+    // Columns are the world-space basis vectors of the local frame:
+    //   Column 0 = local X in world (right)
+    //   Column 1 = local Y in world (forward)
+    //   Column 2 = local Z in world (up)
+    // FO4 NIF coordinate system: X=right, Y=forward, Z=up (right-handed, Z-up)
+    // This matches Remix's Z-up expectation, so no coordinate swap needed.
     state.right[0]   = xform.rot.data[0][0];
-    state.right[1]   = xform.rot.data[0][1];
-    state.right[2]   = xform.rot.data[0][2];
+    state.right[1]   = xform.rot.data[1][0];
+    state.right[2]   = xform.rot.data[2][0];
 
-    state.forward[0] = xform.rot.data[1][0];
+    state.forward[0] = xform.rot.data[0][1];
     state.forward[1] = xform.rot.data[1][1];
-    state.forward[2] = xform.rot.data[1][2];
+    state.forward[2] = xform.rot.data[2][1];
 
-    state.up[0]      = xform.rot.data[2][0];
-    state.up[1]      = xform.rot.data[2][1];
+    state.up[0]      = xform.rot.data[0][2];
+    state.up[1]      = xform.rot.data[1][2];
     state.up[2]      = xform.rot.data[2][2];
 
     state.fovY = playerCam->fDefaultWorldFov;
@@ -71,6 +78,18 @@ CameraState Camera::Get() {
     state.nearPlane = 5.0f;
     state.farPlane = 100000.0f;
     state.valid = true;
+
+    // Log camera state once every ~5 seconds (300 frames at 60fps)
+    static int s_logCounter = 0;
+    if (s_logCounter++ % 300 == 0) {
+        _MESSAGE("FO4RemixPlugin: Camera pos=(%.1f, %.1f, %.1f) fwd=(%.3f, %.3f, %.3f) "
+                 "up=(%.3f, %.3f, %.3f) right=(%.3f, %.3f, %.3f) fov=%.1f",
+                 state.position[0], state.position[1], state.position[2],
+                 state.forward[0], state.forward[1], state.forward[2],
+                 state.up[0], state.up[1], state.up[2],
+                 state.right[0], state.right[1], state.right[2],
+                 state.fovY);
+    }
 
     return state;
 }

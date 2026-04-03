@@ -19,71 +19,60 @@ bool RemixRenderer::Init() {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return false;
 
-    remixapi_MaterialInfo matInfo = {};
-    matInfo.sType = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
-    matInfo.hash = 0xF04F04F04;
-
-    remixapi_ErrorCode status = api->CreateMaterial(&matInfo, &g_testMaterial);
-    if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
-        _MESSAGE("FO4RemixPlugin: CreateMaterial failed (error %d)", status);
-        return false;
-    }
-
+    // Match UnityRTX's CreateTestTriangle exactly:
+    // - No material (nullptr)
+    // - No indices (indices_count = 0)
+    // - Vertices at Z=10, normal (0,0,-1), color white
     remixapi_HardcodedVertex vertices[3] = {};
 
-    vertices[0].position[0] = -100.0f;
-    vertices[0].position[1] = 0.0f;
-    vertices[0].position[2] = 0.0f;
+    // Vertex 0: (5, -5, 10)
+    vertices[0].position[0] = 5.0f;
+    vertices[0].position[1] = -5.0f;
+    vertices[0].position[2] = 10.0f;
     vertices[0].normal[0] = 0.0f;
     vertices[0].normal[1] = 0.0f;
-    vertices[0].normal[2] = 1.0f;
-    vertices[0].texcoord[0] = 0.0f;
-    vertices[0].texcoord[1] = 0.0f;
-    vertices[0].color = PackColor(255, 0, 0);
+    vertices[0].normal[2] = -1.0f;
+    vertices[0].color = 0xFFFFFFFF;
 
-    vertices[1].position[0] = 100.0f;
-    vertices[1].position[1] = 0.0f;
-    vertices[1].position[2] = 0.0f;
+    // Vertex 1: (0, 5, 10)
+    vertices[1].position[0] = 0.0f;
+    vertices[1].position[1] = 5.0f;
+    vertices[1].position[2] = 10.0f;
     vertices[1].normal[0] = 0.0f;
     vertices[1].normal[1] = 0.0f;
-    vertices[1].normal[2] = 1.0f;
-    vertices[1].texcoord[0] = 1.0f;
-    vertices[1].texcoord[1] = 0.0f;
-    vertices[1].color = PackColor(0, 255, 0);
+    vertices[1].normal[2] = -1.0f;
+    vertices[1].color = 0xFFFFFFFF;
 
-    vertices[2].position[0] = 0.0f;
-    vertices[2].position[1] = 0.0f;
-    vertices[2].position[2] = 200.0f;
+    // Vertex 2: (-5, -5, 10)
+    vertices[2].position[0] = -5.0f;
+    vertices[2].position[1] = -5.0f;
+    vertices[2].position[2] = 10.0f;
     vertices[2].normal[0] = 0.0f;
     vertices[2].normal[1] = 0.0f;
-    vertices[2].normal[2] = 1.0f;
-    vertices[2].texcoord[0] = 0.5f;
-    vertices[2].texcoord[1] = 1.0f;
-    vertices[2].color = PackColor(0, 0, 255);
-
-    uint32_t indices[3] = { 0, 1, 2 };
+    vertices[2].normal[2] = -1.0f;
+    vertices[2].color = 0xFFFFFFFF;
 
     remixapi_MeshInfoSurfaceTriangles surface = {};
     surface.vertices_values = vertices;
     surface.vertices_count = 3;
-    surface.indices_values = indices;
-    surface.indices_count = 3;
+    surface.indices_values = nullptr;
+    surface.indices_count = 0;
     surface.skinning_hasvalue = 0;
-    surface.material = g_testMaterial;
+    surface.material = nullptr;
 
     remixapi_MeshInfo meshInfo = {};
     meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-    meshInfo.hash = 0xF04E5401;
+    meshInfo.hash = 0x1;
     meshInfo.surfaces_values = &surface;
     meshInfo.surfaces_count = 1;
 
-    status = api->CreateMesh(&meshInfo, &g_testMesh);
+    remixapi_ErrorCode status = api->CreateMesh(&meshInfo, &g_testMesh);
     if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
         _MESSAGE("FO4RemixPlugin: CreateMesh failed (error %d)", status);
         return false;
     }
 
-    _MESSAGE("FO4RemixPlugin: Test triangle created (mesh=%p, material=%p)", g_testMesh, g_testMaterial);
+    _MESSAGE("FO4RemixPlugin: Test triangle created (mesh=%p)", g_testMesh);
     return true;
 }
 
@@ -93,14 +82,27 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
 
     remixapi_CameraInfoParameterizedEXT camParams = {};
     camParams.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
-    camParams.position    = { cam.position[0], cam.position[1], cam.position[2] };
-    camParams.forward     = { cam.forward[0],  cam.forward[1],  cam.forward[2] };
-    camParams.up          = { cam.up[0],       cam.up[1],       cam.up[2] };
-    camParams.right       = { cam.right[0],    cam.right[1],    cam.right[2] };
-    camParams.fovYInDegrees = cam.fovY;
-    camParams.aspect      = cam.aspectRatio;
-    camParams.nearPlane   = cam.nearPlane;
-    camParams.farPlane    = cam.farPlane;
+
+    if (cam.valid) {
+        camParams.position    = { cam.position[0], cam.position[1], cam.position[2] };
+        camParams.forward     = { cam.forward[0],  cam.forward[1],  cam.forward[2] };
+        camParams.up          = { cam.up[0],       cam.up[1],       cam.up[2] };
+        camParams.right       = { cam.right[0],    cam.right[1],    cam.right[2] };
+        camParams.fovYInDegrees = cam.fovY;
+        camParams.aspect      = cam.aspectRatio;
+        camParams.nearPlane   = cam.nearPlane;
+        camParams.farPlane    = cam.farPlane;
+    } else {
+        // Test camera: origin, looking down +Z (matches UnityRTX's SetupTestCamera)
+        camParams.position    = { 0.0f, 0.0f, 0.0f };
+        camParams.forward     = { 0.0f, 0.0f, 1.0f };
+        camParams.up          = { 0.0f, 1.0f, 0.0f };
+        camParams.right       = { 1.0f, 0.0f, 0.0f };
+        camParams.fovYInDegrees = 75.0f;
+        camParams.aspect      = 1280.0f / 720.0f;
+        camParams.nearPlane   = 0.1f;
+        camParams.farPlane    = 1000.0f;
+    }
 
     remixapi_CameraInfo camInfo = {};
     camInfo.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
@@ -137,9 +139,5 @@ void RemixRenderer::Shutdown() {
     if (g_testMesh) {
         api->DestroyMesh(g_testMesh);
         g_testMesh = nullptr;
-    }
-    if (g_testMaterial) {
-        api->DestroyMaterial(g_testMaterial);
-        g_testMaterial = nullptr;
     }
 }
