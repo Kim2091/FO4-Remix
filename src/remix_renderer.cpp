@@ -6,50 +6,27 @@
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
 
-#include <cstring>
-
 static remixapi_MeshHandle g_testMesh = nullptr;
-static remixapi_MaterialHandle g_testMaterial = nullptr;
-
-static uint32_t PackColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a = 255) {
-    return (uint32_t(b)) | (uint32_t(g) << 8) | (uint32_t(r) << 16) | (uint32_t(a) << 24);
-}
 
 bool RemixRenderer::Init() {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return false;
 
-    // Match UnityRTX's CreateTestTriangle exactly:
-    // - No material (nullptr)
-    // - No indices (indices_count = 0)
-    // - Vertices at Z=10, normal (0,0,-1), color white
+    // Remix needs at least one DrawInstance per frame to trigger path tracing.
+    // Create a small triangle in local space (centered near origin, facing -Y).
+    // The instance transform will place it in front of the camera each frame.
     remixapi_HardcodedVertex vertices[3] = {};
 
-    // Vertex 0: (5, -5, 10)
-    vertices[0].position[0] = 5.0f;
-    vertices[0].position[1] = -5.0f;
-    vertices[0].position[2] = 10.0f;
-    vertices[0].normal[0] = 0.0f;
-    vertices[0].normal[1] = 0.0f;
-    vertices[0].normal[2] = -1.0f;
+    vertices[0].position[0] =  50.0f; vertices[0].position[1] = 0.0f; vertices[0].position[2] = -50.0f;
+    vertices[0].normal[0] = 0.0f; vertices[0].normal[1] = -1.0f; vertices[0].normal[2] = 0.0f;
     vertices[0].color = 0xFFFFFFFF;
 
-    // Vertex 1: (0, 5, 10)
-    vertices[1].position[0] = 0.0f;
-    vertices[1].position[1] = 5.0f;
-    vertices[1].position[2] = 10.0f;
-    vertices[1].normal[0] = 0.0f;
-    vertices[1].normal[1] = 0.0f;
-    vertices[1].normal[2] = -1.0f;
+    vertices[1].position[0] =   0.0f; vertices[1].position[1] = 0.0f; vertices[1].position[2] =  50.0f;
+    vertices[1].normal[0] = 0.0f; vertices[1].normal[1] = -1.0f; vertices[1].normal[2] = 0.0f;
     vertices[1].color = 0xFFFFFFFF;
 
-    // Vertex 2: (-5, -5, 10)
-    vertices[2].position[0] = -5.0f;
-    vertices[2].position[1] = -5.0f;
-    vertices[2].position[2] = 10.0f;
-    vertices[2].normal[0] = 0.0f;
-    vertices[2].normal[1] = 0.0f;
-    vertices[2].normal[2] = -1.0f;
+    vertices[2].position[0] = -50.0f; vertices[2].position[1] = 0.0f; vertices[2].position[2] = -50.0f;
+    vertices[2].normal[0] = 0.0f; vertices[2].normal[1] = -1.0f; vertices[2].normal[2] = 0.0f;
     vertices[2].color = 0xFFFFFFFF;
 
     remixapi_MeshInfoSurfaceTriangles surface = {};
@@ -72,13 +49,13 @@ bool RemixRenderer::Init() {
         return false;
     }
 
-    _MESSAGE("FO4RemixPlugin: Test triangle created (mesh=%p)", g_testMesh);
+    _MESSAGE("FO4RemixPlugin: Renderer initialized, test mesh created");
     return true;
 }
 
 void RemixRenderer::OnFrame(const CameraState& cam) {
     remixapi_Interface* api = RemixAPI::GetInterface();
-    if (!api || !g_testMesh) return;
+    if (!api) return;
 
     remixapi_CameraInfoParameterizedEXT camParams = {};
     camParams.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO_PARAMETERIZED_EXT;
@@ -93,7 +70,6 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
         camParams.nearPlane   = cam.nearPlane;
         camParams.farPlane    = cam.farPlane;
     } else {
-        // Test camera: origin, looking down +Z (matches UnityRTX's SetupTestCamera)
         camParams.position    = { 0.0f, 0.0f, 0.0f };
         camParams.forward     = { 0.0f, 0.0f, 1.0f };
         camParams.up          = { 0.0f, 1.0f, 0.0f };
@@ -111,19 +87,29 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
 
     api->SetupCamera(&camInfo);
 
-    remixapi_Transform identity = {};
-    identity.matrix[0][0] = 1.0f;
-    identity.matrix[1][1] = 1.0f;
-    identity.matrix[2][2] = 1.0f;
+    // Place test triangle 200 units in front of camera
+    if (g_testMesh) {
+        float px = camParams.position.x + camParams.forward.x * 200.0f;
+        float py = camParams.position.y + camParams.forward.y * 200.0f;
+        float pz = camParams.position.z + camParams.forward.z * 200.0f;
 
-    remixapi_InstanceInfo instance = {};
-    instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-    instance.mesh = g_testMesh;
-    instance.transform = identity;
-    instance.doubleSided = 1;
-    instance.categoryFlags = 0;
+        remixapi_Transform xform = {};
+        xform.matrix[0][0] = 1.0f;
+        xform.matrix[1][1] = 1.0f;
+        xform.matrix[2][2] = 1.0f;
+        xform.matrix[0][3] = px;
+        xform.matrix[1][3] = py;
+        xform.matrix[2][3] = pz;
 
-    api->DrawInstance(&instance);
+        remixapi_InstanceInfo instance = {};
+        instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+        instance.mesh = g_testMesh;
+        instance.transform = xform;
+        instance.doubleSided = 1;
+        instance.categoryFlags = 0;
+
+        api->DrawInstance(&instance);
+    }
 
     remixapi_PresentInfo presentInfo = {};
     presentInfo.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
@@ -134,9 +120,7 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
 
 void RemixRenderer::Shutdown() {
     remixapi_Interface* api = RemixAPI::GetInterface();
-    if (!api) return;
-
-    if (g_testMesh) {
+    if (api && g_testMesh) {
         api->DestroyMesh(g_testMesh);
         g_testMesh = nullptr;
     }
