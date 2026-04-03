@@ -108,7 +108,9 @@ std::vector<ExtractedLight> LightExtractor::ExtractPlayerCellLights()
         float intensity = fade * kIntensityScale * (float)rawRadius;
 
         ExtractedLight light = {};
-        light.hash = refrPtr * 0x9E3779B97F4A7C15ULL;
+        // Stable hash from REFR form ID (consistent across runs)
+        uint32_t refrFormID = *reinterpret_cast<uint32_t*>(refrPtr + 0x14);
+        light.hash = FnvHashCombine(0xCBF29CE484222325ULL, (uint64_t)refrFormID);
 
         // Apply X/Y swap to match mesh coordinate system
         light.position[0] = refrPos[1]; // Bethesda Y -> Remix X

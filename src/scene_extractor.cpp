@@ -61,10 +61,13 @@ static RelocPtr<uintptr_t> s_g_player(0x032D2260);
 //   LoadedData::rootNode       = 0x08  (NiNode*)
 //   TESObjectCELL::objectList  = 0x70  (tArray<TESObjectREFR*>)
 
+static constexpr uintptr_t OFF_FORM_ID          = 0x14;
 static constexpr uintptr_t OFF_REFR_PARENT_CELL = 0xB8;
 static constexpr uintptr_t OFF_REFR_LOADED_DATA = 0xF0;
 static constexpr uintptr_t OFF_LOADED_ROOT_NODE = 0x08;
 static constexpr uintptr_t OFF_CELL_OBJECT_LIST = 0x70;
+
+
 
 // ---------------------------------------------------------------------------
 // Half-float → float conversion
@@ -620,10 +623,12 @@ static uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
     ID3D11Resource* resource = renderData->resource;
     if (!resource) return 0;
 
-    // Compute hash — include post-processing mode so variants don't collide
-    uint64_t hash = (uintptr_t)resource * 0x9E3779B97F4A7C15ULL;
-    if (postProcess == TexturePostProcess::InvertRGB)  hash ^= 0xA3F1D7B200000001ULL;
-    if (postProcess == TexturePostProcess::Octahedral) hash ^= 0x0C7AED8A00000002ULL;
+    // Stable hash from texture name so hashes are consistent across runs
+    const char* texName = tex->name.c_str();
+    uint64_t hash = FnvHash(texName ? texName : "");
+    // Include post-processing mode so variants don't collide
+    if (postProcess == TexturePostProcess::InvertRGB)  hash = FnvHashCombine(hash, 1);
+    if (postProcess == TexturePostProcess::Octahedral) hash = FnvHashCombine(hash, 2);
 
     // Check cache first
     auto it = g_textureCache.find(hash);
@@ -802,7 +807,8 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     }
 
     ExtractedMesh mesh;
-    mesh.hash = baseHash ^ (uintptr_t)shape;
+    // Combine REFR-based hash with shape name for stable per-shape uniqueness
+    mesh.hash = FnvHashCombine(baseHash, FnvHash(shapeName ? shapeName : ""));
     mesh.vertices.resize(shape->numVertices);
 
     for (uint16_t i = 0; i < shape->numVertices; i++) {
@@ -1070,8 +1076,9 @@ ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
         NiNode* rootNode = *reinterpret_cast<NiNode**>(loadedData + OFF_LOADED_ROOT_NODE);
         if (!rootNode) continue;
 
-        // Use object pointer as base hash for uniqueness
-        uint64_t baseHash = refrPtr * 0x9E3779B97F4A7C15ULL; // hash mix
+        // Stable base hash from REFR form ID (consistent across runs)
+        uint32_t refrFormID = *reinterpret_cast<uint32_t*>(refrPtr + OFF_FORM_ID);
+        uint64_t baseHash = FnvHashCombine(0xCBF29CE484222325ULL, (uint64_t)refrFormID);
 
         size_t before = result.size();
         WalkNode(rootNode, baseHash, result, device, newTextures);

@@ -2,6 +2,29 @@
 
 #include <cstdint>
 
+// ---------------------------------------------------------------------------
+// FNV-1a hash utilities for stable, deterministic hashing
+// ---------------------------------------------------------------------------
+inline uint64_t FnvHash(const char* str) {
+    uint64_t h = 0xCBF29CE484222325ULL;
+    if (str) {
+        for (; *str; ++str) {
+            h ^= (uint8_t)*str;
+            h *= 0x100000001B3ULL;
+        }
+    }
+    return h;
+}
+
+inline uint64_t FnvHashCombine(uint64_t h, uint64_t val) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(&val);
+    for (int i = 0; i < 8; i++) {
+        h ^= p[i];
+        h *= 0x100000001B3ULL;
+    }
+    return h;
+}
+
 struct PluginConfig {
     // [Logging]
     bool logShapeInfo;       // Log shape name, vertex format, flags for every extracted shape
