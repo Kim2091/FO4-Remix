@@ -476,6 +476,14 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
 
     const char* shapeName = shape->m_name.c_str();
 
+    // Reject shapes with garbage vertex data (huge but finite extents)
+    static constexpr float kMaxReasonableExtent = 10000.0f;
+    if (maxExtent > kMaxReasonableExtent) {
+        _MESSAGE("FO4RemixPlugin: Rejecting shape \"%s\" - extent %.0f exceeds max (%.0f)",
+                 shapeName ? shapeName : "<null>", maxExtent, kMaxReasonableExtent);
+        return false;
+    }
+
     // Log shapes with large world extent to help identify unwanted geometry
     if (maxExtent > 500.0f) {
         _MESSAGE("FO4RemixPlugin: LARGE shape \"%s\" extent=(%.0f, %.0f, %.0f) maxExt=%.0f "
@@ -512,9 +520,8 @@ static void WalkNode(NiAVObject* obj, uint64_t baseHash,
     // Skip non-renderable geometry by node name
     const char* nodeName = obj->m_name.c_str();
     if (nodeName && nodeName[0]) {
-        if (strstr(nodeName, "RoomMarker") ||
+        if (strstr(nodeName, "Marker") ||
             strstr(nodeName, "Portal") ||
-            strstr(nodeName, "EditorMarker") ||
             strstr(nodeName, "Trigger") ||
             strstr(nodeName, "MultiBound") ||
             strstr(nodeName, "Collision") ||
