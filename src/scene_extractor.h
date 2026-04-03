@@ -1,6 +1,7 @@
 #pragma once
 
 #include "remix/remix_c.h"
+#include "light_extractor.h"
 #include <vector>
 #include <cstdint>
 #include <d3d11.h>
@@ -25,6 +26,7 @@ struct ExtractedMesh {
 struct ExtractionResult {
     std::vector<ExtractedMesh> meshes;
     std::vector<ExtractedTexture> textures;  // Unique textures only
+    std::vector<ExtractedLight> lights;      // Placed lights from the cell
 };
 
 namespace SceneExtractor {
