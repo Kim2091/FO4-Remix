@@ -53,6 +53,7 @@ struct SceneMeshInstance {
 static std::vector<SceneMeshInstance> g_sceneMeshes;
 static std::unordered_map<uint64_t, remixapi_TextureHandle> g_textureHandles;
 static std::unordered_map<uint64_t, remixapi_MaterialHandle> g_materialHandles;
+static std::vector<remixapi_LightHandle> g_lightHandles;
 
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
 static remixapi_MeshHandle g_fallbackMesh = nullptr;
@@ -115,6 +116,11 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
         if (handle) api->DestroyTexture(handle);
     }
     g_textureHandles.clear();
+
+    for (auto& handle : g_lightHandles) {
+        if (handle) api->DestroyLight(handle);
+    }
+    g_lightHandles.clear();
 
     // ----- Upload textures -----
     uint32_t texCreated = 0, texFailed = 0, texSkipped = 0;
@@ -256,6 +262,52 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
     }
 
     _MESSAGE("FO4RemixPlugin: Meshes - created %u, failed %u", meshCreated, meshFailed);
+
+    // ----- Create lights -----
+    uint32_t lightCreated = 0, lightFailed = 0;
+
+    for (auto& light : result.lights) {
+        remixapi_LightInfoSphereEXT sphere = {};
+        sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+        sphere.pNext = nullptr;
+        sphere.position = { light.position[0], light.position[1], light.position[2] };
+        sphere.radius = 0.1f; // Small emitter sphere (not the attenuation range)
+        sphere.volumetricRadianceScale = 1.0f;
+
+        if (light.isSpotLight && light.spotFOV > 0.0f) {
+            sphere.shaping_hasvalue = true;
+            sphere.shaping_value.direction = {
+                light.spotDirection[0],
+                light.spotDirection[1],
+                light.spotDirection[2]
+            };
+            sphere.shaping_value.coneAngleDegrees = light.spotFOV * 0.5f; // FO4 FOV is full angle
+            sphere.shaping_value.coneSoftness = light.spotSoftness;
+            sphere.shaping_value.focusExponent = 0.0f;
+        } else {
+            sphere.shaping_hasvalue = false;
+        }
+
+        remixapi_LightInfo info = {};
+        info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+        info.pNext = &sphere;
+        info.hash = light.hash;
+        info.radiance = { light.radiance[0], light.radiance[1], light.radiance[2] };
+        info.isDynamic = false;
+        info.ignoreViewModel = false;
+
+        remixapi_LightHandle handle = nullptr;
+        remixapi_ErrorCode status = api->CreateLight(&info, &handle);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
+            lightFailed++;
+            continue;
+        }
+
+        g_lightHandles.push_back(handle);
+        lightCreated++;
+    }
+
+    _MESSAGE("FO4RemixPlugin: Lights - created %u, failed %u", lightCreated, lightFailed);
 }
 
 // ---------------------------------------------------------------------------
@@ -306,6 +358,11 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
             instance.categoryFlags = 0;
             api->DrawInstance(&instance);
         }
+
+        // Draw lights
+        for (auto& handle : g_lightHandles) {
+            api->DrawLightInstance(handle);
+        }
     } else if (g_fallbackMesh) {
         // Fallback: place triangle in front of camera to keep path tracing alive
         float px = camParams.position.x + camParams.forward.x * 200.0f;
@@ -354,6 +411,11 @@ void RemixRenderer::Shutdown() {
         if (handle) api->DestroyTexture(handle);
     }
     g_textureHandles.clear();
+
+    for (auto& handle : g_lightHandles) {
+        if (handle) api->DestroyLight(handle);
+    }
+    g_lightHandles.clear();
 
     if (g_fallbackMesh) {
         api->DestroyMesh(g_fallbackMesh);
