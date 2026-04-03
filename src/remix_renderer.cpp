@@ -178,6 +178,7 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
         opaqueExt.opacityConstant   = 1.0f;
         opaqueExt.roughnessConstant = 0.5f;
         opaqueExt.metallicConstant  = 0.0f;
+        opaqueExt.alphaTestType     = 7; // AlphaTestType::kAlways - 0 is kNever which discards all pixels!
 
         remixapi_MaterialInfo matInfo = {};
         matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
