@@ -18,6 +18,9 @@
 typedef HRESULT(STDMETHODCALLTYPE* PFN_Present)(IDXGISwapChain*, UINT, UINT);
 static PFN_Present g_originalPresent = nullptr;
 
+// Game readiness — set by F4SE message handler in main.cpp
+extern std::atomic<bool> g_gameDataReady;
+
 // Remix runs on its own thread to avoid deadlocking the game's DX11 render thread
 static std::thread g_remixThread;
 static std::atomic<bool> g_remixRunning { false };
@@ -27,9 +30,17 @@ static CameraState g_sharedCamera = {};
 
 // Scene extraction state — main thread produces, remix thread consumes
 static std::mutex g_sceneMutex;
-static std::vector<ExtractedMesh> g_pendingScene;
+static ExtractionResult g_pendingScene;
 static std::atomic<bool> g_sceneReady { false };
 static std::atomic<bool> g_sceneExtracted { false };
+
+// Retry state for scene extraction
+static int g_extractionAttempts = 0;
+static int g_nextRetryFrame = 0;
+static constexpr int kInitialRetryDelay = 120;     // ~2 seconds at 60fps
+static constexpr int kMaxRetryDelay = 600;         // ~10 seconds
+static constexpr int kMaxExtractionAttempts = 15;
+static constexpr uint32_t kMinExpectedMeshes = 5;
 
 static void RemixThreadFunc() {
     _MESSAGE("FO4RemixPlugin: Remix thread started");
@@ -50,15 +61,16 @@ static void RemixThreadFunc() {
     while (g_remixRunning) {
         // Check for pending scene data from main thread
         if (g_sceneReady) {
-            std::vector<ExtractedMesh> scene;
+            ExtractionResult scene;
             {
                 std::lock_guard<std::mutex> lock(g_sceneMutex);
                 scene = std::move(g_pendingScene);
                 g_sceneReady = false;
             }
-            if (!scene.empty()) {
-                _MESSAGE("FO4RemixPlugin: Remix thread loading %zu meshes", scene.size());
-                RemixRenderer::LoadSceneMeshes(std::move(scene));
+            if (!scene.meshes.empty()) {
+                _MESSAGE("FO4RemixPlugin: Remix thread loading %zu meshes, %zu textures",
+                         scene.meshes.size(), scene.textures.size());
+                RemixRenderer::LoadScene(std::move(scene));
             }
         }
 
@@ -108,17 +120,43 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         g_sharedCamera = cam;
     }
 
-    // Extract scene geometry once the remix thread is ready and game is loaded
-    // Wait ~10 seconds (600 frames) to ensure all 3D data is loaded into memory
-    if (g_remixReady && !g_sceneExtracted && g_presentCallCount > 60) {
-        _MESSAGE("FO4RemixPlugin: Starting scene extraction on main thread...");
-        g_sceneExtracted = true;
+    // Extract scene geometry once the remix thread, F4SE, and game state are all ready
+    if (g_remixReady && !g_sceneExtracted && g_gameDataReady) {
+        bool canAttempt = g_extractionAttempts < kMaxExtractionAttempts
+                       && g_presentCallCount >= g_nextRetryFrame;
 
-        auto meshes = SceneExtractor::ExtractPlayerCell();
-        if (!meshes.empty()) {
-            std::lock_guard<std::mutex> lock(g_sceneMutex);
-            g_pendingScene = std::move(meshes);
-            g_sceneReady = true;
+        if (canAttempt && SceneExtractor::IsPlayerCellReady()) {
+            g_extractionAttempts++;
+            _MESSAGE("FO4RemixPlugin: Scene extraction attempt %d/%d (frame %d)...",
+                     g_extractionAttempts, kMaxExtractionAttempts, g_presentCallCount);
+
+            ID3D11Device* device = nullptr;
+            swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&device);
+
+            auto extraction = SceneExtractor::ExtractPlayerCell(device);
+
+            if (device) device->Release();
+
+            size_t meshCount = extraction.meshes.size();
+            if (meshCount >= kMinExpectedMeshes) {
+                _MESSAGE("FO4RemixPlugin: Scene extraction succeeded with %zu meshes", meshCount);
+                g_sceneExtracted = true;
+                std::lock_guard<std::mutex> lock(g_sceneMutex);
+                g_pendingScene = std::move(extraction);
+                g_sceneReady = true;
+            } else {
+                // Too few meshes — schedule retry with exponential backoff
+                int delay = kInitialRetryDelay << (g_extractionAttempts - 1);
+                if (delay > kMaxRetryDelay) delay = kMaxRetryDelay;
+                g_nextRetryFrame = g_presentCallCount + delay;
+                _MESSAGE("FO4RemixPlugin: Extraction got %zu meshes (need >= %u), "
+                         "retrying in %d frames (~%.1fs)",
+                         meshCount, kMinExpectedMeshes, delay, delay / 60.0f);
+            }
+        } else if (g_extractionAttempts >= kMaxExtractionAttempts) {
+            g_sceneExtracted = true;
+            _MESSAGE("FO4RemixPlugin: WARNING - Gave up scene extraction after %d attempts",
+                     kMaxExtractionAttempts);
         }
     }
 

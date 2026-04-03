@@ -9,7 +9,7 @@ namespace RemixRenderer {
     void OnFrame(const CameraState& cam);
     void Shutdown();
 
-    // Load extracted meshes into Remix (called on remix thread).
-    // Replaces any previously loaded scene meshes.
-    void LoadSceneMeshes(std::vector<ExtractedMesh>&& meshes);
+    // Upload textures, create materials, and load meshes into Remix.
+    // Replaces any previously loaded scene. Called on the remix thread.
+    void LoadScene(ExtractionResult&& result);
 }

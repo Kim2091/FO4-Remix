@@ -7,9 +7,43 @@
 #include "f4se/PluginAPI.h"
 
 #include <vector>
+#include <unordered_map>
+#include <unordered_set>
+#include <string>
+#include <d3d11.h>
 
 // ---------------------------------------------------------------------------
-// Scene mesh tracking
+// DXGI -> remixapi_Format mapping
+// ---------------------------------------------------------------------------
+static remixapi_Format DxgiToRemixFormat(DXGI_FORMAT fmt) {
+    switch (fmt) {
+        case DXGI_FORMAT_BC1_UNORM:         return REMIXAPI_FORMAT_BC1_RGB_UNORM;
+        case DXGI_FORMAT_BC1_UNORM_SRGB:    return REMIXAPI_FORMAT_BC1_RGB_SRGB;
+        case DXGI_FORMAT_BC3_UNORM:         return REMIXAPI_FORMAT_BC3_UNORM;
+        case DXGI_FORMAT_BC3_UNORM_SRGB:    return REMIXAPI_FORMAT_BC3_SRGB;
+        case DXGI_FORMAT_BC5_UNORM:         return REMIXAPI_FORMAT_BC5_UNORM;
+        case DXGI_FORMAT_BC5_SNORM:         return REMIXAPI_FORMAT_BC5_UNORM; // best available
+        case DXGI_FORMAT_BC7_UNORM:         return REMIXAPI_FORMAT_BC7_UNORM;
+        case DXGI_FORMAT_BC7_UNORM_SRGB:    return REMIXAPI_FORMAT_BC7_SRGB;
+        case DXGI_FORMAT_R8G8B8A8_UNORM:    return REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return REMIXAPI_FORMAT_R8G8B8A8_SRGB;
+        case DXGI_FORMAT_B8G8R8A8_UNORM:    return REMIXAPI_FORMAT_B8G8R8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return REMIXAPI_FORMAT_B8G8R8A8_SRGB;
+        default: return (remixapi_Format)0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hash -> wstring path for Remix texture references
+// ---------------------------------------------------------------------------
+static std::wstring HashToPath(uint64_t hash) {
+    wchar_t buf[32];
+    swprintf(buf, 32, L"0x%llX", (unsigned long long)hash);
+    return std::wstring(buf);
+}
+
+// ---------------------------------------------------------------------------
+// Scene tracking state
 // ---------------------------------------------------------------------------
 struct SceneMeshInstance {
     remixapi_MeshHandle handle;
@@ -17,6 +51,8 @@ struct SceneMeshInstance {
 };
 
 static std::vector<SceneMeshInstance> g_sceneMeshes;
+static std::unordered_map<uint64_t, remixapi_TextureHandle> g_textureHandles;
+static std::unordered_map<uint64_t, remixapi_MaterialHandle> g_materialHandles;
 
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
 static remixapi_MeshHandle g_fallbackMesh = nullptr;
@@ -58,23 +94,136 @@ bool RemixRenderer::Init() {
 }
 
 // ---------------------------------------------------------------------------
-// Load extracted scene meshes into Remix
+// Load extracted textures, materials, and meshes into Remix
 // ---------------------------------------------------------------------------
-void RemixRenderer::LoadSceneMeshes(std::vector<ExtractedMesh>&& meshes) {
+void RemixRenderer::LoadScene(ExtractionResult&& result) {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
-    // Destroy previous scene meshes
+    // ----- Destroy previous state -----
     for (auto& inst : g_sceneMeshes) {
         if (inst.handle) api->DestroyMesh(inst.handle);
     }
     g_sceneMeshes.clear();
 
-    uint32_t created = 0;
-    uint32_t failed = 0;
+    for (auto& [hash, handle] : g_materialHandles) {
+        if (handle) api->DestroyMaterial(handle);
+    }
+    g_materialHandles.clear();
 
-    for (auto& mesh : meshes) {
+    for (auto& [hash, handle] : g_textureHandles) {
+        if (handle) api->DestroyTexture(handle);
+    }
+    g_textureHandles.clear();
+
+    // ----- Upload textures -----
+    uint32_t texCreated = 0, texFailed = 0, texSkipped = 0;
+
+    for (auto& tex : result.textures) {
+        remixapi_Format remixFmt = DxgiToRemixFormat(tex.dxgiFormat);
+        if (remixFmt == (remixapi_Format)0) {
+            _MESSAGE("FO4RemixPlugin: Skipping texture 0x%llX - unsupported DXGI format %u",
+                     (unsigned long long)tex.hash, (unsigned int)tex.dxgiFormat);
+            texSkipped++;
+            continue;
+        }
+
+        remixapi_TextureInfo texInfo = {};
+        texInfo.sType     = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+        texInfo.pNext     = nullptr;
+        texInfo.hash      = tex.hash;
+        texInfo.width     = tex.width;
+        texInfo.height    = tex.height;
+        texInfo.depth     = 1;
+        texInfo.mipLevels = 1;
+        texInfo.format    = remixFmt;
+        texInfo.data      = tex.pixels.data();
+        texInfo.dataSize  = tex.pixels.size();
+
+        remixapi_TextureHandle handle = nullptr;
+        remixapi_ErrorCode status = api->CreateTexture(&texInfo, &handle);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
+            _MESSAGE("FO4RemixPlugin: Failed to upload texture 0x%llX (error %d)",
+                     (unsigned long long)tex.hash, (int)status);
+            texFailed++;
+            continue;
+        }
+
+        g_textureHandles[tex.hash] = handle;
+        texCreated++;
+    }
+
+    _MESSAGE("FO4RemixPlugin: Textures - uploaded %u, failed %u, skipped %u",
+             texCreated, texFailed, texSkipped);
+
+    // ----- Create materials (one per unique diffuseTextureHash) -----
+    std::unordered_set<uint64_t> materialHashes;
+    for (auto& mesh : result.meshes) {
+        if (mesh.diffuseTextureHash != 0)
+            materialHashes.insert(mesh.diffuseTextureHash);
+    }
+
+    uint32_t matCreated = 0, matFailed = 0;
+
+    for (uint64_t diffHash : materialHashes) {
+        std::wstring hashPath = HashToPath(diffHash);
+
+        remixapi_MaterialInfoOpaqueEXT opaqueExt = {};
+        opaqueExt.sType             = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+        opaqueExt.pNext             = nullptr;
+        opaqueExt.roughnessTexture  = nullptr;
+        opaqueExt.metallicTexture   = nullptr;
+        opaqueExt.heightTexture     = nullptr;
+        opaqueExt.albedoConstant    = { 1.0f, 1.0f, 1.0f };
+        opaqueExt.opacityConstant   = 1.0f;
+        opaqueExt.roughnessConstant = 0.5f;
+        opaqueExt.metallicConstant  = 0.0f;
+
+        remixapi_MaterialInfo matInfo = {};
+        matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+        matInfo.pNext              = &opaqueExt;
+        matInfo.hash               = diffHash;
+        matInfo.albedoTexture      = hashPath.c_str();
+        matInfo.normalTexture      = nullptr;
+        matInfo.tangentTexture     = nullptr;
+        matInfo.emissiveTexture    = nullptr;
+        matInfo.emissiveIntensity  = 0.0f;
+        matInfo.emissiveColorConstant = { 0.0f, 0.0f, 0.0f };
+        matInfo.spriteSheetRow     = 1;
+        matInfo.spriteSheetCol     = 1;
+        matInfo.spriteSheetFps     = 0;
+        matInfo.filterMode         = 1;
+        matInfo.wrapModeU          = 0;
+        matInfo.wrapModeV          = 0;
+
+        remixapi_MaterialHandle handle = nullptr;
+        remixapi_ErrorCode status = api->CreateMaterial(&matInfo, &handle);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
+            _MESSAGE("FO4RemixPlugin: Failed to create material for texture 0x%llX (error %d)",
+                     (unsigned long long)diffHash, (int)status);
+            matFailed++;
+            continue;
+        }
+
+        g_materialHandles[diffHash] = handle;
+        matCreated++;
+    }
+
+    _MESSAGE("FO4RemixPlugin: Materials - created %u, failed %u", matCreated, matFailed);
+
+    // ----- Create meshes -----
+    uint32_t meshCreated = 0, meshFailed = 0;
+
+    for (auto& mesh : result.meshes) {
         if (mesh.vertices.empty()) continue;
+
+        // Look up material handle for this mesh's diffuse texture
+        remixapi_MaterialHandle matHandle = nullptr;
+        if (mesh.diffuseTextureHash != 0) {
+            auto it = g_materialHandles.find(mesh.diffuseTextureHash);
+            if (it != g_materialHandles.end())
+                matHandle = it->second;
+        }
 
         remixapi_MeshInfoSurfaceTriangles surface = {};
         surface.vertices_values = mesh.vertices.data();
@@ -82,7 +231,7 @@ void RemixRenderer::LoadSceneMeshes(std::vector<ExtractedMesh>&& meshes) {
         surface.indices_values = mesh.indices.empty() ? nullptr : mesh.indices.data();
         surface.indices_count = (uint32_t)mesh.indices.size();
         surface.skinning_hasvalue = 0;
-        surface.material = nullptr;
+        surface.material = matHandle;
 
         remixapi_MeshInfo meshInfo = {};
         meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
@@ -93,7 +242,7 @@ void RemixRenderer::LoadSceneMeshes(std::vector<ExtractedMesh>&& meshes) {
         remixapi_MeshHandle handle = nullptr;
         remixapi_ErrorCode status = api->CreateMesh(&meshInfo, &handle);
         if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            failed++;
+            meshFailed++;
             continue;
         }
 
@@ -102,10 +251,10 @@ void RemixRenderer::LoadSceneMeshes(std::vector<ExtractedMesh>&& meshes) {
         memcpy(&inst.transform.matrix, mesh.worldTransform, sizeof(mesh.worldTransform));
 
         g_sceneMeshes.push_back(inst);
-        created++;
+        meshCreated++;
     }
 
-    _MESSAGE("FO4RemixPlugin: LoadSceneMeshes - created %u, failed %u", created, failed);
+    _MESSAGE("FO4RemixPlugin: Meshes - created %u, failed %u", meshCreated, meshFailed);
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +343,16 @@ void RemixRenderer::Shutdown() {
         if (inst.handle) api->DestroyMesh(inst.handle);
     }
     g_sceneMeshes.clear();
+
+    for (auto& [hash, handle] : g_materialHandles) {
+        if (handle) api->DestroyMaterial(handle);
+    }
+    g_materialHandles.clear();
+
+    for (auto& [hash, handle] : g_textureHandles) {
+        if (handle) api->DestroyTexture(handle);
+    }
+    g_textureHandles.clear();
 
     if (g_fallbackMesh) {
         api->DestroyMesh(g_fallbackMesh);

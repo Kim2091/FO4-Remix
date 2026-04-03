@@ -6,11 +6,16 @@
 #include "remix_renderer.h"
 
 #include <cstring>
+#include <atomic>
 
 static PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 static F4SEMessagingInterface* g_messaging = nullptr;
 
 static bool g_hookInstalled = false;
+
+// Signals that game forms are loaded and ready for scene extraction.
+// Set by the F4SE GameDataReady message; read by present_hook.cpp.
+std::atomic<bool> g_gameDataReady { false };
 
 void TryInstallHook() {
     if (g_hookInstalled) return;
@@ -29,6 +34,7 @@ void OnF4SEMessage(F4SEMessagingInterface::Message* msg) {
     switch (msg->type) {
     case F4SEMessagingInterface::kMessage_GameDataReady:
         _MESSAGE("FO4RemixPlugin: GameDataReady (data=%p)", msg->data);
+        g_gameDataReady = true;
         TryInstallHook();
         break;
     case F4SEMessagingInterface::kMessage_GameLoaded:

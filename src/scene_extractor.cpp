@@ -8,9 +8,16 @@
 #include "f4se/NiTypes.h"
 #include "f4se/BSGeometry.h"
 #include "f4se/GameTypes.h"
+#include "f4se/NiProperties.h"
+#include "f4se/NiMaterials.h"
+#include "f4se/NiTextures.h"
 
+#include <d3d11.h>
+#include <cmath>
 #include <cstring>
+#include <unordered_map>
 #include <unordered_set>
+#include <wrl/client.h>
 
 // ---------------------------------------------------------------------------
 // g_player RelocPtr — same address as GameReferences.cpp but avoids pulling
@@ -65,10 +72,258 @@ static float UnpackByte(uint8_t b) {
 }
 
 // ---------------------------------------------------------------------------
+// Texture cache — keyed by hash derived from ID3D11Resource pointer
+// ---------------------------------------------------------------------------
+static std::unordered_map<uint64_t, ExtractedTexture> g_textureCache;
+
+// ---------------------------------------------------------------------------
+// Compute mip-0 byte size for a given DXGI_FORMAT, width, height.
+// Returns 0 for unsupported formats (caller should skip texture).
+// ---------------------------------------------------------------------------
+static uint32_t ComputeMip0Size(uint32_t width, uint32_t height, DXGI_FORMAT fmt)
+{
+    uint32_t bw, bh; // block dimensions (in blocks for BC, in pixels for uncompressed)
+    switch (fmt) {
+        // BC1 / DXT1
+        case DXGI_FORMAT_BC1_TYPELESS:      // 70 — not in task list but close
+        case DXGI_FORMAT_BC1_UNORM:         // 71
+        case DXGI_FORMAT_BC1_UNORM_SRGB:    // 72
+            bw = (width + 3) / 4;  if (bw < 1) bw = 1;
+            bh = (height + 3) / 4; if (bh < 1) bh = 1;
+            return bw * bh * 8;
+
+        // BC3 / DXT5
+        case DXGI_FORMAT_BC3_TYPELESS:      // 76
+        case DXGI_FORMAT_BC3_UNORM:         // 77
+        case DXGI_FORMAT_BC3_UNORM_SRGB:    // 78
+            bw = (width + 3) / 4;  if (bw < 1) bw = 1;
+            bh = (height + 3) / 4; if (bh < 1) bh = 1;
+            return bw * bh * 16;
+
+        // BC5
+        case DXGI_FORMAT_BC5_TYPELESS:      // 82
+        case DXGI_FORMAT_BC5_UNORM:         // 83
+        case DXGI_FORMAT_BC5_SNORM:         // 84
+            bw = (width + 3) / 4;  if (bw < 1) bw = 1;
+            bh = (height + 3) / 4; if (bh < 1) bh = 1;
+            return bw * bh * 16;
+
+        // BC7
+        case DXGI_FORMAT_BC7_TYPELESS:      // 97
+        case DXGI_FORMAT_BC7_UNORM:         // 98
+        case DXGI_FORMAT_BC7_UNORM_SRGB:    // 99
+            bw = (width + 3) / 4;  if (bw < 1) bw = 1;
+            bh = (height + 3) / 4; if (bh < 1) bh = 1;
+            return bw * bh * 16;
+
+        // R8G8B8A8
+        case DXGI_FORMAT_R8G8B8A8_UNORM:        // 28
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:   // 29
+            return width * height * 4;
+
+        // B8G8R8A8
+        case DXGI_FORMAT_B8G8R8A8_UNORM:         // 87
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:    // 91
+            return width * height * 4;
+
+        default:
+            return 0; // unsupported
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Determine whether a DXGI_FORMAT is block-compressed and its block byte size.
+// Returns false for uncompressed formats.
+// ---------------------------------------------------------------------------
+static bool IsBlockCompressed(DXGI_FORMAT fmt, uint32_t& blockSize)
+{
+    switch (fmt) {
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC1_UNORM_SRGB:
+            blockSize = 8;
+            return true;
+
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_BC3_UNORM_SRGB:
+        case DXGI_FORMAT_BC5_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM:
+        case DXGI_FORMAT_BC5_SNORM:
+        case DXGI_FORMAT_BC7_TYPELESS:
+        case DXGI_FORMAT_BC7_UNORM:
+        case DXGI_FORMAT_BC7_UNORM_SRGB:
+            blockSize = 16;
+            return true;
+
+        default:
+            blockSize = 0;
+            return false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GPU readback: copy mip 0 of a texture into CPU memory
+// ---------------------------------------------------------------------------
+static bool ReadbackTexture(ID3D11Device* device, ID3D11Texture2D* tex2D,
+                            uint64_t hash, ExtractedTexture& out)
+{
+    using Microsoft::WRL::ComPtr;
+
+    ComPtr<ID3D11DeviceContext> ctx;
+    device->GetImmediateContext(&ctx);
+    if (!ctx) return false;
+
+    D3D11_TEXTURE2D_DESC desc;
+    tex2D->GetDesc(&desc);
+
+    uint32_t dataSize = ComputeMip0Size(desc.Width, desc.Height, desc.Format);
+    if (dataSize == 0) {
+        _MESSAGE("FO4RemixPlugin: ReadbackTexture - unsupported DXGI format %u, skipping", (unsigned)desc.Format);
+        return false;
+    }
+
+    // Create staging texture matching mip 0
+    D3D11_TEXTURE2D_DESC stagingDesc = {};
+    stagingDesc.Width              = desc.Width;
+    stagingDesc.Height             = desc.Height;
+    stagingDesc.MipLevels          = 1;
+    stagingDesc.ArraySize          = 1;
+    stagingDesc.Format             = desc.Format;
+    stagingDesc.SampleDesc.Count   = 1;
+    stagingDesc.SampleDesc.Quality = 0;
+    stagingDesc.Usage              = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags          = 0;
+    stagingDesc.CPUAccessFlags     = D3D11_CPU_ACCESS_READ;
+
+    ComPtr<ID3D11Texture2D> staging;
+    HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &staging);
+    if (FAILED(hr)) {
+        _MESSAGE("FO4RemixPlugin: ReadbackTexture - CreateTexture2D staging failed hr=0x%08X", (unsigned)hr);
+        return false;
+    }
+
+    // Copy mip 0 from the source texture
+    ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex2D, 0, nullptr);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    hr = ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        _MESSAGE("FO4RemixPlugin: ReadbackTexture - Map failed hr=0x%08X", (unsigned)hr);
+        return false;
+    }
+
+    // Determine row layout
+    uint32_t blockSize = 0;
+    bool bc = IsBlockCompressed(desc.Format, blockSize);
+
+    uint32_t numRows;       // number of scanline-rows (or block-rows for BC)
+    uint32_t expectedPitch; // tight row pitch
+
+    if (bc) {
+        uint32_t bw = (desc.Width  + 3) / 4; if (bw < 1) bw = 1;
+        uint32_t bh = (desc.Height + 3) / 4; if (bh < 1) bh = 1;
+        numRows       = bh;
+        expectedPitch = bw * blockSize;
+    } else {
+        numRows       = desc.Height;
+        expectedPitch = desc.Width * 4; // all uncompressed formats we support are 4 bpp
+    }
+
+    out.pixels.resize(dataSize);
+    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+    uint8_t* dst = out.pixels.data();
+
+    for (uint32_t row = 0; row < numRows; row++) {
+        memcpy(dst, src, expectedPitch);
+        src += mapped.RowPitch;
+        dst += expectedPitch;
+    }
+
+    ctx->Unmap(staging.Get(), 0);
+
+    // Fill metadata
+    out.hash       = hash;
+    out.width      = desc.Width;
+    out.height     = desc.Height;
+    out.dxgiFormat = desc.Format;
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Walk the shader property chain on a BSTriShape to extract the diffuse texture
+// ---------------------------------------------------------------------------
+static uint64_t ExtractDiffuseTexture(BSTriShape* shape, ID3D11Device* device,
+                                      std::vector<ExtractedTexture>& newTextures)
+{
+    if (!shape) return 0;
+
+    // BSGeometry::shaderProperty is NiPointer<NiProperty>
+    NiProperty* prop = shape->shaderProperty;
+    if (!prop) return 0;
+
+    BSShaderProperty* shaderProp = static_cast<BSShaderProperty*>(prop);
+    BSShaderMaterial* material = shaderProp->shaderMaterial;
+    if (!material) return 0;
+
+    // GetFeature() == 2 means lighting shader material
+    if (material->GetFeature() != 2) return 0;
+
+    BSLightingShaderMaterialBase* lightingMat =
+        static_cast<BSLightingShaderMaterialBase*>(material);
+
+    NiTexture* diffuseTex = lightingMat->spDiffuseTexture;
+    if (!diffuseTex) return 0;
+
+    BSRenderData* renderData = diffuseTex->rendererData;
+    if (!renderData) return 0;
+
+    ID3D11Resource* resource = renderData->resource;
+    if (!resource) return 0;
+
+    // Compute hash from resource pointer
+    uint64_t hash = (uintptr_t)resource * 0x9E3779B97F4A7C15ULL;
+
+    // Check cache first
+    auto it = g_textureCache.find(hash);
+    if (it != g_textureCache.end()) {
+        return hash;
+    }
+
+    // QueryInterface to ID3D11Texture2D
+    ID3D11Texture2D* tex2D = nullptr;
+    HRESULT hr = resource->QueryInterface(__uuidof(ID3D11Texture2D),
+                                          reinterpret_cast<void**>(&tex2D));
+    if (FAILED(hr) || !tex2D) return 0;
+
+    ExtractedTexture extracted;
+    bool ok = ReadbackTexture(device, tex2D, hash, extracted);
+    tex2D->Release();
+
+    if (!ok) return 0;
+
+    // Log the texture name for debugging
+    const char* texName = diffuseTex->name.c_str();
+    _MESSAGE("FO4RemixPlugin: Extracted diffuse texture \"%s\" %ux%u fmt=%u hash=0x%016llX",
+             texName ? texName : "<null>",
+             extracted.width, extracted.height,
+             (unsigned)extracted.dxgiFormat, hash);
+
+    // Store in cache and output list
+    g_textureCache[hash] = extracted; // copy into cache
+    newTextures.push_back(std::move(extracted));
+
+    return hash;
+}
+
+// ---------------------------------------------------------------------------
 // Extract vertex/index data from a single BSTriShape
 // ---------------------------------------------------------------------------
 static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
-                            std::vector<ExtractedMesh>& out)
+                            std::vector<ExtractedMesh>& out,
+                            ID3D11Device* device,
+                            std::vector<ExtractedTexture>& newTextures)
 {
     if (!shape || shape->numVertices == 0 || shape->numTriangles == 0)
         return false;
@@ -161,12 +416,29 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
         }
     }
 
+    // Validate vertex positions — reject mesh if any are NaN/Inf
+    for (uint16_t i = 0; i < shape->numVertices; i++) {
+        const auto& pos = mesh.vertices[i].position;
+        for (int j = 0; j < 3; j++) {
+            if (std::isnan(pos[j]) || std::isinf(pos[j])) {
+                _MESSAGE("FO4RemixPlugin: Rejecting mesh - vertex %u has NaN/Inf position", i);
+                return false;
+            }
+        }
+    }
+
     // Indices (uint16 → uint32)
     uint32_t indexCount = shape->numTriangles * 3;
     uint16_t* indices16 = reinterpret_cast<uint16_t*>(ibData);
     mesh.indices.resize(indexCount);
     for (uint32_t i = 0; i < indexCount; i++) {
-        mesh.indices[i] = indices16[i];
+        uint32_t idx = indices16[i];
+        if (idx >= shape->numVertices) {
+            _MESSAGE("FO4RemixPlugin: Rejecting mesh - index[%u]=%u >= numVertices=%u",
+                     i, idx, shape->numVertices);
+            return false;
+        }
+        mesh.indices[i] = idx;
     }
 
     // World transform → row-major 3x4
@@ -183,6 +455,10 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     mesh.worldTransform[0][3] = xf.pos.y;
     mesh.worldTransform[1][3] = xf.pos.x;
     mesh.worldTransform[2][3] = xf.pos.z;
+
+    // Extract diffuse texture
+    mesh.diffuseTextureHash = ExtractDiffuseTexture(shape, device, newTextures);
+    mesh.normalTextureHash  = 0; // future
 
     // Log first few shapes' vertex data for debugging
     if (s_loggedShapes < 3 && !mesh.vertices.empty()) {
@@ -203,7 +479,10 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
 // Recursively walk an NiNode tree and extract all BSTriShape children
 // ---------------------------------------------------------------------------
 static void WalkNode(NiAVObject* obj, uint64_t baseHash,
-                     std::vector<ExtractedMesh>& out, int depth = 0)
+                     std::vector<ExtractedMesh>& out,
+                     ID3D11Device* device,
+                     std::vector<ExtractedTexture>& newTextures,
+                     int depth = 0)
 {
     if (!obj || depth > 32) return;
 
@@ -214,7 +493,7 @@ static void WalkNode(NiAVObject* obj, uint64_t baseHash,
     // Check if this is a BSTriShape
     BSTriShape* tri = obj->GetAsBSTriShape();
     if (tri) {
-        ExtractTriShape(tri, baseHash, out);
+        ExtractTriShape(tri, baseHash, out, device, newTextures);
         return; // BSTriShape is a leaf — no children
     }
 
@@ -224,24 +503,62 @@ static void WalkNode(NiAVObject* obj, uint64_t baseHash,
         for (uint16_t i = 0; i < node->m_children.m_emptyRunStart; i++) {
             NiAVObject* child = node->m_children.m_data[i];
             if (child) {
-                WalkNode(child, baseHash, out, depth + 1);
+                WalkNode(child, baseHash, out, device, newTextures, depth + 1);
             }
         }
     }
 }
 
 // ---------------------------------------------------------------------------
+// Lightweight readiness check — is the player in a cell with loaded 3D?
+// ---------------------------------------------------------------------------
+bool SceneExtractor::IsPlayerCellReady()
+{
+    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
+    if (!ppPlayer || !*ppPlayer)
+        return false;
+    uintptr_t player = *ppPlayer;
+
+    // parentCell must exist
+    uintptr_t cellPtr = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
+    if (!cellPtr)
+        return false;
+
+    // Cell must have objects
+    struct SimpleArray {
+        uintptr_t* entries;
+        uint32_t capacity;
+        uint32_t pad0C;
+        uint32_t count;
+    };
+    auto& objectList = *reinterpret_cast<SimpleArray*>(cellPtr + OFF_CELL_OBJECT_LIST);
+    if (!objectList.entries || objectList.count == 0)
+        return false;
+
+    // Player's own 3D must be loaded (strong signal that cell 3D is populated)
+    uintptr_t loadedData = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_LOADED_DATA);
+    if (!loadedData)
+        return false;
+    NiNode* rootNode = *reinterpret_cast<NiNode**>(loadedData + OFF_LOADED_ROOT_NODE);
+    if (!rootNode)
+        return false;
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Extract all geometry from loaded references in the player's current cell
 // ---------------------------------------------------------------------------
-std::vector<ExtractedMesh> SceneExtractor::ExtractPlayerCell()
+ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
 {
     std::vector<ExtractedMesh> result;
+    std::vector<ExtractedTexture> newTextures;
 
     // Get player pointer
     uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
     if (!ppPlayer || !*ppPlayer) {
         _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - no player");
-        return result;
+        return { std::move(result), std::move(newTextures) };
     }
     uintptr_t player = *ppPlayer;
 
@@ -249,7 +566,7 @@ std::vector<ExtractedMesh> SceneExtractor::ExtractPlayerCell()
     uintptr_t cellPtr = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
     if (!cellPtr) {
         _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - no parentCell");
-        return result;
+        return { std::move(result), std::move(newTextures) };
     }
 
     // Access cell objectList (tArray<TESObjectREFR*> at offset 0x70)
@@ -281,12 +598,21 @@ std::vector<ExtractedMesh> SceneExtractor::ExtractPlayerCell()
         uint64_t baseHash = refrPtr * 0x9E3779B97F4A7C15ULL; // hash mix
 
         size_t before = result.size();
-        WalkNode(rootNode, baseHash, result);
+        WalkNode(rootNode, baseHash, result, device, newTextures);
         meshCount += (uint32_t)(result.size() - before);
     }
 
-    _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - extracted %u meshes from %u objects",
-             meshCount, objectList.count);
+    _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - extracted %u meshes, %zu new textures (%zu cached) from %u objects",
+             meshCount, newTextures.size(), g_textureCache.size(), objectList.count);
 
-    return result;
+    return { std::move(result), std::move(newTextures) };
+}
+
+// ---------------------------------------------------------------------------
+// Clear the texture readback cache
+// ---------------------------------------------------------------------------
+void SceneExtractor::ClearTextureCache()
+{
+    _MESSAGE("FO4RemixPlugin: ClearTextureCache - clearing %zu entries", g_textureCache.size());
+    g_textureCache.clear();
 }
