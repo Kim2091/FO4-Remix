@@ -109,7 +109,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     }
 
     // Extract scene geometry once the remix thread is ready and game is loaded
-    // Wait a few frames after remix is ready to ensure game state is stable
+    // Wait ~10 seconds (600 frames) to ensure all 3D data is loaded into memory
     if (g_remixReady && !g_sceneExtracted && g_presentCallCount > 60) {
         _MESSAGE("FO4RemixPlugin: Starting scene extraction on main thread...");
         g_sceneExtracted = true;
