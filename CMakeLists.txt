@@ -44,6 +44,8 @@ target_compile_options(f4se_minimal PUBLIC /FI"f4se_compat.h")
 # Plugin DLL
 add_library(FO4RemixPlugin SHARED
     src/main.cpp
+    src/config.h
+    src/config.cpp
     src/present_hook.h
     src/present_hook.cpp
     src/remix_api.h

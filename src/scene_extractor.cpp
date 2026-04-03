@@ -1,4 +1,5 @@
 #include "scene_extractor.h"
+#include "config.h"
 #include "light_extractor.h"
 
 #include "f4se_common/f4se_version.h"
@@ -18,9 +19,35 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <unordered_map>
 #include <unordered_set>
 #include <wrl/client.h>
+
+// ---------------------------------------------------------------------------
+// Debug: dump an RGBA8 texture to a TGA file for visual inspection
+// ---------------------------------------------------------------------------
+static void DebugDumpTGA(const char* path, const uint8_t* rgba, uint32_t w, uint32_t h)
+{
+    std::ofstream f(path, std::ios::binary);
+    if (!f) return;
+
+    uint8_t header[18] = {};
+    header[2]  = 2; // uncompressed true-color
+    header[12] = (uint8_t)(w & 0xFF);
+    header[13] = (uint8_t)(w >> 8);
+    header[14] = (uint8_t)(h & 0xFF);
+    header[15] = (uint8_t)(h >> 8);
+    header[16] = 32; // bits per pixel
+    header[17] = 0x20; // top-left origin
+    f.write(reinterpret_cast<const char*>(header), 18);
+
+    // TGA is BGRA, our data is RGBA
+    for (uint32_t i = 0; i < w * h; i++) {
+        uint8_t pixel[4] = { rgba[i*4+2], rgba[i*4+1], rgba[i*4+0], rgba[i*4+3] };
+        f.write(reinterpret_cast<const char*>(pixel), 4);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // g_player RelocPtr — same address as GameReferences.cpp but avoids pulling
@@ -349,17 +376,32 @@ static bool DecompressAndInvert(ExtractedTexture& tex)
             uint8_t block[4][4][4]; // [y][x][rgba]
 
             if (isBC5) {
-                // BC5: two independent alpha-style blocks for R and G channels
+                // BC5: R=specular, G=smoothness. Use G channel as-is, write grayscale.
                 uint8_t rChan[4][4], gChan[4][4];
                 DecodeBC3AlphaBlock(src, rChan);
                 DecodeBC3AlphaBlock(src + 8, gChan);
                 for (int y = 0; y < 4; y++)
                     for (int x = 0; x < 4; x++) {
-                        block[y][x][0] = rChan[y][x];
-                        block[y][x][1] = gChan[y][x];
-                        block[y][x][2] = 0;
+                        uint8_t roughness = gChan[y][x];
+                        block[y][x][0] = roughness;
+                        block[y][x][1] = roughness;
+                        block[y][x][2] = roughness;
                         block[y][x][3] = 255;
                     }
+                src += blockSize;
+
+                // Write pixels (already inverted)
+                for (int y = 0; y < 4; y++) {
+                    uint32_t py = by * 4 + y;
+                    if (py >= tex.height) continue;
+                    for (int x = 0; x < 4; x++) {
+                        uint32_t px = bx * 4 + x;
+                        if (px >= tex.width) continue;
+                        uint32_t offset = (py * tex.width + px) * 4;
+                        memcpy(&rgba[offset], block[y][x], 4);
+                    }
+                }
+                continue;
             } else if (isBC3) {
                 uint8_t alphas[4][4];
                 DecodeBC3AlphaBlock(src, alphas);
@@ -372,7 +414,7 @@ static bool DecompressAndInvert(ExtractedTexture& tex)
             }
             src += blockSize;
 
-            // Write decoded + inverted pixels
+            // Write decoded + inverted pixels (BC1/BC3 path)
             for (int y = 0; y < 4; y++) {
                 uint32_t py = by * 4 + y;
                 if (py >= tex.height) continue;
@@ -433,12 +475,142 @@ static void SmoothnessToRoughness(ExtractedTexture& tex)
 }
 
 // ---------------------------------------------------------------------------
+// Tangent-space normal → hemispherical octahedral encoding
+// (Port of NVIDIA's LightspeedOctahedralConverter, MIT license)
+// ---------------------------------------------------------------------------
+static void DecompressNormalBC(ExtractedTexture& tex)
+{
+    bool isBC1 = (tex.dxgiFormat == DXGI_FORMAT_BC1_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC1_UNORM_SRGB ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC1_TYPELESS);
+    bool isBC3 = (tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM_SRGB ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC3_TYPELESS);
+    bool isBC5 = (tex.dxgiFormat == DXGI_FORMAT_BC5_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC5_SNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC5_TYPELESS);
+
+    if (!isBC1 && !isBC3 && !isBC5) return;
+
+    uint32_t bw = (tex.width + 3) / 4;
+    uint32_t bh = (tex.height + 3) / 4;
+    uint32_t blockSize = isBC1 ? 8 : 16;
+
+    std::vector<uint8_t> rgba(tex.width * tex.height * 4);
+    const uint8_t* src = tex.pixels.data();
+
+    for (uint32_t by = 0; by < bh; by++) {
+        for (uint32_t bx = 0; bx < bw; bx++) {
+            uint8_t block[4][4][4];
+
+            if (isBC5) {
+                // BC5: two alpha-style blocks for R and G; reconstruct Z
+                uint8_t rChan[4][4], gChan[4][4];
+                DecodeBC3AlphaBlock(src, rChan);
+                DecodeBC3AlphaBlock(src + 8, gChan);
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++) {
+                        float nx = rChan[y][x] / 255.0f * 2.0f - 1.0f;
+                        float ny = gChan[y][x] / 255.0f * 2.0f - 1.0f;
+                        float nz2 = 1.0f - nx * nx - ny * ny;
+                        float nz = nz2 > 0.0f ? sqrtf(nz2) : 0.0f;
+                        block[y][x][0] = rChan[y][x];
+                        block[y][x][1] = gChan[y][x];
+                        block[y][x][2] = (uint8_t)(nz * 127.5f + 127.5f);
+                        block[y][x][3] = 255;
+                    }
+            } else if (isBC3) {
+                uint8_t alphas[4][4];
+                DecodeBC3AlphaBlock(src, alphas);
+                DecodeBC1ColorBlock(src + 8, block);
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++)
+                        block[y][x][3] = alphas[y][x];
+            } else {
+                DecodeBC1ColorBlock(src, block);
+            }
+            src += blockSize;
+
+            for (int y = 0; y < 4; y++) {
+                uint32_t py = by * 4 + y;
+                if (py >= tex.height) continue;
+                for (int x = 0; x < 4; x++) {
+                    uint32_t px = bx * 4 + x;
+                    if (px >= tex.width) continue;
+                    uint32_t offset = (py * tex.width + px) * 4;
+                    memcpy(&rgba[offset], block[y][x], 4);
+                }
+            }
+        }
+    }
+
+    tex.pixels = std::move(rgba);
+    tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
+static void ConvertNormalToOctahedral(ExtractedTexture& tex)
+{
+    // Decompress BC formats to RGBA first
+    switch (tex.dxgiFormat) {
+        case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB: case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB: case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM: case DXGI_FORMAT_BC5_TYPELESS:
+            DecompressNormalBC(tex);
+            break;
+        default:
+            break;
+    }
+
+    // Must be uncompressed RGBA at this point
+    if (tex.dxgiFormat != DXGI_FORMAT_R8G8B8A8_UNORM &&
+        tex.dxgiFormat != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+        tex.dxgiFormat != DXGI_FORMAT_B8G8R8A8_UNORM &&
+        tex.dxgiFormat != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)
+        return;
+
+    for (uint32_t i = 0; i < tex.width * tex.height; i++) {
+        uint8_t* p = &tex.pixels[i * 4];
+
+        // Decode tangent-space normal from [0,255] to [-1,1]
+        float x = p[0] / 255.0f * 2.0f - 1.0f;
+        float y = p[1] / 255.0f * 2.0f - 1.0f;
+        float z = p[2] / 255.0f * 2.0f - 1.0f;
+
+        // Clamp Z >= 0 (hemispherical — inward normals not supported by Remix)
+        if (z < 0.0f) z = -z;
+
+        // Normalize
+        float len = sqrtf(x * x + y * y + z * z);
+        if (len > 1e-6f) { x /= len; y /= len; z /= len; }
+        else { x = 0; y = 0; z = 1; }
+
+        // Octahedral projection: project onto octahedron surface
+        float absSum = fabsf(x) + fabsf(y) + fabsf(z);
+        float ox = x / absSum;
+        float oy = y / absSum;
+
+        // Hemisphere encoding
+        float rx = (ox + oy) * 0.5f + 0.5f;
+        float ry = (ox - oy) * 0.5f + 0.5f;
+
+        p[0] = (uint8_t)fminf(fmaxf(rx * 255.0f + 0.5f, 0.0f), 255.0f);
+        p[1] = (uint8_t)fminf(fmaxf(ry * 255.0f + 0.5f, 0.0f), 255.0f);
+        p[2] = 0;
+        p[3] = 255;
+    }
+
+    tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+}
+
+// ---------------------------------------------------------------------------
 // Generic texture extraction from any NiTexture slot
 // ---------------------------------------------------------------------------
+enum class TexturePostProcess { None, InvertRGB, Octahedral };
+
 static uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                        ID3D11Device* device,
                                        std::vector<ExtractedTexture>& newTextures,
-                                       bool invertRGB = false)
+                                       TexturePostProcess postProcess = TexturePostProcess::None)
 {
     if (!tex) return 0;
 
@@ -448,10 +620,10 @@ static uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
     ID3D11Resource* resource = renderData->resource;
     if (!resource) return 0;
 
-    // Compute hash from resource pointer — include inversion in hash so the
-    // inverted variant doesn't collide with the raw texture in the cache
+    // Compute hash — include post-processing mode so variants don't collide
     uint64_t hash = (uintptr_t)resource * 0x9E3779B97F4A7C15ULL;
-    if (invertRGB) hash ^= 0xA3F1D7B200000001ULL;
+    if (postProcess == TexturePostProcess::InvertRGB)  hash ^= 0xA3F1D7B200000001ULL;
+    if (postProcess == TexturePostProcess::Octahedral) hash ^= 0x0C7AED8A00000002ULL;
 
     // Check cache first
     auto it = g_textureCache.find(hash);
@@ -471,16 +643,92 @@ static uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
 
     if (!ok) return 0;
 
-    if (invertRGB) {
-        SmoothnessToRoughness(extracted);
+    // --- Debug dump: diffuse control (no post-processing) ---
+    if (postProcess == TexturePostProcess::None) {
+        static int s_dumpDiffuse = 0;
+        if (s_dumpDiffuse < 2) {
+            ExtractedTexture tmp = extracted;
+            // Decompress BC1 to RGBA so we can dump it
+            bool isBC1tmp = (tmp.dxgiFormat == DXGI_FORMAT_BC1_UNORM ||
+                             tmp.dxgiFormat == DXGI_FORMAT_BC1_UNORM_SRGB ||
+                             tmp.dxgiFormat == DXGI_FORMAT_BC1_TYPELESS);
+            if (isBC1tmp) {
+                DecompressNormalBC(tmp); // reuses the BC1 decode path to get RGBA
+            }
+            if (tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+                char path[256];
+                snprintf(path, sizeof(path), "c:/temp/fo4_debug_diffuse_%d.tga", s_dumpDiffuse++);
+                DebugDumpTGA(path, tmp.pixels.data(), tmp.width, tmp.height);
+                _MESSAGE("FO4RemixPlugin: DEBUG dumped diffuse -> %s (%ux%u)", path, tmp.width, tmp.height);
+            }
+        }
     }
 
-    const char* texName = tex->name.c_str();
-    _MESSAGE("FO4RemixPlugin: Extracted %s texture \"%s\" %ux%u fmt=%u hash=0x%016llX%s",
-             slotName, texName ? texName : "<null>",
-             extracted.width, extracted.height,
-             (unsigned)extracted.dxgiFormat, hash,
-             invertRGB ? " (inverted)" : "");
+    // --- Debug dump: raw BC5 decode (before post-processing) ---
+    // Dump first 3 normal + first 3 roughness textures for inspection.
+    {
+        static int s_dumpNormalRaw = 0, s_dumpRoughnessRaw = 0;
+        bool dumpRaw = false;
+        if (postProcess == TexturePostProcess::Octahedral && s_dumpNormalRaw < 3) dumpRaw = true;
+        if (postProcess == TexturePostProcess::InvertRGB  && s_dumpRoughnessRaw < 3) dumpRaw = true;
+
+        if (dumpRaw) {
+            // BC5 needs decompression to RGBA before we can dump, so do a temporary decode
+            ExtractedTexture tmp = extracted; // copy
+            bool isBC5tmp = (tmp.dxgiFormat == DXGI_FORMAT_BC5_UNORM ||
+                             tmp.dxgiFormat == DXGI_FORMAT_BC5_SNORM ||
+                             tmp.dxgiFormat == DXGI_FORMAT_BC5_TYPELESS);
+            if (isBC5tmp) {
+                DecompressNormalBC(tmp); // decodes to RGBA with reconstructed Z
+            }
+            if (tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+                char path[256];
+                if (postProcess == TexturePostProcess::Octahedral)
+                    snprintf(path, sizeof(path), "c:/temp/fo4_debug_normal_raw_%d.tga", s_dumpNormalRaw++);
+                else
+                    snprintf(path, sizeof(path), "c:/temp/fo4_debug_roughness_raw_%d.tga", s_dumpRoughnessRaw++);
+                DebugDumpTGA(path, tmp.pixels.data(), tmp.width, tmp.height);
+                _MESSAGE("FO4RemixPlugin: DEBUG dumped raw decode -> %s (%ux%u)", path, tmp.width, tmp.height);
+            }
+        }
+    }
+
+    if (postProcess == TexturePostProcess::InvertRGB) {
+        SmoothnessToRoughness(extracted);
+    } else if (postProcess == TexturePostProcess::Octahedral) {
+        ConvertNormalToOctahedral(extracted);
+    }
+
+    // --- Debug dump: after post-processing ---
+    {
+        static int s_dumpNormalPost = 0, s_dumpRoughnessPost = 0;
+        bool dumpPost = false;
+        if (postProcess == TexturePostProcess::Octahedral && s_dumpNormalPost < 3) dumpPost = true;
+        if (postProcess == TexturePostProcess::InvertRGB  && s_dumpRoughnessPost < 3) dumpPost = true;
+
+        if (dumpPost && (extracted.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                         extracted.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
+            char path[256];
+            if (postProcess == TexturePostProcess::Octahedral)
+                snprintf(path, sizeof(path), "c:/temp/fo4_debug_normal_post_%d.tga", s_dumpNormalPost++);
+            else
+                snprintf(path, sizeof(path), "c:/temp/fo4_debug_roughness_post_%d.tga", s_dumpRoughnessPost++);
+            DebugDumpTGA(path, extracted.pixels.data(), extracted.width, extracted.height);
+            _MESSAGE("FO4RemixPlugin: DEBUG dumped post-process -> %s (%ux%u)", path, extracted.width, extracted.height);
+        }
+    }
+
+    if (g_config.logTextures) {
+        const char* texName = tex->name.c_str();
+        _MESSAGE("FO4RemixPlugin: Extracted %s texture \"%s\" %ux%u fmt=%u hash=0x%016llX%s",
+                 slotName, texName ? texName : "<null>",
+                 extracted.width, extracted.height,
+                 (unsigned)extracted.dxgiFormat, hash,
+                 postProcess == TexturePostProcess::InvertRGB ? " (inverted)" :
+                 postProcess == TexturePostProcess::Octahedral ? " (octahedral)" : "");
+    }
 
     g_textureCache[hash] = extracted;
     newTextures.push_back(std::move(extracted));
@@ -529,24 +777,27 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     bool hasNormals    = (desc & BSGeometry::kFlag_Normals) != 0;
     bool hasColors     = (desc & BSGeometry::kFlag_VertexColors) != 0;
 
-    // Offsets are stored as nibbles, each representing offset/4
-    uint32_t oUV     = ((desc >>  8) & 0xF) * 4;
-    uint32_t oNormal = ((desc >> 16) & 0xF) * 4;
-    uint32_t oColor  = ((desc >> 24) & 0xF) * 4;
+    // Nibble 1 (szVertex) is a base added to each component offset nibble.
+    // For half-float positions szVertex=0 and offsets are already absolute.
+    // For full-precision positions szVertex=3 (12 bytes / 4) and must be added.
+    uint32_t szVertex = (desc >> 4) & 0xF;
+    uint32_t oUV     = (szVertex + ((desc >>  8) & 0xF)) * 4;
+    uint32_t oNormal = (szVertex + ((desc >> 16) & 0xF)) * 4;
+    uint32_t oColor  = (szVertex + ((desc >> 24) & 0xF)) * 4;
 
-    // Determine position format from UV offset:
-    //   oUV == 8  → positions are 4 half-floats (8 bytes)
-    //   oUV >= 12 → positions are 3 full floats (12 bytes)
-    bool posHalfFloat = (oUV > 0 && oUV <= 8);
+    // FullPrecision flag: positions are 3 full floats (12 bytes)
+    // Otherwise: positions are 4 half-floats (8 bytes)
+    bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
 
-    // Log first shape's vertex format for debugging
-    static int s_loggedShapes = 0;
-    if (s_loggedShapes < 3) {
-        _MESSAGE("FO4RemixPlugin: Shape vertexSize=%u desc=0x%016llX oUV=%u oNormal=%u oColor=%u posHalf=%d "
-                 "flags: UV=%d Norm=%d Color=%d FullPrec=%d verts=%u tris=%u",
-                 vertexSize, desc, oUV, oNormal, oColor, posHalfFloat,
+    const char* shapeName = shape->m_name.c_str();
+    if (g_config.logShapeInfo) {
+        _MESSAGE("FO4RemixPlugin: Shape \"%s\" vertexSize=%u desc=0x%016llX posHalf=%d "
+                 "flags: UV=%d Norm=%d Color=%d FullPrec=%d Skinned=%d verts=%u tris=%u",
+                 shapeName ? shapeName : "<null>",
+                 vertexSize, desc, posHalfFloat,
                  hasUVs, hasNormals, hasColors,
                  (desc & BSGeometry::kFlag_FullPrecision) ? 1 : 0,
+                 (desc & BSGeometry::kFlag_Skinned) ? 1 : 0,
                  shape->numVertices, shape->numTriangles);
     }
 
@@ -597,6 +848,7 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
         } else {
             out_v.color = 0xFFFFFFFF; // white
         }
+
     }
 
     // Validate vertex positions — reject mesh if any are NaN/Inf
@@ -604,7 +856,9 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
         const auto& pos = mesh.vertices[i].position;
         for (int j = 0; j < 3; j++) {
             if (std::isnan(pos[j]) || std::isinf(pos[j])) {
-                _MESSAGE("FO4RemixPlugin: Rejecting mesh - vertex %u has NaN/Inf position", i);
+                if (g_config.logRejections)
+                    _MESSAGE("FO4RemixPlugin: Rejecting mesh \"%s\" - vertex %u has NaN/Inf position",
+                             shapeName ? shapeName : "<null>", i);
                 return false;
             }
         }
@@ -617,8 +871,9 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     for (uint32_t i = 0; i < indexCount; i++) {
         uint32_t idx = indices16[i];
         if (idx >= shape->numVertices) {
-            _MESSAGE("FO4RemixPlugin: Rejecting mesh - index[%u]=%u >= numVertices=%u",
-                     i, idx, shape->numVertices);
+            if (g_config.logRejections)
+                _MESSAGE("FO4RemixPlugin: Rejecting mesh \"%s\" - index[%u]=%u >= numVertices=%u",
+                         shapeName ? shapeName : "<null>", i, idx, shape->numVertices);
             return false;
         }
         mesh.indices[i] = idx;
@@ -655,18 +910,16 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     if (extentY > maxExtent) maxExtent = extentY;
     if (extentZ > maxExtent) maxExtent = extentZ;
 
-    const char* shapeName = shape->m_name.c_str();
-
     // Reject shapes with garbage vertex data (huge but finite extents)
-    static constexpr float kMaxReasonableExtent = 10000.0f;
-    if (maxExtent > kMaxReasonableExtent) {
-        _MESSAGE("FO4RemixPlugin: Rejecting shape \"%s\" - extent %.0f exceeds max (%.0f)",
-                 shapeName ? shapeName : "<null>", maxExtent, kMaxReasonableExtent);
+    if (maxExtent > g_config.maxExtent) {
+        if (g_config.logRejections)
+            _MESSAGE("FO4RemixPlugin: Rejecting shape \"%s\" - extent %.0f exceeds max (%.0f)",
+                     shapeName ? shapeName : "<null>", maxExtent, g_config.maxExtent);
         return false;
     }
 
     // Log shapes with large world extent to help identify unwanted geometry
-    if (maxExtent > 500.0f) {
+    if (g_config.logLargeShapes && maxExtent > 500.0f) {
         _MESSAGE("FO4RemixPlugin: LARGE shape \"%s\" extent=(%.0f, %.0f, %.0f) maxExt=%.0f "
                  "worldPos=(%.1f, %.1f, %.1f) verts=%u tris=%u",
                  shapeName ? shapeName : "<null>",
@@ -678,8 +931,8 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     // Extract textures from the lighting material
     BSLightingShaderMaterialBase* lightingMat = GetLightingMaterial(shape);
     mesh.diffuseTextureHash   = lightingMat ? ExtractMaterialTexture(lightingMat->spDiffuseTexture, "diffuse", device, newTextures) : 0;
-    mesh.normalTextureHash    = lightingMat ? ExtractMaterialTexture(lightingMat->spNormalTexture, "normal", device, newTextures) : 0;
-    mesh.roughnessTextureHash = lightingMat ? ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, true) : 0;
+    mesh.normalTextureHash    = lightingMat ? ExtractMaterialTexture(lightingMat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral) : 0;
+    mesh.roughnessTextureHash = lightingMat ? ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, TexturePostProcess::InvertRGB) : 0;
 
     out.push_back(std::move(mesh));
     return true;

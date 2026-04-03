@@ -1,4 +1,5 @@
 #include "remix_renderer.h"
+#include "config.h"
 #include "remix_api.h"
 
 #include "remix/remix_c.h"
@@ -287,14 +288,18 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
     // ----- Create lights -----
     uint32_t lightCreated = 0, lightFailed = 0;
 
+    if (!g_config.lightsEnabled) {
+        _MESSAGE("FO4RemixPlugin: Lights disabled by config");
+    }
+
     for (auto& light : result.lights) {
+        if (!g_config.lightsEnabled) break;
+
         remixapi_LightInfoSphereEXT sphere = {};
         sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
         sphere.pNext = nullptr;
         sphere.position = { light.position[0], light.position[1], light.position[2] };
-        // Emitter sphere scales with FO4 radius so the path tracer can sample it
-        // at scene distances (Bethesda units, ~70 per meter)
-        sphere.radius = (std::max)(light.radius * 0.025f, 0.5f);
+        sphere.radius = (std::max)(light.radius * 0.025f * g_config.lightRadius, 0.5f);
         sphere.volumetricRadianceScale = 1.0f;
 
         if (light.isSpotLight && light.spotFOV > 0.0f) {
@@ -311,13 +316,34 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
             sphere.shaping_hasvalue = false;
         }
 
+        // Apply intensity multiplier and color strength
+        float cs = g_config.lightColorStrength;
+        float intensity = g_config.lightIntensity;
+        float r = light.radiance[0], g = light.radiance[1], b = light.radiance[2];
+        if (cs < 1.0f) {
+            // Lerp toward white (average luminance) as color strength decreases
+            float avg = (r + g + b) / 3.0f;
+            r = avg + (r - avg) * cs;
+            g = avg + (g - avg) * cs;
+            b = avg + (b - avg) * cs;
+        }
+
         remixapi_LightInfo info = {};
         info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
         info.pNext = &sphere;
         info.hash = light.hash;
-        info.radiance = { light.radiance[0], light.radiance[1], light.radiance[2] };
+        info.radiance = { r * intensity, g * intensity, b * intensity };
         info.isDynamic = false;
         info.ignoreViewModel = false;
+
+        if (lightCreated < 3) {
+            _MESSAGE("FO4RemixPlugin: Light[%u] configIntensity=%.4f origRadiance=(%.1f,%.1f,%.1f) "
+                     "finalRadiance=(%.1f,%.1f,%.1f) radius=%.1f",
+                     lightCreated, intensity,
+                     light.radiance[0], light.radiance[1], light.radiance[2],
+                     info.radiance.x, info.radiance.y, info.radiance.z,
+                     sphere.radius);
+        }
 
         remixapi_LightHandle handle = nullptr;
         remixapi_ErrorCode status = api->CreateLight(&info, &handle);

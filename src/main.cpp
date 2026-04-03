@@ -1,6 +1,7 @@
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
 
+#include "config.h"
 #include "present_hook.h"
 #include "remix_api.h"
 #include "remix_renderer.h"
@@ -72,6 +73,8 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se) {
 
     _MESSAGE("FO4RemixPlugin: Loading (F4SE v%d, runtime v%08X)",
              f4se->f4seVersion, f4se->runtimeVersion);
+
+    LoadConfig();
 
     g_messaging = static_cast<F4SEMessagingInterface*>(
         f4se->QueryInterface(kInterface_Messaging));

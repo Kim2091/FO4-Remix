@@ -1,4 +1,5 @@
 #include "light_extractor.h"
+#include "config.h"
 
 #include "f4se_common/f4se_version.h"
 #include "f4se_common/Relocation.h"
@@ -37,7 +38,8 @@ static constexpr uint32_t LIGH_FLAG_SPOTLIGHT = 0x100;
 // Intensity tuning constant: converts FO4 light into Remix HDR radiance.
 // Scales by radius to ensure lights are visible at their intended range
 // given Bethesda-unit scene distances (~70 units/meter).
-static constexpr float kIntensityScale = 10.0f;
+// Tuned so that INI Intensity=1.0 gives reasonable brightness.
+static constexpr float kIntensityScale = 0.1f;
 
 std::vector<ExtractedLight> LightExtractor::ExtractPlayerCellLights()
 {
@@ -84,7 +86,7 @@ std::vector<ExtractedLight> LightExtractor::ExtractPlayerCellLights()
         float fade         = *reinterpret_cast<float*>(baseForm + OFF_LIGH_FADE);
 
         // Log first few lights for verification
-        if (!s_loggedDiscovery && lightCount < 5) {
+        if (g_config.logLights && !s_loggedDiscovery && lightCount < 5) {
             _MESSAGE("FO4RemixPlugin: Light REFR=0x%llX baseForm=0x%llX "
                      "pos=(%.1f, %.1f, %.1f) rot=(%.2f, %.2f, %.2f) "
                      "radius=%u color=0x%08X flags=0x%08X fov=%.1f fade=%.2f",
@@ -146,6 +148,7 @@ std::vector<ExtractedLight> LightExtractor::ExtractPlayerCellLights()
         s_loggedDiscovery = true;
     }
 
-    _MESSAGE("FO4RemixPlugin: Extracted %u lights from cell", lightCount);
+    if (g_config.logLights)
+        _MESSAGE("FO4RemixPlugin: Extracted %u lights from cell", lightCount);
     return result;
 }
