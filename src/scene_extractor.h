@@ -22,6 +22,9 @@ struct ExtractedMesh {
     uint64_t diffuseTextureHash;    // 0 = no texture
     uint64_t normalTextureHash;     // 0 = no texture
     uint64_t roughnessTextureHash;  // 0 = no texture (FO4 smoothness/spec mask)
+    bool alphaTestEnabled;          // true if NiAlphaProperty has alpha test
+    int alphaTestType;              // Remix/VkCompareOp value (7 = Always = no test)
+    uint8_t alphaTestRef;           // Alpha reference value (0-255)
 };
 
 struct ExtractionResult {

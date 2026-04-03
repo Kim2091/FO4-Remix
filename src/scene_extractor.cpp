@@ -775,6 +775,17 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     if (!shape || shape->numVertices == 0 || shape->numTriangles == 0)
         return false;
 
+    // Skip effect shaders (god rays, glows, particles, etc.) — not real geometry
+    {
+        NiProperty* prop = shape->shaderProperty;
+        if (prop) {
+            BSShaderProperty* sp = static_cast<BSShaderProperty*>(prop);
+            BSShaderMaterial* mat = sp->shaderMaterial;
+            if (!mat || mat->GetFeature() != 2) // 2 = BSLightingShaderMaterialBase
+                return false;
+        }
+    }
+
     // Renderer data → vertex/index buffers
     auto* gfxData = static_cast<BSGraphics::TriShape*>(shape->pRendererData);
     if (!gfxData || !gfxData->pVB || !gfxData->pIB)
@@ -950,6 +961,26 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     mesh.diffuseTextureHash   = lightingMat ? ExtractMaterialTexture(lightingMat->spDiffuseTexture, "diffuse", device, newTextures) : 0;
     mesh.normalTextureHash    = lightingMat ? ExtractMaterialTexture(lightingMat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral) : 0;
     mesh.roughnessTextureHash = lightingMat ? ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, TexturePostProcess::InvertRGB) : 0;
+
+    // Extract alpha test state from NiAlphaProperty (effectState on BSGeometry)
+    mesh.alphaTestEnabled = false;
+    mesh.alphaTestType = 7; // Always (no test)
+    mesh.alphaTestRef = 128;
+    NiProperty* alphaPropRaw = shape->effectState;
+    if (alphaPropRaw) {
+        NiAlphaProperty* alphaProp = static_cast<NiAlphaProperty*>(alphaPropRaw);
+        bool testEnabled = (alphaProp->alphaFlags >> 9) & 1;
+        if (testEnabled) {
+            int niTestFunc = (alphaProp->alphaFlags >> 10) & 7;
+            // Map NiAlphaProperty::TestFunction to Remix/VkCompareOp
+            // NI:  Always=0, Less=1, Equal=2, LessEq=3, Greater=4, NotEq=5, GreaterEq=6, Never=7
+            // VK:  Never=0,  Less=1, Equal=2, LessEq=3, Greater=4, NotEq=5, GreaterEq=6, Always=7
+            static const int niToVk[] = { 7, 1, 2, 3, 4, 5, 6, 0 };
+            mesh.alphaTestEnabled = true;
+            mesh.alphaTestType = niToVk[niTestFunc];
+            mesh.alphaTestRef = alphaProp->alphaThreshold;
+        }
+    }
 
     out.push_back(std::move(mesh));
     return true;

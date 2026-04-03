@@ -243,6 +243,9 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         uint64_t diffuse;
         uint64_t normal;
         uint64_t roughness;
+        bool alphaTestEnabled;
+        int alphaTestType;       // Remix/VkCompareOp
+        uint8_t alphaTestRef;
         uint64_t combined() const {
             uint64_t h = diffuse;
             h ^= normal  * 0x517CC1B727220A95ULL;
@@ -254,8 +257,17 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
     std::unordered_map<uint64_t, MaterialKey> materialKeys;
     for (auto& mesh : result.meshes) {
         if (mesh.diffuseTextureHash == 0) continue;
-        MaterialKey key { mesh.diffuseTextureHash, mesh.normalTextureHash, mesh.roughnessTextureHash };
-        materialKeys.emplace(key.combined(), key);
+        MaterialKey key { mesh.diffuseTextureHash, mesh.normalTextureHash, mesh.roughnessTextureHash,
+                          mesh.alphaTestEnabled, mesh.alphaTestType, mesh.alphaTestRef };
+        auto it = materialKeys.find(key.combined());
+        if (it == materialKeys.end()) {
+            materialKeys.emplace(key.combined(), key);
+        } else if (mesh.alphaTestEnabled && !it->second.alphaTestEnabled) {
+            // If any mesh using this material needs alpha testing, enable it
+            it->second.alphaTestEnabled = true;
+            it->second.alphaTestType = mesh.alphaTestType;
+            it->second.alphaTestRef = mesh.alphaTestRef;
+        }
     }
 
     uint32_t matCreated = 0, matFailed = 0;
@@ -275,7 +287,8 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         opaqueExt.opacityConstant   = 1.0f;
         opaqueExt.roughnessConstant = key.roughness ? 0.5f : 0.8f;
         opaqueExt.metallicConstant  = 0.0f;
-        opaqueExt.alphaTestType     = 7; // AlphaTestType::kAlways
+        opaqueExt.alphaTestType     = key.alphaTestEnabled ? key.alphaTestType : 7;
+        opaqueExt.alphaReferenceValue = key.alphaTestEnabled ? key.alphaTestRef : 0;
 
         remixapi_MaterialInfo matInfo = {};
         matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
