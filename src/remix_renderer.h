@@ -9,7 +9,13 @@ namespace RemixRenderer {
     void OnFrame(const CameraState& cam);
     void Shutdown();
 
-    // Upload textures, create materials, and load meshes into Remix.
-    // Replaces any previously loaded scene. Called on the remix thread.
-    void LoadScene(ExtractionResult&& result);
+    // Upload textures, create materials, and load meshes for a specific cell.
+    // Called on the remix thread.
+    void LoadCellScene(uint32_t cellFormID, ExtractionResult&& result);
+
+    // Destroy all Remix handles for a specific cell.
+    void UnloadCell(uint32_t cellFormID);
+
+    // Destroy all Remix handles for all cells.
+    void UnloadAllCells();
 }

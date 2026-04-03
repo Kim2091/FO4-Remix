@@ -15,7 +15,7 @@ struct ExtractedLight {
 };
 
 namespace LightExtractor {
-    // Extract all placed lights from the player's current cell.
+    // Extract all placed lights from the given cell.
     // Must be called on the main thread.
-    std::vector<ExtractedLight> ExtractPlayerCellLights();
+    std::vector<ExtractedLight> ExtractCellLights(uintptr_t cellPtr);
 }

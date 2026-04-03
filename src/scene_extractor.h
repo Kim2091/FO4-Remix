@@ -30,7 +30,16 @@ struct ExtractionResult {
     std::vector<ExtractedLight> lights;      // Placed lights from the cell
 };
 
+struct CellInfo {
+    uintptr_t cellPtr;
+    uint32_t formID;
+};
+
 namespace SceneExtractor {
+    // Returns the player's current parent cell pointer, or 0 if unavailable.
+    // Cheap enough to call every frame for cell-change detection.
+    uintptr_t GetPlayerCellPtr();
+
     // Lightweight check: player exists, parentCell loaded, cell has objects,
     // and player's 3D root node is present.  Cheap enough to call every frame.
     bool IsPlayerCellReady();
@@ -39,6 +48,12 @@ namespace SceneExtractor {
     // player's current cell.  Must be called on the main thread.
     // |device| is used for GPU texture readback (staging copies).
     ExtractionResult ExtractPlayerCell(ID3D11Device* device);
+
+    // Returns all cells currently loaded by the engine (from DataHandler::cellList).
+    std::vector<CellInfo> GetLoadedCells();
+
+    // Extract all geometry from a specific cell. Must be called on the main thread.
+    ExtractionResult ExtractCell(uintptr_t cellPtr, ID3D11Device* device);
 
     // Drop the internal texture cache (call on cell change if desired).
     void ClearTextureCache();

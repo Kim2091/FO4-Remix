@@ -9,10 +9,6 @@
 #include <cmath>
 #include <cstring>
 
-// Same player RelocPtr as scene_extractor.cpp
-static RelocPtr<uintptr_t> s_g_player(0x032D2260);
-
-static constexpr uintptr_t OFF_REFR_PARENT_CELL = 0xB8;
 static constexpr uintptr_t OFF_REFR_POS         = 0xD0;
 static constexpr uintptr_t OFF_REFR_ROT         = 0xC0;
 static constexpr uintptr_t OFF_REFR_BASE_FORM   = 0xE0;
@@ -41,15 +37,10 @@ static constexpr uint32_t LIGH_FLAG_SPOTLIGHT = 0x100;
 // Tuned so that INI Intensity=1.0 gives reasonable brightness.
 static constexpr float kIntensityScale = 0.1f;
 
-std::vector<ExtractedLight> LightExtractor::ExtractPlayerCellLights()
+std::vector<ExtractedLight> LightExtractor::ExtractCellLights(uintptr_t cellPtr)
 {
     std::vector<ExtractedLight> result;
 
-    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
-    if (!ppPlayer || !*ppPlayer) return result;
-    uintptr_t player = *ppPlayer;
-
-    uintptr_t cellPtr = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
     if (!cellPtr) return result;
 
     struct SimpleArray {

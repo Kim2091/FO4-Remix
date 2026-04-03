@@ -22,6 +22,7 @@
 #include <fstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <unordered_set>
 #include <wrl/client.h>
 
 // ---------------------------------------------------------------------------
@@ -54,6 +55,7 @@ static void DebugDumpTGA(const char* path, const uint8_t* rgba, uint32_t w, uint
 // in the full GameReferences / GameForms dependency chain.
 // ---------------------------------------------------------------------------
 static RelocPtr<uintptr_t> s_g_player(0x032D2260);
+static RelocPtr<uintptr_t> s_g_dataHandler(0x030DC000);
 
 // Known offsets (verified by STATIC_ASSERTs in F4SE SDK headers):
 //   TESObjectREFR::parentCell  = 0xB8  (GameReferences.h)
@@ -992,6 +994,17 @@ static void WalkNode(NiAVObject* obj, uint64_t baseHash,
 }
 
 // ---------------------------------------------------------------------------
+// Return the player's current parent cell pointer (0 if unavailable)
+// ---------------------------------------------------------------------------
+uintptr_t SceneExtractor::GetPlayerCellPtr()
+{
+    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
+    if (!ppPlayer || !*ppPlayer) return 0;
+    uintptr_t player = *ppPlayer;
+    return *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
+}
+
+// ---------------------------------------------------------------------------
 // Lightweight readiness check — is the player in a cell with loaded 3D?
 // ---------------------------------------------------------------------------
 bool SceneExtractor::IsPlayerCellReady()
@@ -1029,25 +1042,88 @@ bool SceneExtractor::IsPlayerCellReady()
 }
 
 // ---------------------------------------------------------------------------
-// Extract all geometry from loaded references in the player's current cell
+// Return all cells currently loaded by the engine (from DataHandler::cellList)
 // ---------------------------------------------------------------------------
-ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
+std::vector<CellInfo> SceneExtractor::GetLoadedCells()
+{
+    std::vector<CellInfo> result;
+    std::unordered_set<uintptr_t> seen;
+
+    // Always include the player's parentCell — this is the one cell guaranteed
+    // to have loaded 3D.  For exterior worldspaces, the grid cells are managed
+    // by GridCellArray (not DataHandler::cellList), so the player's parentCell
+    // would otherwise be missed.
+    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
+    if (ppPlayer && *ppPlayer) {
+        uintptr_t player = *ppPlayer;
+        uintptr_t playerCell = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
+        if (playerCell) {
+            uint32_t formID = *reinterpret_cast<uint32_t*>(playerCell + OFF_FORM_ID);
+            result.push_back({ playerCell, formID });
+            seen.insert(playerCell);
+        }
+    }
+
+    // Supplement with DataHandler::cellList — picks up additional interior cells
+    // that have loaded 3D (e.g., attached cells in interior spaces).
+    uintptr_t* ppDataHandler = reinterpret_cast<uintptr_t*>(s_g_dataHandler.GetPtr());
+    if (!ppDataHandler || !*ppDataHandler) return result;
+    uintptr_t dh = *ppDataHandler;
+
+    // NiTArray<TESObjectCELL*> cellList at offset 0xF58
+    // NiTArray has vtbl(8), then m_data(8), m_arrayBufLen(2), m_emptyRunStart(2), m_size(2), m_growSize(2)
+    uintptr_t cellListBase = dh + 0xF58;
+    uintptr_t* cellData = *reinterpret_cast<uintptr_t**>(cellListBase + 0x08);
+    uint16_t emptyRunStart = *reinterpret_cast<uint16_t*>(cellListBase + 0x12);
+
+    if (!cellData || emptyRunStart == 0) return result;
+
+    for (uint16_t i = 0; i < emptyRunStart; i++) {
+        uintptr_t cellPtr = cellData[i];
+        if (!cellPtr) continue;
+        if (seen.count(cellPtr)) continue;  // skip player's cell (already added)
+
+        // Check objectList count > 0
+        struct SimpleArray {
+            uintptr_t* entries;
+            uint32_t capacity;
+            uint32_t pad0C;
+            uint32_t count;
+        };
+        auto& objectList = *reinterpret_cast<SimpleArray*>(cellPtr + OFF_CELL_OBJECT_LIST);
+        if (!objectList.entries || objectList.count == 0) continue;
+
+        // Only include cells that have at least one object with loaded 3D.
+        // DataHandler::cellList contains all known cell forms, but most won't
+        // have NiNode trees populated until the engine actually renders them.
+        bool hasLoaded3D = false;
+        for (uint32_t j = 0; j < objectList.count; j++) {
+            uintptr_t refrPtr = objectList.entries[j];
+            if (!refrPtr) continue;
+            uintptr_t ld = *reinterpret_cast<uintptr_t*>(refrPtr + OFF_REFR_LOADED_DATA);
+            if (!ld) continue;
+            NiNode* rn = *reinterpret_cast<NiNode**>(ld + OFF_LOADED_ROOT_NODE);
+            if (rn) { hasLoaded3D = true; break; }
+        }
+        if (!hasLoaded3D) continue;
+
+        uint32_t formID = *reinterpret_cast<uint32_t*>(cellPtr + OFF_FORM_ID);
+        result.push_back({ cellPtr, formID });
+        seen.insert(cellPtr);
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Extract all geometry from loaded references in a specific cell
+// ---------------------------------------------------------------------------
+ExtractionResult SceneExtractor::ExtractCell(uintptr_t cellPtr, ID3D11Device* device)
 {
     std::vector<ExtractedMesh> result;
     std::vector<ExtractedTexture> newTextures;
 
-    // Get player pointer
-    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
-    if (!ppPlayer || !*ppPlayer) {
-        _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - no player");
-        return { std::move(result), std::move(newTextures) };
-    }
-    uintptr_t player = *ppPlayer;
-
-    // Get parentCell
-    uintptr_t cellPtr = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
     if (!cellPtr) {
-        _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - no parentCell");
         return { std::move(result), std::move(newTextures) };
     }
 
@@ -1060,7 +1136,8 @@ ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
     };
     auto& objectList = *reinterpret_cast<SimpleArray*>(cellPtr + OFF_CELL_OBJECT_LIST);
 
-    _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - cell has %u objects", objectList.count);
+    uint32_t cellFormID = *reinterpret_cast<uint32_t*>(cellPtr + OFF_FORM_ID);
+    _MESSAGE("FO4RemixPlugin: ExtractCell 0x%08X - cell has %u objects", cellFormID, objectList.count);
 
     uint32_t meshCount = 0;
 
@@ -1068,15 +1145,12 @@ ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
         uintptr_t refrPtr = objectList.entries[i];
         if (!refrPtr) continue;
 
-        // Get LoadedData
         uintptr_t loadedData = *reinterpret_cast<uintptr_t*>(refrPtr + OFF_REFR_LOADED_DATA);
         if (!loadedData) continue;
 
-        // Get root NiNode
         NiNode* rootNode = *reinterpret_cast<NiNode**>(loadedData + OFF_LOADED_ROOT_NODE);
         if (!rootNode) continue;
 
-        // Stable base hash from REFR form ID (consistent across runs)
         uint32_t refrFormID = *reinterpret_cast<uint32_t*>(refrPtr + OFF_FORM_ID);
         uint64_t baseHash = FnvHashCombine(0xCBF29CE484222325ULL, (uint64_t)refrFormID);
 
@@ -1085,9 +1159,8 @@ ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
         meshCount += (uint32_t)(result.size() - before);
     }
 
-    auto lights = LightExtractor::ExtractPlayerCellLights();
+    auto lights = LightExtractor::ExtractCellLights(cellPtr);
 
-    // Count texture types per mesh
     uint32_t hasDiffuse = 0, hasNormal = 0, hasRoughness = 0;
     for (auto& m : result) {
         if (m.diffuseTextureHash)   hasDiffuse++;
@@ -1095,12 +1168,31 @@ ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
         if (m.roughnessTextureHash) hasRoughness++;
     }
 
-    _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - %u meshes (%u diffuse, %u normal, %u roughness), "
+    _MESSAGE("FO4RemixPlugin: ExtractCell 0x%08X - %u meshes (%u diffuse, %u normal, %u roughness), "
              "%zu new textures (%zu cached), %zu lights from %u objects",
-             meshCount, hasDiffuse, hasNormal, hasRoughness,
+             cellFormID, meshCount, hasDiffuse, hasNormal, hasRoughness,
              newTextures.size(), g_textureCache.size(), lights.size(), objectList.count);
 
     return { std::move(result), std::move(newTextures), std::move(lights) };
+}
+
+// ---------------------------------------------------------------------------
+// Extract all geometry from loaded references in the player's current cell
+// ---------------------------------------------------------------------------
+ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
+{
+    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
+    if (!ppPlayer || !*ppPlayer) {
+        _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - no player");
+        return {};
+    }
+    uintptr_t player = *ppPlayer;
+    uintptr_t cellPtr = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
+    if (!cellPtr) {
+        _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - no parentCell");
+        return {};
+    }
+    return ExtractCell(cellPtr, device);
 }
 
 // ---------------------------------------------------------------------------

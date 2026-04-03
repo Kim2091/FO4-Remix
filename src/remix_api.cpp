@@ -51,7 +51,7 @@ static HWND CreateRemixWindow(int width, int height) {
     return hwnd;
 }
 
-bool RemixAPI::Initialize(HWND gameWindow) {
+bool RemixAPI::Initialize(HWND gameWindow, uint32_t width, uint32_t height) {
     if (g_initialized) return true;
 
     remixapi_ErrorCode status = remixapi_lib_loadRemixDllAndInitialize(
@@ -63,8 +63,8 @@ bool RemixAPI::Initialize(HWND gameWindow) {
     }
     _MESSAGE("FO4RemixPlugin: Remix library loaded and initialized");
 
-    // Create a dedicated window for Remix (cannot share the game's DX11 HWND)
-    g_remixWindow = CreateRemixWindow(1280, 720);
+    // Create a dedicated window for Remix matching the game resolution
+    g_remixWindow = CreateRemixWindow(width, height);
     if (!g_remixWindow) {
         _MESSAGE("FO4RemixPlugin: ERROR - Failed to create Remix window");
         return false;

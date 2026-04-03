@@ -52,10 +52,22 @@ struct SceneMeshInstance {
     remixapi_Transform  transform;
 };
 
-static std::vector<SceneMeshInstance> g_sceneMeshes;
-static std::unordered_map<uint64_t, remixapi_TextureHandle> g_textureHandles;
-static std::unordered_map<uint64_t, remixapi_MaterialHandle> g_materialHandles;
-static std::vector<remixapi_LightHandle> g_lightHandles;
+struct CellSceneData {
+    std::vector<SceneMeshInstance> meshes;
+    std::unordered_map<uint64_t, remixapi_MaterialHandle> materials;
+    std::vector<remixapi_LightHandle> lights;
+    std::unordered_set<uint64_t> textureHashes;
+};
+
+static std::unordered_map<uint32_t, CellSceneData> g_cellScenes;
+
+// Textures are shared across cells (same texture may appear in multiple cells)
+// so keep them global with a reference count
+struct TextureRef {
+    remixapi_TextureHandle handle;
+    uint32_t refCount;
+};
+static std::unordered_map<uint64_t, TextureRef> g_textureHandles;
 
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
 static remixapi_MeshHandle g_fallbackMesh = nullptr;
@@ -97,41 +109,100 @@ bool RemixRenderer::Init() {
 }
 
 // ---------------------------------------------------------------------------
-// Load extracted textures, materials, and meshes into Remix
+// Unload all Remix handles for a specific cell
 // ---------------------------------------------------------------------------
-void RemixRenderer::LoadScene(ExtractionResult&& result) {
+void RemixRenderer::UnloadCell(uint32_t cellFormID) {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
-    // ----- Destroy previous state -----
-    for (auto& inst : g_sceneMeshes) {
+    auto it = g_cellScenes.find(cellFormID);
+    if (it == g_cellScenes.end()) return;
+
+    CellSceneData& cell = it->second;
+
+    for (auto& inst : cell.meshes) {
         if (inst.handle) api->DestroyMesh(inst.handle);
     }
-    g_sceneMeshes.clear();
 
-    for (auto& [hash, handle] : g_materialHandles) {
+    for (auto& [hash, handle] : cell.materials) {
         if (handle) api->DestroyMaterial(handle);
     }
-    g_materialHandles.clear();
 
-    for (auto& [hash, handle] : g_textureHandles) {
-        if (handle) api->DestroyTexture(handle);
-    }
-    g_textureHandles.clear();
-
-    for (auto& handle : g_lightHandles) {
+    for (auto& handle : cell.lights) {
         if (handle) api->DestroyLight(handle);
     }
-    g_lightHandles.clear();
 
-    // ----- Upload textures -----
+    // Decrement texture refcounts; destroy if refCount hits 0
+    for (uint64_t texHash : cell.textureHashes) {
+        auto texIt = g_textureHandles.find(texHash);
+        if (texIt != g_textureHandles.end()) {
+            texIt->second.refCount--;
+            if (texIt->second.refCount == 0) {
+                if (texIt->second.handle) api->DestroyTexture(texIt->second.handle);
+                g_textureHandles.erase(texIt);
+            }
+        }
+    }
+
+    g_cellScenes.erase(it);
+}
+
+// ---------------------------------------------------------------------------
+// Unload all cells and destroy all Remix handles
+// ---------------------------------------------------------------------------
+void RemixRenderer::UnloadAllCells() {
+    remixapi_Interface* api = RemixAPI::GetInterface();
+    if (!api) return;
+
+    for (auto& [cellID, cell] : g_cellScenes) {
+        for (auto& inst : cell.meshes) {
+            if (inst.handle) api->DestroyMesh(inst.handle);
+        }
+        for (auto& [hash, handle] : cell.materials) {
+            if (handle) api->DestroyMaterial(handle);
+        }
+        for (auto& handle : cell.lights) {
+            if (handle) api->DestroyLight(handle);
+        }
+    }
+    g_cellScenes.clear();
+
+    for (auto& [hash, texRef] : g_textureHandles) {
+        if (texRef.handle) api->DestroyTexture(texRef.handle);
+    }
+    g_textureHandles.clear();
+}
+
+// ---------------------------------------------------------------------------
+// Load extracted textures, materials, and meshes for a specific cell
+// ---------------------------------------------------------------------------
+void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result) {
+    remixapi_Interface* api = RemixAPI::GetInterface();
+    if (!api) return;
+
+    // If this cell already exists, clean up old data first
+    if (g_cellScenes.find(cellFormID) != g_cellScenes.end()) {
+        UnloadCell(cellFormID);
+    }
+
+    CellSceneData cellData;
+
+    // ----- Upload textures (shared across cells with refcounting) -----
     uint32_t texCreated = 0, texFailed = 0, texSkipped = 0;
 
     for (auto& tex : result.textures) {
+        auto existing = g_textureHandles.find(tex.hash);
+        if (existing != g_textureHandles.end()) {
+            // Texture already loaded by another cell, just bump refcount
+            existing->second.refCount++;
+            cellData.textureHashes.insert(tex.hash);
+            continue;
+        }
+
         remixapi_Format remixFmt = DxgiToRemixFormat(tex.dxgiFormat);
         if (remixFmt == (remixapi_Format)0) {
-            _MESSAGE("FO4RemixPlugin: Skipping texture 0x%llX - unsupported DXGI format %u",
-                     (unsigned long long)tex.hash, (unsigned int)tex.dxgiFormat);
+            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Skipping texture 0x%llX - unsupported DXGI format %u",
+                     cellFormID, (unsigned long long)tex.hash, (unsigned int)tex.dxgiFormat);
             texSkipped++;
             continue;
         }
@@ -151,18 +222,19 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
         remixapi_TextureHandle handle = nullptr;
         remixapi_ErrorCode status = api->CreateTexture(&texInfo, &handle);
         if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            _MESSAGE("FO4RemixPlugin: Failed to upload texture 0x%llX (error %d)",
-                     (unsigned long long)tex.hash, (int)status);
+            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Failed to upload texture 0x%llX (error %d)",
+                     cellFormID, (unsigned long long)tex.hash, (int)status);
             texFailed++;
             continue;
         }
 
-        g_textureHandles[tex.hash] = handle;
+        g_textureHandles[tex.hash] = { handle, 1 };
+        cellData.textureHashes.insert(tex.hash);
         texCreated++;
     }
 
-    _MESSAGE("FO4RemixPlugin: Textures - uploaded %u, failed %u, skipped %u",
-             texCreated, texFailed, texSkipped);
+    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Textures - uploaded %u, failed %u, skipped %u",
+             cellFormID, texCreated, texFailed, texSkipped);
 
     // ----- Create materials (one per unique texture combination) -----
     // Key materials by a combined hash of diffuse+normal+roughness so meshes
@@ -225,17 +297,18 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
         remixapi_MaterialHandle handle = nullptr;
         remixapi_ErrorCode status = api->CreateMaterial(&matInfo, &handle);
         if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            _MESSAGE("FO4RemixPlugin: Failed to create material 0x%llX (error %d)",
-                     (unsigned long long)combinedHash, (int)status);
+            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Failed to create material 0x%llX (error %d)",
+                     cellFormID, (unsigned long long)combinedHash, (int)status);
             matFailed++;
             continue;
         }
 
-        g_materialHandles[combinedHash] = handle;
+        cellData.materials[combinedHash] = handle;
         matCreated++;
     }
 
-    _MESSAGE("FO4RemixPlugin: Materials - created %u, failed %u", matCreated, matFailed);
+    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Materials - created %u, failed %u",
+             cellFormID, matCreated, matFailed);
 
     // ----- Create meshes -----
     uint32_t meshCreated = 0, meshFailed = 0;
@@ -249,8 +322,8 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
             uint64_t combinedHash = mesh.diffuseTextureHash;
             combinedHash ^= mesh.normalTextureHash    * 0x517CC1B727220A95ULL;
             combinedHash ^= mesh.roughnessTextureHash * 0x6C62272E07BB0142ULL;
-            auto it = g_materialHandles.find(combinedHash);
-            if (it != g_materialHandles.end())
+            auto it = cellData.materials.find(combinedHash);
+            if (it != cellData.materials.end())
                 matHandle = it->second;
         }
 
@@ -279,11 +352,12 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
         inst.handle = handle;
         memcpy(&inst.transform.matrix, mesh.worldTransform, sizeof(mesh.worldTransform));
 
-        g_sceneMeshes.push_back(inst);
+        cellData.meshes.push_back(inst);
         meshCreated++;
     }
 
-    _MESSAGE("FO4RemixPlugin: Meshes - created %u, failed %u", meshCreated, meshFailed);
+    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Meshes - created %u, failed %u",
+             cellFormID, meshCreated, meshFailed);
 
     // ----- Create lights -----
     uint32_t lightCreated = 0, lightFailed = 0;
@@ -337,9 +411,9 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
         info.ignoreViewModel = false;
 
         if (lightCreated < 3) {
-            _MESSAGE("FO4RemixPlugin: Light[%u] configIntensity=%.4f origRadiance=(%.1f,%.1f,%.1f) "
+            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Light[%u] configIntensity=%.4f origRadiance=(%.1f,%.1f,%.1f) "
                      "finalRadiance=(%.1f,%.1f,%.1f) radius=%.1f",
-                     lightCreated, intensity,
+                     cellFormID, lightCreated, intensity,
                      light.radiance[0], light.radiance[1], light.radiance[2],
                      info.radiance.x, info.radiance.y, info.radiance.z,
                      sphere.radius);
@@ -352,11 +426,14 @@ void RemixRenderer::LoadScene(ExtractionResult&& result) {
             continue;
         }
 
-        g_lightHandles.push_back(handle);
+        cellData.lights.push_back(handle);
         lightCreated++;
     }
 
-    _MESSAGE("FO4RemixPlugin: Lights - created %u, failed %u", lightCreated, lightFailed);
+    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Lights - created %u, failed %u",
+             cellFormID, lightCreated, lightFailed);
+
+    g_cellScenes[cellFormID] = std::move(cellData);
 }
 
 // ---------------------------------------------------------------------------
@@ -396,9 +473,10 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
     camInfo.type = REMIXAPI_CAMERA_TYPE_WORLD;
     api->SetupCamera(&camInfo);
 
-    // Draw scene meshes
-    if (!g_sceneMeshes.empty()) {
-        for (auto& inst : g_sceneMeshes) {
+    // Draw scene meshes from all loaded cells
+    bool hasAnyMeshes = false;
+    for (auto& [cellID, cellData] : g_cellScenes) {
+        for (auto& inst : cellData.meshes) {
             remixapi_InstanceInfo instance = {};
             instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
             instance.mesh = inst.handle;
@@ -406,13 +484,14 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
             instance.doubleSided = 1;
             instance.categoryFlags = 0;
             api->DrawInstance(&instance);
+            hasAnyMeshes = true;
         }
-
-        // Draw lights
-        for (auto& handle : g_lightHandles) {
+        for (auto& handle : cellData.lights) {
             api->DrawLightInstance(handle);
         }
-    } else if (g_fallbackMesh) {
+    }
+
+    if (!hasAnyMeshes && g_fallbackMesh) {
         // Fallback: place triangle in front of camera to keep path tracing alive
         float px = camParams.position.x + camParams.forward.x * 200.0f;
         float py = camParams.position.y + camParams.forward.y * 200.0f;
@@ -443,30 +522,10 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
 }
 
 void RemixRenderer::Shutdown() {
+    UnloadAllCells();
+
     remixapi_Interface* api = RemixAPI::GetInterface();
-    if (!api) return;
-
-    for (auto& inst : g_sceneMeshes) {
-        if (inst.handle) api->DestroyMesh(inst.handle);
-    }
-    g_sceneMeshes.clear();
-
-    for (auto& [hash, handle] : g_materialHandles) {
-        if (handle) api->DestroyMaterial(handle);
-    }
-    g_materialHandles.clear();
-
-    for (auto& [hash, handle] : g_textureHandles) {
-        if (handle) api->DestroyTexture(handle);
-    }
-    g_textureHandles.clear();
-
-    for (auto& handle : g_lightHandles) {
-        if (handle) api->DestroyLight(handle);
-    }
-    g_lightHandles.clear();
-
-    if (g_fallbackMesh) {
+    if (api && g_fallbackMesh) {
         api->DestroyMesh(g_fallbackMesh);
         g_fallbackMesh = nullptr;
     }
