@@ -178,11 +178,7 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
             mesh.worldTransform[r][c] = xf.rot.data[r][c] * scale;
         }
     }
-    // Negate X and Z rotation rows (keep translation unchanged)
-    for (int c = 0; c < 3; c++) {
-        mesh.worldTransform[0][c] = -mesh.worldTransform[0][c];
-        mesh.worldTransform[2][c] = -mesh.worldTransform[2][c];
-    }
+    // No axis negation — testing clean baseline
     mesh.worldTransform[0][3] = xf.pos.x;
     mesh.worldTransform[1][3] = xf.pos.y;
     mesh.worldTransform[2][3] = xf.pos.z;

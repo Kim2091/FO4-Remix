@@ -57,9 +57,9 @@ CameraState Camera::Get() {
     //   Row 1 = local Y in world (forward)
     //   Row 2 = local Z in world (up)
     // Negate right to flip from FO4's RH to Remix's LH projection
-    state.right[0]   = -xform.rot.data[0][0];
-    state.right[1]   = -xform.rot.data[0][1];
-    state.right[2]   = -xform.rot.data[0][2];
+    state.right[0]   = xform.rot.data[0][0];
+    state.right[1]   = xform.rot.data[0][1];
+    state.right[2]   = xform.rot.data[0][2];
 
     state.forward[0] = xform.rot.data[1][0];
     state.forward[1] = xform.rot.data[1][1];
