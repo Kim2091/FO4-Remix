@@ -92,6 +92,7 @@ static PFN_ClearRenderTargetView g_originalClearRTV = nullptr;
 static ID3D11Texture2D* g_uiRenderTarget = nullptr;
 static bool g_uiRTLocked = false;
 static std::atomic<bool> g_uiClearedThisFrame { false };
+static std::atomic<bool> g_uiDrawnThisFrame { false };
 static bool g_contextHooked = false;
 
 // Per-frame ClearRTV candidate tracking (R8G8B8A8_UNORM textures cleared this frame)
@@ -126,7 +127,7 @@ static void STDMETHODCALLTYPE hkClearRenderTargetView(
                         g_uiClearedThisFrame = true;
                     }
                 } else {
-                    // Detection: add matching textures to per-frame candidate list
+                    // Detection phase: add matching textures to per-frame candidate list
                     D3D11_TEXTURE2D_DESC desc;
                     tex->GetDesc(&desc);
                     if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
@@ -168,7 +169,14 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
             if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
                 if (g_uiRTLocked) {
                     if (tex == g_uiRenderTarget) {
-                        g_uiClearedThisFrame = true;
+                        // If the game didn't clear the RT this frame, do it ourselves
+                        // to prevent stale content from prior frames causing ghosting.
+                        if (!g_uiClearedThisFrame) {
+                            float clearColor[4] = {0, 0, 0, 0};
+                            g_originalClearRTV(context, ppRTVs[0], clearColor);
+                            g_uiClearedThisFrame = true;
+                        }
+                        g_uiDrawnThisFrame = true;
                     }
                 } else {
                     // Check if this sole-bound RT is a ClearRTV candidate
@@ -181,6 +189,7 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
                                 _MESSAGE("FO4RemixPlugin: UI RT detected (cleared + sole-bound): tex=%p", tex);
                             }
                             g_uiClearedThisFrame = true;
+                            g_uiDrawnThisFrame = true;
                             break;
                         }
                     }
@@ -341,10 +350,12 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     }
 
     // Capture UI render target for screen overlay (isolated UI without 3D scene).
-    // The flag is set by OMSetRenderTargets (UI RT was bound this frame) or
-    // ClearRenderTargetView (UI RT was cleared this frame). Either means the
-    // UI pass ran and we should copy.
-    bool uiActiveThisFrame = g_uiClearedThisFrame.exchange(false);
+    // Require BOTH flags: ClearRTV (RT was zeroed) AND OMSetRTs (RT was drawn to).
+    // If only drawn without a clear, the RT has accumulated stale content from
+    // prior frames — skip the copy to avoid ghosting/trailing artifacts.
+    bool uiCleared = g_uiClearedThisFrame.exchange(false);
+    bool uiDrawn = g_uiDrawnThisFrame.exchange(false);
+    bool uiActiveThisFrame = uiCleared && uiDrawn;
 
     if (g_remixReady && g_uiRenderTarget && uiActiveThisFrame) {
         ID3D11Device* device = nullptr;
