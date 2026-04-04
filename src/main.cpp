@@ -46,6 +46,10 @@ void OnF4SEMessage(F4SEMessagingInterface::Message* msg) {
         _MESSAGE("FO4RemixPlugin: InputLoaded");
         TryInstallHook();
         break;
+    case F4SEMessagingInterface::kMessage_PreLoadGame:
+        _MESSAGE("FO4RemixPlugin: PreLoadGame - resetting extraction state");
+        PresentHook::ResetExtractionState();
+        break;
     }
 }
 

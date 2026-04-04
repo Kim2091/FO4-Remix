@@ -444,6 +444,33 @@ bool PresentHook::Install() {
     return true;
 }
 
+void PresentHook::ResetExtractionState() {
+    _MESSAGE("FO4RemixPlugin: Resetting extraction state (save game load)");
+
+    // Tell remix thread to unload everything
+    {
+        std::lock_guard<std::mutex> lock(g_sceneMutex);
+        for (uint32_t cellID : g_extractedCells) {
+            g_pendingUnloads.push_back(cellID);
+        }
+        g_sceneReady = true;
+    }
+
+    // Reset all main-thread extraction tracking
+    g_extractedCells.clear();
+    g_refreshQueue.clear();
+    g_refreshIndex = 0;
+    g_cellPtrMap.clear();
+    g_pendingReextract.clear();
+
+    // Force the initial bootstrap path with retry/quality-gate logic
+    g_firstExtractionDone = false;
+    g_extractionAttempts = 0;
+    g_nextExtractFrame = g_presentCallCount + kInitialRetryDelay;
+
+    SceneExtractor::ClearTextureCache();
+}
+
 void PresentHook::Uninstall() {
     g_remixRunning = false;
     if (g_remixThread.joinable()) {
