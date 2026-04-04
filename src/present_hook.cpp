@@ -65,12 +65,132 @@ static constexpr int kReextractDelay = 180;         // ~3 seconds — retry cell
 // Cells that need re-extraction because textures weren't streamed in yet
 static std::unordered_map<uint32_t, int> g_pendingReextract; // formID -> frame to retry
 
+// Backbuffer capture for screen overlay
+static ID3D11Texture2D* g_stagingTex = nullptr;
+static uint32_t g_stagingWidth = 0;
+static uint32_t g_stagingHeight = 0;
+static DXGI_FORMAT g_stagingFormat = DXGI_FORMAT_UNKNOWN;
+
+static std::mutex g_overlayMutex;
+static std::vector<uint8_t> g_overlayPixels;
+static uint32_t g_overlayWidth = 0;
+static uint32_t g_overlayHeight = 0;
+static DXGI_FORMAT g_overlayDxgiFormat = DXGI_FORMAT_UNKNOWN;
+static std::atomic<bool> g_overlayReady { false };
+
+// UI RT detection uses two hooks together:
+//   ClearRTV: records R8G8B8A8_UNORM candidates cleared with {0,0,0,0}
+//   OMSetRTs: checks if a sole-bound RT was a ClearRTV candidate
+// The intersection uniquely identifies the UI RT — GBuffer R8G8B8A8_UNORM
+// targets are only MRT-bound (never sole), and the backbuffer is never cleared.
+typedef void (STDMETHODCALLTYPE* PFN_OMSetRenderTargets)(
+    ID3D11DeviceContext*, UINT, ID3D11RenderTargetView* const*, ID3D11DepthStencilView*);
+static PFN_OMSetRenderTargets g_originalOMSetRTs = nullptr;
+typedef void (STDMETHODCALLTYPE* PFN_ClearRenderTargetView)(
+    ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT[4]);
+static PFN_ClearRenderTargetView g_originalClearRTV = nullptr;
+static ID3D11Texture2D* g_uiRenderTarget = nullptr;
+static bool g_uiRTLocked = false;
+static std::atomic<bool> g_uiClearedThisFrame { false };
+static bool g_contextHooked = false;
+
+// Per-frame ClearRTV candidate tracking (R8G8B8A8_UNORM textures cleared this frame)
+static constexpr int kMaxClearCandidates = 8;
+static ID3D11Texture2D* g_clearCandidates[kMaxClearCandidates] = {};
+static int g_clearCandidateCount = 0;
+static int g_presentCallCount = 0;
+
 static void PumpMessages() {
     MSG msg;
     while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+}
+
+// ClearRTV hook — Phase 1 of detection: records R8G8B8A8_UNORM candidates.
+// Once locked, just sets the active flag when the known UI RT is cleared.
+static void STDMETHODCALLTYPE hkClearRenderTargetView(
+    ID3D11DeviceContext* context,
+    ID3D11RenderTargetView* rtv,
+    const FLOAT color[4])
+{
+    if (color[0] == 0.0f && color[1] == 0.0f && color[2] == 0.0f && color[3] == 0.0f) {
+        ID3D11Resource* resource = nullptr;
+        rtv->GetResource(&resource);
+        if (resource) {
+            ID3D11Texture2D* tex = nullptr;
+            if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
+                if (g_uiRTLocked) {
+                    if (tex == g_uiRenderTarget) {
+                        g_uiClearedThisFrame = true;
+                    }
+                } else {
+                    // Detection: add matching textures to per-frame candidate list
+                    D3D11_TEXTURE2D_DESC desc;
+                    tex->GetDesc(&desc);
+                    if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                        desc.Width == g_gameWidth && desc.Height == g_gameHeight &&
+                        desc.Usage == D3D11_USAGE_DEFAULT &&
+                        g_clearCandidateCount < kMaxClearCandidates) {
+                        // Avoid duplicates
+                        bool already = false;
+                        for (int i = 0; i < g_clearCandidateCount; i++) {
+                            if (g_clearCandidates[i] == tex) { already = true; break; }
+                        }
+                        if (!already) {
+                            g_clearCandidates[g_clearCandidateCount++] = tex;
+                        }
+                    }
+                }
+                tex->Release();
+            }
+            resource->Release();
+        }
+    }
+    g_originalClearRTV(context, rtv, color);
+}
+
+// OMSetRenderTargets hook — Phase 2 of detection: if a sole-bound RT was also
+// a ClearRTV candidate, it's the UI RT (GBuffer targets are MRT-only,
+// backbuffer is never ClearRTV'd with {0,0,0,0}).
+static void STDMETHODCALLTYPE hkOMSetRenderTargets(
+    ID3D11DeviceContext* context,
+    UINT numViews,
+    ID3D11RenderTargetView* const* ppRTVs,
+    ID3D11DepthStencilView* pDSV)
+{
+    if (numViews == 1 && ppRTVs && ppRTVs[0]) {
+        ID3D11Resource* resource = nullptr;
+        ppRTVs[0]->GetResource(&resource);
+        if (resource) {
+            ID3D11Texture2D* tex = nullptr;
+            if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
+                if (g_uiRTLocked) {
+                    if (tex == g_uiRenderTarget) {
+                        g_uiClearedThisFrame = true;
+                    }
+                } else {
+                    // Check if this sole-bound RT is a ClearRTV candidate
+                    for (int i = 0; i < g_clearCandidateCount; i++) {
+                        if (g_clearCandidates[i] == tex) {
+                            if (g_uiRenderTarget != tex) {
+                                if (g_uiRenderTarget) g_uiRenderTarget->Release();
+                                g_uiRenderTarget = tex;
+                                g_uiRenderTarget->AddRef();
+                                _MESSAGE("FO4RemixPlugin: UI RT detected (cleared + sole-bound): tex=%p", tex);
+                            }
+                            g_uiClearedThisFrame = true;
+                            break;
+                        }
+                    }
+                }
+                tex->Release();
+            }
+            resource->Release();
+        }
+    }
+    g_originalOMSetRTs(context, numViews, ppRTVs, pDSV);
 }
 
 static void RemixThreadFunc() {
@@ -128,10 +248,22 @@ static void RemixThreadFunc() {
             cam = g_sharedCamera;
         }
 
+        // Grab latest overlay data from game thread
+        OverlayData overlay;
+        if (g_overlayReady) {
+            std::lock_guard<std::mutex> lock(g_overlayMutex);
+            overlay.pixels.swap(g_overlayPixels);
+            overlay.width = g_overlayWidth;
+            overlay.height = g_overlayHeight;
+            overlay.dxgiFormat = static_cast<uint32_t>(g_overlayDxgiFormat);
+            overlay.valid = true;
+            g_overlayReady = false;
+        }
+
         // Pump messages before rendering so input is processed even when frames are slow
         PumpMessages();
 
-        RemixRenderer::OnFrame(cam);
+        RemixRenderer::OnFrame(cam, overlay);
 
         // Pump again after rendering
         PumpMessages();
@@ -145,10 +277,11 @@ static void RemixThreadFunc() {
     RemixAPI::Shutdown();
 }
 
-static int g_presentCallCount = 0;
-
 static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
     g_presentCallCount++;
+
+    // Reset per-frame ClearRTV candidate list for next frame's detection
+    g_clearCandidateCount = 0;
 
     // Start remix thread on first Present call
     if (!g_remixRunning && !g_remixThread.joinable()) {
@@ -169,6 +302,147 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         CameraState cam = Camera::Get();
         std::lock_guard<std::mutex> lock(g_cameraMutex);
         g_sharedCamera = cam;
+    }
+
+    // Hook OMSetRenderTargets + ClearRenderTargetView on first opportunity
+    if (!g_contextHooked) {
+        ID3D11Device* hookDevice = nullptr;
+        swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&hookDevice);
+        if (hookDevice) {
+            ID3D11DeviceContext* hookCtx = nullptr;
+            hookDevice->GetImmediateContext(&hookCtx);
+            if (hookCtx) {
+                void** ctxVtable = *reinterpret_cast<void***>(hookCtx);
+
+                // OMSetRenderTargets (vtable index 33) — primary UI RT detection
+                void* omSetRTsAddr = ctxVtable[33];
+                bool omHooked = (MH_CreateHook(omSetRTsAddr, &hkOMSetRenderTargets,
+                                    reinterpret_cast<void**>(&g_originalOMSetRTs)) == MH_OK &&
+                                 MH_EnableHook(omSetRTsAddr) == MH_OK);
+
+                // ClearRenderTargetView (vtable index 50) — sets clearedThisFrame flag
+                void* clearRTVAddr = ctxVtable[50];
+                bool clearHooked = (MH_CreateHook(clearRTVAddr, &hkClearRenderTargetView,
+                                       reinterpret_cast<void**>(&g_originalClearRTV)) == MH_OK &&
+                                    MH_EnableHook(clearRTVAddr) == MH_OK);
+
+                if (omHooked && clearHooked) {
+                    g_contextHooked = true;
+                    _MESSAGE("FO4RemixPlugin: OMSetRenderTargets hooked at %p, ClearRTV hooked at %p",
+                             omSetRTsAddr, clearRTVAddr);
+                } else if (omHooked) {
+                    g_contextHooked = true;
+                    _MESSAGE("FO4RemixPlugin: OMSetRenderTargets hooked at %p (ClearRTV hook failed)", omSetRTsAddr);
+                }
+                hookCtx->Release();
+            }
+            hookDevice->Release();
+        }
+    }
+
+    // Capture UI render target for screen overlay (isolated UI without 3D scene).
+    // The flag is set by OMSetRenderTargets (UI RT was bound this frame) or
+    // ClearRenderTargetView (UI RT was cleared this frame). Either means the
+    // UI pass ran and we should copy.
+    bool uiActiveThisFrame = g_uiClearedThisFrame.exchange(false);
+
+    if (g_remixReady && g_uiRenderTarget && uiActiveThisFrame) {
+        ID3D11Device* device = nullptr;
+        swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&device);
+        if (device) {
+            ID3D11DeviceContext* context = nullptr;
+            device->GetImmediateContext(&context);
+
+            if (context) {
+                D3D11_TEXTURE2D_DESC uiDesc;
+                g_uiRenderTarget->GetDesc(&uiDesc);
+
+                // Create/recreate staging texture if dimensions or format changed
+                if (!g_stagingTex || g_stagingWidth != uiDesc.Width ||
+                    g_stagingHeight != uiDesc.Height || g_stagingFormat != uiDesc.Format) {
+                    if (g_stagingTex) { g_stagingTex->Release(); g_stagingTex = nullptr; }
+
+                    D3D11_TEXTURE2D_DESC stagingDesc = {};
+                    stagingDesc.Width = uiDesc.Width;
+                    stagingDesc.Height = uiDesc.Height;
+                    stagingDesc.MipLevels = 1;
+                    stagingDesc.ArraySize = 1;
+                    stagingDesc.Format = uiDesc.Format;
+                    stagingDesc.SampleDesc.Count = 1;
+                    stagingDesc.Usage = D3D11_USAGE_STAGING;
+                    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+                    HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &g_stagingTex);
+                    if (SUCCEEDED(hr)) {
+                        g_stagingWidth = uiDesc.Width;
+                        g_stagingHeight = uiDesc.Height;
+                        g_stagingFormat = uiDesc.Format;
+                        _MESSAGE("FO4RemixPlugin: Created UI overlay staging texture %ux%u fmt=%u",
+                                 g_stagingWidth, g_stagingHeight, (unsigned)g_stagingFormat);
+                    } else {
+                        _MESSAGE("FO4RemixPlugin: Failed to create UI overlay staging texture (0x%08X)", hr);
+                    }
+                }
+
+                if (g_stagingTex) {
+                    context->CopyResource(g_stagingTex, g_uiRenderTarget);
+
+                    D3D11_MAPPED_SUBRESOURCE mapped;
+                    HRESULT hr = context->Map(g_stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+                    if (SUCCEEDED(hr)) {
+                        uint32_t w = g_stagingWidth;
+                        uint32_t h = g_stagingHeight;
+                        uint32_t rowBytes = w * 4;
+
+                        std::lock_guard<std::mutex> lock(g_overlayMutex);
+                        g_overlayPixels.resize(rowBytes * h);
+
+                        // Copy pixels and un-premultiply alpha.
+                        // The UI RT uses SrcAlpha/1-SrcAlpha blending onto a (0,0,0,0) background,
+                        // so RGB values are premultiplied. DrawScreenOverlay expects straight alpha.
+                        const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+                        uint8_t* dst = g_overlayPixels.data();
+                        for (uint32_t y = 0; y < h; y++) {
+                            const uint8_t* srcRow = src + y * mapped.RowPitch;
+                            uint8_t* dstRow = dst + y * rowBytes;
+                            for (uint32_t x = 0; x < w; x++) {
+                                uint8_t r = srcRow[x * 4 + 0];
+                                uint8_t g = srcRow[x * 4 + 1];
+                                uint8_t b = srcRow[x * 4 + 2];
+                                uint8_t a = srcRow[x * 4 + 3];
+                                if (a > 0 && a < 255) {
+                                    dstRow[x * 4 + 0] = (uint8_t)(std::min)(255u, (uint32_t)r * 255u / a);
+                                    dstRow[x * 4 + 1] = (uint8_t)(std::min)(255u, (uint32_t)g * 255u / a);
+                                    dstRow[x * 4 + 2] = (uint8_t)(std::min)(255u, (uint32_t)b * 255u / a);
+                                } else {
+                                    dstRow[x * 4 + 0] = r;
+                                    dstRow[x * 4 + 1] = g;
+                                    dstRow[x * 4 + 2] = b;
+                                }
+                                dstRow[x * 4 + 3] = a;
+                            }
+                        }
+
+                        g_overlayWidth = w;
+                        g_overlayHeight = h;
+                        g_overlayDxgiFormat = uiDesc.Format;
+                        g_overlayReady = true;
+
+                        context->Unmap(g_stagingTex, 0);
+
+                        // Lock the RT pointer after first successful capture —
+                        // stops re-detection from picking the wrong RT on future frames
+                        if (!g_uiRTLocked) {
+                            g_uiRTLocked = true;
+                            _MESSAGE("FO4RemixPlugin: UI RT locked at %p (%ux%u)",
+                                     g_uiRenderTarget, w, h);
+                        }
+                    }
+                }
+            }
+            if (context) context->Release();
+            device->Release();
+        }
     }
 
     // Multi-cell extraction: initial bootstrap, then incremental new-cell + round-robin refresh
@@ -470,6 +744,15 @@ void PresentHook::ResetExtractionState() {
     g_cellPtrMap.clear();
     g_pendingReextract.clear();
 
+    // Reset UI RT detection — RT resource may change after load
+    if (g_uiRenderTarget) {
+        g_uiRenderTarget->Release();
+        g_uiRenderTarget = nullptr;
+    }
+    g_uiRTLocked = false;
+    g_uiClearedThisFrame = false;
+    g_clearCandidateCount = 0;
+
     // Force the initial bootstrap path with retry/quality-gate logic
     g_firstExtractionDone = false;
     g_extractionAttempts = 0;
@@ -482,6 +765,14 @@ void PresentHook::Uninstall() {
     g_remixRunning = false;
     if (g_remixThread.joinable()) {
         g_remixThread.join();
+    }
+    if (g_uiRenderTarget) {
+        g_uiRenderTarget->Release();
+        g_uiRenderTarget = nullptr;
+    }
+    if (g_stagingTex) {
+        g_stagingTex->Release();
+        g_stagingTex = nullptr;
     }
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();

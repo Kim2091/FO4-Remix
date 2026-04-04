@@ -465,7 +465,7 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
 // ---------------------------------------------------------------------------
 // Per-frame rendering
 // ---------------------------------------------------------------------------
-void RemixRenderer::OnFrame(const CameraState& cam) {
+void RemixRenderer::OnFrame(const CameraState& cam, const OverlayData& overlay) {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
@@ -553,6 +553,14 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
         instance.doubleSided = 1;
         instance.categoryFlags = 0;
         api->DrawInstance(&instance);
+    }
+
+    // Submit screen overlay (game UI/HUD captured from DX11 backbuffer)
+    if (overlay.valid && !overlay.pixels.empty() && api->DrawScreenOverlay) {
+        remixapi_Format fmt = DxgiToRemixFormat(static_cast<DXGI_FORMAT>(overlay.dxgiFormat));
+        if (fmt != static_cast<remixapi_Format>(0)) {
+            api->DrawScreenOverlay(overlay.pixels.data(), overlay.width, overlay.height, fmt, 1.0f);
+        }
     }
 
     // Present
