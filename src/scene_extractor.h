@@ -3,6 +3,7 @@
 #include "remix/remix_c.h"
 #include "light_extractor.h"
 #include <vector>
+#include <array>
 #include <cstdint>
 #include <d3d11.h>
 
@@ -25,6 +26,16 @@ struct ExtractedMesh {
     bool alphaTestEnabled;          // true if NiAlphaProperty has alpha test
     int alphaTestType;              // Remix/VkCompareOp value (7 = Always = no test)
     uint8_t alphaTestRef;           // Alpha reference value (0-255)
+
+    // Skinning data (empty if not skinned)
+    uint32_t bonesPerVertex = 0;              // 0 = not skinned, typically 4
+    std::vector<float> blendWeights;          // bonesPerVertex floats per vertex
+    std::vector<uint32_t> blendIndices;       // bonesPerVertex uint32s per vertex
+    uint32_t boneCount = 0;                   // number of bones in the skeleton
+    // Inverse bind-pose transforms — cached for per-frame bone matrix computation.
+    // Each is a 3x4 row-major matrix (same layout as remixapi_Transform::matrix),
+    // already in Remix coordinate space (X/Y swapped).
+    std::vector<std::array<float, 12>> inverseBindPose;
 };
 
 struct ExtractionResult {
