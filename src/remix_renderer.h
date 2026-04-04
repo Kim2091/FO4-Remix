@@ -13,9 +13,15 @@ struct OverlayData {
     bool valid = false;
 };
 
+struct SkinnedMeshBones {
+    uint64_t meshHash;
+    std::vector<remixapi_Transform> bones;
+};
+
 namespace RemixRenderer {
     bool Init();
-    void OnFrame(const CameraState& cam, const OverlayData& overlay = {});
+    void OnFrame(const CameraState& cam, const OverlayData& overlay = {},
+                 const std::vector<SkinnedMeshBones>& bones = {});
     void Shutdown();
 
     // Upload textures, create materials, and load meshes for a specific cell.

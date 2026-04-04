@@ -49,6 +49,14 @@ struct CellInfo {
     uint32_t formID;
 };
 
+struct SkinnedActorInfo {
+    uint64_t meshHash;                           // matches ExtractedMesh::hash
+    uintptr_t refrPtr;                           // TESObjectREFR* for liveness check
+    uintptr_t skinInstancePtr;                   // BSSkin::Instance*
+    uint32_t boneCount;
+    std::vector<std::array<float, 12>> inverseBindPose;  // cached, Remix coord space
+};
+
 namespace SceneExtractor {
     // Returns the player's current parent cell pointer, or 0 if unavailable.
     // Cheap enough to call every frame for cell-change detection.
@@ -68,6 +76,12 @@ namespace SceneExtractor {
 
     // Extract all geometry from a specific cell. Must be called on the main thread.
     ExtractionResult ExtractCell(uintptr_t cellPtr, ID3D11Device* device);
+
+    // Get all tracked skinned actors (across all cells).
+    const std::vector<SkinnedActorInfo>& GetSkinnedActors();
+
+    // Clear skinned actor tracking for a specific cell (on cell unload).
+    void ClearSkinnedActors(uint32_t cellFormID);
 
     // Drop the internal texture cache (call on cell change if desired).
     void ClearTextureCache();

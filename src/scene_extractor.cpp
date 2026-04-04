@@ -19,6 +19,7 @@
 #include <cfloat>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <fstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -81,7 +82,22 @@ static constexpr uintptr_t OFF_TES_GRID_CELLS   = 0x18;  // GridCellArray*
 static constexpr uintptr_t OFF_GRID_DIMENSION    = 0x10;  // int32 (= uGridsToLoad)
 static constexpr uintptr_t OFF_GRID_CELL_ARRAY   = 0x18;  // TESObjectCELL** (flat dim*dim)
 
+// ---------------------------------------------------------------------------
+// Skinned actor tracking (per-cell, rebuilt on demand)
+// ---------------------------------------------------------------------------
+static std::unordered_map<uint32_t, std::vector<SkinnedActorInfo>> g_skinnedActorsByCell;
+static std::vector<SkinnedActorInfo> g_allSkinnedActors;
+static bool g_skinnedActorsDirty = true;
 
+static void RebuildSkinnedActorList() {
+    g_allSkinnedActors.clear();
+    for (auto& [cellID, actors] : g_skinnedActorsByCell) {
+        for (auto& actor : actors) {
+            g_allSkinnedActors.push_back(actor);
+        }
+    }
+    g_skinnedActorsDirty = false;
+}
 
 // ---------------------------------------------------------------------------
 // Half-float → float conversion
@@ -1407,6 +1423,68 @@ ExtractionResult SceneExtractor::ExtractCell(uintptr_t cellPtr, ID3D11Device* de
         meshCount += (uint32_t)(result.size() - before);
     }
 
+    // Track skinned actors for per-frame bone updates
+    std::vector<SkinnedActorInfo> cellSkinnedActors;
+    for (uint32_t i = 0; i < objectList.count; i++) {
+        uintptr_t refrPtr = objectList.entries[i];
+        if (!refrPtr) continue;
+        uintptr_t loadedData = *reinterpret_cast<uintptr_t*>(refrPtr + OFF_REFR_LOADED_DATA);
+        if (!loadedData) continue;
+        NiNode* rootNode = *reinterpret_cast<NiNode**>(loadedData + OFF_LOADED_ROOT_NODE);
+        if (!rootNode) continue;
+
+        uint32_t refrFormID = *reinterpret_cast<uint32_t*>(refrPtr + OFF_FORM_ID);
+        uint64_t baseHash = FnvHashCombine(0xCBF29CE484222325ULL, (uint64_t)refrFormID);
+
+        // Walk tree to find skinned shapes that were successfully extracted
+        std::function<void(NiAVObject*, int)> findSkinned = [&](NiAVObject* obj, int depth) {
+            if (!obj || depth > 32) return;
+            if (obj->flags & NiAVObject::kFlagNotVisible) return;
+
+            BSTriShape* tri = obj->GetAsBSTriShape();
+            if (tri && tri->skinInstance) {
+                BSSkin::Instance* skinInst = tri->skinInstance;
+                BSSkin::BoneData* boneData = skinInst->boneData;
+                uint32_t boneCount = skinInst->bones.count;
+                if (boneData && boneCount > 0 && boneCount <= REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT) {
+                    const char* sName = tri->m_name.c_str();
+                    uint64_t meshHash = FnvHashCombine(baseHash, FnvHash(sName ? sName : ""));
+
+                    // Only track if we actually extracted this mesh
+                    for (auto& m : result) {
+                        if (m.hash == meshHash && m.bonesPerVertex > 0) {
+                            SkinnedActorInfo info;
+                            info.meshHash = meshHash;
+                            info.refrPtr = refrPtr;
+                            info.skinInstancePtr = reinterpret_cast<uintptr_t>(skinInst);
+                            info.boneCount = boneCount;
+                            info.inverseBindPose = m.inverseBindPose;
+                            cellSkinnedActors.push_back(std::move(info));
+                            break;
+                        }
+                    }
+                }
+                return;
+            }
+
+            NiNode* node = obj->GetAsNiNode();
+            if (node) {
+                for (uint16_t c = 0; c < node->m_children.m_emptyRunStart; c++) {
+                    if (node->m_children.m_data[c])
+                        findSkinned(node->m_children.m_data[c], depth + 1);
+                }
+            }
+        };
+        findSkinned(rootNode, 0);
+    }
+
+    if (!cellSkinnedActors.empty()) {
+        _MESSAGE("FO4RemixPlugin: ExtractCell 0x%08X - tracked %zu skinned shapes",
+                 cellFormID, cellSkinnedActors.size());
+    }
+    g_skinnedActorsByCell[cellFormID] = std::move(cellSkinnedActors);
+    g_skinnedActorsDirty = true;
+
     // Extract terrain geometry from LAND quadrant nodes (BSMultiBoundNode).
     // TESObjectLAND is at cell+0x58, its quadrant node array is at LAND+0x40.
     uint32_t terrainMeshCount = 0;
@@ -1462,6 +1540,19 @@ ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
         return {};
     }
     return ExtractCell(cellPtr, device);
+}
+
+// ---------------------------------------------------------------------------
+// Skinned actor query / cleanup
+// ---------------------------------------------------------------------------
+const std::vector<SkinnedActorInfo>& SceneExtractor::GetSkinnedActors() {
+    if (g_skinnedActorsDirty) RebuildSkinnedActorList();
+    return g_allSkinnedActors;
+}
+
+void SceneExtractor::ClearSkinnedActors(uint32_t cellFormID) {
+    g_skinnedActorsByCell.erase(cellFormID);
+    g_skinnedActorsDirty = true;
 }
 
 // ---------------------------------------------------------------------------

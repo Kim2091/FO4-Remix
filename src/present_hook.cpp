@@ -4,6 +4,10 @@
 #include "camera.h"
 #include "scene_extractor.h"
 
+#include "f4se/BSGeometry.h"
+#include "f4se/NiNodes.h"
+#include "f4se/NiTypes.h"
+
 #include <d3d11.h>
 #include <dxgi.h>
 #include <MinHook.h>
@@ -77,6 +81,15 @@ static uint32_t g_overlayWidth = 0;
 static uint32_t g_overlayHeight = 0;
 static DXGI_FORMAT g_overlayDxgiFormat = DXGI_FORMAT_UNKNOWN;
 static std::atomic<bool> g_overlayReady { false };
+
+// Per-frame bone transforms for skinned meshes
+static std::mutex g_boneMutex;
+static std::vector<SkinnedMeshBones> g_sharedBones;
+static std::atomic<bool> g_bonesReady { false };
+
+// TESObjectREFR offsets for skinned actor liveness checks (same as scene_extractor.cpp)
+static constexpr uintptr_t OFF_REFR_LOADED_DATA_PH = 0xF0;
+static constexpr uintptr_t OFF_LOADED_ROOT_NODE_PH = 0x08;
 
 // UI RT detection uses two hooks together:
 //   ClearRTV: records R8G8B8A8_UNORM candidates cleared with {0,0,0,0}
@@ -269,10 +282,18 @@ static void RemixThreadFunc() {
             g_overlayReady = false;
         }
 
+        // Grab latest bone transforms from game thread
+        std::vector<SkinnedMeshBones> frameBones;
+        if (g_bonesReady) {
+            std::lock_guard<std::mutex> lock(g_boneMutex);
+            frameBones = std::move(g_sharedBones);
+            g_bonesReady = false;
+        }
+
         // Pump messages before rendering so input is processed even when frames are slow
         PumpMessages();
 
-        RemixRenderer::OnFrame(cam, overlay);
+        RemixRenderer::OnFrame(cam, overlay, frameBones);
 
         // Pump again after rendering
         PumpMessages();
@@ -311,6 +332,72 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         CameraState cam = Camera::Get();
         std::lock_guard<std::mutex> lock(g_cameraMutex);
         g_sharedCamera = cam;
+    }
+
+    // Collect per-frame bone transforms for skinned meshes
+    if (g_remixReady) {
+        const auto& skinnedActors = SceneExtractor::GetSkinnedActors();
+        if (!skinnedActors.empty()) {
+            std::vector<SkinnedMeshBones> frameBones;
+            frameBones.reserve(skinnedActors.size());
+
+            for (const auto& actor : skinnedActors) {
+                // Verify actor is still loaded
+                uintptr_t loadedData = *reinterpret_cast<uintptr_t*>(actor.refrPtr + OFF_REFR_LOADED_DATA_PH);
+                if (!loadedData) continue;
+                NiNode* rootNode = *reinterpret_cast<NiNode**>(loadedData + OFF_LOADED_ROOT_NODE_PH);
+                if (!rootNode) continue;
+
+                BSSkin::Instance* skinInst = reinterpret_cast<BSSkin::Instance*>(actor.skinInstancePtr);
+                if (!skinInst || skinInst->bones.count < actor.boneCount)
+                    continue;
+                if (skinInst->worldTransforms.count < actor.boneCount)
+                    continue;
+
+                SkinnedMeshBones entry;
+                entry.meshHash = actor.meshHash;
+                entry.bones.resize(actor.boneCount);
+
+                for (uint32_t b = 0; b < actor.boneCount; b++) {
+                    NiTransform* boneWorld = skinInst->worldTransforms[b];
+                    if (!boneWorld) continue;
+
+                    // Convert bone world transform to Remix coord space (X/Y swap)
+                    float ws = boneWorld->scale;
+                    float bw[3][4];
+                    bw[0][0] = boneWorld->rot.data[0][1] * ws;
+                    bw[0][1] = boneWorld->rot.data[0][0] * ws;
+                    bw[0][2] = boneWorld->rot.data[0][2] * ws;
+                    bw[0][3] = boneWorld->pos.y;
+                    bw[1][0] = boneWorld->rot.data[1][1] * ws;
+                    bw[1][1] = boneWorld->rot.data[1][0] * ws;
+                    bw[1][2] = boneWorld->rot.data[1][2] * ws;
+                    bw[1][3] = boneWorld->pos.x;
+                    bw[2][0] = boneWorld->rot.data[2][1] * ws;
+                    bw[2][1] = boneWorld->rot.data[2][0] * ws;
+                    bw[2][2] = boneWorld->rot.data[2][2] * ws;
+                    bw[2][3] = boneWorld->pos.z;
+
+                    // Multiply: boneWorld * inverseBind (both 3x4 row-major)
+                    const auto& ib = actor.inverseBindPose[b];
+                    auto& out = entry.bones[b];
+                    for (int r = 0; r < 3; r++) {
+                        out.matrix[r][0] = bw[r][0]*ib[0] + bw[r][1]*ib[4] + bw[r][2]*ib[8];
+                        out.matrix[r][1] = bw[r][0]*ib[1] + bw[r][1]*ib[5] + bw[r][2]*ib[9];
+                        out.matrix[r][2] = bw[r][0]*ib[2] + bw[r][1]*ib[6] + bw[r][2]*ib[10];
+                        out.matrix[r][3] = bw[r][0]*ib[3] + bw[r][1]*ib[7] + bw[r][2]*ib[11] + bw[r][3];
+                    }
+                }
+
+                frameBones.push_back(std::move(entry));
+            }
+
+            if (!frameBones.empty()) {
+                std::lock_guard<std::mutex> lock(g_boneMutex);
+                g_sharedBones = std::move(frameBones);
+                g_bonesReady = true;
+            }
+        }
     }
 
     // Hook OMSetRenderTargets + ClearRenderTargetView on first opportunity
@@ -635,6 +722,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     g_extractedCells.erase(cellID);
                     g_cellPtrMap.erase(cellID);
                     g_pendingReextract.erase(cellID);
+                    SceneExtractor::ClearSkinnedActors(cellID);
                     // Remove from refresh queue
                     g_refreshQueue.erase(
                         std::remove(g_refreshQueue.begin(), g_refreshQueue.end(), cellID),

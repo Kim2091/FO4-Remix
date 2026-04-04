@@ -50,6 +50,8 @@ static std::wstring HashToPath(uint64_t hash) {
 struct SceneMeshInstance {
     remixapi_MeshHandle handle;
     remixapi_Transform  transform;
+    bool isSkinned = false;
+    uint64_t meshHash = 0;
 };
 
 struct CellSceneData {
@@ -351,8 +353,18 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         surface.vertices_count = (uint32_t)mesh.vertices.size();
         surface.indices_values = mesh.indices.empty() ? nullptr : mesh.indices.data();
         surface.indices_count = (uint32_t)mesh.indices.size();
-        surface.skinning_hasvalue = 0;
         surface.material = matHandle;
+
+        if (mesh.bonesPerVertex > 0 && !mesh.blendWeights.empty()) {
+            surface.skinning_hasvalue = 1;
+            surface.skinning_value.bonesPerVertex = mesh.bonesPerVertex;
+            surface.skinning_value.blendWeights_values = mesh.blendWeights.data();
+            surface.skinning_value.blendWeights_count = (uint32_t)mesh.blendWeights.size();
+            surface.skinning_value.blendIndices_values = mesh.blendIndices.data();
+            surface.skinning_value.blendIndices_count = (uint32_t)mesh.blendIndices.size();
+        } else {
+            surface.skinning_hasvalue = 0;
+        }
 
         remixapi_MeshInfo meshInfo = {};
         meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
@@ -370,6 +382,8 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         SceneMeshInstance inst;
         inst.handle = handle;
         memcpy(&inst.transform.matrix, mesh.worldTransform, sizeof(mesh.worldTransform));
+        inst.isSkinned = (mesh.bonesPerVertex > 0);
+        inst.meshHash = mesh.hash;
 
         cellData.meshes.push_back(inst);
         meshCreated++;
@@ -465,7 +479,8 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
 // ---------------------------------------------------------------------------
 // Per-frame rendering
 // ---------------------------------------------------------------------------
-void RemixRenderer::OnFrame(const CameraState& cam, const OverlayData& overlay) {
+void RemixRenderer::OnFrame(const CameraState& cam, const OverlayData& overlay,
+                            const std::vector<SkinnedMeshBones>& bones) {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
@@ -499,18 +514,37 @@ void RemixRenderer::OnFrame(const CameraState& cam, const OverlayData& overlay) 
     camInfo.type = REMIXAPI_CAMERA_TYPE_WORLD;
     api->SetupCamera(&camInfo);
 
+    // Build bone transform lookup by mesh hash
+    std::unordered_map<uint64_t, const std::vector<remixapi_Transform>*> boneLookup;
+    for (const auto& entry : bones) {
+        boneLookup[entry.meshHash] = &entry.bones;
+    }
+
     // Draw scene meshes from all loaded cells
     bool hasAnyMeshes = false;
     uint32_t totalLightsDrawn = 0;
     uint32_t totalLightsFailed = 0;
     for (auto& [cellID, cellData] : g_cellScenes) {
         for (auto& inst : cellData.meshes) {
+            remixapi_InstanceInfoBoneTransformsEXT boneExt = {};
             remixapi_InstanceInfo instance = {};
             instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
             instance.mesh = inst.handle;
             instance.transform = inst.transform;
             instance.doubleSided = 1;
             instance.categoryFlags = 0;
+
+            if (inst.isSkinned) {
+                auto it = boneLookup.find(inst.meshHash);
+                if (it != boneLookup.end() && !it->second->empty()) {
+                    boneExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
+                    boneExt.pNext = nullptr;
+                    boneExt.boneTransforms_values = it->second->data();
+                    boneExt.boneTransforms_count = (uint32_t)it->second->size();
+                    instance.pNext = &boneExt;
+                }
+            }
+
             api->DrawInstance(&instance);
             hasAnyMeshes = true;
         }
