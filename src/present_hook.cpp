@@ -60,6 +60,10 @@ static constexpr int kMaxInitialAttempts = 15;
 static constexpr uint32_t kMinExpectedMeshes = 5;
 static constexpr int kNewCellCheckInterval = 60;    // ~1 second at 60fps — check for new cells
 static constexpr int kRefreshInterval = 1800;       // ~30 seconds at 60fps — refresh one existing cell
+static constexpr int kReextractDelay = 180;         // ~3 seconds — retry cells with missing textures
+
+// Cells that need re-extraction because textures weren't streamed in yet
+static std::unordered_map<uint32_t, int> g_pendingReextract; // formID -> frame to retry
 
 static void PumpMessages() {
     MSG msg;
@@ -248,6 +252,23 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                 }
             }
 
+            // Re-extract cells that had missing textures (streaming wasn't done)
+            for (auto it = g_pendingReextract.begin(); it != g_pendingReextract.end(); ) {
+                if (g_presentCallCount >= it->second) {
+                    uint32_t cellID = it->first;
+                    auto ptrIt = g_cellPtrMap.find(cellID);
+                    if (ptrIt != g_cellPtrMap.end() && currentlyLoaded.count(cellID)) {
+                        toExtract.push_back({ ptrIt->second, cellID });
+                        // Remove from extractedCells so it gets treated as new
+                        g_extractedCells.erase(cellID);
+                        _MESSAGE("FO4RemixPlugin: Re-extracting cell 0x%08X (texture streaming retry)", cellID);
+                    }
+                    it = g_pendingReextract.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
             // Pick one existing cell to refresh (round-robin)
             CellInfo refreshCell = { 0, 0 };
             static int g_refreshFrameCounter = 0;
@@ -284,6 +305,21 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                         g_extractedCells.insert(cellInfo.formID);
                         g_refreshQueue.push_back(cellInfo.formID);
                         g_cellPtrMap[cellInfo.formID] = cellInfo.cellPtr;
+
+                        // Check if any mesh is missing its diffuse texture (not yet streamed in)
+                        bool hasMissingTextures = false;
+                        for (auto& mesh : extraction.meshes) {
+                            if (mesh.diffuseTextureHash == 0) {
+                                hasMissingTextures = true;
+                                break;
+                            }
+                        }
+                        if (hasMissingTextures) {
+                            g_pendingReextract[cellInfo.formID] = g_presentCallCount + kReextractDelay;
+                            _MESSAGE("FO4RemixPlugin: Cell 0x%08X has missing textures, scheduling re-extract in ~3s",
+                                     cellInfo.formID);
+                        }
+
                         newScenes.push_back({ cellInfo.formID, std::move(extraction) });
                     }
                 }
@@ -306,6 +342,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     _MESSAGE("FO4RemixPlugin: Cell 0x%08X no longer loaded, scheduling unload", cellID);
                     g_extractedCells.erase(cellID);
                     g_cellPtrMap.erase(cellID);
+                    g_pendingReextract.erase(cellID);
                     // Remove from refresh queue
                     g_refreshQueue.erase(
                         std::remove(g_refreshQueue.begin(), g_refreshQueue.end(), cellID),
