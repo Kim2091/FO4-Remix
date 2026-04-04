@@ -68,6 +68,15 @@ static constexpr uintptr_t OFF_REFR_PARENT_CELL = 0xB8;
 static constexpr uintptr_t OFF_REFR_LOADED_DATA = 0xF0;
 static constexpr uintptr_t OFF_LOADED_ROOT_NODE = 0x08;
 static constexpr uintptr_t OFF_CELL_OBJECT_LIST = 0x70;
+static constexpr uintptr_t OFF_CELL_FLAGS       = 0x40;
+static constexpr uintptr_t OFF_CELL_WORLD_SPACE = 0xC8;
+static constexpr uint16_t  CELL_FLAG_IS_INTERIOR = 0x0001;
+
+// TES singleton and GridCellArray offsets (from static analysis of Fallout4.exe)
+static RelocPtr<uintptr_t> s_g_tes(0x032D2048);
+static constexpr uintptr_t OFF_TES_GRID_CELLS   = 0x18;  // GridCellArray*
+static constexpr uintptr_t OFF_GRID_DIMENSION    = 0x10;  // int32 (= uGridsToLoad)
+static constexpr uintptr_t OFF_GRID_CELL_ARRAY   = 0x18;  // TESObjectCELL** (flat dim*dim)
 
 
 
@@ -1075,46 +1084,40 @@ bool SceneExtractor::IsPlayerCellReady()
 // ---------------------------------------------------------------------------
 // Return all cells currently loaded by the engine (from DataHandler::cellList)
 // ---------------------------------------------------------------------------
-std::vector<CellInfo> SceneExtractor::GetLoadedCells()
+// ---------------------------------------------------------------------------
+// Read exterior grid cells from the TES singleton's GridCellArray.
+//
+// TES singleton (RelocPtr at 0x032D2048) has GridCellArray* at +0x18.
+// GridCellArray has:
+//   +0x10: int32 gridDimension  (= uGridsToLoad, typically 5)
+//   +0x18: TESObjectCELL**      (flat dim*dim array of cell pointers)
+//
+// We iterate the flat array and collect cells that have loaded 3D.
+// ---------------------------------------------------------------------------
+static void CollectGridCells(
+    std::vector<CellInfo>& result,
+    std::unordered_set<uintptr_t>& seen)
 {
-    std::vector<CellInfo> result;
-    std::unordered_set<uintptr_t> seen;
+    uintptr_t* ppTES = reinterpret_cast<uintptr_t*>(s_g_tes.GetPtr());
+    if (!ppTES || !*ppTES) return;
+    uintptr_t tes = *ppTES;
 
-    // Always include the player's parentCell — this is the one cell guaranteed
-    // to have loaded 3D.  For exterior worldspaces, the grid cells are managed
-    // by GridCellArray (not DataHandler::cellList), so the player's parentCell
-    // would otherwise be missed.
-    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
-    if (ppPlayer && *ppPlayer) {
-        uintptr_t player = *ppPlayer;
-        uintptr_t playerCell = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
-        if (playerCell) {
-            uint32_t formID = *reinterpret_cast<uint32_t*>(playerCell + OFF_FORM_ID);
-            result.push_back({ playerCell, formID });
-            seen.insert(playerCell);
-        }
-    }
+    uintptr_t gridPtr = *reinterpret_cast<uintptr_t*>(tes + OFF_TES_GRID_CELLS);
+    if (!gridPtr) return;
 
-    // Supplement with DataHandler::cellList — picks up additional interior cells
-    // that have loaded 3D (e.g., attached cells in interior spaces).
-    uintptr_t* ppDataHandler = reinterpret_cast<uintptr_t*>(s_g_dataHandler.GetPtr());
-    if (!ppDataHandler || !*ppDataHandler) return result;
-    uintptr_t dh = *ppDataHandler;
+    int32_t dim = *reinterpret_cast<int32_t*>(gridPtr + OFF_GRID_DIMENSION);
+    if (dim <= 0 || dim > 11) return;  // sanity check (uGridsToLoad is 3-11)
 
-    // NiTArray<TESObjectCELL*> cellList at offset 0xF58
-    // NiTArray has vtbl(8), then m_data(8), m_arrayBufLen(2), m_emptyRunStart(2), m_size(2), m_growSize(2)
-    uintptr_t cellListBase = dh + 0xF58;
-    uintptr_t* cellData = *reinterpret_cast<uintptr_t**>(cellListBase + 0x08);
-    uint16_t emptyRunStart = *reinterpret_cast<uint16_t*>(cellListBase + 0x12);
+    uintptr_t* cellArray = *reinterpret_cast<uintptr_t**>(gridPtr + OFF_GRID_CELL_ARRAY);
+    if (!cellArray) return;
 
-    if (!cellData || emptyRunStart == 0) return result;
-
-    for (uint16_t i = 0; i < emptyRunStart; i++) {
-        uintptr_t cellPtr = cellData[i];
+    int32_t total = dim * dim;
+    for (int32_t i = 0; i < total; i++) {
+        uintptr_t cellPtr = cellArray[i];
         if (!cellPtr) continue;
-        if (seen.count(cellPtr)) continue;  // skip player's cell (already added)
+        if (seen.count(cellPtr)) continue;
 
-        // Check objectList count > 0
+        // Verify the cell has objects with loaded 3D
         struct SimpleArray {
             uintptr_t* entries;
             uint32_t capacity;
@@ -1124,9 +1127,79 @@ std::vector<CellInfo> SceneExtractor::GetLoadedCells()
         auto& objectList = *reinterpret_cast<SimpleArray*>(cellPtr + OFF_CELL_OBJECT_LIST);
         if (!objectList.entries || objectList.count == 0) continue;
 
-        // Only include cells that have at least one object with loaded 3D.
-        // DataHandler::cellList contains all known cell forms, but most won't
-        // have NiNode trees populated until the engine actually renders them.
+        bool hasLoaded3D = false;
+        uint32_t limit = objectList.count < 32u ? objectList.count : 32u;
+        for (uint32_t j = 0; j < limit; j++) {
+            uintptr_t refrPtr = objectList.entries[j];
+            if (!refrPtr) continue;
+            uintptr_t ld = *reinterpret_cast<uintptr_t*>(refrPtr + OFF_REFR_LOADED_DATA);
+            if (!ld) continue;
+            NiNode* rn = *reinterpret_cast<NiNode**>(ld + OFF_LOADED_ROOT_NODE);
+            if (rn) { hasLoaded3D = true; break; }
+        }
+        if (!hasLoaded3D) continue;
+
+        uint32_t formID = *reinterpret_cast<uint32_t*>(cellPtr + OFF_FORM_ID);
+        result.push_back({ cellPtr, formID });
+        seen.insert(cellPtr);
+    }
+}
+
+std::vector<CellInfo> SceneExtractor::GetLoadedCells()
+{
+    std::vector<CellInfo> result;
+    std::unordered_set<uintptr_t> seen;
+
+    // Always include the player's parentCell — this is the one cell guaranteed
+    // to have loaded 3D.
+    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
+    if (!ppPlayer || !*ppPlayer) return result;
+    uintptr_t player = *ppPlayer;
+
+    uintptr_t playerCell = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
+    if (!playerCell) return result;
+
+    uint32_t playerCellFormID = *reinterpret_cast<uint32_t*>(playerCell + OFF_FORM_ID);
+    result.push_back({ playerCell, playerCellFormID });
+    seen.insert(playerCell);
+
+    // Check if the player is in an exterior worldspace
+    uint16_t cellFlags = *reinterpret_cast<uint16_t*>(playerCell + OFF_CELL_FLAGS);
+    bool isExterior = (cellFlags & CELL_FLAG_IS_INTERIOR) == 0;
+
+    if (isExterior) {
+        // Exterior: read the GridCellArray from the TES singleton.
+        // DataHandler::cellList doesn't contain grid-loaded exterior cells.
+        CollectGridCells(result, seen);
+        return result;
+    }
+
+    // Interior: supplement with DataHandler::cellList for attached cells
+    uintptr_t* ppDataHandler = reinterpret_cast<uintptr_t*>(s_g_dataHandler.GetPtr());
+    if (!ppDataHandler || !*ppDataHandler) return result;
+    uintptr_t dh = *ppDataHandler;
+
+    // NiTArray<TESObjectCELL*> cellList at offset 0xF58
+    uintptr_t cellListBase = dh + 0xF58;
+    uintptr_t* cellData = *reinterpret_cast<uintptr_t**>(cellListBase + 0x08);
+    uint16_t emptyRunStart = *reinterpret_cast<uint16_t*>(cellListBase + 0x12);
+
+    if (!cellData || emptyRunStart == 0) return result;
+
+    for (uint16_t i = 0; i < emptyRunStart; i++) {
+        uintptr_t cellPtr = cellData[i];
+        if (!cellPtr) continue;
+        if (seen.count(cellPtr)) continue;
+
+        struct SimpleArray {
+            uintptr_t* entries;
+            uint32_t capacity;
+            uint32_t pad0C;
+            uint32_t count;
+        };
+        auto& objectList = *reinterpret_cast<SimpleArray*>(cellPtr + OFF_CELL_OBJECT_LIST);
+        if (!objectList.entries || objectList.count == 0) continue;
+
         bool hasLoaded3D = false;
         for (uint32_t j = 0; j < objectList.count; j++) {
             uintptr_t refrPtr = objectList.entries[j];
