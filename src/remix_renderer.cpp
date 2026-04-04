@@ -304,8 +304,8 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         matInfo.spriteSheetCol     = 1;
         matInfo.spriteSheetFps     = 0;
         matInfo.filterMode         = 1;
-        matInfo.wrapModeU          = 0;
-        matInfo.wrapModeV          = 0;
+        matInfo.wrapModeU          = 1;  // Repeat (0 = Clamp)
+        matInfo.wrapModeV          = 1;
 
         remixapi_MaterialHandle handle = nullptr;
         remixapi_ErrorCode status = api->CreateMaterial(&matInfo, &handle);
