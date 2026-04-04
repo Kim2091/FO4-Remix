@@ -888,6 +888,9 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     uint32_t oNormal = (szVertex + ((desc >> 16) & 0xF)) * 4;
     uint32_t oColor  = (szVertex + ((desc >> 24) & 0xF)) * 4;
 
+    bool hasSkinning   = (desc & BSGeometry::kFlag_Skinned) != 0;
+    uint32_t oSkin     = (szVertex + ((desc >> 28) & 0xF)) * 4;
+
     // FullPrecision flag: positions are 3 full floats (12 bytes)
     // Otherwise: positions are 4 half-floats (8 bytes)
     bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
@@ -953,6 +956,63 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
             out_v.color = 0xFFFFFFFF; // white
         }
 
+    }
+
+    // Read skinning data (bone indices + weights) if this shape is skinned
+    if (hasSkinning && shape->skinInstance) {
+        BSSkin::Instance* skinInst = shape->skinInstance;
+        BSSkin::BoneData* boneData = skinInst->boneData;
+        uint32_t boneCount = skinInst->bones.count;
+
+        if (boneData && boneCount > 0 && boneCount <= REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT) {
+            mesh.bonesPerVertex = 4;
+            mesh.boneCount = boneCount;
+            mesh.blendWeights.resize(shape->numVertices * 4);
+            mesh.blendIndices.resize(shape->numVertices * 4);
+
+            for (uint16_t i = 0; i < shape->numVertices; i++) {
+                uint8_t* v = vbData + (uint32_t)i * vertexSize;
+                uint8_t* skinData = v + oSkin;
+
+                // 4 bone indices (1 byte each)
+                for (int j = 0; j < 4; j++) {
+                    mesh.blendIndices[i * 4 + j] = skinData[j];
+                }
+
+                // 4 bone weights (half-float, 2 bytes each, starting at offset +4)
+                uint16_t* weights = reinterpret_cast<uint16_t*>(skinData + 4);
+                for (int j = 0; j < 4; j++) {
+                    mesh.blendWeights[i * 4 + j] = HalfToFloat(weights[j]);
+                }
+            }
+
+            // Cache inverse bind-pose transforms in Remix coordinate space.
+            // Each BoneData::BoneTransforms::transform is the skin-to-bone transform.
+            mesh.inverseBindPose.resize(boneCount);
+            for (uint32_t b = 0; b < boneCount; b++) {
+                const NiTransform& ibp = boneData->transforms[b].transform;
+                float s = ibp.scale;
+                auto& m = mesh.inverseBindPose[b];
+                // X/Y column swap (same as worldTransform conversion)
+                m[0]  = ibp.rot.data[0][1] * s;
+                m[1]  = ibp.rot.data[0][0] * s;
+                m[2]  = ibp.rot.data[0][2] * s;
+                m[3]  = ibp.pos.y;
+                m[4]  = ibp.rot.data[1][1] * s;
+                m[5]  = ibp.rot.data[1][0] * s;
+                m[6]  = ibp.rot.data[1][2] * s;
+                m[7]  = ibp.pos.x;
+                m[8]  = ibp.rot.data[2][1] * s;
+                m[9]  = ibp.rot.data[2][0] * s;
+                m[10] = ibp.rot.data[2][2] * s;
+                m[11] = ibp.pos.z;
+            }
+
+            if (g_config.logShapeInfo) {
+                _MESSAGE("FO4RemixPlugin: Shape \"%s\" skinned: %u bones, %u verts",
+                         shapeName ? shapeName : "<null>", boneCount, shape->numVertices);
+            }
+        }
     }
 
     // Validate vertex positions — reject mesh if any are NaN/Inf
