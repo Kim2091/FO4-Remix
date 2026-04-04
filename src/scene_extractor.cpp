@@ -463,13 +463,13 @@ static bool DecompressAndInvert(ExtractedTexture& tex)
             uint8_t block[4][4][4]; // [y][x][rgba]
 
             if (isBC5) {
-                // BC5: R=specular, G=smoothness. Use G channel as-is, write grayscale.
+                // BC5: R=specular, G=smoothness. Invert G to get roughness.
                 uint8_t rChan[4][4], gChan[4][4];
                 DecodeBC3AlphaBlock(src, rChan);
                 DecodeBC3AlphaBlock(src + 8, gChan);
                 for (int y = 0; y < 4; y++)
                     for (int x = 0; x < 4; x++) {
-                        uint8_t roughness = gChan[y][x];
+                        uint8_t roughness = 255 - gChan[y][x];
                         block[y][x][0] = roughness;
                         block[y][x][1] = roughness;
                         block[y][x][2] = roughness;
@@ -477,7 +477,7 @@ static bool DecompressAndInvert(ExtractedTexture& tex)
                     }
                 src += blockSize;
 
-                // Write pixels (already inverted)
+                // Write pixels
                 for (int y = 0; y < 4; y++) {
                     uint32_t py = by * 4 + y;
                     if (py >= tex.height) continue;
@@ -1034,9 +1034,17 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
 
     // Extract textures from the lighting material
     BSLightingShaderMaterialBase* lightingMat = GetLightingMaterial(shape);
-    mesh.diffuseTextureHash   = lightingMat ? ExtractMaterialTexture(lightingMat->spDiffuseTexture, "diffuse", device, newTextures) : 0;
-    mesh.normalTextureHash    = lightingMat ? ExtractMaterialTexture(lightingMat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral) : 0;
-    mesh.roughnessTextureHash = lightingMat ? ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, TexturePostProcess::InvertRGB) : 0;
+    if (lightingMat && lightingMat->GetType() == BSLightingShaderMaterialBase::kType_Landscape) {
+        // Landscape materials store textures in per-layer arrays, not the base class fields.
+        auto* landMat = static_cast<BSLightingShaderMaterialLandscape*>(lightingMat);
+        mesh.diffuseTextureHash   = ExtractMaterialTexture(landMat->spLandscapeDiffuseTexture[0], "diffuse", device, newTextures);
+        mesh.normalTextureHash    = ExtractMaterialTexture(landMat->spLandscapeNormalTexture[0], "normal", device, newTextures, TexturePostProcess::Octahedral);
+        mesh.roughnessTextureHash = ExtractMaterialTexture(landMat->spLandscapeSmoothSpecTexture[0], "roughness", device, newTextures, TexturePostProcess::InvertRGB);
+    } else {
+        mesh.diffuseTextureHash   = lightingMat ? ExtractMaterialTexture(lightingMat->spDiffuseTexture, "diffuse", device, newTextures) : 0;
+        mesh.normalTextureHash    = lightingMat ? ExtractMaterialTexture(lightingMat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral) : 0;
+        mesh.roughnessTextureHash = lightingMat ? ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, TexturePostProcess::InvertRGB) : 0;
+    }
 
     // Extract alpha test state from NiAlphaProperty (effectState on BSGeometry)
     mesh.alphaTestEnabled = false;
