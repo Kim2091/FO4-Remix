@@ -136,6 +136,14 @@ static uint32_t ComputeMip0Size(uint32_t width, uint32_t height, DXGI_FORMAT fmt
             bh = (height + 3) / 4; if (bh < 1) bh = 1;
             return bw * bh * 8;
 
+        // BC2 / DXT3
+        case DXGI_FORMAT_BC2_TYPELESS:      // 73
+        case DXGI_FORMAT_BC2_UNORM:         // 74
+        case DXGI_FORMAT_BC2_UNORM_SRGB:    // 75
+            bw = (width + 3) / 4;  if (bw < 1) bw = 1;
+            bh = (height + 3) / 4; if (bh < 1) bh = 1;
+            return bw * bh * 16;
+
         // BC3 / DXT5
         case DXGI_FORMAT_BC3_TYPELESS:      // 76
         case DXGI_FORMAT_BC3_UNORM:         // 77
@@ -188,6 +196,9 @@ static bool IsBlockCompressed(DXGI_FORMAT fmt, uint32_t& blockSize)
             blockSize = 8;
             return true;
 
+        case DXGI_FORMAT_BC2_TYPELESS:
+        case DXGI_FORMAT_BC2_UNORM:
+        case DXGI_FORMAT_BC2_UNORM_SRGB:
         case DXGI_FORMAT_BC3_TYPELESS:
         case DXGI_FORMAT_BC3_UNORM:
         case DXGI_FORMAT_BC3_UNORM_SRGB:
@@ -361,6 +372,65 @@ static void DecodeBC3AlphaBlock(const uint8_t* block, uint8_t alphas[4][4])
             alphas[y][x] = palette[bits & 7];
             bits >>= 3;
         }
+}
+
+// Decompress a BC2 (DXT3) texture to R8G8B8A8
+// BC2 = 8 bytes explicit 4-bit alpha + 8 bytes BC1 color per 4x4 block
+static bool DecompressBC2(ExtractedTexture& tex)
+{
+    bool isBC2 = (tex.dxgiFormat == DXGI_FORMAT_BC2_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC2_UNORM_SRGB ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC2_TYPELESS);
+    if (!isBC2) return false;
+
+    uint32_t bw = (tex.width + 3) / 4;
+    uint32_t bh = (tex.height + 3) / 4;
+
+    std::vector<uint8_t> rgba(tex.width * tex.height * 4);
+    const uint8_t* src = tex.pixels.data();
+
+    for (uint32_t by = 0; by < bh; by++) {
+        for (uint32_t bx = 0; bx < bw; bx++) {
+            // First 8 bytes: explicit 4-bit alpha for each of the 16 pixels
+            uint8_t alphas[4][4];
+            for (int y = 0; y < 4; y++) {
+                uint8_t lo = src[y * 2];
+                uint8_t hi = src[y * 2 + 1];
+                alphas[y][0] = (lo & 0x0F) | ((lo & 0x0F) << 4);
+                alphas[y][1] = (lo >> 4)   | ((lo >> 4) << 4);
+                alphas[y][2] = (hi & 0x0F) | ((hi & 0x0F) << 4);
+                alphas[y][3] = (hi >> 4)   | ((hi >> 4) << 4);
+            }
+
+            // Next 8 bytes: BC1 color block
+            uint8_t block[4][4][4];
+            DecodeBC1ColorBlock(src + 8, block);
+
+            // Combine color + alpha
+            for (int y = 0; y < 4; y++) {
+                for (int x = 0; x < 4; x++)
+                    block[y][x][3] = alphas[y][x];
+            }
+
+            src += 16;
+
+            // Write pixels
+            for (int y = 0; y < 4; y++) {
+                uint32_t py = by * 4 + y;
+                if (py >= tex.height) continue;
+                for (int x = 0; x < 4; x++) {
+                    uint32_t px = bx * 4 + x;
+                    if (px >= tex.width) continue;
+                    uint32_t offset = (py * tex.width + px) * 4;
+                    memcpy(&rgba[offset], block[y][x], 4);
+                }
+            }
+        }
+    }
+
+    tex.pixels = std::move(rgba);
+    tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    return true;
 }
 
 // Decompress a BC-compressed texture to R8G8B8A8 and invert RGB (smoothness → roughness)
@@ -658,6 +728,9 @@ static uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
     tex2D->Release();
 
     if (!ok) return 0;
+
+    // BC2 (DXT3) isn't supported by Remix natively — decompress to RGBA8
+    DecompressBC2(extracted);
 
     // --- Debug dump: diffuse control (no post-processing) ---
     if (postProcess == TexturePostProcess::None) {
