@@ -69,8 +69,11 @@ static constexpr uintptr_t OFF_REFR_LOADED_DATA = 0xF0;
 static constexpr uintptr_t OFF_LOADED_ROOT_NODE = 0x08;
 static constexpr uintptr_t OFF_CELL_OBJECT_LIST = 0x70;
 static constexpr uintptr_t OFF_CELL_FLAGS       = 0x40;
+static constexpr uintptr_t OFF_CELL_LAND        = 0x58;  // TESObjectLAND*
 static constexpr uintptr_t OFF_CELL_WORLD_SPACE = 0xC8;
 static constexpr uint16_t  CELL_FLAG_IS_INTERIOR = 0x0001;
+static constexpr uintptr_t OFF_LAND_QUADRANTS   = 0x40;  // BSMultiBoundNode*[4]
+static constexpr int       LAND_QUADRANT_COUNT  = 4;
 
 // TES singleton and GridCellArray offsets (from static analysis of Fallout4.exe)
 static RelocPtr<uintptr_t> s_g_tes(0x032D2048);
@@ -1336,6 +1339,27 @@ ExtractionResult SceneExtractor::ExtractCell(uintptr_t cellPtr, ID3D11Device* de
         meshCount += (uint32_t)(result.size() - before);
     }
 
+    // Extract terrain geometry from LAND quadrant nodes (BSMultiBoundNode).
+    // TESObjectLAND is at cell+0x58, its quadrant node array is at LAND+0x40.
+    uint32_t terrainMeshCount = 0;
+    uintptr_t landPtr = *reinterpret_cast<uintptr_t*>(cellPtr + OFF_CELL_LAND);
+    if (landPtr) {
+        uintptr_t* quadrants = *reinterpret_cast<uintptr_t**>(landPtr + OFF_LAND_QUADRANTS);
+        if (quadrants) {
+            uint32_t landFormID = *reinterpret_cast<uint32_t*>(landPtr + OFF_FORM_ID);
+            for (int q = 0; q < LAND_QUADRANT_COUNT; q++) {
+                uintptr_t nodePtr = quadrants[q];
+                if (!nodePtr) continue;
+                NiNode* quadNode = reinterpret_cast<NiNode*>(nodePtr);
+                uint64_t terrainHash = FnvHashCombine(0xCBF29CE484222325ULL, (uint64_t)landFormID);
+                terrainHash = FnvHashCombine(terrainHash, (uint64_t)q);
+                size_t before = result.size();
+                WalkNode(quadNode, terrainHash, result, device, newTextures);
+                terrainMeshCount += (uint32_t)(result.size() - before);
+            }
+        }
+    }
+
     auto lights = LightExtractor::ExtractCellLights(cellPtr);
 
     uint32_t hasDiffuse = 0, hasNormal = 0, hasRoughness = 0;
@@ -1345,9 +1369,9 @@ ExtractionResult SceneExtractor::ExtractCell(uintptr_t cellPtr, ID3D11Device* de
         if (m.roughnessTextureHash) hasRoughness++;
     }
 
-    _MESSAGE("FO4RemixPlugin: ExtractCell 0x%08X - %u meshes (%u diffuse, %u normal, %u roughness), "
+    _MESSAGE("FO4RemixPlugin: ExtractCell 0x%08X - %u meshes + %u terrain (%u diffuse, %u normal, %u roughness), "
              "%zu new textures (%zu cached), %zu lights from %u objects",
-             cellFormID, meshCount, hasDiffuse, hasNormal, hasRoughness,
+             cellFormID, meshCount, terrainMeshCount, hasDiffuse, hasNormal, hasRoughness,
              newTextures.size(), g_textureCache.size(), lights.size(), objectList.count);
 
     return { std::move(result), std::move(newTextures), std::move(lights) };
