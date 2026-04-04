@@ -252,6 +252,11 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                 }
             }
 
+            if (!toUnload.empty() || !toExtract.empty()) {
+                _MESSAGE("FO4RemixPlugin: Cell transition - %zu currently loaded, %zu to unload, %zu to extract, %zu tracked",
+                         currentlyLoaded.size(), toUnload.size(), toExtract.size(), g_extractedCells.size());
+            }
+
             // Re-extract cells that had missing textures (streaming wasn't done)
             for (auto it = g_pendingReextract.begin(); it != g_pendingReextract.end(); ) {
                 if (g_presentCallCount >= it->second) {
@@ -324,10 +329,12 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     }
                 }
 
-                // Refresh one existing cell
+                // Refresh one existing cell (meshes/textures only — lights don't need
+                // refreshing and destroying+recreating them breaks Remix rendering)
                 if (refreshCell.cellPtr != 0) {
                     _MESSAGE("FO4RemixPlugin: Refreshing cell 0x%08X", refreshCell.formID);
                     auto extraction = SceneExtractor::ExtractCell(refreshCell.cellPtr, device);
+                    extraction.lights.clear();
                     if (!extraction.meshes.empty()) {
                         newScenes.push_back({ refreshCell.formID, std::move(extraction) });
                     }

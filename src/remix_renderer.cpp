@@ -180,8 +180,14 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
-    // If this cell already exists, clean up old data first
+    // If this cell already exists, clean up old data first.
+    // Preserve existing lights during refreshes (empty lights in new data = refresh).
+    std::vector<remixapi_LightHandle> preservedLights;
     if (g_cellScenes.find(cellFormID) != g_cellScenes.end()) {
+        if (result.lights.empty()) {
+            preservedLights = std::move(g_cellScenes[cellFormID].lights);
+            g_cellScenes[cellFormID].lights.clear();
+        }
         UnloadCell(cellFormID);
     }
 
@@ -443,8 +449,15 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         lightCreated++;
     }
 
-    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Lights - created %u, failed %u",
-             cellFormID, lightCreated, lightFailed);
+    // Restore preserved lights from refresh (they weren't destroyed)
+    if (!preservedLights.empty()) {
+        cellData.lights = std::move(preservedLights);
+        _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Lights - preserved %zu from refresh",
+                 cellFormID, cellData.lights.size());
+    } else {
+        _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Lights - created %u, failed %u",
+                 cellFormID, lightCreated, lightFailed);
+    }
 
     g_cellScenes[cellFormID] = std::move(cellData);
 }
@@ -488,6 +501,8 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
 
     // Draw scene meshes from all loaded cells
     bool hasAnyMeshes = false;
+    uint32_t totalLightsDrawn = 0;
+    uint32_t totalLightsFailed = 0;
     for (auto& [cellID, cellData] : g_cellScenes) {
         for (auto& inst : cellData.meshes) {
             remixapi_InstanceInfo instance = {};
@@ -500,8 +515,21 @@ void RemixRenderer::OnFrame(const CameraState& cam) {
             hasAnyMeshes = true;
         }
         for (auto& handle : cellData.lights) {
-            api->DrawLightInstance(handle);
+            remixapi_ErrorCode lightErr = api->DrawLightInstance(handle);
+            if (lightErr == REMIXAPI_ERROR_CODE_SUCCESS) {
+                totalLightsDrawn++;
+            } else {
+                totalLightsFailed++;
+            }
         }
+    }
+
+    // Periodic light status log (every ~5 seconds)
+    static uint32_t s_frameCounter = 0;
+    s_frameCounter++;
+    if (s_frameCounter % 300 == 0) {
+        _MESSAGE("FO4RemixPlugin: OnFrame light status - %zu cells, %u lights drawn, %u lights failed",
+                 g_cellScenes.size(), totalLightsDrawn, totalLightsFailed);
     }
 
     if (!hasAnyMeshes && g_fallbackMesh) {
