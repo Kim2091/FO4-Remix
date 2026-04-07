@@ -25,36 +25,13 @@ static PFN_Present g_originalPresent = nullptr;
 // Game readiness — set by F4SE message handler in main.cpp
 extern std::atomic<bool> g_gameDataReady;
 
-// Remix runs on its own thread to avoid deadlocking the game's DX11 render thread
-static std::thread g_remixThread;
-static std::atomic<bool> g_remixRunning { false };
-static std::atomic<bool> g_remixReady { false };
-static std::mutex g_cameraMutex;
-static CameraState g_sharedCamera = {};
-static uint32_t g_gameWidth = 1280;
-static uint32_t g_gameHeight = 720;
-
 // Per-cell scene data — main thread produces, remix thread consumes
 struct PendingCellScene {
     uint32_t cellFormID;
     ExtractionResult data;
 };
 
-static std::mutex g_sceneMutex;
-static std::vector<PendingCellScene> g_pendingCellScenes;
-static std::vector<uint32_t> g_pendingUnloads;
-static std::atomic<bool> g_sceneReady { false };
-
-// Multi-cell extraction state
-static std::unordered_set<uint32_t> g_extractedCells;       // cells already sent to remix thread
-static std::vector<uint32_t> g_refreshQueue;                // round-robin refresh order
-static size_t g_refreshIndex = 0;
-static std::unordered_map<uint32_t, uintptr_t> g_cellPtrMap; // formID -> cellPtr for refresh
-
-// Extraction timing
-static int g_extractionAttempts = 0;
-static int g_nextExtractFrame = 0;
-static bool g_firstExtractionDone = false;
+// Extraction timing constants
 static constexpr int kInitialRetryDelay = 120;     // ~2 seconds at 60fps
 static constexpr int kMaxRetryDelay = 600;         // ~10 seconds
 static constexpr int kMaxInitialAttempts = 15;
@@ -62,32 +39,6 @@ static constexpr uint32_t kMinExpectedMeshes = 5;
 static constexpr int kNewCellCheckInterval = 60;    // ~1 second at 60fps — check for new cells
 static constexpr int kRefreshInterval = 1800;       // ~30 seconds at 60fps — refresh one existing cell
 static constexpr int kReextractDelay = 180;         // ~3 seconds — retry cells with missing textures
-
-// Cells that need re-extraction because textures weren't streamed in yet
-static std::unordered_map<uint32_t, int> g_pendingReextract; // formID -> frame to retry
-
-// Backbuffer capture for screen overlay
-static ID3D11Texture2D* g_stagingTex = nullptr;
-static uint32_t g_stagingWidth = 0;
-static uint32_t g_stagingHeight = 0;
-static DXGI_FORMAT g_stagingFormat = DXGI_FORMAT_UNKNOWN;
-
-static std::mutex g_overlayMutex;
-static std::vector<uint8_t> g_overlayPixels;
-static uint32_t g_overlayWidth = 0;
-static uint32_t g_overlayHeight = 0;
-static DXGI_FORMAT g_overlayDxgiFormat = DXGI_FORMAT_UNKNOWN;
-static std::atomic<bool> g_overlayReady { false };
-
-// Persistent skinned mesh tracking — game thread updates bone transforms every frame,
-// Remix thread reads the latest snapshot for drawing.
-static std::mutex g_skinnedMeshMutex;
-static std::vector<ExtractedSkinnedMesh> g_trackedSkinnedMeshes;
-
-// Bone transforms computed by game thread, consumed by Remix thread
-static std::mutex g_boneTransformMutex;
-static std::vector<ExtractedSkinnedMesh> g_skinnedMeshesForRendering;
-static uint32_t g_boneUpdateFrameCounter = 0;
 
 // UI RT detection uses two hooks together:
 //   ClearRTV: records R8G8B8A8_UNORM candidates cleared with {0,0,0,0}
@@ -100,31 +51,94 @@ static PFN_OMSetRenderTargets g_originalOMSetRTs = nullptr;
 typedef void (STDMETHODCALLTYPE* PFN_ClearRenderTargetView)(
     ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT[4]);
 static PFN_ClearRenderTargetView g_originalClearRTV = nullptr;
-static ID3D11Texture2D* g_uiRenderTarget = nullptr;
-static bool g_uiRTLocked = false;
-static std::atomic<bool> g_uiClearedThisFrame { false };
-static std::atomic<bool> g_uiDrawnThisFrame { false };
-static bool g_contextHooked = false;
 
-// Per-frame ClearRTV candidate tracking (R8G8B8A8_UNORM textures cleared this frame)
-static constexpr int kMaxClearCandidates = 8;
-static ID3D11Texture2D* g_clearCandidates[kMaxClearCandidates] = {};
-static int g_clearCandidateCount = 0;
-static int g_presentCallCount = 0;
+// ---------------------------------------------------------------------------
+// Grouped state objects — replaces scattered file-scope globals
+// ---------------------------------------------------------------------------
+
+// Remix thread lifecycle and shared camera
+static struct RemixThreadState {
+    std::thread              thread;
+    std::atomic<bool>        running { false };
+    std::atomic<bool>        ready { false };
+    std::mutex               cameraMutex;
+    CameraState              sharedCamera = {};
+    uint32_t                 gameWidth = 1280;
+    uint32_t                 gameHeight = 720;
+} g_remix;
+
+// Scene data pipeline (main thread -> remix thread)
+static struct ScenePipeline {
+    std::mutex               mutex;
+    std::vector<PendingCellScene> pendingScenes;
+    std::vector<uint32_t>    pendingUnloads;
+    std::atomic<bool>        ready { false };
+
+    // Multi-cell tracking
+    std::unordered_set<uint32_t>          extractedCells;
+    std::vector<uint32_t>                 refreshQueue;
+    size_t                                refreshIndex = 0;
+    std::unordered_map<uint32_t, uintptr_t> cellPtrMap;
+
+    // Extraction timing
+    int                      attempts = 0;
+    int                      nextExtractFrame = 0;
+    bool                     firstExtractionDone = false;
+    std::unordered_map<uint32_t, int> pendingReextract;
+} g_scene;
+
+// Overlay capture from game UI render target
+static struct OverlayCapture {
+    ID3D11Texture2D*         stagingTex = nullptr;
+    uint32_t                 stagingWidth = 0;
+    uint32_t                 stagingHeight = 0;
+    DXGI_FORMAT              stagingFormat = DXGI_FORMAT_UNKNOWN;
+
+    std::mutex               mutex;
+    std::vector<uint8_t>     pixels;
+    uint32_t                 width = 0;
+    uint32_t                 height = 0;
+    DXGI_FORMAT              dxgiFormat = DXGI_FORMAT_UNKNOWN;
+    std::atomic<bool>        ready { false };
+} g_overlay;
+
+// Skinned mesh tracking and bone transform pipeline
+static struct SkinnedMeshState {
+    std::mutex               trackingMutex;
+    std::vector<ExtractedSkinnedMesh> tracked;
+
+    std::mutex               boneMutex;
+    std::vector<ExtractedSkinnedMesh> forRendering;
+    uint32_t                 updateFrameCounter = 0;
+} g_skinning;
+
+// UI render target detection state
+static struct UIDetectionState {
+    ID3D11Texture2D*         renderTarget = nullptr;
+    bool                     locked = false;
+    std::atomic<bool>        clearedThisFrame { false };
+    std::atomic<bool>        drawnThisFrame { false };
+    bool                     contextHooked = false;
+
+    static constexpr int     kMaxClearCandidates = 8;
+    ID3D11Texture2D*         clearCandidates[kMaxClearCandidates] = {};
+    int                      clearCandidateCount = 0;
+    int                      presentCallCount = 0;
+} g_ui;
 
 // Merge newly extracted skinned meshes into the persistent tracking list.
 // Called on the game thread after extraction completes.
 static void MergeSkinnedMeshesIntoTracking(const std::vector<PendingCellScene>& scenes) {
-    std::lock_guard<std::mutex> lock(g_skinnedMeshMutex);
+    std::lock_guard<std::mutex> lock(g_skinning.trackingMutex);
     for (const auto& scene : scenes) {
         for (const auto& sm : scene.data.skinnedMeshes) {
             // Check if this mesh is already tracked (by hash)
-            auto it = std::find_if(g_trackedSkinnedMeshes.begin(),
-                                   g_trackedSkinnedMeshes.end(),
+            auto it = std::find_if(g_skinning.tracked.begin(),
+                                   g_skinning.tracked.end(),
                                    [&](const ExtractedSkinnedMesh& existing) {
                                        return existing.hash == sm.hash;
                                    });
-            if (it != g_trackedSkinnedMeshes.end()) {
+            if (it != g_skinning.tracked.end()) {
                 // Update existing entry (bone pointers may have changed on refresh)
                 _MESSAGE("FO4RemixPlugin: [SKINNING] Updated tracked skinned mesh hash=0x%llX owner=0x%08X bones=%u",
                          (unsigned long long)sm.hash, sm.ownerFormID, sm.boneCount);
@@ -133,7 +147,7 @@ static void MergeSkinnedMeshesIntoTracking(const std::vector<PendingCellScene>& 
                 // New skinned mesh
                 _MESSAGE("FO4RemixPlugin: [SKINNING] Added tracked skinned mesh hash=0x%llX owner=0x%08X bones=%u verts=%u",
                          (unsigned long long)sm.hash, sm.ownerFormID, sm.boneCount, sm.vertexCount);
-                g_trackedSkinnedMeshes.push_back(sm);
+                g_skinning.tracked.push_back(sm);
             }
         }
     }
@@ -161,25 +175,25 @@ static void STDMETHODCALLTYPE hkClearRenderTargetView(
         if (resource) {
             ID3D11Texture2D* tex = nullptr;
             if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
-                if (g_uiRTLocked) {
-                    if (tex == g_uiRenderTarget) {
-                        g_uiClearedThisFrame = true;
+                if (g_ui.locked) {
+                    if (tex == g_ui.renderTarget) {
+                        g_ui.clearedThisFrame = true;
                     }
                 } else {
                     // Detection phase: add matching textures to per-frame candidate list
                     D3D11_TEXTURE2D_DESC desc;
                     tex->GetDesc(&desc);
                     if (desc.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
-                        desc.Width == g_gameWidth && desc.Height == g_gameHeight &&
+                        desc.Width == g_remix.gameWidth && desc.Height == g_remix.gameHeight &&
                         desc.Usage == D3D11_USAGE_DEFAULT &&
-                        g_clearCandidateCount < kMaxClearCandidates) {
+                        g_ui.clearCandidateCount < g_ui.kMaxClearCandidates) {
                         // Avoid duplicates
                         bool already = false;
-                        for (int i = 0; i < g_clearCandidateCount; i++) {
-                            if (g_clearCandidates[i] == tex) { already = true; break; }
+                        for (int i = 0; i < g_ui.clearCandidateCount; i++) {
+                            if (g_ui.clearCandidates[i] == tex) { already = true; break; }
                         }
                         if (!already) {
-                            g_clearCandidates[g_clearCandidateCount++] = tex;
+                            g_ui.clearCandidates[g_ui.clearCandidateCount++] = tex;
                         }
                     }
                 }
@@ -206,29 +220,29 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
         if (resource) {
             ID3D11Texture2D* tex = nullptr;
             if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
-                if (g_uiRTLocked) {
-                    if (tex == g_uiRenderTarget) {
+                if (g_ui.locked) {
+                    if (tex == g_ui.renderTarget) {
                         // If the game didn't clear the RT this frame, do it ourselves
                         // to prevent stale content from prior frames causing ghosting.
-                        if (!g_uiClearedThisFrame) {
+                        if (!g_ui.clearedThisFrame) {
                             float clearColor[4] = {0, 0, 0, 0};
                             g_originalClearRTV(context, ppRTVs[0], clearColor);
-                            g_uiClearedThisFrame = true;
+                            g_ui.clearedThisFrame = true;
                         }
-                        g_uiDrawnThisFrame = true;
+                        g_ui.drawnThisFrame = true;
                     }
                 } else {
                     // Check if this sole-bound RT is a ClearRTV candidate
-                    for (int i = 0; i < g_clearCandidateCount; i++) {
-                        if (g_clearCandidates[i] == tex) {
-                            if (g_uiRenderTarget != tex) {
-                                if (g_uiRenderTarget) g_uiRenderTarget->Release();
-                                g_uiRenderTarget = tex;
-                                g_uiRenderTarget->AddRef();
+                    for (int i = 0; i < g_ui.clearCandidateCount; i++) {
+                        if (g_ui.clearCandidates[i] == tex) {
+                            if (g_ui.renderTarget != tex) {
+                                if (g_ui.renderTarget) g_ui.renderTarget->Release();
+                                g_ui.renderTarget = tex;
+                                g_ui.renderTarget->AddRef();
                                 _MESSAGE("FO4RemixPlugin: UI RT detected (cleared + sole-bound): tex=%p", tex);
                             }
-                            g_uiClearedThisFrame = true;
-                            g_uiDrawnThisFrame = true;
+                            g_ui.clearedThisFrame = true;
+                            g_ui.drawnThisFrame = true;
                             break;
                         }
                     }
@@ -247,7 +261,7 @@ static void RemixThreadFunc() {
     // Prevent Windows from ghosting this thread's window when Present() blocks
     DisableProcessWindowsGhosting();
 
-    if (!RemixAPI::Initialize(nullptr, g_gameWidth, g_gameHeight)) {
+    if (!RemixAPI::Initialize(nullptr, g_remix.gameWidth, g_remix.gameHeight)) {
         _MESSAGE("FO4RemixPlugin: ERROR - Remix API init failed on remix thread");
         return;
     }
@@ -258,18 +272,18 @@ static void RemixThreadFunc() {
         return;
     }
 
-    g_remixReady = true;
+    g_remix.ready = true;
 
-    while (g_remixRunning) {
+    while (g_remix.running) {
         // Check for pending scene data from main thread
-        if (g_sceneReady) {
+        if (g_scene.ready) {
             std::vector<PendingCellScene> cellScenes;
             std::vector<uint32_t> unloads;
             {
-                std::lock_guard<std::mutex> lock(g_sceneMutex);
-                cellScenes = std::move(g_pendingCellScenes);
-                unloads = std::move(g_pendingUnloads);
-                g_sceneReady = false;
+                std::lock_guard<std::mutex> lock(g_scene.mutex);
+                cellScenes = std::move(g_scene.pendingScenes);
+                unloads = std::move(g_scene.pendingUnloads);
+                g_scene.ready = false;
             }
 
             // Unload cells that are no longer loaded by the engine
@@ -292,27 +306,27 @@ static void RemixThreadFunc() {
         // Grab latest camera from main thread
         CameraState cam;
         {
-            std::lock_guard<std::mutex> lock(g_cameraMutex);
-            cam = g_sharedCamera;
+            std::lock_guard<std::mutex> lock(g_remix.cameraMutex);
+            cam = g_remix.sharedCamera;
         }
 
         // Grab latest bone transform data from game thread
         std::vector<ExtractedSkinnedMesh> skinnedSnapshot;
         {
-            std::lock_guard<std::mutex> lock(g_boneTransformMutex);
-            skinnedSnapshot = g_skinnedMeshesForRendering;
+            std::lock_guard<std::mutex> lock(g_skinning.boneMutex);
+            skinnedSnapshot = g_skinning.forRendering;
         }
 
         // Grab latest overlay data from game thread
         OverlayData overlay;
-        if (g_overlayReady) {
-            std::lock_guard<std::mutex> lock(g_overlayMutex);
-            overlay.pixels.swap(g_overlayPixels);
-            overlay.width = g_overlayWidth;
-            overlay.height = g_overlayHeight;
-            overlay.dxgiFormat = static_cast<uint32_t>(g_overlayDxgiFormat);
+        if (g_overlay.ready) {
+            std::lock_guard<std::mutex> lock(g_overlay.mutex);
+            overlay.pixels.swap(g_overlay.pixels);
+            overlay.width = g_overlay.width;
+            overlay.height = g_overlay.height;
+            overlay.dxgiFormat = static_cast<uint32_t>(g_overlay.dxgiFormat);
             overlay.valid = true;
-            g_overlayReady = false;
+            g_overlay.ready = false;
         }
 
         // Pump messages before rendering so input is processed even when frames are slow
@@ -333,60 +347,60 @@ static void RemixThreadFunc() {
 }
 
 static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
-    g_presentCallCount++;
+    g_ui.presentCallCount++;
 
     // Reset per-frame ClearRTV candidate list for next frame's detection
-    g_clearCandidateCount = 0;
+    g_ui.clearCandidateCount = 0;
 
     // Start remix thread on first Present call
-    if (!g_remixRunning && !g_remixThread.joinable()) {
+    if (!g_remix.running && !g_remix.thread.joinable()) {
         // Query game swap chain for resolution
         DXGI_SWAP_CHAIN_DESC scDesc = {};
         if (SUCCEEDED(swapChain->GetDesc(&scDesc)) && scDesc.BufferDesc.Width > 0) {
-            g_gameWidth = scDesc.BufferDesc.Width;
-            g_gameHeight = scDesc.BufferDesc.Height;
-            _MESSAGE("FO4RemixPlugin: Game resolution: %ux%u", g_gameWidth, g_gameHeight);
+            g_remix.gameWidth = scDesc.BufferDesc.Width;
+            g_remix.gameHeight = scDesc.BufferDesc.Height;
+            _MESSAGE("FO4RemixPlugin: Game resolution: %ux%u", g_remix.gameWidth, g_remix.gameHeight);
         }
         _MESSAGE("FO4RemixPlugin: hkPresent - launching Remix thread");
-        g_remixRunning = true;
-        g_remixThread = std::thread(RemixThreadFunc);
+        g_remix.running = true;
+        g_remix.thread = std::thread(RemixThreadFunc);
     }
 
     // Update shared camera state for the remix thread
-    if (g_remixReady) {
+    if (g_remix.ready) {
         CameraState cam = Camera::Get();
-        std::lock_guard<std::mutex> lock(g_cameraMutex);
-        g_sharedCamera = cam;
+        std::lock_guard<std::mutex> lock(g_remix.cameraMutex);
+        g_remix.sharedCamera = cam;
     }
 
     // Per-frame bone transform update for all tracked skinned meshes (EVERY frame).
     // This is what makes skeletal animations work — must not be on the 30-second timer.
-    if (g_remixReady && g_gameDataReady && g_config.skinningEnabled) {
-        g_boneUpdateFrameCounter++;
+    if (g_remix.ready && g_gameDataReady && g_config.skinningEnabled) {
+        g_skinning.updateFrameCounter++;
 
         // Update bone transforms and copy for Remix thread under a single lock sequence.
-        // Lock order: g_skinnedMeshMutex first, then g_boneTransformMutex.
+        // Lock order: g_skinning.trackingMutex first, then g_skinning.boneMutex.
         {
-            std::lock_guard<std::mutex> lockSkinned(g_skinnedMeshMutex);
-            if (!g_trackedSkinnedMeshes.empty()) {
-                SceneExtractor::UpdateSkinnedBoneTransforms(g_trackedSkinnedMeshes);
+            std::lock_guard<std::mutex> lockSkinned(g_skinning.trackingMutex);
+            if (!g_skinning.tracked.empty()) {
+                Skinning::UpdateBoneTransforms(g_skinning.tracked);
             }
 
             // Copy updated transforms for Remix thread consumption
             {
-                std::lock_guard<std::mutex> lockBone(g_boneTransformMutex);
-                g_skinnedMeshesForRendering = g_trackedSkinnedMeshes;
+                std::lock_guard<std::mutex> lockBone(g_skinning.boneMutex);
+                g_skinning.forRendering = g_skinning.tracked;
             }
         }
 
         // Rate-limited bone update logging (every 300 frames, ~5 seconds)
-        if (g_boneUpdateFrameCounter % 300 == 0) {
-            std::lock_guard<std::mutex> lock(g_skinnedMeshMutex);
-            if (!g_trackedSkinnedMeshes.empty()) {
+        if (g_skinning.updateFrameCounter % 300 == 0) {
+            std::lock_guard<std::mutex> lock(g_skinning.trackingMutex);
+            if (!g_skinning.tracked.empty()) {
                 _MESSAGE("FO4RemixPlugin: [SKINNING] Bone update frame %u: %zu tracked skinned meshes",
-                         g_boneUpdateFrameCounter, g_trackedSkinnedMeshes.size());
+                         g_skinning.updateFrameCounter, g_skinning.tracked.size());
                 // Log first mesh bone[0] position for debugging
-                const auto& firstMesh = g_trackedSkinnedMeshes[0];
+                const auto& firstMesh = g_skinning.tracked[0];
                 if (firstMesh.boneCount > 0 && !firstMesh.currentBoneTransforms.empty()) {
                     const auto& b0 = firstMesh.currentBoneTransforms[0];
                     _MESSAGE("FO4RemixPlugin: [SKINNING]   Mesh hash=0x%llX bone[0] pos=[%.1f, %.1f, %.1f]",
@@ -397,7 +411,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     }
 
     // Hook OMSetRenderTargets + ClearRenderTargetView on first opportunity
-    if (!g_contextHooked) {
+    if (!g_ui.contextHooked) {
         ID3D11Device* hookDevice = nullptr;
         swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&hookDevice);
         if (hookDevice) {
@@ -419,11 +433,11 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                                     MH_EnableHook(clearRTVAddr) == MH_OK);
 
                 if (omHooked && clearHooked) {
-                    g_contextHooked = true;
+                    g_ui.contextHooked = true;
                     _MESSAGE("FO4RemixPlugin: OMSetRenderTargets hooked at %p, ClearRTV hooked at %p",
                              omSetRTsAddr, clearRTVAddr);
                 } else if (omHooked) {
-                    g_contextHooked = true;
+                    g_ui.contextHooked = true;
                     _MESSAGE("FO4RemixPlugin: OMSetRenderTargets hooked at %p (ClearRTV hook failed)", omSetRTsAddr);
                 }
                 hookCtx->Release();
@@ -436,11 +450,11 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     // Require BOTH flags: ClearRTV (RT was zeroed) AND OMSetRTs (RT was drawn to).
     // If only drawn without a clear, the RT has accumulated stale content from
     // prior frames — skip the copy to avoid ghosting/trailing artifacts.
-    bool uiCleared = g_uiClearedThisFrame.exchange(false);
-    bool uiDrawn = g_uiDrawnThisFrame.exchange(false);
+    bool uiCleared = g_ui.clearedThisFrame.exchange(false);
+    bool uiDrawn = g_ui.drawnThisFrame.exchange(false);
     bool uiActiveThisFrame = uiCleared && uiDrawn;
 
-    if (g_remixReady && g_uiRenderTarget && uiActiveThisFrame) {
+    if (g_remix.ready && g_ui.renderTarget && uiActiveThisFrame) {
         ID3D11Device* device = nullptr;
         swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&device);
         if (device) {
@@ -449,12 +463,12 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
 
             if (context) {
                 D3D11_TEXTURE2D_DESC uiDesc;
-                g_uiRenderTarget->GetDesc(&uiDesc);
+                g_ui.renderTarget->GetDesc(&uiDesc);
 
                 // Create/recreate staging texture if dimensions or format changed
-                if (!g_stagingTex || g_stagingWidth != uiDesc.Width ||
-                    g_stagingHeight != uiDesc.Height || g_stagingFormat != uiDesc.Format) {
-                    if (g_stagingTex) { g_stagingTex->Release(); g_stagingTex = nullptr; }
+                if (!g_overlay.stagingTex || g_overlay.stagingWidth != uiDesc.Width ||
+                    g_overlay.stagingHeight != uiDesc.Height || g_overlay.stagingFormat != uiDesc.Format) {
+                    if (g_overlay.stagingTex) { g_overlay.stagingTex->Release(); g_overlay.stagingTex = nullptr; }
 
                     D3D11_TEXTURE2D_DESC stagingDesc = {};
                     stagingDesc.Width = uiDesc.Width;
@@ -466,36 +480,36 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     stagingDesc.Usage = D3D11_USAGE_STAGING;
                     stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-                    HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &g_stagingTex);
+                    HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &g_overlay.stagingTex);
                     if (SUCCEEDED(hr)) {
-                        g_stagingWidth = uiDesc.Width;
-                        g_stagingHeight = uiDesc.Height;
-                        g_stagingFormat = uiDesc.Format;
+                        g_overlay.stagingWidth = uiDesc.Width;
+                        g_overlay.stagingHeight = uiDesc.Height;
+                        g_overlay.stagingFormat = uiDesc.Format;
                         _MESSAGE("FO4RemixPlugin: Created UI overlay staging texture %ux%u fmt=%u",
-                                 g_stagingWidth, g_stagingHeight, (unsigned)g_stagingFormat);
+                                 g_overlay.stagingWidth, g_overlay.stagingHeight, (unsigned)g_overlay.stagingFormat);
                     } else {
                         _MESSAGE("FO4RemixPlugin: Failed to create UI overlay staging texture (0x%08X)", hr);
                     }
                 }
 
-                if (g_stagingTex) {
-                    context->CopyResource(g_stagingTex, g_uiRenderTarget);
+                if (g_overlay.stagingTex) {
+                    context->CopyResource(g_overlay.stagingTex, g_ui.renderTarget);
 
                     D3D11_MAPPED_SUBRESOURCE mapped;
-                    HRESULT hr = context->Map(g_stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+                    HRESULT hr = context->Map(g_overlay.stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
                     if (SUCCEEDED(hr)) {
-                        uint32_t w = g_stagingWidth;
-                        uint32_t h = g_stagingHeight;
+                        uint32_t w = g_overlay.stagingWidth;
+                        uint32_t h = g_overlay.stagingHeight;
                         uint32_t rowBytes = w * 4;
 
-                        std::lock_guard<std::mutex> lock(g_overlayMutex);
-                        g_overlayPixels.resize(rowBytes * h);
+                        std::lock_guard<std::mutex> lock(g_overlay.mutex);
+                        g_overlay.pixels.resize(rowBytes * h);
 
                         // Copy pixels and un-premultiply alpha.
                         // The UI RT uses SrcAlpha/1-SrcAlpha blending onto a (0,0,0,0) background,
                         // so RGB values are premultiplied. DrawScreenOverlay expects straight alpha.
                         const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
-                        uint8_t* dst = g_overlayPixels.data();
+                        uint8_t* dst = g_overlay.pixels.data();
                         for (uint32_t y = 0; y < h; y++) {
                             const uint8_t* srcRow = src + y * mapped.RowPitch;
                             uint8_t* dstRow = dst + y * rowBytes;
@@ -517,19 +531,19 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                             }
                         }
 
-                        g_overlayWidth = w;
-                        g_overlayHeight = h;
-                        g_overlayDxgiFormat = uiDesc.Format;
-                        g_overlayReady = true;
+                        g_overlay.width = w;
+                        g_overlay.height = h;
+                        g_overlay.dxgiFormat = uiDesc.Format;
+                        g_overlay.ready = true;
 
-                        context->Unmap(g_stagingTex, 0);
+                        context->Unmap(g_overlay.stagingTex, 0);
 
                         // Lock the RT pointer after first successful capture —
                         // stops re-detection from picking the wrong RT on future frames
-                        if (!g_uiRTLocked) {
-                            g_uiRTLocked = true;
+                        if (!g_ui.locked) {
+                            g_ui.locked = true;
                             _MESSAGE("FO4RemixPlugin: UI RT locked at %p (%ux%u)",
-                                     g_uiRenderTarget, w, h);
+                                     g_ui.renderTarget, w, h);
                         }
                     }
                 }
@@ -540,13 +554,13 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     }
 
     // Multi-cell extraction: initial bootstrap, then incremental new-cell + round-robin refresh
-    if (g_remixReady && g_gameDataReady && g_presentCallCount >= g_nextExtractFrame) {
-        if (!g_firstExtractionDone) {
+    if (g_remix.ready && g_gameDataReady && g_ui.presentCallCount >= g_scene.nextExtractFrame) {
+        if (!g_scene.firstExtractionDone) {
             // Initial extraction: retry with backoff until we get enough meshes from any cell
-            if (g_extractionAttempts < kMaxInitialAttempts && SceneExtractor::IsPlayerCellReady()) {
-                g_extractionAttempts++;
+            if (g_scene.attempts < kMaxInitialAttempts && SceneExtractor::IsPlayerCellReady()) {
+                g_scene.attempts++;
                 _MESSAGE("FO4RemixPlugin: Initial multi-cell extraction attempt %d/%d (frame %d)...",
-                         g_extractionAttempts, kMaxInitialAttempts, g_presentCallCount);
+                         g_scene.attempts, kMaxInitialAttempts, g_ui.presentCallCount);
 
                 auto loadedCells = SceneExtractor::GetLoadedCells();
 
@@ -560,9 +574,9 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     auto extraction = SceneExtractor::ExtractCell(cellInfo.cellPtr, device);
                     totalMeshes += extraction.meshes.size() + extraction.skinnedMeshes.size();
                     if (!extraction.meshes.empty() || !extraction.skinnedMeshes.empty()) {
-                        g_extractedCells.insert(cellInfo.formID);
-                        g_refreshQueue.push_back(cellInfo.formID);
-                        g_cellPtrMap[cellInfo.formID] = cellInfo.cellPtr;
+                        g_scene.extractedCells.insert(cellInfo.formID);
+                        g_scene.refreshQueue.push_back(cellInfo.formID);
+                        g_scene.cellPtrMap[cellInfo.formID] = cellInfo.cellPtr;
                         newScenes.push_back({ cellInfo.formID, std::move(extraction) });
                     }
                 }
@@ -572,27 +586,27 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                 if (totalMeshes >= kMinExpectedMeshes) {
                     _MESSAGE("FO4RemixPlugin: Initial extraction succeeded: %zu cells, %zu total meshes",
                              newScenes.size(), totalMeshes);
-                    g_firstExtractionDone = true;
-                    g_nextExtractFrame = g_presentCallCount + kNewCellCheckInterval;
-                    g_refreshIndex = 0;
+                    g_scene.firstExtractionDone = true;
+                    g_scene.nextExtractFrame = g_ui.presentCallCount + kNewCellCheckInterval;
+                    g_scene.refreshIndex = 0;
                     // Merge skinned meshes into tracking BEFORE moving data to Remix thread
                     MergeSkinnedMeshesIntoTracking(newScenes);
-                    std::lock_guard<std::mutex> lock(g_sceneMutex);
-                    g_pendingCellScenes = std::move(newScenes);
-                    g_sceneReady = true;
+                    std::lock_guard<std::mutex> lock(g_scene.mutex);
+                    g_scene.pendingScenes = std::move(newScenes);
+                    g_scene.ready = true;
                 } else {
-                    int delay = kInitialRetryDelay << (g_extractionAttempts - 1);
+                    int delay = kInitialRetryDelay << (g_scene.attempts - 1);
                     if (delay > kMaxRetryDelay) delay = kMaxRetryDelay;
-                    g_nextExtractFrame = g_presentCallCount + delay;
+                    g_scene.nextExtractFrame = g_ui.presentCallCount + delay;
                     _MESSAGE("FO4RemixPlugin: Initial extraction got %zu meshes (need >= %u), "
                              "retrying in %d frames (~%.1fs)",
                              totalMeshes, kMinExpectedMeshes, delay, delay / 60.0f);
                 }
-            } else if (g_extractionAttempts >= kMaxInitialAttempts) {
+            } else if (g_scene.attempts >= kMaxInitialAttempts) {
                 _MESSAGE("FO4RemixPlugin: WARNING - Gave up initial extraction after %d attempts",
                          kMaxInitialAttempts);
-                g_firstExtractionDone = true;
-                g_nextExtractFrame = g_presentCallCount + kNewCellCheckInterval;
+                g_scene.firstExtractionDone = true;
+                g_scene.nextExtractFrame = g_ui.presentCallCount + kNewCellCheckInterval;
             }
         } else {
             // Steady-state: check for new/removed cells, and refresh one existing cell
@@ -608,7 +622,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
 
             // Detect cells to unload (were extracted but no longer loaded by engine)
             std::vector<uint32_t> toUnload;
-            for (uint32_t cellID : g_extractedCells) {
+            for (uint32_t cellID : g_scene.extractedCells) {
                 if (currentlyLoaded.find(cellID) == currentlyLoaded.end()) {
                     toUnload.push_back(cellID);
                 }
@@ -617,28 +631,28 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
             // Detect new cells to extract
             std::vector<CellInfo> toExtract;
             for (auto& cellInfo : loadedCells) {
-                if (g_extractedCells.find(cellInfo.formID) == g_extractedCells.end()) {
+                if (g_scene.extractedCells.find(cellInfo.formID) == g_scene.extractedCells.end()) {
                     toExtract.push_back(cellInfo);
                 }
             }
 
             if (!toUnload.empty() || !toExtract.empty()) {
                 _MESSAGE("FO4RemixPlugin: Cell transition - %zu currently loaded, %zu to unload, %zu to extract, %zu tracked",
-                         currentlyLoaded.size(), toUnload.size(), toExtract.size(), g_extractedCells.size());
+                         currentlyLoaded.size(), toUnload.size(), toExtract.size(), g_scene.extractedCells.size());
             }
 
             // Re-extract cells that had missing textures (streaming wasn't done)
-            for (auto it = g_pendingReextract.begin(); it != g_pendingReextract.end(); ) {
-                if (g_presentCallCount >= it->second) {
+            for (auto it = g_scene.pendingReextract.begin(); it != g_scene.pendingReextract.end(); ) {
+                if (g_ui.presentCallCount >= it->second) {
                     uint32_t cellID = it->first;
-                    auto ptrIt = g_cellPtrMap.find(cellID);
-                    if (ptrIt != g_cellPtrMap.end() && currentlyLoaded.count(cellID)) {
+                    auto ptrIt = g_scene.cellPtrMap.find(cellID);
+                    if (ptrIt != g_scene.cellPtrMap.end() && currentlyLoaded.count(cellID)) {
                         toExtract.push_back({ ptrIt->second, cellID });
                         // Remove from extractedCells so it gets treated as new
-                        g_extractedCells.erase(cellID);
+                        g_scene.extractedCells.erase(cellID);
                         _MESSAGE("FO4RemixPlugin: Re-extracting cell 0x%08X (texture streaming retry)", cellID);
                     }
-                    it = g_pendingReextract.erase(it);
+                    it = g_scene.pendingReextract.erase(it);
                 } else {
                     ++it;
                 }
@@ -648,13 +662,13 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
             CellInfo refreshCell = { 0, 0 };
             static int g_refreshFrameCounter = 0;
             g_refreshFrameCounter += kNewCellCheckInterval;
-            if (g_refreshFrameCounter >= kRefreshInterval && !g_refreshQueue.empty()) {
+            if (g_refreshFrameCounter >= kRefreshInterval && !g_scene.refreshQueue.empty()) {
                 g_refreshFrameCounter = 0;
                 // Find next valid cell in refresh queue
-                for (size_t attempts = 0; attempts < g_refreshQueue.size(); attempts++) {
-                    if (g_refreshIndex >= g_refreshQueue.size()) g_refreshIndex = 0;
-                    uint32_t candidateID = g_refreshQueue[g_refreshIndex];
-                    g_refreshIndex++;
+                for (size_t attempts = 0; attempts < g_scene.refreshQueue.size(); attempts++) {
+                    if (g_scene.refreshIndex >= g_scene.refreshQueue.size()) g_scene.refreshIndex = 0;
+                    uint32_t candidateID = g_scene.refreshQueue[g_scene.refreshIndex];
+                    g_scene.refreshIndex++;
                     auto it = currentPtrMap.find(candidateID);
                     if (it != currentPtrMap.end()) {
                         refreshCell.formID = candidateID;
@@ -677,9 +691,9 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     _MESSAGE("FO4RemixPlugin: Extracting new cell 0x%08X", cellInfo.formID);
                     auto extraction = SceneExtractor::ExtractCell(cellInfo.cellPtr, device);
                     if (!extraction.meshes.empty() || !extraction.skinnedMeshes.empty()) {
-                        g_extractedCells.insert(cellInfo.formID);
-                        g_refreshQueue.push_back(cellInfo.formID);
-                        g_cellPtrMap[cellInfo.formID] = cellInfo.cellPtr;
+                        g_scene.extractedCells.insert(cellInfo.formID);
+                        g_scene.refreshQueue.push_back(cellInfo.formID);
+                        g_scene.cellPtrMap[cellInfo.formID] = cellInfo.cellPtr;
 
                         // Check if any mesh is missing its diffuse texture (not yet streamed in)
                         bool hasMissingTextures = false;
@@ -690,7 +704,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                             }
                         }
                         if (hasMissingTextures) {
-                            g_pendingReextract[cellInfo.formID] = g_presentCallCount + kReextractDelay;
+                            g_scene.pendingReextract[cellInfo.formID] = g_ui.presentCallCount + kReextractDelay;
                             _MESSAGE("FO4RemixPlugin: Cell 0x%08X has missing textures, scheduling re-extract in ~3s",
                                      cellInfo.formID);
                         }
@@ -717,23 +731,23 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
             if (!toUnload.empty()) {
                 for (uint32_t cellID : toUnload) {
                     _MESSAGE("FO4RemixPlugin: Cell 0x%08X no longer loaded, scheduling unload", cellID);
-                    g_extractedCells.erase(cellID);
-                    g_cellPtrMap.erase(cellID);
-                    g_pendingReextract.erase(cellID);
+                    g_scene.extractedCells.erase(cellID);
+                    g_scene.cellPtrMap.erase(cellID);
+                    g_scene.pendingReextract.erase(cellID);
                     // Remove from refresh queue
-                    g_refreshQueue.erase(
-                        std::remove(g_refreshQueue.begin(), g_refreshQueue.end(), cellID),
-                        g_refreshQueue.end());
+                    g_scene.refreshQueue.erase(
+                        std::remove(g_scene.refreshQueue.begin(), g_scene.refreshQueue.end(), cellID),
+                        g_scene.refreshQueue.end());
                 }
-                if (g_refreshIndex >= g_refreshQueue.size()) g_refreshIndex = 0;
+                if (g_scene.refreshIndex >= g_scene.refreshQueue.size()) g_scene.refreshIndex = 0;
                 needsUpdate = true;
 
                 // Remove tracked skinned meshes belonging to unloaded cells.
                 // We remove by ownerFormID: any skinned mesh whose owner was in an unloaded cell
                 // should be removed to prevent reading stale bone pointers.
                 {
-                    std::lock_guard<std::mutex> lock(g_skinnedMeshMutex);
-                    size_t beforeCount = g_trackedSkinnedMeshes.size();
+                    std::lock_guard<std::mutex> lock(g_skinning.trackingMutex);
+                    size_t beforeCount = g_skinning.tracked.size();
                     // We don't have a direct cell->ownerFormID mapping, so we remove ALL
                     // skinned meshes that were tracked. They will be re-added on re-extraction.
                     // This is conservative but safe. In practice, cell unloads are infrequent.
@@ -749,7 +763,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     if (beforeCount > 0) {
                         _MESSAGE("FO4RemixPlugin: [SKINNING] Clearing %zu tracked skinned meshes due to %zu cell unloads",
                                  beforeCount, toUnload.size());
-                        g_trackedSkinnedMeshes.clear();
+                        g_skinning.tracked.clear();
                     }
                 }
             }
@@ -761,18 +775,18 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
 
             if (!newScenes.empty() || needsUpdate) {
                 SceneExtractor::ClearTextureCache();
-                std::lock_guard<std::mutex> lock(g_sceneMutex);
+                std::lock_guard<std::mutex> lock(g_scene.mutex);
                 // Append to any pending scenes not yet consumed
                 for (auto& scene : newScenes) {
-                    g_pendingCellScenes.push_back(std::move(scene));
+                    g_scene.pendingScenes.push_back(std::move(scene));
                 }
                 for (uint32_t cellID : toUnload) {
-                    g_pendingUnloads.push_back(cellID);
+                    g_scene.pendingUnloads.push_back(cellID);
                 }
-                g_sceneReady = true;
+                g_scene.ready = true;
             }
 
-            g_nextExtractFrame = g_presentCallCount + kNewCellCheckInterval;
+            g_scene.nextExtractFrame = g_ui.presentCallCount + kNewCellCheckInterval;
         }
     }
 
@@ -856,62 +870,62 @@ void PresentHook::ResetExtractionState() {
 
     // Tell remix thread to unload everything
     {
-        std::lock_guard<std::mutex> lock(g_sceneMutex);
-        for (uint32_t cellID : g_extractedCells) {
-            g_pendingUnloads.push_back(cellID);
+        std::lock_guard<std::mutex> lock(g_scene.mutex);
+        for (uint32_t cellID : g_scene.extractedCells) {
+            g_scene.pendingUnloads.push_back(cellID);
         }
-        g_sceneReady = true;
+        g_scene.ready = true;
     }
 
     // Reset all main-thread extraction tracking
-    g_extractedCells.clear();
-    g_refreshQueue.clear();
-    g_refreshIndex = 0;
-    g_cellPtrMap.clear();
-    g_pendingReextract.clear();
+    g_scene.extractedCells.clear();
+    g_scene.refreshQueue.clear();
+    g_scene.refreshIndex = 0;
+    g_scene.cellPtrMap.clear();
+    g_scene.pendingReextract.clear();
 
     // Clear all tracked skinned meshes (bone pointers are invalidated on save load)
     {
-        std::lock_guard<std::mutex> lock(g_skinnedMeshMutex);
+        std::lock_guard<std::mutex> lock(g_skinning.trackingMutex);
         _MESSAGE("FO4RemixPlugin: [SKINNING] Clearing %zu tracked skinned meshes (save load reset)",
-                 g_trackedSkinnedMeshes.size());
-        g_trackedSkinnedMeshes.clear();
+                 g_skinning.tracked.size());
+        g_skinning.tracked.clear();
     }
     {
-        std::lock_guard<std::mutex> lock(g_boneTransformMutex);
-        g_skinnedMeshesForRendering.clear();
+        std::lock_guard<std::mutex> lock(g_skinning.boneMutex);
+        g_skinning.forRendering.clear();
     }
-    g_boneUpdateFrameCounter = 0;
+    g_skinning.updateFrameCounter = 0;
 
     // Reset UI RT detection — RT resource may change after load
-    if (g_uiRenderTarget) {
-        g_uiRenderTarget->Release();
-        g_uiRenderTarget = nullptr;
+    if (g_ui.renderTarget) {
+        g_ui.renderTarget->Release();
+        g_ui.renderTarget = nullptr;
     }
-    g_uiRTLocked = false;
-    g_uiClearedThisFrame = false;
-    g_clearCandidateCount = 0;
+    g_ui.locked = false;
+    g_ui.clearedThisFrame = false;
+    g_ui.clearCandidateCount = 0;
 
     // Force the initial bootstrap path with retry/quality-gate logic
-    g_firstExtractionDone = false;
-    g_extractionAttempts = 0;
-    g_nextExtractFrame = g_presentCallCount + kInitialRetryDelay;
+    g_scene.firstExtractionDone = false;
+    g_scene.attempts = 0;
+    g_scene.nextExtractFrame = g_ui.presentCallCount + kInitialRetryDelay;
 
     SceneExtractor::ClearTextureCache();
 }
 
 void PresentHook::Uninstall() {
-    g_remixRunning = false;
-    if (g_remixThread.joinable()) {
-        g_remixThread.join();
+    g_remix.running = false;
+    if (g_remix.thread.joinable()) {
+        g_remix.thread.join();
     }
-    if (g_uiRenderTarget) {
-        g_uiRenderTarget->Release();
-        g_uiRenderTarget = nullptr;
+    if (g_ui.renderTarget) {
+        g_ui.renderTarget->Release();
+        g_ui.renderTarget = nullptr;
     }
-    if (g_stagingTex) {
-        g_stagingTex->Release();
-        g_stagingTex = nullptr;
+    if (g_overlay.stagingTex) {
+        g_overlay.stagingTex->Release();
+        g_overlay.stagingTex = nullptr;
     }
     MH_DisableHook(MH_ALL_HOOKS);
     MH_Uninitialize();

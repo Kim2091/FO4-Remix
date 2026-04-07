@@ -56,6 +56,8 @@ add_library(FO4RemixPlugin SHARED
     src/camera.cpp
     src/scene_extractor.h
     src/scene_extractor.cpp
+    src/skinning.h
+    src/skinning.cpp
     src/light_extractor.h
     src/light_extractor.cpp
     src/f4se_compat.h

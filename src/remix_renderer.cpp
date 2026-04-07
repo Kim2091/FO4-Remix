@@ -183,105 +183,50 @@ void RemixRenderer::UnloadAllCells() {
 }
 
 // ---------------------------------------------------------------------------
-// Load extracted textures, materials, and meshes for a specific cell
+// Material key: identifies a unique material by its texture combo + emissive params
+// Defined at file scope so both CreateCellMaterials and LoadCellScene can use it.
 // ---------------------------------------------------------------------------
-void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result) {
-    remixapi_Interface* api = RemixAPI::GetInterface();
-    if (!api) return;
-
-    // If this cell already exists, clean up old data first.
-    // Preserve existing lights during refreshes (empty lights in new data = refresh).
-    std::vector<remixapi_LightHandle> preservedLights;
-    if (g_cellScenes.find(cellFormID) != g_cellScenes.end()) {
-        if (result.lights.empty()) {
-            preservedLights = std::move(g_cellScenes[cellFormID].lights);
-            g_cellScenes[cellFormID].lights.clear();
-        }
-        UnloadCell(cellFormID);
+struct MaterialKey {
+    uint64_t diffuse;
+    uint64_t normal;
+    uint64_t roughness;
+    uint64_t emissive;
+    float emissiveColorR, emissiveColorG, emissiveColorB;
+    float emissiveIntensity;
+    bool alphaTestEnabled;
+    int alphaTestType;       // Remix/VkCompareOp
+    uint8_t alphaTestRef;
+    uint64_t combined() const {
+        uint64_t h = diffuse;
+        h ^= normal    * 0x517CC1B727220A95ULL;
+        h ^= roughness * 0x6C62272E07BB0142ULL;
+        h ^= emissive  * 0x9E3779B97F4A7C15ULL;
+        // Include emissive color/intensity so different tints get separate materials
+        uint32_t ri, gi, bi, ii;
+        memcpy(&ri, &emissiveColorR, 4);
+        memcpy(&gi, &emissiveColorG, 4);
+        memcpy(&bi, &emissiveColorB, 4);
+        memcpy(&ii, &emissiveIntensity, 4);
+        h ^= (uint64_t)ri * 0x85EBCA6BC2B2AE35ULL;
+        h ^= (uint64_t)gi * 0xC2B2AE3D27D4EB4FULL;
+        h ^= (uint64_t)bi * 0x165667B19E3779F9ULL;
+        h ^= (uint64_t)ii * 0x27D4EB2F165667C5ULL;
+        return h;
     }
+};
 
-    CellSceneData cellData;
-
-    // ----- Upload textures (shared across cells with refcounting) -----
-    uint32_t texCreated = 0, texFailed = 0, texSkipped = 0;
-
-    for (auto& tex : result.textures) {
-        auto existing = g_textureHandles.find(tex.hash);
-        if (existing != g_textureHandles.end()) {
-            // Texture already loaded by another cell, just bump refcount
-            existing->second.refCount++;
-            cellData.textureHashes.insert(tex.hash);
-            continue;
-        }
-
-        remixapi_Format remixFmt = DxgiToRemixFormat(tex.dxgiFormat);
-        if (remixFmt == (remixapi_Format)0) {
-            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Skipping texture 0x%llX - unsupported DXGI format %u",
-                     cellFormID, (unsigned long long)tex.hash, (unsigned int)tex.dxgiFormat);
-            texSkipped++;
-            continue;
-        }
-
-        remixapi_TextureInfo texInfo = {};
-        texInfo.sType     = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
-        texInfo.pNext     = nullptr;
-        texInfo.hash      = tex.hash;
-        texInfo.width     = tex.width;
-        texInfo.height    = tex.height;
-        texInfo.depth     = 1;
-        texInfo.mipLevels = 1;
-        texInfo.format    = remixFmt;
-        texInfo.data      = tex.pixels.data();
-        texInfo.dataSize  = tex.pixels.size();
-
-        remixapi_TextureHandle handle = nullptr;
-        remixapi_ErrorCode status = api->CreateTexture(&texInfo, &handle);
-        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Failed to upload texture 0x%llX (error %d)",
-                     cellFormID, (unsigned long long)tex.hash, (int)status);
-            texFailed++;
-            continue;
-        }
-
-        g_textureHandles[tex.hash] = { handle, 1 };
-        cellData.textureHashes.insert(tex.hash);
-        texCreated++;
-    }
-
-    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Textures - uploaded %u, failed %u, skipped %u",
-             cellFormID, texCreated, texFailed, texSkipped);
-
-    // ----- Create materials (one per unique texture combination) -----
-    // Key materials by a combined hash of diffuse+normal+roughness+emissive so meshes
-    // with different PBR maps or emissive parameters get separate materials.
-    struct MaterialKey {
-        uint64_t diffuse;
-        uint64_t normal;
-        uint64_t roughness;
-        uint64_t emissive;
-        float emissiveColorR, emissiveColorG, emissiveColorB;
-        float emissiveIntensity;
-        bool alphaTestEnabled;
-        int alphaTestType;       // Remix/VkCompareOp
-        uint8_t alphaTestRef;
-        uint64_t combined() const {
-            uint64_t h = diffuse;
-            h ^= normal    * 0x517CC1B727220A95ULL;
-            h ^= roughness * 0x6C62272E07BB0142ULL;
-            h ^= emissive  * 0x9E3779B97F4A7C15ULL;
-            // Include emissive color/intensity so different tints get separate materials
-            uint32_t ri, gi, bi, ii;
-            memcpy(&ri, &emissiveColorR, 4);
-            memcpy(&gi, &emissiveColorG, 4);
-            memcpy(&bi, &emissiveColorB, 4);
-            memcpy(&ii, &emissiveIntensity, 4);
-            h ^= (uint64_t)ri * 0x85EBCA6BC2B2AE35ULL;
-            h ^= (uint64_t)gi * 0xC2B2AE3D27D4EB4FULL;
-            h ^= (uint64_t)bi * 0x165667B19E3779F9ULL;
-            h ^= (uint64_t)ii * 0x27D4EB2F165667C5ULL;
-            return h;
-        }
-    };
+// ---------------------------------------------------------------------------
+// Create Remix materials from an extraction result.
+// Collects unique MaterialKey entries from meshes and skinned meshes, then
+// creates one Remix material per unique key.  Returns material handles keyed
+// by the combined hash.
+// ---------------------------------------------------------------------------
+static std::unordered_map<uint64_t, remixapi_MaterialHandle> CreateCellMaterials(
+    remixapi_Interface* api,
+    uint32_t cellFormID,
+    const ExtractionResult& result)
+{
+    std::unordered_map<uint64_t, remixapi_MaterialHandle> materials;
 
     std::unordered_map<uint64_t, MaterialKey> materialKeys;
 
@@ -366,12 +311,87 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
             continue;
         }
 
-        cellData.materials[combinedHash] = handle;
+        materials[combinedHash] = handle;
         matCreated++;
     }
 
     _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Materials - created %u, failed %u",
              cellFormID, matCreated, matFailed);
+
+    return materials;
+}
+
+// ---------------------------------------------------------------------------
+// Load extracted textures, materials, and meshes for a specific cell
+// ---------------------------------------------------------------------------
+void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result) {
+    remixapi_Interface* api = RemixAPI::GetInterface();
+    if (!api) return;
+
+    // If this cell already exists, clean up old data first.
+    // Preserve existing lights during refreshes (empty lights in new data = refresh).
+    std::vector<remixapi_LightHandle> preservedLights;
+    if (g_cellScenes.find(cellFormID) != g_cellScenes.end()) {
+        if (result.lights.empty()) {
+            preservedLights = std::move(g_cellScenes[cellFormID].lights);
+            g_cellScenes[cellFormID].lights.clear();
+        }
+        UnloadCell(cellFormID);
+    }
+
+    CellSceneData cellData;
+
+    // ----- Upload textures (shared across cells with refcounting) -----
+    uint32_t texCreated = 0, texFailed = 0, texSkipped = 0;
+
+    for (auto& tex : result.textures) {
+        auto existing = g_textureHandles.find(tex.hash);
+        if (existing != g_textureHandles.end()) {
+            // Texture already loaded by another cell, just bump refcount
+            existing->second.refCount++;
+            cellData.textureHashes.insert(tex.hash);
+            continue;
+        }
+
+        remixapi_Format remixFmt = DxgiToRemixFormat(tex.dxgiFormat);
+        if (remixFmt == (remixapi_Format)0) {
+            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Skipping texture 0x%llX - unsupported DXGI format %u",
+                     cellFormID, (unsigned long long)tex.hash, (unsigned int)tex.dxgiFormat);
+            texSkipped++;
+            continue;
+        }
+
+        remixapi_TextureInfo texInfo = {};
+        texInfo.sType     = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
+        texInfo.pNext     = nullptr;
+        texInfo.hash      = tex.hash;
+        texInfo.width     = tex.width;
+        texInfo.height    = tex.height;
+        texInfo.depth     = 1;
+        texInfo.mipLevels = 1;
+        texInfo.format    = remixFmt;
+        texInfo.data      = tex.pixels.data();
+        texInfo.dataSize  = tex.pixels.size();
+
+        remixapi_TextureHandle handle = nullptr;
+        remixapi_ErrorCode status = api->CreateTexture(&texInfo, &handle);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
+            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Failed to upload texture 0x%llX (error %d)",
+                     cellFormID, (unsigned long long)tex.hash, (int)status);
+            texFailed++;
+            continue;
+        }
+
+        g_textureHandles[tex.hash] = { handle, 1 };
+        cellData.textureHashes.insert(tex.hash);
+        texCreated++;
+    }
+
+    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Textures - uploaded %u, failed %u, skipped %u",
+             cellFormID, texCreated, texFailed, texSkipped);
+
+    // ----- Create materials (one per unique texture combination) -----
+    cellData.materials = CreateCellMaterials(api, cellFormID, result);
 
     // ----- Create meshes -----
     uint32_t meshCreated = 0, meshFailed = 0;

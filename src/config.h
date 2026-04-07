@@ -1,6 +1,37 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+
+// ---------------------------------------------------------------------------
+// Half-float -> float conversion (shared across scene_extractor and skinning)
+// ---------------------------------------------------------------------------
+inline float HalfToFloat(uint16_t h) {
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t mant = h & 0x3FF;
+
+    uint32_t result;
+    if (exp == 0) {
+        if (mant == 0) {
+            result = sign;
+        } else {
+            // Denormalized -> renormalize
+            exp = 1;
+            while (!(mant & 0x400)) { mant <<= 1; exp--; }
+            mant &= 0x3FF;
+            result = sign | ((exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        result = sign | 0x7F800000 | (mant << 13); // Inf / NaN
+    } else {
+        result = sign | ((exp + 112) << 23) | (mant << 13);
+    }
+
+    float f;
+    memcpy(&f, &result, 4);
+    return f;
+}
 
 // ---------------------------------------------------------------------------
 // FNV-1a hash utilities for stable, deterministic hashing
