@@ -41,6 +41,11 @@ struct ExtractedMesh {
     uint64_t diffuseTextureHash;    // 0 = no texture
     uint64_t normalTextureHash;     // 0 = no texture
     uint64_t roughnessTextureHash;  // 0 = no texture (FO4 smoothness/spec mask)
+    uint64_t emissiveTextureHash = 0;   // 0 = no glow map (from BSLightingShaderMaterialGlowmap)
+    float emissiveColorR = 0.0f;        // Emissive color R from BSLightingShaderProperty (0-1)
+    float emissiveColorG = 0.0f;        // Emissive color G
+    float emissiveColorB = 0.0f;        // Emissive color B
+    float emissiveIntensity = 0.0f;     // fEmitColorScale from BSLightingShaderProperty
     bool alphaTestEnabled;          // true if NiAlphaProperty has alpha test
     int alphaTestType;              // Remix/VkCompareOp value (7 = Always = no test)
     uint8_t alphaTestRef;           // Alpha reference value (0-255)
@@ -59,6 +64,11 @@ struct ExtractedSkinnedMesh {
     uint64_t          diffuseTextureHash = 0;
     uint64_t          normalTextureHash = 0;
     uint64_t          roughnessTextureHash = 0;
+    uint64_t          emissiveTextureHash = 0;
+    float             emissiveColorR = 0.0f;
+    float             emissiveColorG = 0.0f;
+    float             emissiveColorB = 0.0f;
+    float             emissiveIntensity = 0.0f;
     bool              alphaTestEnabled = false;
     int               alphaTestType = 7;
     uint8_t           alphaTestRef = 128;

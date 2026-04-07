@@ -32,6 +32,7 @@ struct PluginConfig {
     bool logRejections;      // Log rejected meshes (NaN, extent, etc.)
     bool logTextures;        // Log extracted texture info
     bool logLights;          // Log extracted light info
+    bool logBoneDiag;        // One-shot bone matrix diagnostic dump (first skinned mesh, bone 0)
 
     // [Limits]
     float maxExtent;         // Reject shapes with extent larger than this (default 10000)
@@ -41,6 +42,15 @@ struct PluginConfig {
     float lightIntensity;    // Multiplier for light radiance (default 1.0)
     float lightRadius;       // Multiplier for light radius (default 1.0)
     float lightColorStrength;// 0 = white, 1 = full game color (default 1.0)
+
+    // [Skinning]
+    bool  skinningEnabled;   // Extract and animate skinned meshes (characters, creatures)
+
+    // [Emissive]
+    bool  emissiveGlowMapsEnabled;  // Extract glow map textures from BSLightingShaderMaterialGlowmap
+    bool  emissiveColorEnabled;     // Use emissive color/scale from BSLightingShaderProperty
+    float emissiveIntensity;        // Global multiplier on FO4's fEmitColorScale
+    bool  logEmissive;              // Log emissive extraction details
 };
 
 // Global config instance

@@ -1,4 +1,5 @@
 #include "present_hook.h"
+#include "config.h"
 #include "remix_api.h"
 #include "remix_renderer.h"
 #include "camera.h"
@@ -360,7 +361,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
 
     // Per-frame bone transform update for all tracked skinned meshes (EVERY frame).
     // This is what makes skeletal animations work — must not be on the 30-second timer.
-    if (g_remixReady && g_gameDataReady) {
+    if (g_remixReady && g_gameDataReady && g_config.skinningEnabled) {
         g_boneUpdateFrameCounter++;
 
         // Update bone transforms and copy for Remix thread under a single lock sequence.

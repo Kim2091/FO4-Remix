@@ -840,6 +840,53 @@ static BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape)
     return static_cast<BSLightingShaderMaterialBase*>(material);
 }
 
+// Extract emissive data from a shape's shader property and material
+static void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
+                                ID3D11Device* device, std::vector<ExtractedTexture>& newTextures,
+                                uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity)
+{
+    outTexHash = 0;
+    outR = outG = outB = 0.0f;
+    outIntensity = 0.0f;
+
+    if (!shape || !lightingMat) return;
+
+    // 1. Glow map texture from BSLightingShaderMaterialGlowmap
+    if (g_config.emissiveGlowMapsEnabled &&
+        lightingMat->GetType() == BSLightingShaderMaterialBase::kType_Glowmap)
+    {
+        auto* glowMat = static_cast<BSLightingShaderMaterialGlowmap*>(lightingMat);
+        if (glowMat->spGlowMapTexture) {
+            outTexHash = ExtractMaterialTexture(glowMat->spGlowMapTexture, "emissive", device, newTextures);
+        }
+    }
+
+    // 2. Emissive color/scale from BSLightingShaderProperty
+    if (g_config.emissiveColorEnabled) {
+        NiProperty* prop = shape->shaderProperty;
+        if (prop) {
+            BSShaderProperty* shaderProp = static_cast<BSShaderProperty*>(prop);
+            // Check EmitColor flag
+            if (shaderProp->flags & BSShaderProperty::kShaderFlags_EmitColor) {
+                BSLightingShaderProperty* lightingProp = static_cast<BSLightingShaderProperty*>(shaderProp);
+                if (lightingProp->pEmissiveColor) {
+                    outR = lightingProp->pEmissiveColor->r;
+                    outG = lightingProp->pEmissiveColor->g;
+                    outB = lightingProp->pEmissiveColor->b;
+                }
+                outIntensity = lightingProp->fEmitColorScale;
+            }
+        }
+    }
+
+    if (g_config.logEmissive && (outTexHash != 0 || outIntensity > 0.0f)) {
+        const char* shapeName = shape->m_name.c_str();
+        _MESSAGE("FO4RemixPlugin: [EMISSIVE] Shape \"%s\" glowTex=0x%016llX color=(%.3f,%.3f,%.3f) scale=%.3f",
+                 shapeName ? shapeName : "<null>",
+                 (unsigned long long)outTexHash, outR, outG, outB, outIntensity);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Step 3: Read BSSkin data from a BSGeometry node (raw pointer access)
 // ---------------------------------------------------------------------------
@@ -990,20 +1037,58 @@ static void ComputeBoneMatrix(
     }
 }
 
-// Apply the same coordinate system swap as static meshes.
-// The static mesh path swaps columns 0/1 in the rotation and X/Y in translation.
-// This matches: rotation -> R*S (column swap), translation -> S*T (component swap).
+// Apply the same coordinate system swap as static meshes and the camera.
+// Both use a column swap on rotation (R*S) and component swap on translation (S*T).
+// This must match exactly or skinned meshes will rotate incorrectly relative to the world.
 static void ApplyCoordinateSwap(float matrix[3][4]) {
-    // Swap columns 0 and 1 of the rotation (3x3) part
+    // Swap COLUMNS 0 and 1 in the 3x3 rotation part (= right-multiply by swap matrix S).
+    // This matches the static mesh path: worldTransform[r][0] = rot[r][1], [r][1] = rot[r][0].
     for (int r = 0; r < 3; r++) {
         std::swap(matrix[r][0], matrix[r][1]);
     }
-    // Swap X and Y in translation (column 3)
+    // Swap X/Y in translation, same as static meshes: pos.y → [0][3], pos.x → [1][3].
     std::swap(matrix[0][3], matrix[1][3]);
+}
+
+// Diagnostic: dump bone 0 matrices for the first skinned mesh, then auto-disable.
+// Fires every ~120 frames while logBoneDiag is true, so you can capture multiple orientations.
+static void DumpBoneDiagnostic(const NiTransformPadded& boneWorld,
+                                const NiTransformPadded& invBind,
+                                const float preSwap[3][4],
+                                const float postSwap[3][4]) {
+    _MESSAGE("FO4RemixPlugin: [BONE_DIAG] ======== Bone 0 Diagnostic ========");
+    _MESSAGE("FO4RemixPlugin: [BONE_DIAG] boneWorld rot:");
+    for (int r = 0; r < 3; r++)
+        _MESSAGE("FO4RemixPlugin: [BONE_DIAG]   [%d] %+.6f %+.6f %+.6f", r,
+                 boneWorld.rot[r][0], boneWorld.rot[r][1], boneWorld.rot[r][2]);
+    _MESSAGE("FO4RemixPlugin: [BONE_DIAG] boneWorld translate: %+.3f %+.3f %+.3f  scale: %.4f",
+             boneWorld.translate[0], boneWorld.translate[1], boneWorld.translate[2], boneWorld.scale);
+
+    _MESSAGE("FO4RemixPlugin: [BONE_DIAG] invBind rot:");
+    for (int r = 0; r < 3; r++)
+        _MESSAGE("FO4RemixPlugin: [BONE_DIAG]   [%d] %+.6f %+.6f %+.6f", r,
+                 invBind.rot[r][0], invBind.rot[r][1], invBind.rot[r][2]);
+    _MESSAGE("FO4RemixPlugin: [BONE_DIAG] invBind translate: %+.3f %+.3f %+.3f  scale: %.4f",
+             invBind.translate[0], invBind.translate[1], invBind.translate[2], invBind.scale);
+
+    _MESSAGE("FO4RemixPlugin: [BONE_DIAG] computed (pre-swap):");
+    for (int r = 0; r < 3; r++)
+        _MESSAGE("FO4RemixPlugin: [BONE_DIAG]   [%d] %+.6f %+.6f %+.6f | %+.3f", r,
+                 preSwap[r][0], preSwap[r][1], preSwap[r][2], preSwap[r][3]);
+
+    _MESSAGE("FO4RemixPlugin: [BONE_DIAG] final (post-swap):");
+    for (int r = 0; r < 3; r++)
+        _MESSAGE("FO4RemixPlugin: [BONE_DIAG]   [%d] %+.6f %+.6f %+.6f | %+.3f", r,
+                 postSwap[r][0], postSwap[r][1], postSwap[r][2], postSwap[r][3]);
+    _MESSAGE("FO4RemixPlugin: [BONE_DIAG] ====================================");
 }
 
 // Called every frame to update bone transforms for all tracked skinned meshes.
 void SceneExtractor::UpdateSkinnedBoneTransforms(std::vector<ExtractedSkinnedMesh>& skinnedMeshes) {
+    static uint32_t s_diagFrameCounter = 0;
+    bool doDiag = g_config.logBoneDiag && !skinnedMeshes.empty();
+    bool diagThisFrame = doDiag && (s_diagFrameCounter++ % 120 == 0);
+
     for (auto& sm : skinnedMeshes) {
         // Safety: validate array sizes match boneCount
         if (sm.boneWorldTransformPtrs.size() < sm.boneCount ||
@@ -1047,7 +1132,16 @@ void SceneExtractor::UpdateSkinnedBoneTransforms(std::vector<ExtractedSkinnedMes
                     memcpy(&boneWorld, reinterpret_cast<void*>(transformPtr), sizeof(NiTransformPadded));
 
                     ComputeBoneMatrix(boneWorld, sm.inverseBindPoses[i], boneMatrix);
-                    ApplyCoordinateSwap(boneMatrix);
+
+                    // Diagnostic: capture pre-swap matrix for bone 0 of first mesh
+                    if (diagThisFrame && i == 0 && &sm == &skinnedMeshes[0]) {
+                        float preSwap[3][4];
+                        memcpy(preSwap, boneMatrix, sizeof(preSwap));
+                        ApplyCoordinateSwap(boneMatrix);
+                        DumpBoneDiagnostic(boneWorld, sm.inverseBindPoses[0], preSwap, boneMatrix);
+                    } else {
+                        ApplyCoordinateSwap(boneMatrix);
+                    }
                 } __except(EXCEPTION_EXECUTE_HANDLER) {
                     memset(boneMatrix, 0, sizeof(boneMatrix));
                     boneMatrix[0][0] = 1.0f;
@@ -1355,6 +1449,11 @@ static bool ExtractSkinnedTriShape(BSTriShape* shape, uint64_t baseHash,
     sm.normalTextureHash    = lightingMat ? ExtractMaterialTexture(lightingMat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral) : 0;
     sm.roughnessTextureHash = lightingMat ? ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, TexturePostProcess::InvertRGB) : 0;
 
+    // Extract emissive data (glow map texture + emissive color/scale)
+    ExtractEmissiveData(shape, lightingMat, device, newTextures,
+                        sm.emissiveTextureHash, sm.emissiveColorR, sm.emissiveColorG,
+                        sm.emissiveColorB, sm.emissiveIntensity);
+
     // ---- Extract alpha test state ----
     sm.alphaTestEnabled = false;
     sm.alphaTestType = 7;
@@ -1602,6 +1701,11 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
         mesh.roughnessTextureHash = lightingMat ? ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, TexturePostProcess::InvertRGB) : 0;
     }
 
+    // Extract emissive data (glow map texture + emissive color/scale)
+    ExtractEmissiveData(shape, lightingMat, device, newTextures,
+                        mesh.emissiveTextureHash, mesh.emissiveColorR, mesh.emissiveColorG,
+                        mesh.emissiveColorB, mesh.emissiveIntensity);
+
     // Extract alpha test state from NiAlphaProperty (effectState on BSGeometry)
     mesh.alphaTestEnabled = false;
     mesh.alphaTestType = 7; // Always (no test)
@@ -1661,7 +1765,7 @@ static void WalkNode(NiAVObject* obj, uint64_t baseHash,
     if (tri) {
         // Check skinned flag and route accordingly
         uint64_t vertexDesc = tri->vertexDesc;
-        if ((vertexDesc & kVertexFlag_Skinned) && skinnedOut) {
+        if ((vertexDesc & kVertexFlag_Skinned) && skinnedOut && g_config.skinningEnabled) {
             ExtractSkinnedTriShape(tri, baseHash, *skinnedOut, device, newTextures, ownerFormID);
         } else {
             ExtractTriShape(tri, baseHash, out, device, newTextures);

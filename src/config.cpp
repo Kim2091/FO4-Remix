@@ -40,6 +40,7 @@ void LoadConfig() {
     g_config.logRejections  = GetIniBool("Logging", "LogRejections",  true,  dllPath);
     g_config.logTextures    = GetIniBool("Logging", "LogTextures",    false, dllPath);
     g_config.logLights      = GetIniBool("Logging", "LogLights",      false, dllPath);
+    g_config.logBoneDiag    = GetIniBool("Logging", "LogBoneDiag",    false, dllPath);
 
     // [Limits]
     g_config.maxExtent = GetIniFloat("Limits", "MaxExtent", 10000.0f, dllPath);
@@ -50,6 +51,15 @@ void LoadConfig() {
     g_config.lightRadius       = GetIniFloat("Lights", "RadiusMultiplier", 1.0f, dllPath);
     g_config.lightColorStrength = GetIniFloat("Lights", "ColorStrength", 1.0f, dllPath);
 
+    // [Skinning]
+    g_config.skinningEnabled = GetIniBool("Skinning", "Enabled", true, dllPath);
+
+    // [Emissive]
+    g_config.emissiveGlowMapsEnabled = GetIniBool("Emissive", "GlowMapsEnabled", true, dllPath);
+    g_config.emissiveColorEnabled    = GetIniBool("Emissive", "EmissiveColorEnabled", true, dllPath);
+    g_config.emissiveIntensity       = GetIniFloat("Emissive", "Intensity", 1.0f, dllPath);
+    g_config.logEmissive             = GetIniBool("Emissive", "LogEmissive", false, dllPath);
+
     _MESSAGE("FO4RemixPlugin: Config loaded - LogShapeInfo=%d LogLargeShapes=%d LogRejections=%d "
              "LogTextures=%d LogLights=%d MaxExtent=%.0f",
              g_config.logShapeInfo, g_config.logLargeShapes, g_config.logRejections,
@@ -57,4 +67,8 @@ void LoadConfig() {
     _MESSAGE("FO4RemixPlugin: Lights - Enabled=%d Intensity=%.2f RadiusMul=%.2f ColorStrength=%.2f",
              g_config.lightsEnabled, g_config.lightIntensity,
              g_config.lightRadius, g_config.lightColorStrength);
+    _MESSAGE("FO4RemixPlugin: Skinning - Enabled=%d", g_config.skinningEnabled);
+    _MESSAGE("FO4RemixPlugin: Emissive - GlowMaps=%d EmissiveColor=%d Intensity=%.2f LogEmissive=%d",
+             g_config.emissiveGlowMapsEnabled, g_config.emissiveColorEnabled,
+             g_config.emissiveIntensity, g_config.logEmissive);
 }

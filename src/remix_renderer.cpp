@@ -8,6 +8,7 @@
 #include "f4se/PluginAPI.h"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -251,19 +252,33 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
              cellFormID, texCreated, texFailed, texSkipped);
 
     // ----- Create materials (one per unique texture combination) -----
-    // Key materials by a combined hash of diffuse+normal+roughness so meshes
-    // with different PBR maps get separate materials.
+    // Key materials by a combined hash of diffuse+normal+roughness+emissive so meshes
+    // with different PBR maps or emissive parameters get separate materials.
     struct MaterialKey {
         uint64_t diffuse;
         uint64_t normal;
         uint64_t roughness;
+        uint64_t emissive;
+        float emissiveColorR, emissiveColorG, emissiveColorB;
+        float emissiveIntensity;
         bool alphaTestEnabled;
         int alphaTestType;       // Remix/VkCompareOp
         uint8_t alphaTestRef;
         uint64_t combined() const {
             uint64_t h = diffuse;
-            h ^= normal  * 0x517CC1B727220A95ULL;
+            h ^= normal    * 0x517CC1B727220A95ULL;
             h ^= roughness * 0x6C62272E07BB0142ULL;
+            h ^= emissive  * 0x9E3779B97F4A7C15ULL;
+            // Include emissive color/intensity so different tints get separate materials
+            uint32_t ri, gi, bi, ii;
+            memcpy(&ri, &emissiveColorR, 4);
+            memcpy(&gi, &emissiveColorG, 4);
+            memcpy(&bi, &emissiveColorB, 4);
+            memcpy(&ii, &emissiveIntensity, 4);
+            h ^= (uint64_t)ri * 0x85EBCA6BC2B2AE35ULL;
+            h ^= (uint64_t)gi * 0xC2B2AE3D27D4EB4FULL;
+            h ^= (uint64_t)bi * 0x165667B19E3779F9ULL;
+            h ^= (uint64_t)ii * 0x27D4EB2F165667C5ULL;
             return h;
         }
     };
@@ -274,6 +289,8 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
     for (auto& mesh : result.meshes) {
         if (mesh.diffuseTextureHash == 0) continue;
         MaterialKey key { mesh.diffuseTextureHash, mesh.normalTextureHash, mesh.roughnessTextureHash,
+                          mesh.emissiveTextureHash, mesh.emissiveColorR, mesh.emissiveColorG,
+                          mesh.emissiveColorB, mesh.emissiveIntensity,
                           mesh.alphaTestEnabled, mesh.alphaTestType, mesh.alphaTestRef };
         auto it = materialKeys.find(key.combined());
         if (it == materialKeys.end()) {
@@ -289,6 +306,8 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
     for (auto& sm : result.skinnedMeshes) {
         if (sm.diffuseTextureHash == 0) continue;
         MaterialKey key { sm.diffuseTextureHash, sm.normalTextureHash, sm.roughnessTextureHash,
+                          sm.emissiveTextureHash, sm.emissiveColorR, sm.emissiveColorG,
+                          sm.emissiveColorB, sm.emissiveIntensity,
                           sm.alphaTestEnabled, sm.alphaTestType, sm.alphaTestRef };
         auto it = materialKeys.find(key.combined());
         if (it == materialKeys.end()) {
@@ -306,6 +325,7 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         std::wstring diffPath = HashToPath(key.diffuse);
         std::wstring normalPath = key.normal ? HashToPath(key.normal) : L"";
         std::wstring roughPath = key.roughness ? HashToPath(key.roughness) : L"";
+        std::wstring emissivePath = key.emissive ? HashToPath(key.emissive) : L"";
 
         remixapi_MaterialInfoOpaqueEXT opaqueExt = {};
         opaqueExt.sType             = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
@@ -327,9 +347,9 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         matInfo.albedoTexture      = diffPath.c_str();
         matInfo.normalTexture      = key.normal ? normalPath.c_str() : nullptr;
         matInfo.tangentTexture     = nullptr;
-        matInfo.emissiveTexture    = nullptr;
-        matInfo.emissiveIntensity  = 0.0f;
-        matInfo.emissiveColorConstant = { 0.0f, 0.0f, 0.0f };
+        matInfo.emissiveTexture       = key.emissive ? emissivePath.c_str() : nullptr;
+        matInfo.emissiveIntensity     = key.emissiveIntensity * g_config.emissiveIntensity;
+        matInfo.emissiveColorConstant = { key.emissiveColorR, key.emissiveColorG, key.emissiveColorB };
         matInfo.spriteSheetRow     = 1;
         matInfo.spriteSheetCol     = 1;
         matInfo.spriteSheetFps     = 0;
@@ -362,9 +382,11 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         // Look up material handle by combined texture hash
         remixapi_MaterialHandle matHandle = nullptr;
         if (mesh.diffuseTextureHash != 0) {
-            uint64_t combinedHash = mesh.diffuseTextureHash;
-            combinedHash ^= mesh.normalTextureHash    * 0x517CC1B727220A95ULL;
-            combinedHash ^= mesh.roughnessTextureHash * 0x6C62272E07BB0142ULL;
+            MaterialKey lookupKey { mesh.diffuseTextureHash, mesh.normalTextureHash, mesh.roughnessTextureHash,
+                                    mesh.emissiveTextureHash, mesh.emissiveColorR, mesh.emissiveColorG,
+                                    mesh.emissiveColorB, mesh.emissiveIntensity,
+                                    mesh.alphaTestEnabled, mesh.alphaTestType, mesh.alphaTestRef };
+            uint64_t combinedHash = lookupKey.combined();
             auto it = cellData.materials.find(combinedHash);
             if (it != cellData.materials.end())
                 matHandle = it->second;
@@ -411,9 +433,11 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         // Look up material handle by combined texture hash
         remixapi_MaterialHandle matHandle = nullptr;
         if (sm.diffuseTextureHash != 0) {
-            uint64_t combinedHash = sm.diffuseTextureHash;
-            combinedHash ^= sm.normalTextureHash    * 0x517CC1B727220A95ULL;
-            combinedHash ^= sm.roughnessTextureHash * 0x6C62272E07BB0142ULL;
+            MaterialKey lookupKey { sm.diffuseTextureHash, sm.normalTextureHash, sm.roughnessTextureHash,
+                                    sm.emissiveTextureHash, sm.emissiveColorR, sm.emissiveColorG,
+                                    sm.emissiveColorB, sm.emissiveIntensity,
+                                    sm.alphaTestEnabled, sm.alphaTestType, sm.alphaTestRef };
+            uint64_t combinedHash = lookupKey.combined();
             auto it = cellData.materials.find(combinedHash);
             if (it != cellData.materials.end())
                 matHandle = it->second;
