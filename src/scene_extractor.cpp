@@ -844,17 +844,17 @@ static BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape)
 // Step 3: Read BSSkin data from a BSGeometry node (raw pointer access)
 // ---------------------------------------------------------------------------
 static bool ReadSkinData(uintptr_t bsGeometryPtr, ExtractedSkinnedMesh& out) {
-    // 1. Read BSSkin::Instance pointer from BSGeometry+0x130
-    uintptr_t skinInstPtr = *reinterpret_cast<uintptr_t*>(bsGeometryPtr + 0x130);
+    // 1. Read BSSkin::Instance pointer from BSGeometry+0x140
+    uintptr_t skinInstPtr = *reinterpret_cast<uintptr_t*>(bsGeometryPtr + 0x140);
     if (skinInstPtr == 0) {
         _MESSAGE("FO4RemixPlugin: [SKINNING] skinInstance is null at BSGeometry 0x%p", (void*)bsGeometryPtr);
         return false;
     }
 
-    // 2. Read bone count from boneNodes NiTArray at skinInst+0x10
-    //    NiTArray: data* at +0x00, count at +0x0A (uint16_t)
+    // 2. Read bone count from boneNodes BSTArray at skinInst+0x10
+    //    BSTArray: data* at +0x00, capacity(uint32) at +0x08, count(uint32) at +0x10
     uintptr_t boneNodesArrayPtr = *reinterpret_cast<uintptr_t*>(skinInstPtr + 0x10);
-    uint16_t boneCount = *reinterpret_cast<uint16_t*>(skinInstPtr + 0x10 + 0x0A);
+    uint32_t boneCount = *reinterpret_cast<uint32_t*>(skinInstPtr + 0x10 + 0x10);
 
     if (boneCount == 0) {
         _MESSAGE("FO4RemixPlugin: [SKINNING] boneCount is 0 at skinInst 0x%p", (void*)skinInstPtr);
@@ -893,24 +893,39 @@ static bool ReadSkinData(uintptr_t bsGeometryPtr, ExtractedSkinnedMesh& out) {
     out.boneCount = boneCount;
     out.inverseBindPoses.resize(boneCount);
     out.boneNodePtrs.resize(boneCount);
+    out.boneWorldTransformPtrs.resize(boneCount);
+
+    // 6. Read boneWorldTransforms array at skinInst+0x28 (BSTArray)
+    //    This array ALWAYS has valid pointers for every bone, even when boneNodes has nulls.
+    //    For bones with NiNodes: points to NiAVObject+0x70 (the worldTransform)
+    //    For bones without NiNodes (BSFlattenedBoneTree): points to the flat bone array entry
+    uintptr_t boneWorldTransformArrayPtr = *reinterpret_cast<uintptr_t*>(skinInstPtr + 0x28);
 
     uint32_t nullBoneCount = 0;
+    uint32_t nullTransformCount = 0;
     for (uint32_t i = 0; i < boneCount; i++) {
         // Inverse bind pose: skip 0x10 NiBound, read 0x40 NiTransform
         uintptr_t entryPtr = invBindArrayPtr + i * 0x50 + 0x10;
         memcpy(&out.inverseBindPoses[i], reinterpret_cast<void*>(entryPtr), sizeof(NiTransformPadded));
 
-        // Bone node pointer
+        // Bone node pointer (may be null for BSFlattenedBoneTree bones)
         uintptr_t boneNodePtr = reinterpret_cast<uintptr_t*>(boneNodesArrayPtr)[i];
         out.boneNodePtrs[i] = boneNodePtr;
         if (boneNodePtr == 0) nullBoneCount++;
+
+        // Bone world transform pointer (always valid)
+        uintptr_t transformPtr = boneWorldTransformArrayPtr
+            ? reinterpret_cast<uintptr_t*>(boneWorldTransformArrayPtr)[i]
+            : 0;
+        out.boneWorldTransformPtrs[i] = transformPtr;
+        if (transformPtr == 0) nullTransformCount++;
     }
 
     // Pre-allocate per-frame transform storage
     out.currentBoneTransforms.resize(boneCount);
 
-    _MESSAGE("FO4RemixPlugin: [SKINNING] ReadSkinData OK: bones=%u skelRoot=0x%p nullBones=%u",
-             boneCount, (void*)skelRootPtr, nullBoneCount);
+    _MESSAGE("FO4RemixPlugin: [SKINNING] ReadSkinData OK: bones=%u skelRoot=0x%p nullNodes=%u nullTransforms=%u",
+             boneCount, (void*)skelRootPtr, nullBoneCount, nullTransformCount);
 
     // Log first 3 bones for debug
     for (uint32_t i = 0; i < boneCount && i < 3; i++) {
@@ -991,65 +1006,97 @@ static void ApplyCoordinateSwap(float matrix[3][4]) {
 void SceneExtractor::UpdateSkinnedBoneTransforms(std::vector<ExtractedSkinnedMesh>& skinnedMeshes) {
     for (auto& sm : skinnedMeshes) {
         // Safety: validate array sizes match boneCount
-        if (sm.boneNodePtrs.size() < sm.boneCount ||
+        if (sm.boneWorldTransformPtrs.size() < sm.boneCount ||
             sm.inverseBindPoses.size() < sm.boneCount ||
             sm.currentBoneTransforms.size() < sm.boneCount) {
-            // Arrays not properly sized; skip this mesh entirely
             continue;
         }
 
-        // Safety: validate boneCount is reasonable
         if (sm.boneCount == 0 || sm.boneCount > kMaxBonesPerSkeleton) {
             continue;
         }
 
-        // Skeleton root validity check: read a few bytes from the skeleton root
-        // to verify the pointer is still valid. If the root is stale, skip this mesh.
+        // Skeleton root validity check
         if (sm.skeletonRootPtr != 0) {
             __try {
                 volatile uint8_t probe = *reinterpret_cast<uint8_t*>(sm.skeletonRootPtr);
                 (void)probe;
             } __except(EXCEPTION_EXECUTE_HANDLER) {
-                // Skeleton root pointer is stale; skip this mesh
                 continue;
             }
         }
 
         for (uint32_t i = 0; i < sm.boneCount; i++) {
-            uintptr_t boneNodePtr = sm.boneNodePtrs[i];
-
             float boneMatrix[3][4];
 
-            if (boneNodePtr == 0) {
-                // Null bone -- use identity matrix
+            // Use boneWorldTransformPtrs -- always valid for every bone,
+            // even when boneNodePtrs[i] is null (BSFlattenedBoneTree).
+            // Each pointer points directly to a NiTransformPadded (0x40 bytes).
+            uintptr_t transformPtr = sm.boneWorldTransformPtrs[i];
+
+            if (transformPtr == 0) {
+                // Fallback: identity (should never happen with boneWorldTransforms)
                 memset(boneMatrix, 0, sizeof(boneMatrix));
                 boneMatrix[0][0] = 1.0f;
                 boneMatrix[1][1] = 1.0f;
                 boneMatrix[2][2] = 1.0f;
             } else {
                 __try {
-                    // Read current world transform from live game memory
-                    NiTransformPadded boneWorld = ReadWorldTransform(boneNodePtr);
+                    // Read the bone's current world transform directly
+                    NiTransformPadded boneWorld;
+                    memcpy(&boneWorld, reinterpret_cast<void*>(transformPtr), sizeof(NiTransformPadded));
 
-                    // Compute final matrix: boneWorld * inverseBindPose
                     ComputeBoneMatrix(boneWorld, sm.inverseBindPoses[i], boneMatrix);
-
-                    // Apply coordinate system conversion (same X<->Y swap as static meshes)
                     ApplyCoordinateSwap(boneMatrix);
                 } __except(EXCEPTION_EXECUTE_HANDLER) {
-                    // Bone node pointer is stale; use identity for this bone
                     memset(boneMatrix, 0, sizeof(boneMatrix));
                     boneMatrix[0][0] = 1.0f;
                     boneMatrix[1][1] = 1.0f;
                     boneMatrix[2][2] = 1.0f;
-                    // Mark this bone as null so we don't try again next frame
-                    sm.boneNodePtrs[i] = 0;
+                    sm.boneWorldTransformPtrs[i] = 0;
                 }
             }
 
-            // Store as flat 12 floats for Remix
             memcpy(sm.currentBoneTransforms[i].data(), boneMatrix, 12 * sizeof(float));
         }
+    }
+}
+
+// Helper: dump BSDynamicTriShape memory layout (SEH-safe, no C++ objects)
+static void DumpDynamicShapeLayout(uintptr_t shapeAddr, uint32_t szVertex) {
+    _MESSAGE("FO4RemixPlugin: [DYNAMIC] shape=0x%p szVertex=%u probing offsets 0x170-0x1A8:",
+             (void*)shapeAddr, szVertex);
+    __try {
+        for (uint32_t off = 0x170; off <= 0x1A8; off += 8) {
+            uintptr_t val = *reinterpret_cast<uintptr_t*>(shapeAddr + off);
+            _MESSAGE("FO4RemixPlugin: [DYNAMIC]   +0x%03X = 0x%016llX", off, val);
+        }
+        for (uint32_t off = 0x170; off <= 0x1A0; off += 4) {
+            uint32_t val32 = *reinterpret_cast<uint32_t*>(shapeAddr + off);
+            _MESSAGE("FO4RemixPlugin: [DYNAMIC]   +0x%03X (u32) = %u (0x%08X)", off, val32, val32);
+        }
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        _MESSAGE("FO4RemixPlugin: [DYNAMIC]   exception reading shape memory");
+    }
+}
+
+static void DumpDynamicVertexData(uint8_t* dynVerts, uint32_t posStride) {
+    _MESSAGE("FO4RemixPlugin: [DYNAMIC] dynVerts=0x%p stride=%u first 16 bytes:", dynVerts, posStride);
+    __try {
+        _MESSAGE("FO4RemixPlugin: [DYNAMIC]   %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X %02X",
+                 dynVerts[0], dynVerts[1], dynVerts[2], dynVerts[3],
+                 dynVerts[4], dynVerts[5], dynVerts[6], dynVerts[7],
+                 dynVerts[8], dynVerts[9], dynVerts[10], dynVerts[11],
+                 dynVerts[12], dynVerts[13], dynVerts[14], dynVerts[15]);
+        uint16_t* asHalf = reinterpret_cast<uint16_t*>(dynVerts);
+        _MESSAGE("FO4RemixPlugin: [DYNAMIC]   as half: %.3f %.3f %.3f %.3f",
+                 HalfToFloat(asHalf[0]), HalfToFloat(asHalf[1]),
+                 HalfToFloat(asHalf[2]), HalfToFloat(asHalf[3]));
+        float* asFloat = reinterpret_cast<float*>(dynVerts);
+        _MESSAGE("FO4RemixPlugin: [DYNAMIC]   as f32:  %.3f %.3f %.3f %.3f",
+                 asFloat[0], asFloat[1], asFloat[2], asFloat[3]);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        _MESSAGE("FO4RemixPlugin: [DYNAMIC]   exception reading dynVerts data");
     }
 }
 
@@ -1101,16 +1148,44 @@ static bool ExtractSkinnedTriShape(BSTriShape* shape, uint64_t baseHash,
 
     bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
 
+    // BSDynamicTriShape detection: szVertex (bits [7:4]) is non-zero for dynamic shapes.
+    // Face/head/hair meshes are BSDynamicTriShape — morphed positions live in
+    // dynamicVertices, not in pVB->pData.
+    // Dynamic buffer always uses half-float positions (matching static VB format).
+    uint8_t* posData = vbData;
+    uint32_t posStride = vertexSize;
+    bool isDynamic = (szVertex != 0);
+    if (isDynamic) {
+        uintptr_t shapeAddr = reinterpret_cast<uintptr_t>(shape);
+
+        // Dump BSDynamicTriShape memory layout (first dynamic mesh only)
+        static bool s_dumpedOnce = false;
+        if (!s_dumpedOnce) {
+            s_dumpedOnce = true;
+            DumpDynamicShapeLayout(shapeAddr, szVertex);
+        }
+
+        // Try offset 0x180 (F4SE standard for dynamicVertices)
+        uint8_t* dynVerts = *reinterpret_cast<uint8_t**>(shapeAddr + 0x180);
+        if (dynVerts) {
+            posData = dynVerts;
+            posStride = szVertex * 4;
+            DumpDynamicVertexData(dynVerts, posStride);
+        } else {
+            isDynamic = false;
+        }
+    }
+
     // Step 2: Compute blend weight/index offsets
     uint32_t blendWeightOffset = (uint32_t)((desc >> 26) & 0x3C);
     uint32_t blendIndexOffset  = blendWeightOffset + 8;
 
     const char* shapeName = shape->m_name.c_str();
 
-    _MESSAGE("FO4RemixPlugin: [SKINNING] Extracting skinned shape \"%s\" verts=%u tris=%u bones offset: weight=%u index=%u",
+    _MESSAGE("FO4RemixPlugin: [SKINNING] Extracting skinned shape \"%s\" verts=%u tris=%u bones offset: weight=%u index=%u dynamic=%d",
              shapeName ? shapeName : "<null>",
              shape->numVertices, shape->numTriangles,
-             blendWeightOffset, blendIndexOffset);
+             blendWeightOffset, blendIndexOffset, isDynamic);
 
     ExtractedSkinnedMesh sm;
     sm.ownerFormID = ownerFormID;
@@ -1129,14 +1204,18 @@ static bool ExtractSkinnedTriShape(BSTriShape* shape, uint64_t baseHash,
         remixapi_HardcodedVertex& out_v = sm.vertices[i];
         memset(&out_v, 0, sizeof(out_v));
 
-        // Position (always at offset 0)
-        if (posHalfFloat) {
-            uint16_t* pos = reinterpret_cast<uint16_t*>(v);
+        // Position: read from dynamic buffer for BSDynamicTriShape, static VB otherwise.
+        // Dynamic buffer always stores HALF4 positions (verified via memory dump), even when
+        // kFlag_FullPrecision is set — because szVertex serves double-duty as both the
+        // dynamic vertex size AND the attribute offset base for non-dynamic shapes.
+        uint8_t* pv = posData + (uint32_t)i * posStride;
+        if (isDynamic || posHalfFloat) {
+            uint16_t* pos = reinterpret_cast<uint16_t*>(pv);
             out_v.position[0] = HalfToFloat(pos[0]);
             out_v.position[1] = HalfToFloat(pos[1]);
             out_v.position[2] = HalfToFloat(pos[2]);
         } else {
-            float* pos = reinterpret_cast<float*>(v);
+            float* pos = reinterpret_cast<float*>(pv);
             out_v.position[0] = pos[0];
             out_v.position[1] = pos[1];
             out_v.position[2] = pos[2];
@@ -1169,17 +1248,26 @@ static bool ExtractSkinnedTriShape(BSTriShape* shape, uint64_t baseHash,
         }
     }
 
-    // Validate vertex positions
+    // Validate vertex positions and compute bounds
+    float sMinPos[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
+    float sMaxPos[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
     for (uint16_t i = 0; i < shape->numVertices; i++) {
         const auto& pos = sm.vertices[i].position;
         for (int j = 0; j < 3; j++) {
             if (std::isnan(pos[j]) || std::isinf(pos[j])) {
-                _MESSAGE("FO4RemixPlugin: [SKINNING] Rejecting skinned mesh \"%s\" - vertex %u has NaN/Inf position",
-                         shapeName ? shapeName : "<null>", i);
+                _MESSAGE("FO4RemixPlugin: [SKINNING] Rejecting skinned mesh \"%s\" - vertex %u has NaN/Inf position (%.3f, %.3f, %.3f)",
+                         shapeName ? shapeName : "<null>", i, pos[0], pos[1], pos[2]);
                 return false;
             }
+            if (pos[j] < sMinPos[j]) sMinPos[j] = pos[j];
+            if (pos[j] > sMaxPos[j]) sMaxPos[j] = pos[j];
         }
     }
+    _MESSAGE("FO4RemixPlugin: [SKINNING] Mesh \"%s\" obj-space bounds: (%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f) extent=(%.1f,%.1f,%.1f)",
+             shapeName ? shapeName : "<null>",
+             sMinPos[0], sMinPos[1], sMinPos[2],
+             sMaxPos[0], sMaxPos[1], sMaxPos[2],
+             sMaxPos[0]-sMinPos[0], sMaxPos[1]-sMinPos[1], sMaxPos[2]-sMinPos[2]);
 
     // ---- Indices (uint16 -> uint32) ----
     uint32_t indexCount = shape->numTriangles * 3;
@@ -1343,15 +1431,31 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
     // Otherwise: positions are 4 half-floats (8 bytes)
     bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
 
+    // BSDynamicTriShape: morphed positions in dynamicVertices (offset 0x180)
+    uint8_t* posData = vbData;
+    uint32_t posStride = vertexSize;
+    bool isDynamic = (szVertex != 0);
+    if (isDynamic) {
+        uint8_t* dynVerts = *reinterpret_cast<uint8_t**>(
+            reinterpret_cast<uintptr_t>(shape) + 0x180);
+        if (dynVerts) {
+            posData = dynVerts;
+            posStride = szVertex * 4;
+        } else {
+            isDynamic = false;
+        }
+    }
+
     const char* shapeName = shape->m_name.c_str();
     if (g_config.logShapeInfo) {
         _MESSAGE("FO4RemixPlugin: Shape \"%s\" vertexSize=%u desc=0x%016llX posHalf=%d "
-                 "flags: UV=%d Norm=%d Color=%d FullPrec=%d Skinned=%d verts=%u tris=%u",
+                 "flags: UV=%d Norm=%d Color=%d FullPrec=%d Skinned=%d dynamic=%d verts=%u tris=%u",
                  shapeName ? shapeName : "<null>",
                  vertexSize, desc, posHalfFloat,
                  hasUVs, hasNormals, hasColors,
                  (desc & BSGeometry::kFlag_FullPrecision) ? 1 : 0,
                  (desc & BSGeometry::kFlag_Skinned) ? 1 : 0,
+                 isDynamic,
                  shape->numVertices, shape->numTriangles);
     }
 
@@ -1365,14 +1469,15 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
         remixapi_HardcodedVertex& out_v = mesh.vertices[i];
         memset(&out_v, 0, sizeof(out_v));
 
-        // Position (always at offset 0)
-        if (posHalfFloat) {
-            uint16_t* pos = reinterpret_cast<uint16_t*>(v);
+        // Position: dynamic buffer always stores HALF4 regardless of FullPrecision flag
+        uint8_t* pv = posData + (uint32_t)i * posStride;
+        if (isDynamic || posHalfFloat) {
+            uint16_t* pos = reinterpret_cast<uint16_t*>(pv);
             out_v.position[0] = HalfToFloat(pos[0]);
             out_v.position[1] = HalfToFloat(pos[1]);
             out_v.position[2] = HalfToFloat(pos[2]);
         } else {
-            float* pos = reinterpret_cast<float*>(v);
+            float* pos = reinterpret_cast<float*>(pv);
             out_v.position[0] = pos[0];
             out_v.position[1] = pos[1];
             out_v.position[2] = pos[2];

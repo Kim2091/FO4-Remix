@@ -622,6 +622,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // Build bone transforms array for Remix
             std::vector<remixapi_Transform> boneTransforms(inst.boneCount);
 
+            bool usedRealBones = false;
             if (matchedSM && matchedSM->boneCount == inst.boneCount &&
                 matchedSM->currentBoneTransforms.size() == inst.boneCount) {
                 // Use real bone transforms from game thread
@@ -631,6 +632,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     memcpy(&boneTransforms[b], matchedSM->currentBoneTransforms[b].data(),
                            sizeof(remixapi_Transform));
                 }
+                usedRealBones = true;
             } else {
                 // Fallback: identity bone transforms (bind pose) if no bone data available
                 for (uint32_t b = 0; b < inst.boneCount; b++) {
@@ -638,6 +640,44 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     boneTransforms[b].matrix[0][0] = 1.0f;
                     boneTransforms[b].matrix[1][1] = 1.0f;
                     boneTransforms[b].matrix[2][2] = 1.0f;
+                }
+            }
+
+            // Enhanced diagnostics: log once per skinned mesh on first frame
+            static std::unordered_set<uint64_t> s_loggedSkinnedHashes;
+            if (s_loggedSkinnedHashes.find(inst.meshHash) == s_loggedSkinnedHashes.end()) {
+                s_loggedSkinnedHashes.insert(inst.meshHash);
+                const float* b0 = boneTransforms[0].matrix[0];
+                float tx = boneTransforms[0].matrix[0][3];
+                float ty = boneTransforms[0].matrix[1][3];
+                float tz = boneTransforms[0].matrix[2][3];
+                _MESSAGE("FO4RemixPlugin: [SKINNED DRAW] hash=0x%llX bones=%u %s bone0_trans=(%.1f,%.1f,%.1f) bone0_diag=(%.4f,%.4f,%.4f)",
+                         inst.meshHash, inst.boneCount,
+                         usedRealBones ? "REAL" : "FALLBACK_IDENTITY",
+                         tx, ty, tz,
+                         boneTransforms[0].matrix[0][0],
+                         boneTransforms[0].matrix[1][1],
+                         boneTransforms[0].matrix[2][2]);
+                // Flag suspiciously large translations (>100k units = likely world-space issue)
+                for (uint32_t b = 0; b < inst.boneCount; b++) {
+                    float btx = boneTransforms[b].matrix[0][3];
+                    float bty = boneTransforms[b].matrix[1][3];
+                    float btz = boneTransforms[b].matrix[2][3];
+                    if (fabsf(btx) > 100000.f || fabsf(bty) > 100000.f || fabsf(btz) > 100000.f) {
+                        _MESSAGE("FO4RemixPlugin: [SKINNED DRAW] WARNING hash=0x%llX bone[%u] extreme translation=(%.1f,%.1f,%.1f)",
+                                 inst.meshHash, b, btx, bty, btz);
+                        break;
+                    }
+                    // Check for NaN/Inf in bone transforms
+                    bool hasBad = false;
+                    for (int rr = 0; rr < 3 && !hasBad; rr++)
+                        for (int cc = 0; cc < 4 && !hasBad; cc++)
+                            if (std::isnan(boneTransforms[b].matrix[rr][cc]) || std::isinf(boneTransforms[b].matrix[rr][cc]))
+                                hasBad = true;
+                    if (hasBad) {
+                        _MESSAGE("FO4RemixPlugin: [SKINNED DRAW] WARNING hash=0x%llX bone[%u] has NaN/Inf transform!", inst.meshHash, b);
+                        break;
+                    }
                 }
             }
 

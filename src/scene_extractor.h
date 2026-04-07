@@ -11,7 +11,7 @@
 // ---------------------------------------------------------------------------
 // Skinning constants
 // ---------------------------------------------------------------------------
-static constexpr uint32_t kMaxBonesPerSkeleton = 60;   // FO4 cb10 = 180 float4s / 3 per bone
+static constexpr uint32_t kMaxBonesPerSkeleton = 128;  // Remix API has no bone limit; game meshes go up to ~117
 static constexpr uint32_t kBonesPerVertex = 4;          // Always 4 in FO4
 static constexpr uint64_t kVertexFlag_Skinned = 0x4000000000000ULL; // bit 50
 
@@ -72,7 +72,12 @@ struct ExtractedSkinnedMesh {
     std::vector<NiTransformPadded> inverseBindPoses;  // boneCount entries
 
     // Live bone node pointers -- read each frame for current world transforms.
-    std::vector<uintptr_t> boneNodePtrs;  // boneCount entries (NiAVObject*)
+    std::vector<uintptr_t> boneNodePtrs;  // boneCount entries (NiAVObject*), many may be null
+
+    // Bone world transform pointers -- from BSSkin::Instance+0x28 (boneWorldTransforms array).
+    // Unlike boneNodePtrs, these are ALWAYS valid for every bone (BSFlattenedBoneTree).
+    // Each points to a NiTransformPadded (0x40 bytes) containing the bone's current world transform.
+    std::vector<uintptr_t> boneWorldTransformPtrs;  // boneCount entries, always non-null
 
     // Skeleton root pointer -- used for validity checking.
     uintptr_t skeletonRootPtr = 0;        // NiNode*
