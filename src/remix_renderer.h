@@ -13,9 +13,21 @@ struct OverlayData {
     bool valid = false;
 };
 
+// Tracks a skinned mesh that has been created in Remix
+struct SkinnedMeshInstance {
+    remixapi_MeshHandle      meshHandle = nullptr;
+    remixapi_MaterialHandle  materialHandle = nullptr;
+    uint64_t                 meshHash = 0;
+    uint32_t                 boneCount = 0;
+    uint32_t                 ownerFormID = 0;
+    bool                     isValid = false;
+};
+
 namespace RemixRenderer {
     bool Init();
-    void OnFrame(const CameraState& cam, const OverlayData& overlay = {});
+    void OnFrame(const CameraState& cam,
+                 const std::vector<ExtractedSkinnedMesh>& skinnedMeshBoneData,
+                 const OverlayData& overlay = {});
     void Shutdown();
 
     // Upload textures, create materials, and load meshes for a specific cell.

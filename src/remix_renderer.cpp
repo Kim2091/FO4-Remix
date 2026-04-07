@@ -54,6 +54,7 @@ struct SceneMeshInstance {
 
 struct CellSceneData {
     std::vector<SceneMeshInstance> meshes;
+    std::vector<SkinnedMeshInstance> skinnedMeshInstances;  // Skinned meshes
     std::unordered_map<uint64_t, remixapi_MaterialHandle> materials;
     std::vector<remixapi_LightHandle> lights;
     std::unordered_set<uint64_t> textureHashes;
@@ -124,6 +125,10 @@ void RemixRenderer::UnloadCell(uint32_t cellFormID) {
         if (inst.handle) api->DestroyMesh(inst.handle);
     }
 
+    for (auto& inst : cell.skinnedMeshInstances) {
+        if (inst.meshHandle) api->DestroyMesh(inst.meshHandle);
+    }
+
     for (auto& [hash, handle] : cell.materials) {
         if (handle) api->DestroyMaterial(handle);
     }
@@ -157,6 +162,9 @@ void RemixRenderer::UnloadAllCells() {
     for (auto& [cellID, cell] : g_cellScenes) {
         for (auto& inst : cell.meshes) {
             if (inst.handle) api->DestroyMesh(inst.handle);
+        }
+        for (auto& inst : cell.skinnedMeshInstances) {
+            if (inst.meshHandle) api->DestroyMesh(inst.meshHandle);
         }
         for (auto& [hash, handle] : cell.materials) {
             if (handle) api->DestroyMaterial(handle);
@@ -261,6 +269,8 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
     };
 
     std::unordered_map<uint64_t, MaterialKey> materialKeys;
+
+    // Collect material keys from static meshes
     for (auto& mesh : result.meshes) {
         if (mesh.diffuseTextureHash == 0) continue;
         MaterialKey key { mesh.diffuseTextureHash, mesh.normalTextureHash, mesh.roughnessTextureHash,
@@ -269,10 +279,24 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         if (it == materialKeys.end()) {
             materialKeys.emplace(key.combined(), key);
         } else if (mesh.alphaTestEnabled && !it->second.alphaTestEnabled) {
-            // If any mesh using this material needs alpha testing, enable it
             it->second.alphaTestEnabled = true;
             it->second.alphaTestType = mesh.alphaTestType;
             it->second.alphaTestRef = mesh.alphaTestRef;
+        }
+    }
+
+    // Collect material keys from skinned meshes
+    for (auto& sm : result.skinnedMeshes) {
+        if (sm.diffuseTextureHash == 0) continue;
+        MaterialKey key { sm.diffuseTextureHash, sm.normalTextureHash, sm.roughnessTextureHash,
+                          sm.alphaTestEnabled, sm.alphaTestType, sm.alphaTestRef };
+        auto it = materialKeys.find(key.combined());
+        if (it == materialKeys.end()) {
+            materialKeys.emplace(key.combined(), key);
+        } else if (sm.alphaTestEnabled && !it->second.alphaTestEnabled) {
+            it->second.alphaTestEnabled = true;
+            it->second.alphaTestType = sm.alphaTestType;
+            it->second.alphaTestRef = sm.alphaTestRef;
         }
     }
 
@@ -378,6 +402,70 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
     _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Meshes - created %u, failed %u",
              cellFormID, meshCreated, meshFailed);
 
+    // ----- Create skinned meshes -----
+    uint32_t skinnedCreated = 0, skinnedFailed = 0;
+
+    for (auto& sm : result.skinnedMeshes) {
+        if (sm.vertices.empty()) continue;
+
+        // Look up material handle by combined texture hash
+        remixapi_MaterialHandle matHandle = nullptr;
+        if (sm.diffuseTextureHash != 0) {
+            uint64_t combinedHash = sm.diffuseTextureHash;
+            combinedHash ^= sm.normalTextureHash    * 0x517CC1B727220A95ULL;
+            combinedHash ^= sm.roughnessTextureHash * 0x6C62272E07BB0142ULL;
+            auto it = cellData.materials.find(combinedHash);
+            if (it != cellData.materials.end())
+                matHandle = it->second;
+        }
+
+        remixapi_MeshInfoSurfaceTriangles surface = {};
+        surface.vertices_values = sm.vertices.data();
+        surface.vertices_count = (uint32_t)sm.vertices.size();
+        surface.indices_values = sm.indices.empty() ? nullptr : sm.indices.data();
+        surface.indices_count = (uint32_t)sm.indices.size();
+
+        // Set skinning data
+        surface.skinning_hasvalue = 1;
+        surface.skinning_value.bonesPerVertex = kBonesPerVertex;
+        surface.skinning_value.blendWeights_values = sm.blendWeights.data();
+        surface.skinning_value.blendWeights_count  = static_cast<uint32_t>(sm.blendWeights.size());
+        surface.skinning_value.blendIndices_values = sm.blendIndices.data();
+        surface.skinning_value.blendIndices_count  = static_cast<uint32_t>(sm.blendIndices.size());
+
+        surface.material = matHandle;
+
+        remixapi_MeshInfo meshInfo = {};
+        meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+        meshInfo.hash = sm.hash;
+        meshInfo.surfaces_values = &surface;
+        meshInfo.surfaces_count = 1;
+
+        remixapi_MeshHandle handle = nullptr;
+        remixapi_ErrorCode status = api->CreateMesh(&meshInfo, &handle);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
+            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Failed to create skinned mesh 0x%llX (error %d)",
+                     cellFormID, (unsigned long long)sm.hash, (int)status);
+            skinnedFailed++;
+            continue;
+        }
+
+        SkinnedMeshInstance inst;
+        inst.meshHandle = handle;
+        inst.materialHandle = matHandle;
+        inst.meshHash = sm.hash;
+        inst.boneCount = sm.boneCount;
+        inst.ownerFormID = sm.ownerFormID;
+        inst.isValid = true;
+        cellData.skinnedMeshInstances.push_back(inst);
+        skinnedCreated++;
+    }
+
+    if (skinnedCreated > 0 || skinnedFailed > 0) {
+        _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Skinned meshes - created %u, failed %u",
+                 cellFormID, skinnedCreated, skinnedFailed);
+    }
+
     // ----- Create lights -----
     uint32_t lightCreated = 0, lightFailed = 0;
 
@@ -465,7 +553,9 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
 // ---------------------------------------------------------------------------
 // Per-frame rendering
 // ---------------------------------------------------------------------------
-void RemixRenderer::OnFrame(const CameraState& cam, const OverlayData& overlay) {
+void RemixRenderer::OnFrame(const CameraState& cam,
+                            const std::vector<ExtractedSkinnedMesh>& skinnedMeshBoneData,
+                            const OverlayData& overlay) {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
@@ -514,6 +604,76 @@ void RemixRenderer::OnFrame(const CameraState& cam, const OverlayData& overlay) 
             api->DrawInstance(&instance);
             hasAnyMeshes = true;
         }
+
+        // Draw skinned mesh instances with real per-frame bone transforms.
+        // Bone transforms are computed by the game thread and passed in via skinnedMeshBoneData.
+        for (auto& inst : cellData.skinnedMeshInstances) {
+            if (!inst.isValid) continue;
+
+            // Find the corresponding ExtractedSkinnedMesh with current bone transforms
+            const ExtractedSkinnedMesh* matchedSM = nullptr;
+            for (const auto& sm : skinnedMeshBoneData) {
+                if (sm.hash == inst.meshHash) {
+                    matchedSM = &sm;
+                    break;
+                }
+            }
+
+            // Build bone transforms array for Remix
+            std::vector<remixapi_Transform> boneTransforms(inst.boneCount);
+
+            if (matchedSM && matchedSM->boneCount == inst.boneCount &&
+                matchedSM->currentBoneTransforms.size() == inst.boneCount) {
+                // Use real bone transforms from game thread
+                static_assert(sizeof(remixapi_Transform) == 12 * sizeof(float),
+                              "remixapi_Transform must be 48 bytes");
+                for (uint32_t b = 0; b < inst.boneCount; b++) {
+                    memcpy(&boneTransforms[b], matchedSM->currentBoneTransforms[b].data(),
+                           sizeof(remixapi_Transform));
+                }
+            } else {
+                // Fallback: identity bone transforms (bind pose) if no bone data available
+                for (uint32_t b = 0; b < inst.boneCount; b++) {
+                    memset(&boneTransforms[b], 0, sizeof(remixapi_Transform));
+                    boneTransforms[b].matrix[0][0] = 1.0f;
+                    boneTransforms[b].matrix[1][1] = 1.0f;
+                    boneTransforms[b].matrix[2][2] = 1.0f;
+                }
+            }
+
+            // Safety check: bone count within Remix limit
+            uint32_t boneCountToSubmit = inst.boneCount;
+            if (boneCountToSubmit > REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT) {
+                boneCountToSubmit = REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT;
+            }
+
+            // Build bone transforms extension struct
+            remixapi_InstanceInfoBoneTransformsEXT boneExt = {};
+            boneExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
+            boneExt.pNext = nullptr;
+            boneExt.boneTransforms_values = boneTransforms.data();
+            boneExt.boneTransforms_count  = boneCountToSubmit;
+
+            // Identity instance transform (bones handle world positioning)
+            remixapi_Transform identityXform = {};
+            identityXform.matrix[0][0] = 1.0f;
+            identityXform.matrix[1][1] = 1.0f;
+            identityXform.matrix[2][2] = 1.0f;
+
+            remixapi_InstanceInfo instance = {};
+            instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
+            instance.pNext = &boneExt;
+            instance.mesh = inst.meshHandle;
+            instance.transform = identityXform;
+            instance.doubleSided = 1;
+            instance.categoryFlags = 0;
+
+            remixapi_ErrorCode err = api->DrawInstance(&instance);
+            if (err == REMIXAPI_ERROR_CODE_SUCCESS) {
+                hasAnyMeshes = true;
+            }
+        }
+
         for (auto& handle : cellData.lights) {
             remixapi_ErrorCode lightErr = api->DrawLightInstance(handle);
             if (lightErr == REMIXAPI_ERROR_CODE_SUCCESS) {
@@ -524,12 +684,36 @@ void RemixRenderer::OnFrame(const CameraState& cam, const OverlayData& overlay) 
         }
     }
 
-    // Periodic light status log (every ~5 seconds)
+    // Periodic status log (every ~5 seconds)
     static uint32_t s_frameCounter = 0;
+    static uint32_t s_skinnedWithBones = 0;
+    static uint32_t s_skinnedFallback = 0;
+    static uint32_t s_skinnedDrawFailed = 0;
     s_frameCounter++;
     if (s_frameCounter % 300 == 0) {
-        _MESSAGE("FO4RemixPlugin: OnFrame light status - %zu cells, %u lights drawn, %u lights failed",
+        _MESSAGE("FO4RemixPlugin: OnFrame status - %zu cells, %u lights drawn, %u lights failed",
                  g_cellScenes.size(), totalLightsDrawn, totalLightsFailed);
+
+        // Count skinned mesh stats for this snapshot
+        uint32_t totalSkinned = 0;
+        uint32_t withRealBones = 0;
+        for (auto& [cid, cd] : g_cellScenes) {
+            for (auto& inst : cd.skinnedMeshInstances) {
+                if (!inst.isValid) continue;
+                totalSkinned++;
+                // Check if bone data was available
+                for (const auto& sm : skinnedMeshBoneData) {
+                    if (sm.hash == inst.meshHash && sm.boneCount == inst.boneCount) {
+                        withRealBones++;
+                        break;
+                    }
+                }
+            }
+        }
+        if (totalSkinned > 0) {
+            _MESSAGE("FO4RemixPlugin: [SKINNING] Draw status: %u skinned instances, %u with real bones, %u identity fallback, boneData entries=%zu",
+                     totalSkinned, withRealBones, totalSkinned - withRealBones, skinnedMeshBoneData.size());
+        }
     }
 
     if (!hasAnyMeshes && g_fallbackMesh) {

@@ -841,6 +841,457 @@ static BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape)
 }
 
 // ---------------------------------------------------------------------------
+// Step 3: Read BSSkin data from a BSGeometry node (raw pointer access)
+// ---------------------------------------------------------------------------
+static bool ReadSkinData(uintptr_t bsGeometryPtr, ExtractedSkinnedMesh& out) {
+    // 1. Read BSSkin::Instance pointer from BSGeometry+0x130
+    uintptr_t skinInstPtr = *reinterpret_cast<uintptr_t*>(bsGeometryPtr + 0x130);
+    if (skinInstPtr == 0) {
+        _MESSAGE("FO4RemixPlugin: [SKINNING] skinInstance is null at BSGeometry 0x%p", (void*)bsGeometryPtr);
+        return false;
+    }
+
+    // 2. Read bone count from boneNodes NiTArray at skinInst+0x10
+    //    NiTArray: data* at +0x00, count at +0x0A (uint16_t)
+    uintptr_t boneNodesArrayPtr = *reinterpret_cast<uintptr_t*>(skinInstPtr + 0x10);
+    uint16_t boneCount = *reinterpret_cast<uint16_t*>(skinInstPtr + 0x10 + 0x0A);
+
+    if (boneCount == 0) {
+        _MESSAGE("FO4RemixPlugin: [SKINNING] boneCount is 0 at skinInst 0x%p", (void*)skinInstPtr);
+        return false;
+    }
+    if (boneCount > kMaxBonesPerSkeleton) {
+        _MESSAGE("FO4RemixPlugin: [SKINNING] boneCount %u exceeds max %u at skinInst 0x%p",
+                 boneCount, kMaxBonesPerSkeleton, (void*)skinInstPtr);
+        return false;
+    }
+    if (boneNodesArrayPtr == 0) {
+        _MESSAGE("FO4RemixPlugin: [SKINNING] boneNodesArray is null at skinInst 0x%p", (void*)skinInstPtr);
+        return false;
+    }
+
+    // 3. Read boneData pointer from skinInst+0x40
+    uintptr_t boneDataPtr = *reinterpret_cast<uintptr_t*>(skinInstPtr + 0x40);
+    if (boneDataPtr == 0) {
+        _MESSAGE("FO4RemixPlugin: [SKINNING] boneData is null at skinInst 0x%p", (void*)skinInstPtr);
+        return false;
+    }
+
+    // 4. Read skeletonRoot pointer from skinInst+0x48
+    uintptr_t skelRootPtr = *reinterpret_cast<uintptr_t*>(skinInstPtr + 0x48);
+    out.skeletonRootPtr = skelRootPtr;
+
+    // 5. Read inverse bind poses from boneData+0x10 NiTArray
+    //    Array data pointer at boneData+0x10+0x00
+    //    Each entry is 0x50 bytes: 0x10 NiBound + 0x40 NiTransform
+    uintptr_t invBindArrayPtr = *reinterpret_cast<uintptr_t*>(boneDataPtr + 0x10);
+    if (invBindArrayPtr == 0) {
+        _MESSAGE("FO4RemixPlugin: [SKINNING] invBindArray is null at boneData 0x%p", (void*)boneDataPtr);
+        return false;
+    }
+
+    out.boneCount = boneCount;
+    out.inverseBindPoses.resize(boneCount);
+    out.boneNodePtrs.resize(boneCount);
+
+    uint32_t nullBoneCount = 0;
+    for (uint32_t i = 0; i < boneCount; i++) {
+        // Inverse bind pose: skip 0x10 NiBound, read 0x40 NiTransform
+        uintptr_t entryPtr = invBindArrayPtr + i * 0x50 + 0x10;
+        memcpy(&out.inverseBindPoses[i], reinterpret_cast<void*>(entryPtr), sizeof(NiTransformPadded));
+
+        // Bone node pointer
+        uintptr_t boneNodePtr = reinterpret_cast<uintptr_t*>(boneNodesArrayPtr)[i];
+        out.boneNodePtrs[i] = boneNodePtr;
+        if (boneNodePtr == 0) nullBoneCount++;
+    }
+
+    // Pre-allocate per-frame transform storage
+    out.currentBoneTransforms.resize(boneCount);
+
+    _MESSAGE("FO4RemixPlugin: [SKINNING] ReadSkinData OK: bones=%u skelRoot=0x%p nullBones=%u",
+             boneCount, (void*)skelRootPtr, nullBoneCount);
+
+    // Log first 3 bones for debug
+    for (uint32_t i = 0; i < boneCount && i < 3; i++) {
+        const auto& ib = out.inverseBindPoses[i];
+        _MESSAGE("FO4RemixPlugin: [SKINNING]   Bone[%u]: node=0x%p invBind rot=[%.3f,%.3f,%.3f / %.3f,%.3f,%.3f / %.3f,%.3f,%.3f] "
+                 "trans=[%.1f,%.1f,%.1f] scale=%.3f",
+                 i, (void*)out.boneNodePtrs[i],
+                 ib.rot[0][0], ib.rot[0][1], ib.rot[0][2],
+                 ib.rot[1][0], ib.rot[1][1], ib.rot[1][2],
+                 ib.rot[2][0], ib.rot[2][1], ib.rot[2][2],
+                 ib.translate[0], ib.translate[1], ib.translate[2], ib.scale);
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Step 5: Bone transform computation helpers
+// ---------------------------------------------------------------------------
+
+// Read an NiAVObject's world transform from game memory (at +0x70)
+static NiTransformPadded ReadWorldTransform(uintptr_t niAVObjectPtr) {
+    NiTransformPadded t;
+    memcpy(&t, reinterpret_cast<void*>(niAVObjectPtr + 0x70), sizeof(NiTransformPadded));
+    return t;
+}
+
+// Compute: result = boneWorld * invBind  (affine 3x4 matrix multiply)
+// Both inputs are NiTransformPadded; output is a 3x4 row-major matrix for Remix.
+static void ComputeBoneMatrix(
+    const NiTransformPadded& boneWorld,
+    const NiTransformPadded& invBind,
+    float outMatrix[3][4])
+{
+    // Build effective 3x3 for boneWorld: rot[r][c] * scale
+    float A[3][3];
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            A[r][c] = boneWorld.rot[r][c] * boneWorld.scale;
+
+    // Build effective 3x3 for invBind: rot[r][c] * scale
+    float B[3][3];
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 3; c++)
+            B[r][c] = invBind.rot[r][c] * invBind.scale;
+
+    // Result rotation = A * B (3x3 matrix multiply)
+    for (int r = 0; r < 3; r++) {
+        for (int c = 0; c < 3; c++) {
+            outMatrix[r][c] = A[r][0] * B[0][c]
+                            + A[r][1] * B[1][c]
+                            + A[r][2] * B[2][c];
+        }
+    }
+
+    // Result translation = A * invBind.translate + boneWorld.translate
+    for (int r = 0; r < 3; r++) {
+        outMatrix[r][3] = A[r][0] * invBind.translate[0]
+                        + A[r][1] * invBind.translate[1]
+                        + A[r][2] * invBind.translate[2]
+                        + boneWorld.translate[r];
+    }
+}
+
+// Apply the same coordinate system swap as static meshes.
+// The static mesh path swaps columns 0/1 in the rotation and X/Y in translation.
+// This matches: rotation -> R*S (column swap), translation -> S*T (component swap).
+static void ApplyCoordinateSwap(float matrix[3][4]) {
+    // Swap columns 0 and 1 of the rotation (3x3) part
+    for (int r = 0; r < 3; r++) {
+        std::swap(matrix[r][0], matrix[r][1]);
+    }
+    // Swap X and Y in translation (column 3)
+    std::swap(matrix[0][3], matrix[1][3]);
+}
+
+// Called every frame to update bone transforms for all tracked skinned meshes.
+void SceneExtractor::UpdateSkinnedBoneTransforms(std::vector<ExtractedSkinnedMesh>& skinnedMeshes) {
+    for (auto& sm : skinnedMeshes) {
+        // Safety: validate array sizes match boneCount
+        if (sm.boneNodePtrs.size() < sm.boneCount ||
+            sm.inverseBindPoses.size() < sm.boneCount ||
+            sm.currentBoneTransforms.size() < sm.boneCount) {
+            // Arrays not properly sized; skip this mesh entirely
+            continue;
+        }
+
+        // Safety: validate boneCount is reasonable
+        if (sm.boneCount == 0 || sm.boneCount > kMaxBonesPerSkeleton) {
+            continue;
+        }
+
+        // Skeleton root validity check: read a few bytes from the skeleton root
+        // to verify the pointer is still valid. If the root is stale, skip this mesh.
+        if (sm.skeletonRootPtr != 0) {
+            __try {
+                volatile uint8_t probe = *reinterpret_cast<uint8_t*>(sm.skeletonRootPtr);
+                (void)probe;
+            } __except(EXCEPTION_EXECUTE_HANDLER) {
+                // Skeleton root pointer is stale; skip this mesh
+                continue;
+            }
+        }
+
+        for (uint32_t i = 0; i < sm.boneCount; i++) {
+            uintptr_t boneNodePtr = sm.boneNodePtrs[i];
+
+            float boneMatrix[3][4];
+
+            if (boneNodePtr == 0) {
+                // Null bone -- use identity matrix
+                memset(boneMatrix, 0, sizeof(boneMatrix));
+                boneMatrix[0][0] = 1.0f;
+                boneMatrix[1][1] = 1.0f;
+                boneMatrix[2][2] = 1.0f;
+            } else {
+                __try {
+                    // Read current world transform from live game memory
+                    NiTransformPadded boneWorld = ReadWorldTransform(boneNodePtr);
+
+                    // Compute final matrix: boneWorld * inverseBindPose
+                    ComputeBoneMatrix(boneWorld, sm.inverseBindPoses[i], boneMatrix);
+
+                    // Apply coordinate system conversion (same X<->Y swap as static meshes)
+                    ApplyCoordinateSwap(boneMatrix);
+                } __except(EXCEPTION_EXECUTE_HANDLER) {
+                    // Bone node pointer is stale; use identity for this bone
+                    memset(boneMatrix, 0, sizeof(boneMatrix));
+                    boneMatrix[0][0] = 1.0f;
+                    boneMatrix[1][1] = 1.0f;
+                    boneMatrix[2][2] = 1.0f;
+                    // Mark this bone as null so we don't try again next frame
+                    sm.boneNodePtrs[i] = 0;
+                }
+            }
+
+            // Store as flat 12 floats for Remix
+            memcpy(sm.currentBoneTransforms[i].data(), boneMatrix, 12 * sizeof(float));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Step 4: Extract a skinned BSTriShape — base mesh + blend weights/indices + BSSkin
+// ---------------------------------------------------------------------------
+static bool ExtractSkinnedTriShape(BSTriShape* shape, uint64_t baseHash,
+                                   std::vector<ExtractedSkinnedMesh>& out,
+                                   ID3D11Device* device,
+                                   std::vector<ExtractedTexture>& newTextures,
+                                   uint32_t ownerFormID)
+{
+    if (!shape || shape->numVertices == 0 || shape->numTriangles == 0)
+        return false;
+
+    // Skip effect shaders — not real geometry
+    {
+        NiProperty* prop = shape->shaderProperty;
+        if (prop) {
+            BSShaderProperty* sp = static_cast<BSShaderProperty*>(prop);
+            BSShaderMaterial* mat = sp->shaderMaterial;
+            if (!mat || mat->GetFeature() != 2)
+                return false;
+        }
+    }
+
+    // Renderer data -> vertex/index buffers
+    auto* gfxData = static_cast<BSGraphics::TriShape*>(shape->pRendererData);
+    if (!gfxData || !gfxData->pVB || !gfxData->pIB)
+        return false;
+
+    uint8_t* vbData = static_cast<uint8_t*>(gfxData->pVB->pData);
+    uint8_t* ibData = static_cast<uint8_t*>(gfxData->pIB->pData);
+    if (!vbData || !ibData)
+        return false;
+
+    uint64_t desc = shape->vertexDesc;
+    uint16_t vertexSize = shape->GetVertexSize();
+    if (vertexSize == 0) return false;
+
+    bool hasUVs     = (desc & BSGeometry::kFlag_UVs) != 0;
+    bool hasNormals = (desc & BSGeometry::kFlag_Normals) != 0;
+    bool hasColors  = (desc & BSGeometry::kFlag_VertexColors) != 0;
+
+    uint32_t szVertex = (desc >> 4) & 0xF;
+    uint32_t oUV     = (szVertex + ((desc >>  8) & 0xF)) * 4;
+    uint32_t oNormal = (szVertex + ((desc >> 16) & 0xF)) * 4;
+    uint32_t oColor  = (szVertex + ((desc >> 24) & 0xF)) * 4;
+
+    bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
+
+    // Step 2: Compute blend weight/index offsets
+    uint32_t blendWeightOffset = (uint32_t)((desc >> 26) & 0x3C);
+    uint32_t blendIndexOffset  = blendWeightOffset + 8;
+
+    const char* shapeName = shape->m_name.c_str();
+
+    _MESSAGE("FO4RemixPlugin: [SKINNING] Extracting skinned shape \"%s\" verts=%u tris=%u bones offset: weight=%u index=%u",
+             shapeName ? shapeName : "<null>",
+             shape->numVertices, shape->numTriangles,
+             blendWeightOffset, blendIndexOffset);
+
+    ExtractedSkinnedMesh sm;
+    sm.ownerFormID = ownerFormID;
+    sm.vertexCount = shape->numVertices;
+    sm.indexCount = shape->numTriangles * 3;
+
+    // Generate a unique mesh hash (include ownerFormID for per-REFR uniqueness)
+    sm.hash = FnvHashCombine(baseHash, FnvHash(shapeName ? shapeName : ""));
+    sm.hash = FnvHashCombine(sm.hash, (uint64_t)0x534B494EULL); // "SKIN" tag
+
+    // ---- Extract base vertex data (positions, normals, UVs, colors) ----
+    sm.vertices.resize(shape->numVertices);
+
+    for (uint16_t i = 0; i < shape->numVertices; i++) {
+        uint8_t* v = vbData + (uint32_t)i * vertexSize;
+        remixapi_HardcodedVertex& out_v = sm.vertices[i];
+        memset(&out_v, 0, sizeof(out_v));
+
+        // Position (always at offset 0)
+        if (posHalfFloat) {
+            uint16_t* pos = reinterpret_cast<uint16_t*>(v);
+            out_v.position[0] = HalfToFloat(pos[0]);
+            out_v.position[1] = HalfToFloat(pos[1]);
+            out_v.position[2] = HalfToFloat(pos[2]);
+        } else {
+            float* pos = reinterpret_cast<float*>(v);
+            out_v.position[0] = pos[0];
+            out_v.position[1] = pos[1];
+            out_v.position[2] = pos[2];
+        }
+
+        // UVs
+        if (hasUVs && oUV + 4 <= vertexSize) {
+            uint16_t* uv = reinterpret_cast<uint16_t*>(v + oUV);
+            out_v.texcoord[0] = HalfToFloat(uv[0]);
+            out_v.texcoord[1] = HalfToFloat(uv[1]);
+        }
+
+        // Normals
+        if (hasNormals && oNormal + 4 <= vertexSize) {
+            uint8_t* n = v + oNormal;
+            out_v.normal[0] = UnpackByte(n[0]);
+            out_v.normal[1] = UnpackByte(n[1]);
+            out_v.normal[2] = UnpackByte(n[2]);
+        } else {
+            out_v.normal[0] = 0.0f;
+            out_v.normal[1] = 0.0f;
+            out_v.normal[2] = 1.0f;
+        }
+
+        // Color
+        if (hasColors && oColor + 4 <= vertexSize) {
+            memcpy(&out_v.color, v + oColor, 4);
+        } else {
+            out_v.color = 0xFFFFFFFF;
+        }
+    }
+
+    // Validate vertex positions
+    for (uint16_t i = 0; i < shape->numVertices; i++) {
+        const auto& pos = sm.vertices[i].position;
+        for (int j = 0; j < 3; j++) {
+            if (std::isnan(pos[j]) || std::isinf(pos[j])) {
+                _MESSAGE("FO4RemixPlugin: [SKINNING] Rejecting skinned mesh \"%s\" - vertex %u has NaN/Inf position",
+                         shapeName ? shapeName : "<null>", i);
+                return false;
+            }
+        }
+    }
+
+    // ---- Indices (uint16 -> uint32) ----
+    uint32_t indexCount = shape->numTriangles * 3;
+    uint16_t* indices16 = reinterpret_cast<uint16_t*>(ibData);
+    sm.indices.resize(indexCount);
+    for (uint32_t i = 0; i < indexCount; i++) {
+        uint32_t idx = indices16[i];
+        if (idx >= shape->numVertices) {
+            _MESSAGE("FO4RemixPlugin: [SKINNING] Rejecting skinned mesh \"%s\" - index[%u]=%u >= numVertices=%u",
+                     shapeName ? shapeName : "<null>", i, idx, shape->numVertices);
+            return false;
+        }
+        sm.indices[i] = idx;
+    }
+
+    // ---- Step 2: Extract blend weights and blend indices ----
+    sm.blendWeights.resize(sm.vertexCount * kBonesPerVertex);
+    sm.blendIndices.resize(sm.vertexCount * kBonesPerVertex);
+
+    float minWeightSum = FLT_MAX, maxWeightSum = -FLT_MAX;
+    double totalWeightSum = 0.0;
+    uint32_t badWeightCount = 0;
+    uint32_t maxBoneIdx = 0;
+
+    for (uint32_t i = 0; i < sm.vertexCount; i++) {
+        uint32_t base = i * kBonesPerVertex;
+        uint8_t* v = vbData + (uint32_t)i * vertexSize;
+
+        // Read blend weights (HALF4)
+        const uint16_t* hw = reinterpret_cast<const uint16_t*>(v + blendWeightOffset);
+        float w0 = HalfToFloat(hw[0]);
+        float w1 = HalfToFloat(hw[1]);
+        float w2 = HalfToFloat(hw[2]);
+        float w3 = 1.0f - w0 - w1 - w2;  // 4th weight is implicit
+        if (w3 < 0.0f) w3 = 0.0f;
+
+        sm.blendWeights[base + 0] = w0;
+        sm.blendWeights[base + 1] = w1;
+        sm.blendWeights[base + 2] = w2;
+        sm.blendWeights[base + 3] = w3;
+
+        // Validate weight sum
+        float wSum = w0 + w1 + w2 + w3;
+        if (wSum < minWeightSum) minWeightSum = wSum;
+        if (wSum > maxWeightSum) maxWeightSum = wSum;
+        totalWeightSum += wSum;
+        if (fabsf(wSum - 1.0f) > 0.01f) badWeightCount++;
+
+        // Read blend indices (R8G8B8A8)
+        const uint8_t* bi = v + blendIndexOffset;
+        sm.blendIndices[base + 0] = bi[0];
+        sm.blendIndices[base + 1] = bi[1];
+        sm.blendIndices[base + 2] = bi[2];
+        sm.blendIndices[base + 3] = bi[3];
+
+        for (int j = 0; j < 4; j++) {
+            if (bi[j] > maxBoneIdx) maxBoneIdx = bi[j];
+        }
+    }
+
+    _MESSAGE("FO4RemixPlugin: [SKINNING] Vertex weight stats: min_sum=%.4f max_sum=%.4f avg_sum=%.4f bad_count=%u/%u",
+             minWeightSum, maxWeightSum, (float)(totalWeightSum / sm.vertexCount),
+             badWeightCount, sm.vertexCount);
+    _MESSAGE("FO4RemixPlugin: [SKINNING] Bone index range: [0, %u]", maxBoneIdx);
+
+    // ---- Step 3: Read BSSkin data ----
+    if (!ReadSkinData(reinterpret_cast<uintptr_t>(shape), sm)) {
+        _MESSAGE("FO4RemixPlugin: [SKINNING] ReadSkinData failed for \"%s\"",
+                 shapeName ? shapeName : "<null>");
+        return false;
+    }
+
+    // Validate bone indices against actual bone count
+    for (uint32_t i = 0; i < sm.vertexCount * kBonesPerVertex; i++) {
+        if (sm.blendIndices[i] >= sm.boneCount) {
+            _MESSAGE("FO4RemixPlugin: [SKINNING] Bone index %u >= boneCount %u, clamping to 0",
+                     sm.blendIndices[i], sm.boneCount);
+            sm.blendIndices[i] = 0;
+        }
+    }
+
+    // ---- Extract textures ----
+    BSLightingShaderMaterialBase* lightingMat = GetLightingMaterial(shape);
+    sm.diffuseTextureHash   = lightingMat ? ExtractMaterialTexture(lightingMat->spDiffuseTexture, "diffuse", device, newTextures) : 0;
+    sm.normalTextureHash    = lightingMat ? ExtractMaterialTexture(lightingMat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral) : 0;
+    sm.roughnessTextureHash = lightingMat ? ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, TexturePostProcess::InvertRGB) : 0;
+
+    // ---- Extract alpha test state ----
+    sm.alphaTestEnabled = false;
+    sm.alphaTestType = 7;
+    sm.alphaTestRef = 128;
+    NiProperty* alphaPropRaw = shape->effectState;
+    if (alphaPropRaw) {
+        NiAlphaProperty* alphaProp = static_cast<NiAlphaProperty*>(alphaPropRaw);
+        bool testEnabled = (alphaProp->alphaFlags >> 9) & 1;
+        if (testEnabled) {
+            int niTestFunc = (alphaProp->alphaFlags >> 10) & 7;
+            static const int niToVk[] = { 7, 1, 2, 3, 4, 5, 6, 0 };
+            sm.alphaTestEnabled = true;
+            sm.alphaTestType = niToVk[niTestFunc];
+            sm.alphaTestRef = alphaProp->alphaThreshold;
+        }
+    }
+
+    _MESSAGE("FO4RemixPlugin: [SKINNING] Extracted skinned mesh: hash=0x%016llX owner=0x%08X bones=%u vertices=%u indices=%u",
+             (unsigned long long)sm.hash, ownerFormID, sm.boneCount, sm.vertexCount, sm.indexCount);
+
+    out.push_back(std::move(sm));
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Extract vertex/index data from a single BSTriShape
 // ---------------------------------------------------------------------------
 static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
@@ -1077,6 +1528,8 @@ static void WalkNode(NiAVObject* obj, uint64_t baseHash,
                      std::vector<ExtractedMesh>& out,
                      ID3D11Device* device,
                      std::vector<ExtractedTexture>& newTextures,
+                     std::vector<ExtractedSkinnedMesh>* skinnedOut = nullptr,
+                     uint32_t ownerFormID = 0,
                      int depth = 0)
 {
     if (!obj || depth > 32) return;
@@ -1101,8 +1554,14 @@ static void WalkNode(NiAVObject* obj, uint64_t baseHash,
     // Check if this is a BSTriShape
     BSTriShape* tri = obj->GetAsBSTriShape();
     if (tri) {
-        ExtractTriShape(tri, baseHash, out, device, newTextures);
-        return; // BSTriShape is a leaf — no children
+        // Check skinned flag and route accordingly
+        uint64_t vertexDesc = tri->vertexDesc;
+        if ((vertexDesc & kVertexFlag_Skinned) && skinnedOut) {
+            ExtractSkinnedTriShape(tri, baseHash, *skinnedOut, device, newTextures, ownerFormID);
+        } else {
+            ExtractTriShape(tri, baseHash, out, device, newTextures);
+        }
+        return; // BSTriShape is a leaf -- no children
     }
 
     // If it's an NiNode, recurse into children
@@ -1111,7 +1570,7 @@ static void WalkNode(NiAVObject* obj, uint64_t baseHash,
         for (uint16_t i = 0; i < node->m_children.m_emptyRunStart; i++) {
             NiAVObject* child = node->m_children.m_data[i];
             if (child) {
-                WalkNode(child, baseHash, out, device, newTextures, depth + 1);
+                WalkNode(child, baseHash, out, device, newTextures, skinnedOut, ownerFormID, depth + 1);
             }
         }
     }
@@ -1309,10 +1768,11 @@ std::vector<CellInfo> SceneExtractor::GetLoadedCells()
 ExtractionResult SceneExtractor::ExtractCell(uintptr_t cellPtr, ID3D11Device* device)
 {
     std::vector<ExtractedMesh> result;
+    std::vector<ExtractedSkinnedMesh> skinnedResult;
     std::vector<ExtractedTexture> newTextures;
 
     if (!cellPtr) {
-        return { std::move(result), std::move(newTextures) };
+        return { std::move(result), std::move(skinnedResult), std::move(newTextures) };
     }
 
     // Access cell objectList (tArray<TESObjectREFR*> at offset 0x70)
@@ -1343,12 +1803,13 @@ ExtractionResult SceneExtractor::ExtractCell(uintptr_t cellPtr, ID3D11Device* de
         uint64_t baseHash = FnvHashCombine(0xCBF29CE484222325ULL, (uint64_t)refrFormID);
 
         size_t before = result.size();
-        WalkNode(rootNode, baseHash, result, device, newTextures);
+        WalkNode(rootNode, baseHash, result, device, newTextures, &skinnedResult, refrFormID);
         meshCount += (uint32_t)(result.size() - before);
     }
 
     // Extract terrain geometry from LAND quadrant nodes (BSMultiBoundNode).
     // TESObjectLAND is at cell+0x58, its quadrant node array is at LAND+0x40.
+    // (Terrain is never skinned, so no skinned output is passed.)
     uint32_t terrainMeshCount = 0;
     uintptr_t landPtr = *reinterpret_cast<uintptr_t*>(cellPtr + OFF_CELL_LAND);
     if (landPtr) {
@@ -1377,12 +1838,13 @@ ExtractionResult SceneExtractor::ExtractCell(uintptr_t cellPtr, ID3D11Device* de
         if (m.roughnessTextureHash) hasRoughness++;
     }
 
-    _MESSAGE("FO4RemixPlugin: ExtractCell 0x%08X - %u meshes + %u terrain (%u diffuse, %u normal, %u roughness), "
+    _MESSAGE("FO4RemixPlugin: ExtractCell 0x%08X - %u meshes + %u terrain + %zu skinned (%u diffuse, %u normal, %u roughness), "
              "%zu new textures (%zu cached), %zu lights from %u objects",
-             cellFormID, meshCount, terrainMeshCount, hasDiffuse, hasNormal, hasRoughness,
+             cellFormID, meshCount, terrainMeshCount, skinnedResult.size(),
+             hasDiffuse, hasNormal, hasRoughness,
              newTextures.size(), g_textureCache.size(), lights.size(), objectList.count);
 
-    return { std::move(result), std::move(newTextures), std::move(lights) };
+    return { std::move(result), std::move(skinnedResult), std::move(newTextures), std::move(lights) };
 }
 
 // ---------------------------------------------------------------------------

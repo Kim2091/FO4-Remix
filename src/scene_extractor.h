@@ -3,8 +3,27 @@
 #include "remix/remix_c.h"
 #include "light_extractor.h"
 #include <vector>
+#include <array>
 #include <cstdint>
+#include <string>
 #include <d3d11.h>
+
+// ---------------------------------------------------------------------------
+// Skinning constants
+// ---------------------------------------------------------------------------
+static constexpr uint32_t kMaxBonesPerSkeleton = 60;   // FO4 cb10 = 180 float4s / 3 per bone
+static constexpr uint32_t kBonesPerVertex = 4;          // Always 4 in FO4
+static constexpr uint64_t kVertexFlag_Skinned = 0x4000000000000ULL; // bit 50
+
+// ---------------------------------------------------------------------------
+// NiTransformPadded — matches the verified 0x40 byte engine layout
+// ---------------------------------------------------------------------------
+struct NiTransformPadded {
+    float rot[3][4];     // 3 rows x 4 floats (4th is SIMD padding), 48 bytes
+    float translate[3];  // xyz, 12 bytes
+    float scale;         // uniform scale, 4 bytes
+};
+static_assert(sizeof(NiTransformPadded) == 0x40, "NiTransformPadded must be 64 bytes");
 
 struct ExtractedTexture {
     uint64_t hash;
@@ -27,8 +46,47 @@ struct ExtractedMesh {
     uint8_t alphaTestRef;           // Alpha reference value (0-255)
 };
 
+// ---------------------------------------------------------------------------
+// ExtractedSkinnedMesh — skinned mesh data extracted from BSTriShape + BSSkin
+// ---------------------------------------------------------------------------
+struct ExtractedSkinnedMesh {
+    // ---- Base mesh data (same fields as ExtractedMesh) ----
+    uint64_t          hash;
+    std::vector<remixapi_HardcodedVertex> vertices;
+    std::vector<uint32_t> indices;
+    uint32_t          vertexCount = 0;
+    uint32_t          indexCount = 0;
+    uint64_t          diffuseTextureHash = 0;
+    uint64_t          normalTextureHash = 0;
+    uint64_t          roughnessTextureHash = 0;
+    bool              alphaTestEnabled = false;
+    int               alphaTestType = 7;
+    uint8_t           alphaTestRef = 128;
+
+    // ---- Skinning data (extracted once) ----
+    std::vector<float>    blendWeights;    // flat: kBonesPerVertex * vertexCount floats
+    std::vector<uint32_t> blendIndices;    // flat: kBonesPerVertex * vertexCount uint32s
+    uint32_t              boneCount = 0;   // number of bones in this skeleton
+
+    // Inverse bind pose transforms -- one per bone, extracted from BSSkin::BoneData.
+    std::vector<NiTransformPadded> inverseBindPoses;  // boneCount entries
+
+    // Live bone node pointers -- read each frame for current world transforms.
+    std::vector<uintptr_t> boneNodePtrs;  // boneCount entries (NiAVObject*)
+
+    // Skeleton root pointer -- used for validity checking.
+    uintptr_t skeletonRootPtr = 0;        // NiNode*
+
+    // Owner reference -- the TESObjectREFR formID that owns this skinned mesh.
+    uint32_t ownerFormID = 0;
+
+    // ---- Per-frame computed bone transforms (updated every frame) ----
+    std::vector<std::array<float, 12>> currentBoneTransforms;  // boneCount entries
+};
+
 struct ExtractionResult {
     std::vector<ExtractedMesh> meshes;
+    std::vector<ExtractedSkinnedMesh> skinnedMeshes;  // Skinned meshes with blend data
     std::vector<ExtractedTexture> textures;  // Unique textures only
     std::vector<ExtractedLight> lights;      // Placed lights from the cell
 };
@@ -60,4 +118,9 @@ namespace SceneExtractor {
 
     // Drop the internal texture cache (call on cell change if desired).
     void ClearTextureCache();
+
+    // Called every frame from the game thread to update bone transforms for all
+    // tracked skinned meshes.  Reads bone world transforms from live game memory
+    // and computes final bone matrices.
+    void UpdateSkinnedBoneTransforms(std::vector<ExtractedSkinnedMesh>& skinnedMeshes);
 }
