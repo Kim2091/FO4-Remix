@@ -360,6 +360,13 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         Diagnostics::EmitPeriodic(frameIndex, gs);
     }
 
+    // Override Remix's RIDEV_NOLEGACY keyboard registration once the overlay
+    // thread has had time to set it up (~1s after init). Internally idempotent:
+    // returns immediately after the first successful RIDEV_REMOVE.
+    if (frameIndex > 60) {
+        RemixAPI::RestoreLegacyKeyboardInput();
+    }
+
     g_ui.presentCallCount++;
 
     // Reset per-frame ClearRTV candidate list for next frame's detection

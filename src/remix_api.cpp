@@ -1,5 +1,6 @@
 #include "remix_api.h"
 
+#include "config.h"
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
 
@@ -116,4 +117,25 @@ remixapi_Interface* RemixAPI::GetInterface() {
 
 bool RemixAPI::IsInitialized() {
     return g_initialized;
+}
+
+void RemixAPI::RestoreLegacyKeyboardInput() {
+    if (!g_config.restoreLegacyInput) return;
+
+    static bool s_done = false;
+    if (s_done) return;
+
+    RAWINPUTDEVICE rid = {};
+    rid.usUsagePage = 0x01;     // Generic Desktop
+    rid.usUsage     = 0x06;     // Keyboard
+    rid.dwFlags     = RIDEV_REMOVE;
+    rid.hwndTarget  = nullptr;  // Required to be NULL when RIDEV_REMOVE is set
+
+    if (RegisterRawInputDevices(&rid, 1, sizeof(RAWINPUTDEVICE))) {
+        _MESSAGE("FO4RemixPlugin: Restored legacy keyboard input (Remix dev-menu hotkeys disabled)");
+        s_done = true;
+    }
+    // If it returns FALSE the registration may not be in place yet; leave
+    // s_done=false so the next call retries. Caller (present hook) is
+    // expected to invoke this on a delayed cadence (~2s) until it sticks.
 }

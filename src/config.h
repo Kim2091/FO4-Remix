@@ -93,6 +93,15 @@ struct PluginConfig {
     // VK_IMAGE_LAYOUT_UNDEFINED). Gating this here keeps the plugin functional
     // for everything else; flip to true once the runtime barrier path is fixed.
     bool hudOverlayEnabled;
+
+    // After Remix's overlay window registers raw input with RIDEV_NOLEGACY on
+    // the keyboard, WM_KEYDOWN/WM_KEYUP stop being delivered to ANY window in
+    // this process -- including the game window. When restoreLegacyInput is
+    // true (default), the plugin issues a RIDEV_REMOVE for keyboard right
+    // after Remix's Startup, restoring legacy keyboard messages to the game.
+    // Trade-off: dev-menu raw-input hotkeys (Alt+X, etc.) stop working. Set
+    // false if you need the dev menu and don't mind losing game keyboard.
+    bool restoreLegacyInput;
 };
 
 // Global config instance
