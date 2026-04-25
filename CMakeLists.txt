@@ -62,6 +62,8 @@ add_library(FO4RemixPlugin SHARED
     src/light_extractor.cpp
     src/fo4_diagnostics.h
     src/fo4_diagnostics.cpp
+    src/startup_diag.h
+    src/startup_diag.cpp
     src/f4se_compat.h
 )
 
@@ -77,6 +79,7 @@ target_link_libraries(FO4RemixPlugin PRIVATE
     d3d11
     dxgi
     shell32
+    psapi
 )
 
 target_compile_definitions(FO4RemixPlugin PRIVATE
