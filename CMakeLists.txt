@@ -17,12 +17,26 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
-# Copy remix_c.h from dxvk-remix-gmod if not present
-set(REMIX_HEADER_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix-gmod/public/include/remix/remix_c.h")
+# Copy remix_c.h from a dxvk-remix source. Prefer the in-source RTX Remix Plus
+# checkout (dxvk-remix/) over the legacy sibling (../dxvk-remix-gmod/). Always
+# refresh the snapshot at configure time so an upstream ABI change picked up
+# via 'git pull' is reflected on the next build without manual cache deletion.
 set(REMIX_HEADER_DST "${CMAKE_CURRENT_SOURCE_DIR}/extern/remix/remix_c.h")
-if(EXISTS "${REMIX_HEADER_SRC}" AND NOT EXISTS "${REMIX_HEADER_DST}")
+set(REMIX_HEADER_SRC "")
+foreach(REMIX_CANDIDATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/dxvk-remix/public/include/remix/remix_c.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix/public/include/remix/remix_c.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix-gmod/public/include/remix/remix_c.h")
+    if(EXISTS "${REMIX_CANDIDATE}")
+        set(REMIX_HEADER_SRC "${REMIX_CANDIDATE}")
+        break()
+    endif()
+endforeach()
+if(REMIX_HEADER_SRC)
     file(COPY "${REMIX_HEADER_SRC}" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/extern/remix/")
-    message(STATUS "Copied remix_c.h from dxvk-remix-gmod")
+    message(STATUS "Refreshed remix_c.h from ${REMIX_HEADER_SRC}")
+else()
+    message(WARNING "remix_c.h source not found; using cached snapshot at ${REMIX_HEADER_DST}")
 endif()
 
 # F4SE minimal sources — only what we need for a plugin
