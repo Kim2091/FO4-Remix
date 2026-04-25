@@ -244,6 +244,7 @@ static std::unordered_map<uint64_t, remixapi_MaterialHandle> CreateCellMaterials
                           mesh.emissiveTextureHash, mesh.emissiveColorR, mesh.emissiveColorG,
                           mesh.emissiveColorB, mesh.emissiveIntensity,
                           mesh.alphaTestEnabled, mesh.alphaTestType, mesh.alphaTestRef };
+        key.useDrawCallAlphaState = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
         auto it = materialKeys.find(key.combined());
         if (it == materialKeys.end()) {
             materialKeys.emplace(key.combined(), key);
@@ -261,6 +262,7 @@ static std::unordered_map<uint64_t, remixapi_MaterialHandle> CreateCellMaterials
                           sm.emissiveTextureHash, sm.emissiveColorR, sm.emissiveColorG,
                           sm.emissiveColorB, sm.emissiveIntensity,
                           sm.alphaTestEnabled, sm.alphaTestType, sm.alphaTestRef };
+        key.useDrawCallAlphaState = sm.alphaTestEnabled || sm.alphaBlendEnabled;
         auto it = materialKeys.find(key.combined());
         if (it == materialKeys.end()) {
             materialKeys.emplace(key.combined(), key);
@@ -418,6 +420,7 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
                                     mesh.emissiveTextureHash, mesh.emissiveColorR, mesh.emissiveColorG,
                                     mesh.emissiveColorB, mesh.emissiveIntensity,
                                     mesh.alphaTestEnabled, mesh.alphaTestType, mesh.alphaTestRef };
+            lookupKey.useDrawCallAlphaState = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
             uint64_t combinedHash = lookupKey.combined();
             auto it = cellData.materials.find(combinedHash);
             if (it != cellData.materials.end())
@@ -469,6 +472,7 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
                                     sm.emissiveTextureHash, sm.emissiveColorR, sm.emissiveColorG,
                                     sm.emissiveColorB, sm.emissiveIntensity,
                                     sm.alphaTestEnabled, sm.alphaTestType, sm.alphaTestRef };
+            lookupKey.useDrawCallAlphaState = sm.alphaTestEnabled || sm.alphaBlendEnabled;
             uint64_t combinedHash = lookupKey.combined();
             auto it = cellData.materials.find(combinedHash);
             if (it != cellData.materials.end())
