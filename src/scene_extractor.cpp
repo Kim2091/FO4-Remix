@@ -1075,6 +1075,34 @@ static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
             mesh.alphaTestType = niToVk[niTestFunc];
             mesh.alphaTestRef = alphaProp->alphaThreshold;
         }
+
+        // Alpha blend (bit 0 = enabled, bits 1-4 = src factor, bits 5-8 = dst factor).
+        // Bethesda AlphaFunction -> VkBlendFactor mapping. VkBlendFactor enum
+        // values are ABI-stable per Vulkan spec; the cast happens on the Remix
+        // side. Out-of-range NI indices (>10) fall back to opaque (1, 0).
+        static const uint32_t niBlendToVk[] = {
+            1,   //  0 kOne          -> VK_BLEND_FACTOR_ONE
+            0,   //  1 kZero         -> VK_BLEND_FACTOR_ZERO
+            2,   //  2 kSrcColor     -> VK_BLEND_FACTOR_SRC_COLOR
+            3,   //  3 kInvSrcColor  -> VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR
+            4,   //  4 kDestColor    -> VK_BLEND_FACTOR_DST_COLOR
+            5,   //  5 kInvDestColor -> VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR
+            6,   //  6 kSrcAlpha     -> VK_BLEND_FACTOR_SRC_ALPHA
+            7,   //  7 kInvSrcAlpha  -> VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+            8,   //  8 kDestAlpha    -> VK_BLEND_FACTOR_DST_ALPHA
+            9,   //  9 kInvDestAlpha -> VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA
+            14,  // 10 kSrcAlphaSat  -> VK_BLEND_FACTOR_SRC_ALPHA_SATURATE
+        };
+        const bool blendEnabled = alphaProp->alphaFlags & 1;
+        if (blendEnabled) {
+            const int niSrc = (alphaProp->alphaFlags >> 1) & 0xF;
+            const int niDst = (alphaProp->alphaFlags >> 5) & 0xF;
+            const uint32_t vkSrc = (niSrc < 11) ? niBlendToVk[niSrc] : 1;
+            const uint32_t vkDst = (niDst < 11) ? niBlendToVk[niDst] : 0;
+            mesh.alphaBlendEnabled    = true;
+            mesh.srcColorBlendFactor  = vkSrc;
+            mesh.dstColorBlendFactor  = vkDst;
+        }
     }
 
     out.push_back(std::move(mesh));
