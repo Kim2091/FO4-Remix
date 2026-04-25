@@ -920,8 +920,15 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         api->DrawInstance(&instance);
     }
 
-    // Submit screen overlay (game UI/HUD captured from DX11 backbuffer)
-    if (overlay.valid && !overlay.pixels.empty() && api->DrawScreenOverlay) {
+    // Submit screen overlay (game UI/HUD captured from DX11 backbuffer).
+    // Gated on g_config.hudOverlayEnabled (default false) because the in-source
+    // dxvk-remix's dispatchScreenOverlay currently asserts inside dxvk_barrier
+    // (dstLayout == VK_IMAGE_LAYOUT_UNDEFINED) the moment a HUD frame is staged.
+    // Flip the [Overlay] HudOverlayEnabled INI key to true once the runtime
+    // barrier path is fixed.
+    if (g_config.hudOverlayEnabled
+        && overlay.valid && !overlay.pixels.empty()
+        && api->DrawScreenOverlay) {
         remixapi_Format fmt = DxgiToRemixFormat(static_cast<DXGI_FORMAT>(overlay.dxgiFormat));
         if (fmt != static_cast<remixapi_Format>(0)) {
             api->DrawScreenOverlay(overlay.pixels.data(), overlay.width, overlay.height, fmt, 1.0f);

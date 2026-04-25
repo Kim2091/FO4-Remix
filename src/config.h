@@ -85,6 +85,14 @@ struct PluginConfig {
 
     // [Diagnostics]
     bool diagEnabled;          // Master toggle for periodic diagnostic logging (default true)
+
+    // [Overlay]
+    // HUD/Scaleform overlay submission via Remix's DrawScreenOverlay API.
+    // Default OFF: the in-source dxvk-remix's dispatchScreenOverlay currently
+    // asserts in dxvk_barrier.cpp on a Vulkan layout transition (dstLayout ==
+    // VK_IMAGE_LAYOUT_UNDEFINED). Gating this here keeps the plugin functional
+    // for everything else; flip to true once the runtime barrier path is fixed.
+    bool hudOverlayEnabled;
 };
 
 // Global config instance
