@@ -71,6 +71,13 @@ struct TextureRef {
 };
 static std::unordered_map<uint64_t, TextureRef> g_textureHandles;
 
+// Per-hash Remix InstanceInfoBlendEXT, populated at LoadCellScene time for
+// meshes that have any alpha state (test or blend). OnFrame's DrawInstance
+// loop chains the stored struct onto instance.pNext so Remix honors per-
+// instance alpha state. Keyed by the mesh's `hash` field (NOT MaterialKey
+// hash) -- per-instance, not per-material.
+static std::unordered_map<uint64_t, remixapi_InstanceInfoBlendEXT> g_geometryAlphaState;
+
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
 static remixapi_MeshHandle g_fallbackMesh = nullptr;
 
@@ -448,6 +455,33 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
             continue;
         }
 
+        // Per-instance alpha state for this mesh. If the mesh has neither
+        // test nor blend, erase any prior entry (could happen if a mesh
+        // re-uploaded with different state). Otherwise write the EXT.
+        if (mesh.alphaTestEnabled || mesh.alphaBlendEnabled) {
+            remixapi_InstanceInfoBlendEXT blend = {};
+            blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+            blend.pNext = nullptr;
+            blend.alphaTestEnabled         = mesh.alphaTestEnabled ? 1 : 0;
+            blend.alphaTestReferenceValue  = mesh.alphaTestRef;
+            blend.alphaTestCompareOp       = (uint32_t)mesh.alphaTestType;
+            blend.alphaBlendEnabled        = mesh.alphaBlendEnabled ? 1 : 0;
+            blend.srcColorBlendFactor      = mesh.srcColorBlendFactor;
+            blend.dstColorBlendFactor      = mesh.dstColorBlendFactor;
+            blend.colorBlendOp             = 0;  // VK_BLEND_OP_ADD
+            blend.srcAlphaBlendFactor      = mesh.srcColorBlendFactor;
+            blend.dstAlphaBlendFactor      = mesh.dstColorBlendFactor;
+            blend.alphaBlendOp             = 0;  // VK_BLEND_OP_ADD
+            blend.writeMask                = 0xF;  // RGBA
+            blend.isVertexColorBakedLighting = 0;
+            // Remaining textureColorArg* and tFactor* fields stay zero --
+            // those are fixed-function emulation paths the Remix fork
+            // ignores when alphaBlend/alphaTest are the active inputs.
+            g_geometryAlphaState[mesh.hash] = blend;
+        } else {
+            g_geometryAlphaState.erase(mesh.hash);
+        }
+
         SceneMeshInstance inst;
         inst.handle = handle;
         memcpy(&inst.transform.matrix, mesh.worldTransform, sizeof(mesh.worldTransform));
@@ -508,6 +542,28 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
                      cellFormID, (unsigned long long)sm.hash, (int)status);
             skinnedFailed++;
             continue;
+        }
+
+        // Per-instance alpha state for this skinned mesh.
+        if (sm.alphaTestEnabled || sm.alphaBlendEnabled) {
+            remixapi_InstanceInfoBlendEXT blend = {};
+            blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+            blend.pNext = nullptr;
+            blend.alphaTestEnabled         = sm.alphaTestEnabled ? 1 : 0;
+            blend.alphaTestReferenceValue  = sm.alphaTestRef;
+            blend.alphaTestCompareOp       = (uint32_t)sm.alphaTestType;
+            blend.alphaBlendEnabled        = sm.alphaBlendEnabled ? 1 : 0;
+            blend.srcColorBlendFactor      = sm.srcColorBlendFactor;
+            blend.dstColorBlendFactor      = sm.dstColorBlendFactor;
+            blend.colorBlendOp             = 0;  // VK_BLEND_OP_ADD
+            blend.srcAlphaBlendFactor      = sm.srcColorBlendFactor;
+            blend.dstAlphaBlendFactor      = sm.dstColorBlendFactor;
+            blend.alphaBlendOp             = 0;  // VK_BLEND_OP_ADD
+            blend.writeMask                = 0xF;  // RGBA
+            blend.isVertexColorBakedLighting = 0;
+            g_geometryAlphaState[sm.hash] = blend;
+        } else {
+            g_geometryAlphaState.erase(sm.hash);
         }
 
         SkinnedMeshInstance inst;

@@ -44,6 +44,8 @@ struct ExtractedSkinnedMesh {
     int               alphaTestType = 7;
     uint8_t           alphaTestRef = 128;
     bool              alphaBlendEnabled = false;  // mirrors ExtractedMesh field
+    uint32_t          srcColorBlendFactor = 1;    // VK_BLEND_FACTOR_ONE
+    uint32_t          dstColorBlendFactor = 0;    // VK_BLEND_FACTOR_ZERO
 
     // ---- Skinning data (extracted once) ----
     std::vector<float>    blendWeights;    // flat: kBonesPerVertex * vertexCount floats
