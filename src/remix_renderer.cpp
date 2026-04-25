@@ -196,6 +196,7 @@ struct MaterialKey {
     bool alphaTestEnabled;
     int alphaTestType;       // Remix/VkCompareOp
     uint8_t alphaTestRef;
+    bool useDrawCallAlphaState = false;  // true -> opaqueExt.useDrawCallAlphaState=1
     uint64_t combined() const {
         uint64_t h = diffuse;
         h ^= normal    * 0x517CC1B727220A95ULL;
@@ -211,6 +212,12 @@ struct MaterialKey {
         h ^= (uint64_t)gi * 0xC2B2AE3D27D4EB4FULL;
         h ^= (uint64_t)bi * 0x165667B19E3779F9ULL;
         h ^= (uint64_t)ii * 0x27D4EB2F165667C5ULL;
+        // Distinguish materials that defer alpha to per-instance state.
+        // Different value here means a different material in cache, which
+        // is what we want -- otherwise a per-instance alpha-blend mesh
+        // would share its material with an opaque variant and the Remix
+        // fork would honor only one of the two states.
+        h ^= (uint64_t)(useDrawCallAlphaState ? 1 : 0) * 0x9FB21C651E98DF25ULL;
         return h;
     }
 };
