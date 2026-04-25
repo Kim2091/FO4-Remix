@@ -60,6 +60,8 @@ add_library(FO4RemixPlugin SHARED
     src/skinning.cpp
     src/light_extractor.h
     src/light_extractor.cpp
+    src/fo4_diagnostics.h
+    src/fo4_diagnostics.cpp
     src/f4se_compat.h
 )
 
