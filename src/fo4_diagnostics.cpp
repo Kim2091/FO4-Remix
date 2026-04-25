@@ -1,5 +1,6 @@
 #include "fo4_diagnostics.h"
 #include "scene_extractor.h"
+#include "config.h"
 
 #include "f4se/PluginAPI.h"  // _MESSAGE
 
@@ -74,6 +75,7 @@ GameStateSnapshot SnapshotGameState() {
 }
 
 void EmitPeriodic(uint64_t frameIndex, const GameStateSnapshot& gs) {
+    if (!g_config.diagEnabled) return;
     // [GameState] -- tells the log reader what frame the summary applies to,
     // which cell, and whether the player is in-game vs. paused at a menu.
     _MESSAGE("FO4RemixPlugin: [GameState] frame=%llu cellID=0x%08X interior=%d anyMenu=%d playerPos=(%.1f,%.1f,%.1f)",

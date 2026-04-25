@@ -60,6 +60,10 @@ void LoadConfig() {
     g_config.emissiveIntensity       = GetIniFloat("Emissive", "Intensity", 1.0f, dllPath);
     g_config.logEmissive             = GetIniBool("Emissive", "LogEmissive", false, dllPath);
 
+    // [Diagnostics]
+    g_config.diagEnabled = GetIniBool("Diagnostics", "Enabled", true, dllPath);
+    _MESSAGE("FO4RemixPlugin: Diagnostics - Enabled=%d", g_config.diagEnabled);
+
     _MESSAGE("FO4RemixPlugin: Config loaded - LogShapeInfo=%d LogLargeShapes=%d LogRejections=%d "
              "LogTextures=%d LogLights=%d MaxExtent=%.0f",
              g_config.logShapeInfo, g_config.logLargeShapes, g_config.logRejections,

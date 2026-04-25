@@ -82,6 +82,9 @@ struct PluginConfig {
     bool  emissiveColorEnabled;     // Use emissive color/scale from BSLightingShaderProperty
     float emissiveIntensity;        // Global multiplier on FO4's fEmitColorScale
     bool  logEmissive;              // Log emissive extraction details
+
+    // [Diagnostics]
+    bool diagEnabled;          // Master toggle for periodic diagnostic logging (default true)
 };
 
 // Global config instance
