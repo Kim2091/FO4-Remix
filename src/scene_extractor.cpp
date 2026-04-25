@@ -64,6 +64,7 @@ static RelocPtr<uintptr_t> s_g_dataHandler(0x030DC000);
 
 static constexpr uintptr_t OFF_FORM_ID          = 0x14;
 static constexpr uintptr_t OFF_REFR_PARENT_CELL = 0xB8;
+static constexpr uintptr_t OFF_REFR_POS         = 0xD0;  // NiPoint3 (3 floats)
 static constexpr uintptr_t OFF_REFR_LOADED_DATA = 0xF0;
 static constexpr uintptr_t OFF_LOADED_ROOT_NODE = 0x08;
 static constexpr uintptr_t OFF_CELL_OBJECT_LIST = 0x70;
@@ -1173,6 +1174,21 @@ uintptr_t SceneExtractor::GetPlayerCellPtr()
     if (!ppPlayer || !*ppPlayer) return 0;
     uintptr_t player = *ppPlayer;
     return *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
+}
+
+// ---------------------------------------------------------------------------
+// Read the player's world position. Outputs unchanged (remain 0) if the
+// player singleton is absent (e.g. main menu).
+// ---------------------------------------------------------------------------
+void SceneExtractor::GetPlayerPosition(float& outX, float& outY, float& outZ)
+{
+    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
+    if (!ppPlayer || !*ppPlayer) return;
+    uintptr_t player = *ppPlayer;
+    const float* pos = reinterpret_cast<const float*>(player + OFF_REFR_POS);
+    outX = pos[0];
+    outY = pos[1];
+    outZ = pos[2];
 }
 
 // ---------------------------------------------------------------------------

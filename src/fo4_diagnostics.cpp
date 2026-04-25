@@ -1,9 +1,7 @@
 #include "fo4_diagnostics.h"
+#include "scene_extractor.h"
 
 #include "f4se/PluginAPI.h"  // _MESSAGE
-// FO4 game-singleton headers needed for SnapshotGameState. Adapt the include
-// paths to whatever scene_extractor.cpp uses for PlayerCharacter / TES.
-// Placeholder includes; refine when wiring SnapshotGameState in B3.
 
 #include <atomic>
 #include <cstdint>
@@ -58,11 +56,21 @@ void OnCellUnloaded(uint32_t cellID) {
     _MESSAGE("FO4RemixPlugin: [Diag] CellUnloaded id=0x%08X", cellID);
 }
 
-// SnapshotGameState + EmitPeriodic land in B3 + B4. Stubs so the file
-// links after this commit:
-
 GameStateSnapshot SnapshotGameState() {
-    return GameStateSnapshot{};
+    GameStateSnapshot ctx{};
+
+    // Cell identity — formID and interior flag.
+    uintptr_t cellPtr = SceneExtractor::GetPlayerCellPtr();
+    if (cellPtr) {
+        ctx.cellFormID  = *reinterpret_cast<const uint32_t*>(cellPtr + 0x14);  // TESForm::formID
+        ctx.cellInterior = (*reinterpret_cast<const uint32_t*>(cellPtr + 0x40)) & 1;  // flags bit 0
+    }
+
+    // Player world position (TESObjectREFR::pos at +0xD0).
+    SceneExtractor::GetPlayerPosition(ctx.playerX, ctx.playerY, ctx.playerZ);
+
+    // cellName and anyMenuOpen deferred (require deeper singleton access).
+    return ctx;
 }
 
 void EmitPeriodic(uint64_t frameIndex, const GameStateSnapshot& /*gs*/) {

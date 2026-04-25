@@ -83,6 +83,10 @@ namespace SceneExtractor {
     // Cheap enough to call every frame for cell-change detection.
     uintptr_t GetPlayerCellPtr();
 
+    // Reads the player's world position (TESObjectREFR::pos at +0xD0).
+    // Outputs are left unchanged (default 0) when player is unavailable.
+    void GetPlayerPosition(float& outX, float& outY, float& outZ);
+
     // Lightweight check: player exists, parentCell loaded, cell has objects,
     // and player's 3D root node is present.  Cheap enough to call every frame.
     bool IsPlayerCellReady();
