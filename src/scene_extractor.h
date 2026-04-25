@@ -33,6 +33,15 @@ struct ExtractedMesh {
     bool alphaTestEnabled;          // true if NiAlphaProperty has alpha test
     int alphaTestType;              // Remix/VkCompareOp value (7 = Always = no test)
     uint8_t alphaTestRef;           // Alpha reference value (0-255)
+
+    // Alpha blend state (NiAlphaProperty bits 0, 1-4, 5-8 -> VkBlendFactor).
+    // When alphaBlendEnabled is true, Remix applies per-instance blend via
+    // InstanceInfoBlendEXT chained at DrawInstance time. Material flips
+    // opaqueExt.useDrawCallAlphaState=1 so the instance state wins over
+    // the material-level alpha test defaults.
+    bool     alphaBlendEnabled = false;
+    uint32_t srcColorBlendFactor = 1;  // VK_BLEND_FACTOR_ONE
+    uint32_t dstColorBlendFactor = 0;  // VK_BLEND_FACTOR_ZERO
 };
 
 struct ExtractionResult {
