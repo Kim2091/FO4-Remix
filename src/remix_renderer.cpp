@@ -51,6 +51,7 @@ static std::wstring HashToPath(uint64_t hash) {
 struct SceneMeshInstance {
     remixapi_MeshHandle handle;
     remixapi_Transform  transform;
+    uint64_t            meshHash = 0;  // NEW: index into g_geometryAlphaState
 };
 
 struct CellSceneData {
@@ -485,6 +486,7 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         SceneMeshInstance inst;
         inst.handle = handle;
         memcpy(&inst.transform.matrix, mesh.worldTransform, sizeof(mesh.worldTransform));
+        inst.meshHash = mesh.hash;
 
         cellData.meshes.push_back(inst);
         meshCreated++;
@@ -717,6 +719,19 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             instance.transform = inst.transform;
             instance.doubleSided = 1;
             instance.categoryFlags = 0;
+
+            // Chain per-instance alpha state if this mesh has any. Local
+            // copy of the EXT so we can clear pNext for safety (the cached
+            // entry's pNext is undefined) and so the address remains valid
+            // through DrawInstance.
+            remixapi_InstanceInfoBlendEXT blendLocal = {};
+            auto alphaIt = g_geometryAlphaState.find(inst.meshHash);
+            if (alphaIt != g_geometryAlphaState.end()) {
+                blendLocal = alphaIt->second;
+                blendLocal.pNext = nullptr;
+                instance.pNext = &blendLocal;
+            }
+
             api->DrawInstance(&instance);
             hasAnyMeshes = true;
         }
@@ -823,6 +838,16 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             instance.transform = identityXform;
             instance.doubleSided = 1;
             instance.categoryFlags = 0;
+
+            // Extend pNext chain with per-instance alpha state if any.
+            remixapi_InstanceInfoBlendEXT skinnedBlendLocal = {};
+            auto skinnedAlphaIt = g_geometryAlphaState.find(inst.meshHash);
+            if (skinnedAlphaIt != g_geometryAlphaState.end()) {
+                skinnedBlendLocal = skinnedAlphaIt->second;
+                skinnedBlendLocal.pNext = nullptr;
+                // Append after boneExt by setting its pNext.
+                boneExt.pNext = &skinnedBlendLocal;
+            }
 
             remixapi_ErrorCode err = api->DrawInstance(&instance);
             if (err == REMIXAPI_ERROR_CODE_SUCCESS) {
