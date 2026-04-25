@@ -354,6 +354,12 @@ static void RemixThreadFunc() {
 }
 
 static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
+    const uint64_t frameIndex = Diagnostics::Tick();
+    if (Diagnostics::ShouldEmitPeriodic(frameIndex)) {
+        const auto gs = Diagnostics::SnapshotGameState();
+        Diagnostics::EmitPeriodic(frameIndex, gs);
+    }
+
     g_ui.presentCallCount++;
 
     // Reset per-frame ClearRTV candidate list for next frame's detection
