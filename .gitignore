@@ -10,3 +10,6 @@ build/
 # OS
 Thumbs.db
 Desktop.ini
+
+# Superpowers worktrees
+.worktrees/
