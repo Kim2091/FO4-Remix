@@ -1,5 +1,6 @@
 #include "present_hook.h"
 #include "config.h"
+#include "fo4_diagnostics.h"
 #include "remix_api.h"
 #include "remix_renderer.h"
 #include "camera.h"
@@ -290,6 +291,7 @@ static void RemixThreadFunc() {
             for (uint32_t cellID : unloads) {
                 _MESSAGE("FO4RemixPlugin: Remix thread unloading cell 0x%08X", cellID);
                 RemixRenderer::UnloadCell(cellID);
+                Diagnostics::OnCellUnloaded(cellID);
             }
 
             // Load new/refreshed cell scenes
@@ -298,7 +300,12 @@ static void RemixThreadFunc() {
                     _MESSAGE("FO4RemixPlugin: Remix thread loading cell 0x%08X (%zu meshes, %zu skinned, %zu textures, %zu lights)",
                              cell.cellFormID, cell.data.meshes.size(), cell.data.skinnedMeshes.size(),
                              cell.data.textures.size(), cell.data.lights.size());
+                    const size_t meshCount    = cell.data.meshes.size();
+                    const size_t skinnedCount = cell.data.skinnedMeshes.size();
+                    const size_t textureCount = cell.data.textures.size();
+                    const size_t lightCount   = cell.data.lights.size();
                     RemixRenderer::LoadCellScene(cell.cellFormID, std::move(cell.data));
+                    Diagnostics::OnCellLoaded(cell.cellFormID, meshCount, skinnedCount, textureCount, lightCount);
                 }
             }
         }
