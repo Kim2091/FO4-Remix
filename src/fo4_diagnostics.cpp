@@ -73,8 +73,18 @@ GameStateSnapshot SnapshotGameState() {
     return ctx;
 }
 
-void EmitPeriodic(uint64_t frameIndex, const GameStateSnapshot& /*gs*/) {
-    _MESSAGE("FO4RemixPlugin: [Diag] periodic frame=%llu cellsLoaded=%llu cellsUnloaded=%llu meshes=%llu skinned=%llu textures=%llu lights=%llu",
+void EmitPeriodic(uint64_t frameIndex, const GameStateSnapshot& gs) {
+    // [GameState] -- tells the log reader what frame the summary applies to,
+    // which cell, and whether the player is in-game vs. paused at a menu.
+    _MESSAGE("FO4RemixPlugin: [GameState] frame=%llu cellID=0x%08X interior=%d anyMenu=%d playerPos=(%.1f,%.1f,%.1f)",
+             (unsigned long long)frameIndex,
+             gs.cellFormID,
+             gs.cellInterior ? 1 : 0,
+             gs.anyMenuOpen ? 1 : 0,
+             gs.playerX, gs.playerY, gs.playerZ);
+
+    // [Plugin] -- cumulative counters + cell-load activity.
+    _MESSAGE("FO4RemixPlugin: [Plugin] frame=%llu cellsLoaded=%llu cellsUnloaded=%llu meshesExtracted=%llu skinnedMeshes=%llu textures=%llu lights=%llu",
              (unsigned long long)frameIndex,
              (unsigned long long)g_cumCellsLoaded.load(std::memory_order_relaxed),
              (unsigned long long)g_cumCellsUnloaded.load(std::memory_order_relaxed),
