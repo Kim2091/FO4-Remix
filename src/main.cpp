@@ -5,6 +5,7 @@
 #include "present_hook.h"
 #include "remix_api.h"
 #include "remix_renderer.h"
+#include "startup_diag.h"
 
 #include <cstring>
 #include <atomic>
@@ -79,6 +80,7 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se) {
              f4se->f4seVersion, f4se->runtimeVersion);
 
     LoadConfig();
+    StartupDiag::DumpEnvironment();
 
     g_messaging = static_cast<F4SEMessagingInterface*>(
         f4se->QueryInterface(kInterface_Messaging));
