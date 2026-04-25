@@ -291,6 +291,11 @@ static std::unordered_map<uint64_t, remixapi_MaterialHandle> CreateCellMaterials
         opaqueExt.metallicConstant  = 0.0f;
         opaqueExt.alphaTestType     = key.alphaTestEnabled ? key.alphaTestType : 7;
         opaqueExt.alphaReferenceValue = key.alphaTestEnabled ? key.alphaTestRef : 0;
+        // Tell Remix to honor per-instance alpha state via InstanceInfoBlendEXT
+        // chained at DrawInstance time. Set when the mesh has either alpha-test
+        // or alpha-blend enabled; otherwise the material's own alpha defaults
+        // (above) win.
+        opaqueExt.useDrawCallAlphaState = key.useDrawCallAlphaState ? 1 : 0;
 
         remixapi_MaterialInfo matInfo = {};
         matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
