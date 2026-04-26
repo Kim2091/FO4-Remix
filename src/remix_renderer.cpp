@@ -1243,6 +1243,68 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         }
     }
 
+    // ------------------------------------------------------------------
+    // LRU sweeps. Run every cullingTextureLRUSweepPeriod frames.
+    //
+    //   (1) Material sweep -- the LEVER: materials hold Rc<DxvkImageView>
+    //       refs to textures, so cascade-evicting stale materials is what
+    //       actually drops texture VRAM for shared sets. Gated by budget;
+    //       below budget, no eviction (TTL-only mode skips this gate).
+    //
+    //   (2) Texture sweep -- the BACKSTOP: catches textures whose cache
+    //       entry survives their material. Cheap; runs on the same cadence.
+    // ------------------------------------------------------------------
+    static uint32_t s_texLRUSweepCounter = 0;
+    if (g_config.cullingTextureLRUSweepPeriod > 0) {
+        ++s_texLRUSweepCounter;
+        if (s_texLRUSweepCounter >= g_config.cullingTextureLRUSweepPeriod) {
+            s_texLRUSweepCounter = 0;
+            const uint64_t currentFrameIndex = Diagnostics::CurrentFrameIndex();
+
+            uint64_t currentMaterialTexBytes = 0;
+            VramStats vramStats{};
+            if (RemixRenderer::GetVramStats(&vramStats)) {
+                currentMaterialTexBytes = vramStats.usedMaterialTextureBytes;
+            }
+            const uint64_t budgetBytes = static_cast<uint64_t>(g_config.cullingTextureBudgetMiB) << 20;
+
+            if (g_config.cullingMaterialLRUGraceFrames > 0) {
+                auto matResult = RemixRenderer::SweepStaleMaterials(
+                    currentFrameIndex,
+                    g_config.cullingMaterialLRUGraceFrames,
+                    budgetBytes,
+                    currentMaterialTexBytes);
+                _MESSAGE("FO4RemixPlugin: [LRU] Material sweep: %u/%u stale, %u cells evicted",
+                         matResult.staleMaterialCount,
+                         matResult.materialCacheCount,
+                         matResult.cellsEvicted);
+            }
+
+            // Re-query VRAM after the material sweep so the texture sweep's
+            // budget gate sees the freed bytes.
+            if (g_config.cullingTextureBudgetMiB > 0) {
+                VramStats vramStatsAfter{};
+                if (RemixRenderer::GetVramStats(&vramStatsAfter)) {
+                    currentMaterialTexBytes = vramStatsAfter.usedMaterialTextureBytes;
+                }
+            }
+
+            if (g_config.cullingTextureLRUGraceFrames > 0) {
+                auto texResult = RemixRenderer::SweepStaleTextures(
+                    currentFrameIndex,
+                    g_config.cullingTextureLRUGraceFrames,
+                    budgetBytes,
+                    currentMaterialTexBytes);
+                _MESSAGE("FO4RemixPlugin: [LRU] Texture sweep: %u/%u stale, %u cells evicted, %u budget, %u orphans",
+                         texResult.staleTextureCount,
+                         texResult.textureHandleCount,
+                         texResult.cellsEvicted,
+                         texResult.budgetEvictions,
+                         texResult.orphanTexturesDestroyed);
+            }
+        }
+    }
+
     // Present
     remixapi_PresentInfo presentInfo = {};
     presentInfo.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
