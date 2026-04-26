@@ -796,6 +796,24 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
             api->DrawInstance(&instance);
             hasAnyMeshes = true;
+
+            // Stamp lastDrawnFrame on the textures + material this mesh just
+            // drew. Read by SweepStaleMaterials / SweepStaleTextures to
+            // distinguish live entries (some owner drew them recently) from
+            // stale entries (no owner drew them in ttlFrames).
+            const uint64_t now = Diagnostics::CurrentFrameIndex();
+            for (uint64_t texHash : inst.textureHashes) {
+                auto texIt = g_textureHandles.find(texHash);
+                if (texIt != g_textureHandles.end()) {
+                    texIt->second.lastDrawnFrame = now;
+                }
+            }
+            if (inst.materialHash != 0) {
+                auto matIt = g_materialCache.find(inst.materialHash);
+                if (matIt != g_materialCache.end()) {
+                    matIt->second.lastDrawnFrame = now;
+                }
+            }
         }
 
         // Draw skinned mesh instances with real per-frame bone transforms.
@@ -914,6 +932,20 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             remixapi_ErrorCode err = api->DrawInstance(&instance);
             if (err == REMIXAPI_ERROR_CODE_SUCCESS) {
                 hasAnyMeshes = true;
+
+                const uint64_t skinnedNow = Diagnostics::CurrentFrameIndex();
+                for (uint64_t texHash : inst.textureHashes) {
+                    auto texIt = g_textureHandles.find(texHash);
+                    if (texIt != g_textureHandles.end()) {
+                        texIt->second.lastDrawnFrame = skinnedNow;
+                    }
+                }
+                if (inst.materialHash != 0) {
+                    auto matIt = g_materialCache.find(inst.materialHash);
+                    if (matIt != g_materialCache.end()) {
+                        matIt->second.lastDrawnFrame = skinnedNow;
+                    }
+                }
             }
         }
 
