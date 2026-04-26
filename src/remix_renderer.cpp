@@ -241,6 +241,116 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
 }
 
 // ---------------------------------------------------------------------------
+// SweepStaleTextures -- the BACKSTOP for the material sweep.
+//
+// Catches textures whose cache entry survives their owning materials (e.g.
+// after the material sweep cascades a cell, refcount drops handle the
+// common case, but a defensive orphan pass below mops up anything left).
+//
+// Two-pass eviction logic:
+//   (1) TTL pass -- collect textures un-drawn in ttlFrames.
+//   (2) Budget pass -- if currentMaterialTex is over budgetBytes, add the
+//       oldest non-stale textures (with min-age guardrail and per-sweep
+//       cap) to the eviction set.
+// Then cell-granular eviction (any cell with a mesh referencing a stale
+// texture is unloaded), then defensive orphan-handle destruction.
+// ---------------------------------------------------------------------------
+RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
+        uint64_t currentFrameIndex,
+        uint64_t ttlFrames,
+        uint64_t budgetBytes,
+        uint64_t currentMaterialTexBytes) {
+    StaleTextureSweepResult result{};
+    result.textureHandleCount = static_cast<uint32_t>(g_textureHandles.size());
+
+    // Pass 1: TTL.
+    std::unordered_set<uint64_t> staleTextures;
+    staleTextures.reserve(g_textureHandles.size() / 4 + 8);
+    for (const auto& [hash, tex] : g_textureHandles) {
+        const uint64_t age = (currentFrameIndex > tex.lastDrawnFrame)
+            ? (currentFrameIndex - tex.lastDrawnFrame) : 0;
+        if (age > ttlFrames) {
+            staleTextures.insert(hash);
+        }
+    }
+    result.staleTextureCount = static_cast<uint32_t>(staleTextures.size());
+
+    // Pass 2: budget overlay. Skyrim's guardrails: min-age 120 frames (~2s
+    // @ 60fps so we don't evict things drawn this second), per-sweep cap 32
+    // so a single sweep can't catastrophically drop everything.
+    if (budgetBytes > 0 && currentMaterialTexBytes > budgetBytes) {
+        constexpr uint64_t kBudgetMinAgeFrames        = 120;
+        constexpr uint32_t kBudgetMaxEvictionsPerSweep = 32;
+
+        std::vector<std::pair<uint64_t, uint64_t>> byAge;  // (age, hash)
+        byAge.reserve(g_textureHandles.size());
+        for (const auto& [hash, tex] : g_textureHandles) {
+            if (staleTextures.count(hash)) continue;
+            const uint64_t age = (currentFrameIndex > tex.lastDrawnFrame)
+                ? (currentFrameIndex - tex.lastDrawnFrame) : 0;
+            if (age < kBudgetMinAgeFrames) continue;
+            byAge.emplace_back(age, hash);
+        }
+        std::sort(byAge.begin(), byAge.end(),
+                  [](const auto& a, const auto& b) { return a.first > b.first; });
+
+        const uint64_t toAdd = (std::min<uint64_t>)(kBudgetMaxEvictionsPerSweep, byAge.size());
+        for (uint64_t i = 0; i < toAdd; ++i) {
+            staleTextures.insert(byAge[i].second);
+            ++result.budgetEvictions;
+        }
+    }
+
+    if (staleTextures.empty()) {
+        return result;
+    }
+
+    // Pass 3: cell-granular eviction.
+    std::unordered_set<uint32_t> cellsToUnload;
+    for (const auto& [cellID, cellData] : g_cellScenes) {
+        bool cellTouchesStale = false;
+        for (const auto& inst : cellData.meshes) {
+            for (uint64_t texHash : inst.textureHashes) {
+                if (staleTextures.count(texHash)) { cellTouchesStale = true; break; }
+            }
+            if (cellTouchesStale) break;
+        }
+        if (!cellTouchesStale) {
+            for (const auto& inst : cellData.skinnedMeshInstances) {
+                for (uint64_t texHash : inst.textureHashes) {
+                    if (staleTextures.count(texHash)) { cellTouchesStale = true; break; }
+                }
+                if (cellTouchesStale) break;
+            }
+        }
+        if (cellTouchesStale) cellsToUnload.insert(cellID);
+    }
+    for (uint32_t cellID : cellsToUnload) {
+        UnloadCell(cellID);
+    }
+    result.cellsEvicted = static_cast<uint32_t>(cellsToUnload.size());
+
+    // Orphan cleanup: textures the cell-unload didn't already release. With
+    // the global texture refcount, an entry only survives here if some cell
+    // we did NOT unload still references it -- but defensive sweep doesn't
+    // hurt, and budget-pass entries that never had a cell owner go through
+    // here.
+    remixapi_Interface* api = RemixAPI::GetInterface();
+    if (api) {
+        for (uint64_t texHash : staleTextures) {
+            auto texIt = g_textureHandles.find(texHash);
+            if (texIt != g_textureHandles.end() && texIt->second.refCount == 0) {
+                if (texIt->second.handle) api->DestroyTexture(texIt->second.handle);
+                g_textureHandles.erase(texIt);
+                ++result.orphanTexturesDestroyed;
+            }
+        }
+    }
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Unload all Remix handles for a specific cell
 // ---------------------------------------------------------------------------
 void RemixRenderer::UnloadCell(uint32_t cellFormID) {
