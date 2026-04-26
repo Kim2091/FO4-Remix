@@ -137,6 +137,34 @@ bool RemixRenderer::Init() {
 }
 
 // ---------------------------------------------------------------------------
+// VRAM telemetry. Returns false if the Remix runtime doesn't expose
+// GetVramStats (older headers / missing entry point); callers that gate
+// on a VRAM budget should degrade to TTL-only mode in that case.
+// ---------------------------------------------------------------------------
+bool RemixRenderer::GetVramStats(VramStats* out) {
+    if (!out) return false;
+    *out = {};
+    remixapi_Interface* api = RemixAPI::GetInterface();
+    if (!api || !api->GetVramStats) return false;
+
+    remixapi_VramStats s = {};
+    if (api->GetVramStats(&s) != REMIXAPI_ERROR_CODE_SUCCESS) return false;
+    out->totalAllocatedBytes               = s.totalAllocatedBytes;
+    out->totalUsedBytes                    = s.totalUsedBytes;
+    out->poolRetainedBytes                 = s.poolRetainedBytes;
+    out->usedReplacementGeometryBytes      = s.usedReplacementGeometryBytes;
+    out->usedBufferBytes                   = s.usedBufferBytes;
+    out->usedAccelerationStructureBytes    = s.usedAccelerationStructureBytes;
+    out->usedOpacityMicromapBytes          = s.usedOpacityMicromapBytes;
+    out->usedMaterialTextureBytes          = s.usedMaterialTextureBytes;
+    out->usedRenderTargetBytes             = s.usedRenderTargetBytes;
+    out->driverAllocatedBytes              = s.driverAllocatedBytes;
+    out->driverBudgetBytes                 = s.driverBudgetBytes;
+    out->forkTextureCacheCount             = s.forkTextureCacheCount;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Unload all Remix handles for a specific cell
 // ---------------------------------------------------------------------------
 void RemixRenderer::UnloadCell(uint32_t cellFormID) {

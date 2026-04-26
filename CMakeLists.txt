@@ -26,6 +26,8 @@ set(REMIX_HEADER_SRC "")
 foreach(REMIX_CANDIDATE
         "${CMAKE_CURRENT_SOURCE_DIR}/dxvk-remix/public/include/remix/remix_c.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix/public/include/remix/remix_c.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../dxvk-remix/public/include/remix/remix_c.h"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../dxvk-remix/public/include/remix/remix_c.h"
         "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix-gmod/public/include/remix/remix_c.h")
     if(EXISTS "${REMIX_CANDIDATE}")
         set(REMIX_HEADER_SRC "${REMIX_CANDIDATE}")

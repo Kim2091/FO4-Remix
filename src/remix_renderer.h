@@ -27,6 +27,22 @@ struct SkinnedMeshInstance {
 };
 
 namespace RemixRenderer {
+    struct VramStats {
+        uint64_t totalAllocatedBytes              = 0;
+        uint64_t totalUsedBytes                   = 0;
+        uint64_t poolRetainedBytes                = 0;
+        uint64_t usedReplacementGeometryBytes     = 0;
+        uint64_t usedBufferBytes                  = 0;
+        uint64_t usedAccelerationStructureBytes   = 0;
+        uint64_t usedOpacityMicromapBytes         = 0;
+        uint64_t usedMaterialTextureBytes         = 0;  // <-- the field SweepStale* reads
+        uint64_t usedRenderTargetBytes            = 0;
+        uint64_t driverAllocatedBytes             = 0;
+        uint64_t driverBudgetBytes                = 0;
+        uint32_t forkTextureCacheCount            = 0;
+    };
+    bool GetVramStats(VramStats* out);
+
     bool Init();
     void OnFrame(const CameraState& cam,
                  const std::vector<ExtractedSkinnedMesh>& skinnedMeshBoneData,
