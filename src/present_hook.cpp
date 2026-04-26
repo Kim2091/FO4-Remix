@@ -368,10 +368,15 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         RemixAPI::RestoreLegacyKeyboardInput();
     }
 
-    // After Remix has had time to register raw input on its overlay HWND
-    // (~1.5s in), re-bind raw-input keyboard+mouse to the game HWND so the
-    // last-call-wins replacement reclaims input for FO4. Idempotent.
-    if (frameIndex > 90 && g_remix.gameHwnd) {
+    // Once the Remix thread has finished init (g_remix.ready is set right
+    // after Remix Startup / dxvk_RegisterD3D9Device returns), re-bind
+    // raw-input keyboard+mouse to the game HWND. Win32 raw-input is
+    // process-wide last-call-wins per device class; firing AFTER the
+    // runtime's overlay-HWND registration lets us reclaim input for FO4.
+    // Frame-number gating is unreliable -- new runtime builds can finish
+    // init at very different frame counts.  Idempotent (returns after first
+    // successful registration).
+    if (g_remix.ready && g_remix.gameHwnd) {
         RemixAPI::RebindRawInputToGameWindow(g_remix.gameHwnd);
     }
 

@@ -180,10 +180,15 @@ void RemixAPI::RestoreLegacyKeyboardInput() {
 }
 
 void RemixAPI::RebindRawInputToGameWindow(HWND gameWindow) {
-    static bool s_done = false;
-    if (s_done) return;
     if (!gameWindow) return;
 
+    // Re-register every call (idempotent + cheap, microseconds). Multiple
+    // actors in the runtime register raw input at different times -- the
+    // overlay window thread spawns separately from Remix Startup and runs
+    // its own RegisterRawInputDevices(RIDEV_INPUTSINK) on the overlay HWND.
+    // A one-shot rebind here loses to whichever actor registers last.
+    // Re-registering on every Present guarantees we eventually win and stay
+    // won (no runtime code re-registers in a loop).
     RAWINPUTDEVICE rid[2] = {};
     // Keyboard
     rid[0].usUsagePage = 0x01;
@@ -196,11 +201,22 @@ void RemixAPI::RebindRawInputToGameWindow(HWND gameWindow) {
     rid[1].dwFlags     = 0;
     rid[1].hwndTarget  = gameWindow;
 
-    if (RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
-        _MESSAGE("FO4RemixPlugin: Re-bound raw input (kbd+mouse) to game HWND %p", gameWindow);
-        s_done = true;
+    BOOL ok = RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE));
+
+    // Throttled logging: first success, then any change in success/error state.
+    static bool s_loggedSuccess = false;
+    static DWORD s_lastErr = 0;
+    if (ok) {
+        if (!s_loggedSuccess) {
+            _MESSAGE("FO4RemixPlugin: Re-bound raw input (kbd+mouse) to game HWND %p", gameWindow);
+            s_loggedSuccess = true;
+            s_lastErr = 0;
+        }
     } else {
-        _MESSAGE("FO4RemixPlugin: RebindRawInputToGameWindow failed (GetLastError=%lu)",
-                 GetLastError());
+        DWORD err = GetLastError();
+        if (err != s_lastErr) {
+            _MESSAGE("FO4RemixPlugin: RebindRawInputToGameWindow failed (GetLastError=%lu)", err);
+            s_lastErr = err;
+        }
     }
 }

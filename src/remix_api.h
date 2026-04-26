@@ -23,6 +23,9 @@ namespace RemixAPI {
     // FO4's prior registration on the game HWND, killing in-game input.
     // We re-register on the game HWND (no flags) to claim ownership back.
     // Trade-off: Remix dev-menu hotkeys stop receiving raw input.
-    // Idempotent: returns immediately after the first successful call.
+    // Safe to call every frame -- internally throttled and microseconds-cheap.
+    // Repeated calls are required because the runtime's overlay thread can
+    // re-register raw input AFTER our first rebind; we keep claiming until
+    // it sticks and stays.
     void RebindRawInputToGameWindow(HWND gameWindow);
 }
