@@ -43,6 +43,28 @@ namespace RemixRenderer {
     };
     bool GetVramStats(VramStats* out);
 
+    struct StaleMaterialSweepResult {
+        uint32_t materialCacheCount = 0;
+        uint32_t staleMaterialCount = 0;
+        uint32_t cellsEvicted       = 0;  // FO4-specific: cell-granular eviction
+    };
+    StaleMaterialSweepResult SweepStaleMaterials(uint64_t currentFrameIndex,
+                                                 uint64_t ttlFrames,
+                                                 uint64_t budgetBytes,
+                                                 uint64_t currentMaterialTexBytes);
+
+    struct StaleTextureSweepResult {
+        uint32_t textureHandleCount     = 0;
+        uint32_t staleTextureCount      = 0;
+        uint32_t cellsEvicted           = 0;  // cell-granular for FO4
+        uint32_t budgetEvictions        = 0;
+        uint32_t orphanTexturesDestroyed = 0;
+    };
+    StaleTextureSweepResult SweepStaleTextures(uint64_t currentFrameIndex,
+                                               uint64_t ttlFrames,
+                                               uint64_t budgetBytes,
+                                               uint64_t currentMaterialTexBytes);
+
     bool Init();
     void OnFrame(const CameraState& cam,
                  const std::vector<ExtractedSkinnedMesh>& skinnedMeshBoneData,

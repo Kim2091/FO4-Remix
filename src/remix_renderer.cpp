@@ -165,6 +165,82 @@ bool RemixRenderer::GetVramStats(VramStats* out) {
 }
 
 // ---------------------------------------------------------------------------
+// SweepStaleMaterials -- the LEVER for VRAM reclamation.
+//
+// Materials hold Rc<DxvkImageView> refs in the Remix runtime, so cascade-
+// evicting stale materials is what actually drops texture VRAM for shared
+// texture sets. FO4 has no per-mesh RemoveGeometry yet, so the eviction unit
+// is the cell: any cell containing a mesh whose material is stale is
+// unloaded wholesale. Coarser than Skyrim's per-mesh eviction; consistent
+// with FO4's existing eviction model.
+//
+// Budget gate: when budgetBytes > 0, sweep only fires if currentMaterialTex
+// is over budget. budgetBytes == 0 means TTL-only mode (always fire, evict
+// strictly by age).
+// ---------------------------------------------------------------------------
+RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
+        uint64_t currentFrameIndex,
+        uint64_t ttlFrames,
+        uint64_t budgetBytes,
+        uint64_t currentMaterialTexBytes) {
+    StaleMaterialSweepResult result{};
+    result.materialCacheCount = static_cast<uint32_t>(g_materialCache.size());
+
+    const bool budgetActive = (budgetBytes > 0);
+    const bool isOverBudget = budgetActive && (currentMaterialTexBytes > budgetBytes);
+    if (budgetActive && !isOverBudget) {
+        return result;
+    }
+
+    // Pass 1: collect hashes of stale materials (no owner drew in ttlFrames).
+    std::unordered_set<uint64_t> staleMaterials;
+    staleMaterials.reserve(g_materialCache.size() / 4 + 8);
+    for (const auto& [hash, mat] : g_materialCache) {
+        const uint64_t age = (currentFrameIndex > mat.lastDrawnFrame)
+            ? (currentFrameIndex - mat.lastDrawnFrame) : 0;
+        if (age > ttlFrames) {
+            staleMaterials.insert(hash);
+        }
+    }
+    result.staleMaterialCount = static_cast<uint32_t>(staleMaterials.size());
+
+    if (staleMaterials.empty()) {
+        return result;
+    }
+
+    // Pass 2: cell-granular cascade eviction. Any cell whose meshes reference
+    // a stale material gets unloaded; UnloadCell handles the refcount math
+    // (and may drop the material entirely if no other cell still owns it).
+    std::unordered_set<uint32_t> cellsToUnload;
+    for (const auto& [cellID, cellData] : g_cellScenes) {
+        bool cellTouchesStale = false;
+        for (const auto& inst : cellData.meshes) {
+            if (inst.materialHash != 0 && staleMaterials.count(inst.materialHash)) {
+                cellTouchesStale = true;
+                break;
+            }
+        }
+        if (!cellTouchesStale) {
+            for (const auto& inst : cellData.skinnedMeshInstances) {
+                if (inst.materialHash != 0 && staleMaterials.count(inst.materialHash)) {
+                    cellTouchesStale = true;
+                    break;
+                }
+            }
+        }
+        if (cellTouchesStale) {
+            cellsToUnload.insert(cellID);
+        }
+    }
+    for (uint32_t cellID : cellsToUnload) {
+        UnloadCell(cellID);
+    }
+    result.cellsEvicted = static_cast<uint32_t>(cellsToUnload.size());
+
+    return result;
+}
+
+// ---------------------------------------------------------------------------
 // Unload all Remix handles for a specific cell
 // ---------------------------------------------------------------------------
 void RemixRenderer::UnloadCell(uint32_t cellFormID) {
