@@ -4,6 +4,7 @@
 #include "scene_extractor.h"
 #include <vector>
 #include <cstdint>
+#include <unordered_set>
 
 struct OverlayData {
     std::vector<uint8_t> pixels;  // tightly packed RGBA/BGRA, 4 bpp
@@ -21,6 +22,8 @@ struct SkinnedMeshInstance {
     uint32_t                 boneCount = 0;
     uint32_t                 ownerFormID = 0;
     bool                     isValid = false;
+    uint64_t                 materialHash = 0;       // Index into g_materialCache (LRU)
+    std::unordered_set<uint64_t> textureHashes;      // Textures used by this mesh's material
 };
 
 namespace RemixRenderer {

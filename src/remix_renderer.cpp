@@ -1,6 +1,7 @@
 #include "remix_renderer.h"
 #include "config.h"
 #include "remix_api.h"
+#include "fo4_diagnostics.h"
 
 #include "remix/remix_c.h"
 
@@ -51,13 +52,15 @@ static std::wstring HashToPath(uint64_t hash) {
 struct SceneMeshInstance {
     remixapi_MeshHandle handle;
     remixapi_Transform  transform;
-    uint64_t            meshHash = 0;  // NEW: index into g_geometryAlphaState
+    uint64_t            meshHash = 0;       // Index into g_geometryAlphaState
+    uint64_t            materialHash = 0;   // Index into g_materialCache (LRU)
+    std::unordered_set<uint64_t> textureHashes;  // Textures used by this mesh's material
 };
 
 struct CellSceneData {
     std::vector<SceneMeshInstance> meshes;
     std::vector<SkinnedMeshInstance> skinnedMeshInstances;  // Skinned meshes
-    std::unordered_map<uint64_t, remixapi_MaterialHandle> materials;
+    std::unordered_set<uint64_t> materialHashes;   // Hashes into g_materialCache owned by this cell
     std::vector<remixapi_LightHandle> lights;
     std::unordered_set<uint64_t> textureHashes;
 };
@@ -153,8 +156,18 @@ void RemixRenderer::UnloadCell(uint32_t cellFormID) {
         if (inst.meshHandle) api->DestroyMesh(inst.meshHandle);
     }
 
-    for (auto& [hash, handle] : cell.materials) {
-        if (handle) api->DestroyMaterial(handle);
+    // Decrement refcounts in the global material cache. Destroy the
+    // material handle when the refcount hits zero; otherwise leave it
+    // for other cells that still reference it.
+    for (uint64_t matHash : cell.materialHashes) {
+        auto matIt = g_materialCache.find(matHash);
+        if (matIt != g_materialCache.end()) {
+            if (matIt->second.refCount > 0) matIt->second.refCount--;
+            if (matIt->second.refCount == 0) {
+                if (matIt->second.handle) api->DestroyMaterial(matIt->second.handle);
+                g_materialCache.erase(matIt);
+            }
+        }
     }
 
     for (auto& handle : cell.lights) {
@@ -190,14 +203,18 @@ void RemixRenderer::UnloadAllCells() {
         for (auto& inst : cell.skinnedMeshInstances) {
             if (inst.meshHandle) api->DestroyMesh(inst.meshHandle);
         }
-        for (auto& [hash, handle] : cell.materials) {
-            if (handle) api->DestroyMaterial(handle);
-        }
         for (auto& handle : cell.lights) {
             if (handle) api->DestroyLight(handle);
         }
     }
     g_cellScenes.clear();
+
+    // Destroy every material in the global cache. Refcounts are irrelevant
+    // since every cell is being unloaded; nothing can still own these.
+    for (auto& [hash, matRef] : g_materialCache) {
+        if (matRef.handle) api->DestroyMaterial(matRef.handle);
+    }
+    g_materialCache.clear();
 
     for (auto& [hash, texRef] : g_textureHandles) {
         if (texRef.handle) api->DestroyTexture(texRef.handle);
@@ -296,9 +313,20 @@ static std::unordered_map<uint64_t, remixapi_MaterialHandle> CreateCellMaterials
         }
     }
 
-    uint32_t matCreated = 0, matFailed = 0;
+    uint32_t matCreated = 0, matReused = 0, matFailed = 0;
 
     for (auto& [combinedHash, key] : materialKeys) {
+        // Check the global cache first; if a previous cell already created
+        // this material, bump its refcount and skip CreateMaterial.
+        auto cacheIt = g_materialCache.find(combinedHash);
+        if (cacheIt != g_materialCache.end()) {
+            cacheIt->second.refCount++;
+            cacheIt->second.lastDrawnFrame = Diagnostics::CurrentFrameIndex();
+            materials[combinedHash] = cacheIt->second.handle;
+            matReused++;
+            continue;
+        }
+
         std::wstring diffPath = HashToPath(key.diffuse);
         std::wstring normalPath = key.normal ? HashToPath(key.normal) : L"";
         std::wstring roughPath = key.roughness ? HashToPath(key.roughness) : L"";
@@ -348,12 +376,13 @@ static std::unordered_map<uint64_t, remixapi_MaterialHandle> CreateCellMaterials
             continue;
         }
 
+        g_materialCache[combinedHash] = { handle, 1, Diagnostics::CurrentFrameIndex() };
         materials[combinedHash] = handle;
         matCreated++;
     }
 
-    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Materials - created %u, failed %u",
-             cellFormID, matCreated, matFailed);
+    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Materials - created %u, reused %u, failed %u",
+             cellFormID, matCreated, matReused, matFailed);
 
     return materials;
 }
@@ -428,7 +457,13 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
              cellFormID, texCreated, texFailed, texSkipped);
 
     // ----- Create materials (one per unique texture combination) -----
-    cellData.materials = CreateCellMaterials(api, cellFormID, result);
+    // The returned map is a local lookup of combinedHash -> handle for the
+    // mesh-creation loops below; the actual handles are owned by g_materialCache
+    // (refcounted, swept by SweepStaleMaterials).
+    auto materialsLookup = CreateCellMaterials(api, cellFormID, result);
+    for (auto& [combinedHash, _] : materialsLookup) {
+        cellData.materialHashes.insert(combinedHash);
+    }
 
     // ----- Create meshes -----
     uint32_t meshCreated = 0, meshFailed = 0;
@@ -438,15 +473,16 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
 
         // Look up material handle by combined texture hash
         remixapi_MaterialHandle matHandle = nullptr;
+        uint64_t combinedHash = 0;
         if (mesh.diffuseTextureHash != 0) {
             MaterialKey lookupKey { mesh.diffuseTextureHash, mesh.normalTextureHash, mesh.roughnessTextureHash,
                                     mesh.emissiveTextureHash, mesh.emissiveColorR, mesh.emissiveColorG,
                                     mesh.emissiveColorB, mesh.emissiveIntensity,
                                     mesh.alphaTestEnabled, mesh.alphaTestType, mesh.alphaTestRef };
             lookupKey.useDrawCallAlphaState = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
-            uint64_t combinedHash = lookupKey.combined();
-            auto it = cellData.materials.find(combinedHash);
-            if (it != cellData.materials.end())
+            combinedHash = lookupKey.combined();
+            auto it = materialsLookup.find(combinedHash);
+            if (it != materialsLookup.end())
                 matHandle = it->second;
         }
 
@@ -502,6 +538,11 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         inst.handle = handle;
         memcpy(&inst.transform.matrix, mesh.worldTransform, sizeof(mesh.worldTransform));
         inst.meshHash = mesh.hash;
+        inst.materialHash = combinedHash;
+        if (mesh.diffuseTextureHash)   inst.textureHashes.insert(mesh.diffuseTextureHash);
+        if (mesh.normalTextureHash)    inst.textureHashes.insert(mesh.normalTextureHash);
+        if (mesh.roughnessTextureHash) inst.textureHashes.insert(mesh.roughnessTextureHash);
+        if (mesh.emissiveTextureHash)  inst.textureHashes.insert(mesh.emissiveTextureHash);
 
         cellData.meshes.push_back(inst);
         meshCreated++;
@@ -518,15 +559,16 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
 
         // Look up material handle by combined texture hash
         remixapi_MaterialHandle matHandle = nullptr;
+        uint64_t combinedHash = 0;
         if (sm.diffuseTextureHash != 0) {
             MaterialKey lookupKey { sm.diffuseTextureHash, sm.normalTextureHash, sm.roughnessTextureHash,
                                     sm.emissiveTextureHash, sm.emissiveColorR, sm.emissiveColorG,
                                     sm.emissiveColorB, sm.emissiveIntensity,
                                     sm.alphaTestEnabled, sm.alphaTestType, sm.alphaTestRef };
             lookupKey.useDrawCallAlphaState = sm.alphaTestEnabled || sm.alphaBlendEnabled;
-            uint64_t combinedHash = lookupKey.combined();
-            auto it = cellData.materials.find(combinedHash);
-            if (it != cellData.materials.end())
+            combinedHash = lookupKey.combined();
+            auto it = materialsLookup.find(combinedHash);
+            if (it != materialsLookup.end())
                 matHandle = it->second;
         }
 
@@ -590,6 +632,11 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         inst.boneCount = sm.boneCount;
         inst.ownerFormID = sm.ownerFormID;
         inst.isValid = true;
+        inst.materialHash = combinedHash;
+        if (sm.diffuseTextureHash)   inst.textureHashes.insert(sm.diffuseTextureHash);
+        if (sm.normalTextureHash)    inst.textureHashes.insert(sm.normalTextureHash);
+        if (sm.roughnessTextureHash) inst.textureHashes.insert(sm.roughnessTextureHash);
+        if (sm.emissiveTextureHash)  inst.textureHashes.insert(sm.emissiveTextureHash);
         cellData.skinnedMeshInstances.push_back(inst);
         skinnedCreated++;
     }
