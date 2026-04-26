@@ -69,8 +69,23 @@ static std::unordered_map<uint32_t, CellSceneData> g_cellScenes;
 struct TextureRef {
     remixapi_TextureHandle handle;
     uint32_t refCount;
+    uint64_t lastDrawnFrame = 0;  // Stamped in OnFrame DrawInstance loop;
+                                  // read by SweepStaleTextures.
 };
 static std::unordered_map<uint64_t, TextureRef> g_textureHandles;
+
+// Materials are shared across cells (same texture combo may appear in
+// multiple cells) so keep them global with a reference count, similar to
+// textures. lastDrawnFrame is stamped in OnFrame when any owner mesh's
+// DrawInstance fires; it drives SweepStaleMaterials -- the LEVER that
+// actually frees VRAM for shared texture sets, because materials hold
+// Rc<DxvkImageView> refs and only their destruction drops those refs.
+struct MaterialRef {
+    remixapi_MaterialHandle handle;
+    uint32_t refCount;
+    uint64_t lastDrawnFrame = 0;
+};
+static std::unordered_map<uint64_t, MaterialRef> g_materialCache;
 
 // Per-hash Remix InstanceInfoBlendEXT, populated at LoadCellScene time for
 // meshes that have any alpha state (test or blend). OnFrame's DrawInstance
