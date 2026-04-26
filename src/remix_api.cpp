@@ -3,51 +3,36 @@
 #include "config.h"
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
+#include <d3d9.h>
 
 static remixapi_Interface g_remixInterface = {};
 static HMODULE g_remixDll = nullptr;
 static bool g_initialized = false;
 static HWND g_remixWindow = nullptr;
+static IDirect3D9Ex* g_d3d9 = nullptr;
+static IDirect3DDevice9Ex* g_d3d9Device = nullptr;
 
-static LRESULT CALLBACK RemixWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_PAINT: {
-        // CRITICAL: Must handle WM_PAINT or Windows marks window as frozen
-        PAINTSTRUCT ps;
-        BeginPaint(hwnd, &ps);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
-    case WM_ERASEBKGND:
-        return 1;
-    }
-    return DefWindowProcW(hwnd, msg, wParam, lParam);
-}
-
+// Window construction matched to Skyrim's working dual-window setup:
+// DefWindowProcW (no custom WndProc), 0 ext style (no WS_EX_APPWINDOW),
+// CW_USEDEFAULT position, no explicit ShowWindow/UpdateWindow.
 static HWND CreateRemixWindow(int width, int height) {
     HINSTANCE hInst = GetModuleHandleW(nullptr);
 
     WNDCLASSEXW wc = {};
     wc.cbSize = sizeof(wc);
     wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = RemixWndProc;
+    wc.lpfnWndProc = DefWindowProcW;
     wc.hInstance = hInst;
-    wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512)); // IDC_ARROW
     wc.lpszClassName = L"FO4RemixWindow";
     RegisterClassExW(&wc);
 
     HWND hwnd = CreateWindowExW(
-        WS_EX_APPWINDOW,
+        0,
         wc.lpszClassName,
         L"Fallout 4 - RTX Remix",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        100, 100, width, height,
+        CW_USEDEFAULT, CW_USEDEFAULT, width, height,
         nullptr, nullptr, hInst, nullptr);
-
-    if (hwnd) {
-        ShowWindow(hwnd, SW_SHOW);
-        UpdateWindow(hwnd);
-    }
 
     return hwnd;
 }
@@ -68,27 +53,79 @@ bool RemixAPI::Initialize(HWND gameWindow, uint32_t width, uint32_t height) {
     g_remixWindow = CreateRemixWindow(width, height);
     if (!g_remixWindow) {
         _MESSAGE("FO4RemixPlugin: ERROR - Failed to create Remix window");
-        return false;
-    }
-    _MESSAGE("FO4RemixPlugin: Remix window created (HWND=%p)", g_remixWindow);
-
-    remixapi_StartupInfo startupInfo = {};
-    startupInfo.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
-    startupInfo.hwnd = g_remixWindow;
-    startupInfo.disableSrgbConversionForOutput = 0;
-    startupInfo.forceNoVkSwapchain = 0;
-    startupInfo.editorModeEnabled = 0;
-
-    status = g_remixInterface.Startup(&startupInfo);
-    if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
-        _MESSAGE("FO4RemixPlugin: Startup failed (error %d)", status);
-        DestroyWindow(g_remixWindow);
-        g_remixWindow = nullptr;
         FreeLibrary(g_remixDll);
         g_remixDll = nullptr;
         return false;
     }
-    _MESSAGE("FO4RemixPlugin: Remix Startup complete");
+    _MESSAGE("FO4RemixPlugin: Remix window created (HWND=%p, gameHwnd=%p)",
+             g_remixWindow, gameWindow);
+
+    // Preferred path: explicitly create + register a D3D9 device through Remix's
+    // dxvk extension. This skips Startup()'s default-init flow that spawns the
+    // dev-menu overlay window -- whose RegisterRawInputDevices(keyboard, mouse)
+    // would otherwise replace the game's own raw-input registrations (Win32
+    // last-call-wins) and kill in-game input. Falls back to Startup() if the
+    // dxvk extension isn't available or any setup step fails.
+    bool deviceRegistered = false;
+    if (g_remixInterface.dxvk_CreateD3D9) {
+        status = g_remixInterface.dxvk_CreateD3D9(FALSE, &g_d3d9);
+        if (status == REMIXAPI_ERROR_CODE_SUCCESS && g_d3d9) {
+            D3DPRESENT_PARAMETERS pp = {};
+            pp.BackBufferWidth = width;
+            pp.BackBufferHeight = height;
+            pp.BackBufferFormat = D3DFMT_A8R8G8B8;
+            pp.BackBufferCount = 1;
+            pp.SwapEffect = D3DSWAPEFFECT_DISCARD;
+            pp.hDeviceWindow = g_remixWindow;
+            pp.Windowed = TRUE;
+            pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
+
+            HRESULT hr = g_d3d9->CreateDeviceEx(
+                D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, g_remixWindow,
+                D3DCREATE_HARDWARE_VERTEXPROCESSING,
+                &pp, nullptr, &g_d3d9Device);
+
+            if (SUCCEEDED(hr) && g_d3d9Device) {
+                status = g_remixInterface.dxvk_RegisterD3D9Device(g_d3d9Device);
+                if (status == REMIXAPI_ERROR_CODE_SUCCESS) {
+                    _MESSAGE("FO4RemixPlugin: D3D9 device explicitly created and registered (Startup() bypassed)");
+                    deviceRegistered = true;
+                } else {
+                    _MESSAGE("FO4RemixPlugin: dxvk_RegisterD3D9Device failed (error %d) -- falling back to Startup()", status);
+                    g_d3d9Device->Release(); g_d3d9Device = nullptr;
+                    g_d3d9->Release();       g_d3d9       = nullptr;
+                }
+            } else {
+                _MESSAGE("FO4RemixPlugin: CreateDeviceEx failed (HRESULT=0x%08X) -- falling back to Startup()", (unsigned)hr);
+                if (g_d3d9) { g_d3d9->Release(); g_d3d9 = nullptr; }
+            }
+        } else {
+            _MESSAGE("FO4RemixPlugin: dxvk_CreateD3D9 failed (error %d) -- falling back to Startup()", status);
+        }
+    } else {
+        _MESSAGE("FO4RemixPlugin: dxvk_CreateD3D9 not present in this runtime -- falling back to Startup()");
+    }
+
+    if (!deviceRegistered) {
+        remixapi_StartupInfo startupInfo = {};
+        startupInfo.sType = REMIXAPI_STRUCT_TYPE_STARTUP_INFO;
+        startupInfo.hwnd = g_remixWindow;
+        startupInfo.disableSrgbConversionForOutput = 0;
+        startupInfo.forceNoVkSwapchain = 0;
+        startupInfo.editorModeEnabled = 0;
+
+        status = g_remixInterface.Startup(&startupInfo);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS) {
+            _MESSAGE("FO4RemixPlugin: Startup failed (error %d)", status);
+            DestroyWindow(g_remixWindow);
+            g_remixWindow = nullptr;
+            FreeLibrary(g_remixDll);
+            g_remixDll = nullptr;
+            return false;
+        }
+    }
+    _MESSAGE("FO4RemixPlugin: Remix Startup complete (%s)",
+             deviceRegistered ? "via dxvk_RegisterD3D9Device" : "via Startup()");
 
     g_initialized = true;
     return true;
@@ -100,6 +137,8 @@ void RemixAPI::Shutdown() {
     if (g_remixInterface.Shutdown) {
         g_remixInterface.Shutdown();
     }
+    if (g_d3d9Device) { g_d3d9Device->Release(); g_d3d9Device = nullptr; }
+    if (g_d3d9)       { g_d3d9->Release();       g_d3d9       = nullptr; }
     if (g_remixWindow) {
         DestroyWindow(g_remixWindow);
         g_remixWindow = nullptr;
@@ -138,4 +177,30 @@ void RemixAPI::RestoreLegacyKeyboardInput() {
     // If it returns FALSE the registration may not be in place yet; leave
     // s_done=false so the next call retries. Caller (present hook) is
     // expected to invoke this on a delayed cadence (~2s) until it sticks.
+}
+
+void RemixAPI::RebindRawInputToGameWindow(HWND gameWindow) {
+    static bool s_done = false;
+    if (s_done) return;
+    if (!gameWindow) return;
+
+    RAWINPUTDEVICE rid[2] = {};
+    // Keyboard
+    rid[0].usUsagePage = 0x01;
+    rid[0].usUsage     = 0x06;
+    rid[0].dwFlags     = 0;
+    rid[0].hwndTarget  = gameWindow;
+    // Mouse
+    rid[1].usUsagePage = 0x01;
+    rid[1].usUsage     = 0x02;
+    rid[1].dwFlags     = 0;
+    rid[1].hwndTarget  = gameWindow;
+
+    if (RegisterRawInputDevices(rid, 2, sizeof(RAWINPUTDEVICE))) {
+        _MESSAGE("FO4RemixPlugin: Re-bound raw input (kbd+mouse) to game HWND %p", gameWindow);
+        s_done = true;
+    } else {
+        _MESSAGE("FO4RemixPlugin: RebindRawInputToGameWindow failed (GetLastError=%lu)",
+                 GetLastError());
+    }
 }

@@ -90,6 +90,7 @@ target_include_directories(FO4RemixPlugin PRIVATE
 target_link_libraries(FO4RemixPlugin PRIVATE
     f4se_minimal
     minhook
+    d3d9
     d3d11
     dxgi
     shell32

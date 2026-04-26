@@ -66,6 +66,7 @@ static struct RemixThreadState {
     CameraState              sharedCamera = {};
     uint32_t                 gameWidth = 1280;
     uint32_t                 gameHeight = 720;
+    HWND                     gameHwnd = nullptr;
 } g_remix;
 
 // Scene data pipeline (main thread -> remix thread)
@@ -262,7 +263,7 @@ static void RemixThreadFunc() {
     // Prevent Windows from ghosting this thread's window when Present() blocks
     DisableProcessWindowsGhosting();
 
-    if (!RemixAPI::Initialize(nullptr, g_remix.gameWidth, g_remix.gameHeight)) {
+    if (!RemixAPI::Initialize(g_remix.gameHwnd, g_remix.gameWidth, g_remix.gameHeight)) {
         _MESSAGE("FO4RemixPlugin: ERROR - Remix API init failed on remix thread");
         return;
     }
@@ -367,6 +368,13 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         RemixAPI::RestoreLegacyKeyboardInput();
     }
 
+    // After Remix has had time to register raw input on its overlay HWND
+    // (~1.5s in), re-bind raw-input keyboard+mouse to the game HWND so the
+    // last-call-wins replacement reclaims input for FO4. Idempotent.
+    if (frameIndex > 90 && g_remix.gameHwnd) {
+        RemixAPI::RebindRawInputToGameWindow(g_remix.gameHwnd);
+    }
+
     g_ui.presentCallCount++;
 
     // Reset per-frame ClearRTV candidate list for next frame's detection
@@ -379,7 +387,9 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         if (SUCCEEDED(swapChain->GetDesc(&scDesc)) && scDesc.BufferDesc.Width > 0) {
             g_remix.gameWidth = scDesc.BufferDesc.Width;
             g_remix.gameHeight = scDesc.BufferDesc.Height;
-            _MESSAGE("FO4RemixPlugin: Game resolution: %ux%u", g_remix.gameWidth, g_remix.gameHeight);
+            g_remix.gameHwnd = scDesc.OutputWindow;
+            _MESSAGE("FO4RemixPlugin: Game resolution: %ux%u (gameHwnd=%p)",
+                     g_remix.gameWidth, g_remix.gameHeight, g_remix.gameHwnd);
         }
         _MESSAGE("FO4RemixPlugin: hkPresent - launching Remix thread");
         g_remix.running = true;
