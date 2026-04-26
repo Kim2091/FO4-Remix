@@ -86,6 +86,12 @@ struct PluginConfig {
     // [Diagnostics]
     bool diagEnabled;          // Master toggle for periodic diagnostic logging (default true)
 
+    // [Culling]
+    uint32_t cullingTextureLRUGraceFrames;   // Frames a texture can go un-drawn before sweep cascades owner meshes (default 600)
+    uint32_t cullingTextureLRUSweepPeriod;   // Frames between sweep invocations (default 60)
+    uint32_t cullingTextureBudgetMiB;        // Soft cap on materialTex VRAM (default 0 = disabled, TTL-only)
+    uint32_t cullingMaterialLRUGraceFrames;  // Frames a material can go un-drawn before cascade-eviction (default 600)
+
     // [Overlay]
     // HUD/Scaleform overlay submission via Remix's DrawScreenOverlay API.
     // Default OFF: the in-source dxvk-remix's dispatchScreenOverlay currently

@@ -18,6 +18,10 @@ static float GetIniFloat(const char* section, const char* key, float def, const 
     return (float)atof(buf);
 }
 
+static int GetIniInt(const char* section, const char* key, int def, const char* path) {
+    return GetPrivateProfileIntA(section, key, def, path);
+}
+
 void LoadConfig() {
     // Build path: same directory as the DLL
     char dllPath[MAX_PATH] = {};
@@ -63,6 +67,17 @@ void LoadConfig() {
     // [Diagnostics]
     g_config.diagEnabled = GetIniBool("Diagnostics", "Enabled", true, dllPath);
     _MESSAGE("FO4RemixPlugin: Diagnostics - Enabled=%d", g_config.diagEnabled);
+
+    // [Culling]
+    g_config.cullingTextureLRUGraceFrames  = (uint32_t)GetIniInt("Culling", "TextureLRUGraceFrames",  600, dllPath);
+    g_config.cullingTextureLRUSweepPeriod  = (uint32_t)GetIniInt("Culling", "TextureLRUSweepPeriod",  60,  dllPath);
+    g_config.cullingTextureBudgetMiB       = (uint32_t)GetIniInt("Culling", "TextureBudgetMiB",       0,   dllPath);
+    g_config.cullingMaterialLRUGraceFrames = (uint32_t)GetIniInt("Culling", "MaterialLRUGraceFrames", 600, dllPath);
+    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u",
+             g_config.cullingTextureLRUGraceFrames,
+             g_config.cullingTextureLRUSweepPeriod,
+             g_config.cullingTextureBudgetMiB,
+             g_config.cullingMaterialLRUGraceFrames);
 
     // [Overlay]
     g_config.hudOverlayEnabled  = GetIniBool("Overlay", "HudOverlayEnabled",  false, dllPath);
