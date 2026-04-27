@@ -84,7 +84,8 @@ struct PluginConfig {
     bool  logEmissive;              // Log emissive extraction details
 
     // [Diagnostics]
-    bool diagEnabled;          // Master toggle for periodic diagnostic logging (default true)
+    bool diagEnabled;             // Master toggle for periodic diagnostic logging (default true)
+    bool diagPhase0SmokeHook;     // [Phase 0 RE only] Install BSLightingShaderProperty render-pass hook (default false)
 
     // [Culling]
     uint32_t cullingTextureLRUGraceFrames;   // Frames a texture can go un-drawn before sweep cascades owner meshes (default 600)

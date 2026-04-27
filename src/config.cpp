@@ -65,8 +65,10 @@ void LoadConfig() {
     g_config.logEmissive             = GetIniBool("Emissive", "LogEmissive", false, dllPath);
 
     // [Diagnostics]
-    g_config.diagEnabled = GetIniBool("Diagnostics", "Enabled", true, dllPath);
-    _MESSAGE("FO4RemixPlugin: Diagnostics - Enabled=%d", g_config.diagEnabled);
+    g_config.diagEnabled         = GetIniBool("Diagnostics", "Enabled",         true,  dllPath);
+    g_config.diagPhase0SmokeHook = GetIniBool("Diagnostics", "Phase0SmokeHook", false, dllPath);
+    _MESSAGE("FO4RemixPlugin: Diagnostics - Enabled=%d Phase0SmokeHook=%d",
+             g_config.diagEnabled, g_config.diagPhase0SmokeHook);
 
     // [Culling]
     g_config.cullingTextureLRUGraceFrames  = (uint32_t)GetIniInt("Culling", "TextureLRUGraceFrames",  600, dllPath);

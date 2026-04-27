@@ -2,6 +2,7 @@
 #include "f4se/PluginAPI.h"
 
 #include "config.h"
+#include "phase0_smoke_hook.h"
 #include "present_hook.h"
 #include "remix_api.h"
 #include "remix_renderer.h"
@@ -81,6 +82,10 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se) {
 
     LoadConfig();
     StartupDiag::DumpEnvironment();
+
+    // Phase 0 RE: install BSLightingShaderProperty render-pass smoke hook
+    // if [Diagnostics] Phase0SmokeHook=1. No-op when disabled (default).
+    Phase0SmokeHook::Install();
 
     g_messaging = static_cast<F4SEMessagingInterface*>(
         f4se->QueryInterface(kInterface_Messaging));
