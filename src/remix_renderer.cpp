@@ -2,6 +2,7 @@
 #include "config.h"
 #include "remix_api.h"
 #include "fo4_diagnostics.h"
+#include "semantic_capture.h"
 
 #include "remix/remix_c.h"
 
@@ -1304,6 +1305,11 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             }
         }
     }
+
+    // Phase 1A: tick the semantic-capture sweep (TTL + periodic stats).
+    // Internally rate-limits to once per kSweepPeriodFrames; cheap to call
+    // every frame.
+    SemanticCapture::Tick();
 
     // Present
     remixapi_PresentInfo presentInfo = {};

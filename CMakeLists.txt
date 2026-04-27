@@ -80,8 +80,8 @@ add_library(FO4RemixPlugin SHARED
     src/fo4_diagnostics.cpp
     src/startup_diag.h
     src/startup_diag.cpp
-    src/phase0_smoke_hook.h
-    src/phase0_smoke_hook.cpp
+    src/semantic_capture.h
+    src/semantic_capture.cpp
     src/f4se_compat.h
 )
 

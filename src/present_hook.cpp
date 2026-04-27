@@ -878,9 +878,12 @@ bool PresentHook::Install() {
     DestroyWindow(dummyHwnd);
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
 
-    if (MH_Initialize() != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: ERROR - MH_Initialize failed");
-        return false;
+    {
+        MH_STATUS mhInit = MH_Initialize();
+        if (mhInit != MH_OK && mhInit != MH_ERROR_ALREADY_INITIALIZED) {
+            _MESSAGE("FO4RemixPlugin: ERROR - MH_Initialize failed (%d)", (int)mhInit);
+            return false;
+        }
     }
 
     if (MH_CreateHook(presentAddr, &hkPresent,
