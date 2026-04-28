@@ -1,7 +1,7 @@
 #pragma once
 
 #include "camera.h"
-#include "scene_extractor.h"
+#include "bs_extraction.h"
 #include <vector>
 #include <cstdint>
 #include <unordered_set>
@@ -12,18 +12,6 @@ struct OverlayData {
     uint32_t height = 0;
     uint32_t dxgiFormat = 0;      // DXGI_FORMAT of the captured backbuffer
     bool valid = false;
-};
-
-// Tracks a skinned mesh that has been created in Remix
-struct SkinnedMeshInstance {
-    remixapi_MeshHandle      meshHandle = nullptr;
-    remixapi_MaterialHandle  materialHandle = nullptr;
-    uint64_t                 meshHash = 0;
-    uint32_t                 boneCount = 0;
-    uint32_t                 ownerFormID = 0;
-    bool                     isValid = false;
-    uint64_t                 materialHash = 0;       // Index into g_materialCache (LRU)
-    std::unordered_set<uint64_t> textureHashes;      // Textures used by this mesh's material
 };
 
 namespace RemixRenderer {
@@ -46,7 +34,7 @@ namespace RemixRenderer {
     struct StaleMaterialSweepResult {
         uint32_t materialCacheCount = 0;
         uint32_t staleMaterialCount = 0;
-        uint32_t cellsEvicted       = 0;  // FO4-specific: cell-granular eviction
+        uint32_t cellsEvicted       = 0;  // Always 0 post-Phase-1B (cells retired). Kept for ABI compat with the periodic stats logger.
     };
     StaleMaterialSweepResult SweepStaleMaterials(uint64_t currentFrameIndex,
                                                  uint64_t ttlFrames,
@@ -56,7 +44,7 @@ namespace RemixRenderer {
     struct StaleTextureSweepResult {
         uint32_t textureHandleCount     = 0;
         uint32_t staleTextureCount      = 0;
-        uint32_t cellsEvicted           = 0;  // cell-granular for FO4
+        uint32_t cellsEvicted           = 0;  // Always 0 post-Phase-1B (cells retired). Kept for ABI compat with the periodic stats logger.
         uint32_t budgetEvictions        = 0;
         uint32_t orphanTexturesDestroyed = 0;
     };
@@ -67,17 +55,27 @@ namespace RemixRenderer {
 
     bool Init();
     void OnFrame(const CameraState& cam,
-                 const std::vector<ExtractedSkinnedMesh>& skinnedMeshBoneData,
                  const OverlayData& overlay = {});
     void Shutdown();
 
-    // Upload textures, create materials, and load meshes for a specific cell.
-    // Called on the remix thread.
-    void LoadCellScene(uint32_t cellFormID, ExtractionResult&& result);
+    enum class SubmitStatus {
+        kSubmitted,   // mesh + material handles created, drawable in g_drawables
+        kFailed       // rejected (e.g. mesh creation failed); caller may retry
+    };
 
-    // Destroy all Remix handles for a specific cell.
-    void UnloadCell(uint32_t cellFormID);
+    // Per-drawable submission, idempotent on `hash`. Walks g_textureHandles +
+    // g_materialCache (creating cache entries as needed). Stores the resulting
+    // mesh handle + material refcount in g_drawables.
+    //
+    // Called from semantic_capture's resolve loop on the Remix thread.
+    SubmitStatus SubmitDrawable(uint64_t hash,
+                                const ExtractedMesh& mesh,
+                                const std::vector<ExtractedTexture>& newTextures);
 
-    // Destroy all Remix handles for all cells.
-    void UnloadAllCells();
+    // Release the drawable identified by hash: destroy its mesh handle,
+    // decrement material refcount (destroy when 0, cascading texture refcount
+    // decrements). Idempotent on missing hash.
+    //
+    // Called from semantic_capture's TTL eviction path on the Remix thread.
+    void ReleaseDrawable(uint64_t hash);
 }

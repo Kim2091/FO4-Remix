@@ -1,5 +1,5 @@
 #include "fo4_diagnostics.h"
-#include "scene_extractor.h"
+#include "bs_extraction.h"
 #include "config.h"
 
 #include "f4se/PluginAPI.h"  // _MESSAGE
@@ -61,14 +61,14 @@ GameStateSnapshot SnapshotGameState() {
     GameStateSnapshot ctx{};
 
     // Cell identity — formID and interior flag.
-    uintptr_t cellPtr = SceneExtractor::GetPlayerCellPtr();
+    uintptr_t cellPtr = BsExtraction::GetPlayerCellPtr();
     if (cellPtr) {
         ctx.cellFormID  = *reinterpret_cast<const uint32_t*>(cellPtr + 0x14);  // TESForm::formID
         ctx.cellInterior = (*reinterpret_cast<const uint32_t*>(cellPtr + 0x40)) & 1;  // flags bit 0
     }
 
     // Player world position (TESObjectREFR::pos at +0xD0).
-    SceneExtractor::GetPlayerPosition(ctx.playerX, ctx.playerY, ctx.playerZ);
+    BsExtraction::GetPlayerPosition(ctx.playerX, ctx.playerY, ctx.playerZ);
 
     // cellName and anyMenuOpen deferred (require deeper singleton access).
     return ctx;

@@ -1,8 +1,6 @@
 #pragma once
 
 #include "remix/remix_c.h"
-#include "light_extractor.h"
-#include "skinning.h"
 #include <vector>
 #include <array>
 #include <cstdint>
@@ -44,20 +42,13 @@ struct ExtractedMesh {
     uint32_t dstColorBlendFactor = 0;  // VK_BLEND_FACTOR_ZERO
 };
 
-struct ExtractionResult {
-    std::vector<ExtractedMesh> meshes;
-    std::vector<ExtractedSkinnedMesh> skinnedMeshes;  // Skinned meshes with blend data
-    std::vector<ExtractedTexture> textures;  // Unique textures only
-    std::vector<ExtractedLight> lights;      // Placed lights from the cell
-};
-
 struct CellInfo {
     uintptr_t cellPtr;
     uint32_t formID;
 };
 
 // ---------------------------------------------------------------------------
-// Texture post-processing modes (shared between scene_extractor and skinning)
+// Texture post-processing modes (shared between bs_extraction and skinning)
 // ---------------------------------------------------------------------------
 enum class TexturePostProcess { None, InvertRGB, Octahedral };
 
@@ -75,10 +66,11 @@ struct ParsedGeometry {
 
 // Forward declarations for F4SE types used in shared function signatures
 struct BSTriShape;
+struct BSGeometry;
 struct BSLightingShaderMaterialBase;
 struct NiTexture;
 
-namespace SceneExtractor {
+namespace BsExtraction {
     // Returns the player's current parent cell pointer, or 0 if unavailable.
     // Cheap enough to call every frame for cell-change detection.
     uintptr_t GetPlayerCellPtr();
@@ -91,21 +83,13 @@ namespace SceneExtractor {
     // and player's 3D root node is present.  Cheap enough to call every frame.
     bool IsPlayerCellReady();
 
-    // Extract all BSTriShape meshes and their diffuse textures from the
-    // player's current cell.  Must be called on the main thread.
-    // |device| is used for GPU texture readback (staging copies).
-    ExtractionResult ExtractPlayerCell(ID3D11Device* device);
-
     // Returns all cells currently loaded by the engine (from DataHandler::cellList).
     std::vector<CellInfo> GetLoadedCells();
-
-    // Extract all geometry from a specific cell. Must be called on the main thread.
-    ExtractionResult ExtractCell(uintptr_t cellPtr, ID3D11Device* device);
 
     // Drop the internal texture cache (call on cell change if desired).
     void ClearTextureCache();
 
-    // --- Shared helper functions (used by both scene_extractor.cpp and skinning.cpp) ---
+    // --- Shared helper functions (used by both bs_extraction.cpp and skinning.cpp) ---
 
     // Parse vertices and indices from a BSTriShape. Returns false if the shape
     // should be skipped (effect shader, missing data, NaN positions, bad indices).
@@ -124,4 +108,10 @@ namespace SceneExtractor {
     void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
                              ID3D11Device* device, std::vector<ExtractedTexture>& newTextures,
                              uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity);
+
+    // Read alpha-test + alpha-blend state from the geometry's NiAlphaProperty
+    // (effectState slot) and write it into mesh.alphaTest* / alphaBlend* fields.
+    // Defaults: alphaTestEnabled=false, alphaTestType=7 (Always), alphaTestRef=128,
+    // alphaBlendEnabled=false. Geo may be any BSGeometry-derived shape.
+    void ExtractAlphaState(BSGeometry* geo, ExtractedMesh& mesh);
 }

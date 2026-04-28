@@ -1,6 +1,5 @@
-#include "scene_extractor.h"
+#include "bs_extraction.h"
 #include "config.h"
-#include "light_extractor.h"
 
 #include "f4se_common/f4se_version.h"
 #include "f4se_common/Relocation.h"
@@ -612,7 +611,7 @@ static void ConvertNormalToOctahedral(ExtractedTexture& tex)
 // ---------------------------------------------------------------------------
 // Generic texture extraction from any NiTexture slot
 // ---------------------------------------------------------------------------
-uint64_t SceneExtractor::ExtractMaterialTexture(NiTexture* tex, const char* slotName,
+uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                        ID3D11Device* device,
                                        std::vector<ExtractedTexture>& newTextures,
                                        TexturePostProcess postProcess)
@@ -747,7 +746,7 @@ uint64_t SceneExtractor::ExtractMaterialTexture(NiTexture* tex, const char* slot
 }
 
 // Get the BSLightingShaderMaterialBase from a shape, or nullptr
-BSLightingShaderMaterialBase* SceneExtractor::GetLightingMaterial(BSTriShape* shape)
+BSLightingShaderMaterialBase* BsExtraction::GetLightingMaterial(BSTriShape* shape)
 {
     if (!shape) return nullptr;
     NiProperty* prop = shape->shaderProperty;
@@ -759,7 +758,7 @@ BSLightingShaderMaterialBase* SceneExtractor::GetLightingMaterial(BSTriShape* sh
 }
 
 // Extract emissive data from a shape's shader property and material
-void SceneExtractor::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
+void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
                                 ID3D11Device* device, std::vector<ExtractedTexture>& newTextures,
                                 uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity)
 {
@@ -808,7 +807,7 @@ void SceneExtractor::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMate
 // Parse vertices and indices from a BSTriShape. Returns false if the shape
 // should be skipped (effect shader, missing data, NaN positions, bad indices).
 // When logRejections is false, NaN/Inf and bad-index rejections are silent.
-bool SceneExtractor::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections)
+bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections)
 {
     if (!shape || shape->numVertices == 0 || shape->numTriangles == 0)
         return false;
@@ -951,224 +950,65 @@ bool SceneExtractor::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, 
 }
 
 // ---------------------------------------------------------------------------
-// Extract vertex/index data from a single BSTriShape
+// Extract alpha-test + alpha-blend state from the geometry's NiAlphaProperty
 // ---------------------------------------------------------------------------
-static bool ExtractTriShape(BSTriShape* shape, uint64_t baseHash,
-                            std::vector<ExtractedMesh>& out,
-                            ID3D11Device* device,
-                            std::vector<ExtractedTexture>& newTextures)
-{
-    // ---- Parse common vertex/index data ----
-    ParsedGeometry geo;
-    if (!SceneExtractor::ParseShapeGeometry(shape, geo, g_config.logRejections))
-        return false;
-
-    uint64_t desc = geo.vertexDesc;
-    const char* shapeName = shape->m_name.c_str();
-
-    if (g_config.logShapeInfo) {
-        bool hasUVs     = (desc & BSGeometry::kFlag_UVs) != 0;
-        bool hasNormals = (desc & BSGeometry::kFlag_Normals) != 0;
-        bool hasColors  = (desc & BSGeometry::kFlag_VertexColors) != 0;
-        bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
-        _MESSAGE("FO4RemixPlugin: Shape \"%s\" vertexSize=%u desc=0x%016llX posHalf=%d "
-                 "flags: UV=%d Norm=%d Color=%d FullPrec=%d Skinned=%d dynamic=%d verts=%u tris=%u",
-                 shapeName ? shapeName : "<null>",
-                 geo.vertexSize, desc, posHalfFloat,
-                 hasUVs, hasNormals, hasColors,
-                 (desc & BSGeometry::kFlag_FullPrecision) ? 1 : 0,
-                 (desc & BSGeometry::kFlag_Skinned) ? 1 : 0,
-                 geo.isDynamic,
-                 shape->numVertices, shape->numTriangles);
-    }
-
-    ExtractedMesh mesh;
-    // Combine REFR-based hash with shape name for stable per-shape uniqueness
-    mesh.hash = FnvHashCombine(baseHash, FnvHash(shapeName ? shapeName : ""));
-
-    // ---- Copy vertex/index data from parsed geometry ----
-    mesh.vertices = std::move(geo.vertices);
-    mesh.indices  = std::move(geo.indices);
-
-    // World transform → row-major 3x4
-    // Negate X and Z axes to mirror the world into Remix's LH coordinate system
-    const NiTransform& xf = shape->m_worldTransform;
-    float scale = xf.scale;
-    // Swap X and Y columns in rotation to match camera coordinate swap
-    for (int r = 0; r < 3; r++) {
-        mesh.worldTransform[r][0] = xf.rot.data[r][1] * scale;
-        mesh.worldTransform[r][1] = xf.rot.data[r][0] * scale;
-        mesh.worldTransform[r][2] = xf.rot.data[r][2] * scale;
-    }
-    // Swap X and Y in translation too
-    mesh.worldTransform[0][3] = xf.pos.y;
-    mesh.worldTransform[1][3] = xf.pos.x;
-    mesh.worldTransform[2][3] = xf.pos.z;
-
-    // Compute local-space bounding extent for diagnostics
-    float minPos[3] = { FLT_MAX, FLT_MAX, FLT_MAX };
-    float maxPos[3] = { -FLT_MAX, -FLT_MAX, -FLT_MAX };
-    for (uint16_t i = 0; i < shape->numVertices; i++) {
-        for (int j = 0; j < 3; j++) {
-            if (mesh.vertices[i].position[j] < minPos[j]) minPos[j] = mesh.vertices[i].position[j];
-            if (mesh.vertices[i].position[j] > maxPos[j]) maxPos[j] = mesh.vertices[i].position[j];
-        }
-    }
-    float extentX = (maxPos[0] - minPos[0]) * scale;
-    float extentY = (maxPos[1] - minPos[1]) * scale;
-    float extentZ = (maxPos[2] - minPos[2]) * scale;
-    float maxExtent = extentX;
-    if (extentY > maxExtent) maxExtent = extentY;
-    if (extentZ > maxExtent) maxExtent = extentZ;
-
-    // Reject shapes with garbage vertex data (huge but finite extents)
-    if (maxExtent > g_config.maxExtent) {
-        if (g_config.logRejections)
-            _MESSAGE("FO4RemixPlugin: Rejecting shape \"%s\" - extent %.0f exceeds max (%.0f)",
-                     shapeName ? shapeName : "<null>", maxExtent, g_config.maxExtent);
-        return false;
-    }
-
-    // Log shapes with large world extent to help identify unwanted geometry
-    if (g_config.logLargeShapes && maxExtent > 500.0f) {
-        _MESSAGE("FO4RemixPlugin: LARGE shape \"%s\" extent=(%.0f, %.0f, %.0f) maxExt=%.0f "
-                 "worldPos=(%.1f, %.1f, %.1f) verts=%u tris=%u",
-                 shapeName ? shapeName : "<null>",
-                 extentX, extentY, extentZ, maxExtent,
-                 xf.pos.x, xf.pos.y, xf.pos.z,
-                 shape->numVertices, shape->numTriangles);
-    }
-
-    // Extract textures from the lighting material
-    BSLightingShaderMaterialBase* lightingMat = SceneExtractor::GetLightingMaterial(shape);
-    if (lightingMat && lightingMat->GetType() == BSLightingShaderMaterialBase::kType_Landscape) {
-        // Landscape materials store textures in per-layer arrays, not the base class fields.
-        auto* landMat = static_cast<BSLightingShaderMaterialLandscape*>(lightingMat);
-        mesh.diffuseTextureHash   = SceneExtractor::ExtractMaterialTexture(landMat->spLandscapeDiffuseTexture[0], "diffuse", device, newTextures);
-        mesh.normalTextureHash    = SceneExtractor::ExtractMaterialTexture(landMat->spLandscapeNormalTexture[0], "normal", device, newTextures, TexturePostProcess::Octahedral);
-        mesh.roughnessTextureHash = SceneExtractor::ExtractMaterialTexture(landMat->spLandscapeSmoothSpecTexture[0], "roughness", device, newTextures, TexturePostProcess::InvertRGB);
-    } else {
-        mesh.diffuseTextureHash   = lightingMat ? SceneExtractor::ExtractMaterialTexture(lightingMat->spDiffuseTexture, "diffuse", device, newTextures) : 0;
-        mesh.normalTextureHash    = lightingMat ? SceneExtractor::ExtractMaterialTexture(lightingMat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral) : 0;
-        mesh.roughnessTextureHash = lightingMat ? SceneExtractor::ExtractMaterialTexture(lightingMat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, TexturePostProcess::InvertRGB) : 0;
-    }
-
-    // Extract emissive data (glow map texture + emissive color/scale)
-    SceneExtractor::ExtractEmissiveData(shape, lightingMat, device, newTextures,
-                        mesh.emissiveTextureHash, mesh.emissiveColorR, mesh.emissiveColorG,
-                        mesh.emissiveColorB, mesh.emissiveIntensity);
-
-    // Extract alpha test state from NiAlphaProperty (effectState on BSGeometry)
+void BsExtraction::ExtractAlphaState(BSGeometry* geo, ExtractedMesh& mesh) {
     mesh.alphaTestEnabled = false;
-    mesh.alphaTestType = 7; // Always (no test)
-    mesh.alphaTestRef = 128;
-    NiProperty* alphaPropRaw = shape->effectState;
-    if (alphaPropRaw) {
-        NiAlphaProperty* alphaProp = static_cast<NiAlphaProperty*>(alphaPropRaw);
-        bool testEnabled = (alphaProp->alphaFlags >> 9) & 1;
-        if (testEnabled) {
-            int niTestFunc = (alphaProp->alphaFlags >> 10) & 7;
-            // Map NiAlphaProperty::TestFunction to Remix/VkCompareOp
-            // NI:  Always=0, Less=1, Equal=2, LessEq=3, Greater=4, NotEq=5, GreaterEq=6, Never=7
-            // VK:  Never=0,  Less=1, Equal=2, LessEq=3, Greater=4, NotEq=5, GreaterEq=6, Always=7
-            static const int niToVk[] = { 7, 1, 2, 3, 4, 5, 6, 0 };
-            mesh.alphaTestEnabled = true;
-            mesh.alphaTestType = niToVk[niTestFunc];
-            mesh.alphaTestRef = alphaProp->alphaThreshold;
-        }
+    mesh.alphaTestType    = 7;   // Always (no test)
+    mesh.alphaTestRef     = 128;
+    mesh.alphaBlendEnabled    = false;
+    mesh.srcColorBlendFactor  = 1;  // VK_BLEND_FACTOR_ONE
+    mesh.dstColorBlendFactor  = 0;  // VK_BLEND_FACTOR_ZERO
 
-        // Alpha blend (bit 0 = enabled, bits 1-4 = src factor, bits 5-8 = dst factor).
-        // Bethesda AlphaFunction -> VkBlendFactor mapping. VkBlendFactor enum
-        // values are ABI-stable per Vulkan spec; the cast happens on the Remix
-        // side. Out-of-range NI indices (>10) fall back to opaque (1, 0).
-        static const uint32_t niBlendToVk[] = {
-            1,   //  0 kOne          -> VK_BLEND_FACTOR_ONE
-            0,   //  1 kZero         -> VK_BLEND_FACTOR_ZERO
-            2,   //  2 kSrcColor     -> VK_BLEND_FACTOR_SRC_COLOR
-            3,   //  3 kInvSrcColor  -> VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR
-            4,   //  4 kDestColor    -> VK_BLEND_FACTOR_DST_COLOR
-            5,   //  5 kInvDestColor -> VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR
-            6,   //  6 kSrcAlpha     -> VK_BLEND_FACTOR_SRC_ALPHA
-            7,   //  7 kInvSrcAlpha  -> VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
-            8,   //  8 kDestAlpha    -> VK_BLEND_FACTOR_DST_ALPHA
-            9,   //  9 kInvDestAlpha -> VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA
-            14,  // 10 kSrcAlphaSat  -> VK_BLEND_FACTOR_SRC_ALPHA_SATURATE
-        };
-        const bool blendEnabled = alphaProp->alphaFlags & 1;
-        if (blendEnabled) {
-            const int niSrc = (alphaProp->alphaFlags >> 1) & 0xF;
-            const int niDst = (alphaProp->alphaFlags >> 5) & 0xF;
-            const uint32_t vkSrc = (niSrc < 11) ? niBlendToVk[niSrc] : 1;
-            const uint32_t vkDst = (niDst < 11) ? niBlendToVk[niDst] : 0;
-            mesh.alphaBlendEnabled    = true;
-            mesh.srcColorBlendFactor  = vkSrc;
-            mesh.dstColorBlendFactor  = vkDst;
-        }
+    if (!geo) return;
+    NiProperty* alphaPropRaw = geo->effectState;
+    if (!alphaPropRaw) return;
+
+    NiAlphaProperty* alphaProp = static_cast<NiAlphaProperty*>(alphaPropRaw);
+
+    // Alpha test: bit 9 = enabled, bits 10-12 = function
+    bool testEnabled = (alphaProp->alphaFlags >> 9) & 1;
+    if (testEnabled) {
+        int niTestFunc = (alphaProp->alphaFlags >> 10) & 7;
+        // NI:  Always=0, Less=1, Equal=2, LessEq=3, Greater=4, NotEq=5, GreaterEq=6, Never=7
+        // VK:  Never=0,  Less=1, Equal=2, LessEq=3, Greater=4, NotEq=5, GreaterEq=6, Always=7
+        static const int niToVk[] = { 7, 1, 2, 3, 4, 5, 6, 0 };
+        mesh.alphaTestEnabled = true;
+        mesh.alphaTestType    = niToVk[niTestFunc];
+        mesh.alphaTestRef     = alphaProp->alphaThreshold;
     }
 
-    out.push_back(std::move(mesh));
-    return true;
-}
+    // Alpha blend: bit 0 = enabled, bits 1-4 = src factor, bits 5-8 = dst factor
+    static const uint32_t niBlendToVk[] = {
+        1,   //  0 kOne          -> VK_BLEND_FACTOR_ONE
+        0,   //  1 kZero         -> VK_BLEND_FACTOR_ZERO
+        2,   //  2 kSrcColor     -> VK_BLEND_FACTOR_SRC_COLOR
+        3,   //  3 kInvSrcColor  -> VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR
+        4,   //  4 kDestColor    -> VK_BLEND_FACTOR_DST_COLOR
+        5,   //  5 kInvDestColor -> VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR
+        6,   //  6 kSrcAlpha     -> VK_BLEND_FACTOR_SRC_ALPHA
+        7,   //  7 kInvSrcAlpha  -> VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA
+        8,   //  8 kDestAlpha    -> VK_BLEND_FACTOR_DST_ALPHA
+        9,   //  9 kInvDestAlpha -> VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA
+        14,  // 10 kSrcAlphaSat  -> VK_BLEND_FACTOR_SRC_ALPHA_SATURATE
+    };
 
-// ---------------------------------------------------------------------------
-// Recursively walk an NiNode tree and extract all BSTriShape children
-// ---------------------------------------------------------------------------
-static void WalkNode(NiAVObject* obj, uint64_t baseHash,
-                     std::vector<ExtractedMesh>& out,
-                     ID3D11Device* device,
-                     std::vector<ExtractedTexture>& newTextures,
-                     std::vector<ExtractedSkinnedMesh>* skinnedOut = nullptr,
-                     uint32_t ownerFormID = 0,
-                     int depth = 0)
-{
-    if (!obj || depth > 32) return;
-
-    // Skip invisible nodes
-    if (obj->flags & NiAVObject::kFlagNotVisible)
-        return;
-
-    // Skip non-renderable geometry by node name
-    const char* nodeName = obj->m_name.c_str();
-    if (nodeName && nodeName[0]) {
-        if (strstr(nodeName, "Marker") ||
-            strstr(nodeName, "Portal") ||
-            strstr(nodeName, "Trigger") ||
-            strstr(nodeName, "MultiBound") ||
-            strstr(nodeName, "Collision") ||
-            strstr(nodeName, "bhk")) {
-            return;
-        }
-    }
-
-    // Check if this is a BSTriShape
-    BSTriShape* tri = obj->GetAsBSTriShape();
-    if (tri) {
-        // Check skinned flag and route accordingly
-        uint64_t vertexDesc = tri->vertexDesc;
-        if ((vertexDesc & kVertexFlag_Skinned) && skinnedOut && g_config.skinningEnabled) {
-            Skinning::ExtractSkinnedTriShape(tri, baseHash, *skinnedOut, device, newTextures, ownerFormID);
-        } else {
-            ExtractTriShape(tri, baseHash, out, device, newTextures);
-        }
-        return; // BSTriShape is a leaf -- no children
-    }
-
-    // If it's an NiNode, recurse into children
-    NiNode* node = obj->GetAsNiNode();
-    if (node) {
-        for (uint16_t i = 0; i < node->m_children.m_emptyRunStart; i++) {
-            NiAVObject* child = node->m_children.m_data[i];
-            if (child) {
-                WalkNode(child, baseHash, out, device, newTextures, skinnedOut, ownerFormID, depth + 1);
-            }
-        }
+    const bool blendEnabled = alphaProp->alphaFlags & 1;
+    if (blendEnabled) {
+        const int niSrc = (alphaProp->alphaFlags >> 1) & 0xF;
+        const int niDst = (alphaProp->alphaFlags >> 5) & 0xF;
+        const uint32_t vkSrc = (niSrc < 11) ? niBlendToVk[niSrc] : 1;
+        const uint32_t vkDst = (niDst < 11) ? niBlendToVk[niDst] : 0;
+        mesh.alphaBlendEnabled    = true;
+        mesh.srcColorBlendFactor  = vkSrc;
+        mesh.dstColorBlendFactor  = vkDst;
     }
 }
 
 // ---------------------------------------------------------------------------
 // Return the player's current parent cell pointer (0 if unavailable)
 // ---------------------------------------------------------------------------
-uintptr_t SceneExtractor::GetPlayerCellPtr()
+uintptr_t BsExtraction::GetPlayerCellPtr()
 {
     uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
     if (!ppPlayer || !*ppPlayer) return 0;
@@ -1180,7 +1020,7 @@ uintptr_t SceneExtractor::GetPlayerCellPtr()
 // Read the player's world position. Outputs unchanged (remain 0) if the
 // player singleton is absent (e.g. main menu).
 // ---------------------------------------------------------------------------
-void SceneExtractor::GetPlayerPosition(float& outX, float& outY, float& outZ)
+void BsExtraction::GetPlayerPosition(float& outX, float& outY, float& outZ)
 {
     uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
     if (!ppPlayer || !*ppPlayer) return;
@@ -1194,7 +1034,7 @@ void SceneExtractor::GetPlayerPosition(float& outX, float& outY, float& outZ)
 // ---------------------------------------------------------------------------
 // Lightweight readiness check — is the player in a cell with loaded 3D?
 // ---------------------------------------------------------------------------
-bool SceneExtractor::IsPlayerCellReady()
+bool BsExtraction::IsPlayerCellReady()
 {
     uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
     if (!ppPlayer || !*ppPlayer)
@@ -1292,7 +1132,7 @@ static void CollectGridCells(
     }
 }
 
-std::vector<CellInfo> SceneExtractor::GetLoadedCells()
+std::vector<CellInfo> BsExtraction::GetLoadedCells()
 {
     std::vector<CellInfo> result;
     std::unordered_set<uintptr_t> seen;
@@ -1367,113 +1207,9 @@ std::vector<CellInfo> SceneExtractor::GetLoadedCells()
 }
 
 // ---------------------------------------------------------------------------
-// Extract all geometry from loaded references in a specific cell
-// ---------------------------------------------------------------------------
-ExtractionResult SceneExtractor::ExtractCell(uintptr_t cellPtr, ID3D11Device* device)
-{
-    std::vector<ExtractedMesh> result;
-    std::vector<ExtractedSkinnedMesh> skinnedResult;
-    std::vector<ExtractedTexture> newTextures;
-
-    if (!cellPtr) {
-        return { std::move(result), std::move(skinnedResult), std::move(newTextures) };
-    }
-
-    // Access cell objectList (tArray<TESObjectREFR*> at offset 0x70)
-    struct SimpleArray {
-        uintptr_t* entries;
-        uint32_t capacity;
-        uint32_t pad0C;
-        uint32_t count;
-    };
-    auto& objectList = *reinterpret_cast<SimpleArray*>(cellPtr + OFF_CELL_OBJECT_LIST);
-
-    uint32_t cellFormID = *reinterpret_cast<uint32_t*>(cellPtr + OFF_FORM_ID);
-    _MESSAGE("FO4RemixPlugin: ExtractCell 0x%08X - cell has %u objects", cellFormID, objectList.count);
-
-    uint32_t meshCount = 0;
-
-    for (uint32_t i = 0; i < objectList.count; i++) {
-        uintptr_t refrPtr = objectList.entries[i];
-        if (!refrPtr) continue;
-
-        uintptr_t loadedData = *reinterpret_cast<uintptr_t*>(refrPtr + OFF_REFR_LOADED_DATA);
-        if (!loadedData) continue;
-
-        NiNode* rootNode = *reinterpret_cast<NiNode**>(loadedData + OFF_LOADED_ROOT_NODE);
-        if (!rootNode) continue;
-
-        uint32_t refrFormID = *reinterpret_cast<uint32_t*>(refrPtr + OFF_FORM_ID);
-        uint64_t baseHash = FnvHashCombine(0xCBF29CE484222325ULL, (uint64_t)refrFormID);
-
-        size_t before = result.size();
-        WalkNode(rootNode, baseHash, result, device, newTextures, &skinnedResult, refrFormID);
-        meshCount += (uint32_t)(result.size() - before);
-    }
-
-    // Extract terrain geometry from LAND quadrant nodes (BSMultiBoundNode).
-    // TESObjectLAND is at cell+0x58, its quadrant node array is at LAND+0x40.
-    // (Terrain is never skinned, so no skinned output is passed.)
-    uint32_t terrainMeshCount = 0;
-    uintptr_t landPtr = *reinterpret_cast<uintptr_t*>(cellPtr + OFF_CELL_LAND);
-    if (landPtr) {
-        uintptr_t* quadrants = *reinterpret_cast<uintptr_t**>(landPtr + OFF_LAND_QUADRANTS);
-        if (quadrants) {
-            uint32_t landFormID = *reinterpret_cast<uint32_t*>(landPtr + OFF_FORM_ID);
-            for (int q = 0; q < LAND_QUADRANT_COUNT; q++) {
-                uintptr_t nodePtr = quadrants[q];
-                if (!nodePtr) continue;
-                NiNode* quadNode = reinterpret_cast<NiNode*>(nodePtr);
-                uint64_t terrainHash = FnvHashCombine(0xCBF29CE484222325ULL, (uint64_t)landFormID);
-                terrainHash = FnvHashCombine(terrainHash, (uint64_t)q);
-                size_t before = result.size();
-                WalkNode(quadNode, terrainHash, result, device, newTextures);
-                terrainMeshCount += (uint32_t)(result.size() - before);
-            }
-        }
-    }
-
-    auto lights = LightExtractor::ExtractCellLights(cellPtr);
-
-    uint32_t hasDiffuse = 0, hasNormal = 0, hasRoughness = 0;
-    for (auto& m : result) {
-        if (m.diffuseTextureHash)   hasDiffuse++;
-        if (m.normalTextureHash)    hasNormal++;
-        if (m.roughnessTextureHash) hasRoughness++;
-    }
-
-    _MESSAGE("FO4RemixPlugin: ExtractCell 0x%08X - %u meshes + %u terrain + %zu skinned (%u diffuse, %u normal, %u roughness), "
-             "%zu new textures (%zu cached), %zu lights from %u objects",
-             cellFormID, meshCount, terrainMeshCount, skinnedResult.size(),
-             hasDiffuse, hasNormal, hasRoughness,
-             newTextures.size(), g_textureCache.size(), lights.size(), objectList.count);
-
-    return { std::move(result), std::move(skinnedResult), std::move(newTextures), std::move(lights) };
-}
-
-// ---------------------------------------------------------------------------
-// Extract all geometry from loaded references in the player's current cell
-// ---------------------------------------------------------------------------
-ExtractionResult SceneExtractor::ExtractPlayerCell(ID3D11Device* device)
-{
-    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
-    if (!ppPlayer || !*ppPlayer) {
-        _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - no player");
-        return {};
-    }
-    uintptr_t player = *ppPlayer;
-    uintptr_t cellPtr = *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
-    if (!cellPtr) {
-        _MESSAGE("FO4RemixPlugin: ExtractPlayerCell - no parentCell");
-        return {};
-    }
-    return ExtractCell(cellPtr, device);
-}
-
-// ---------------------------------------------------------------------------
 // Clear the texture readback cache
 // ---------------------------------------------------------------------------
-void SceneExtractor::ClearTextureCache()
+void BsExtraction::ClearTextureCache()
 {
     _MESSAGE("FO4RemixPlugin: ClearTextureCache - clearing %zu entries", g_textureCache.size());
     g_textureCache.clear();

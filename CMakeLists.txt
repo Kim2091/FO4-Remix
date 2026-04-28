@@ -70,18 +70,16 @@ add_library(FO4RemixPlugin SHARED
     src/remix_renderer.cpp
     src/camera.h
     src/camera.cpp
-    src/scene_extractor.h
-    src/scene_extractor.cpp
-    src/skinning.h
-    src/skinning.cpp
-    src/light_extractor.h
-    src/light_extractor.cpp
+    src/bs_extraction.h
+    src/bs_extraction.cpp
     src/fo4_diagnostics.h
     src/fo4_diagnostics.cpp
     src/startup_diag.h
     src/startup_diag.cpp
     src/semantic_capture.h
     src/semantic_capture.cpp
+    src/resolvers/lighting_static.h
+    src/resolvers/lighting_static.cpp
     src/f4se_compat.h
 )
 

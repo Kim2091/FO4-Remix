@@ -4,7 +4,7 @@
 #include <cstring>
 
 // ---------------------------------------------------------------------------
-// Half-float -> float conversion (shared across scene_extractor and skinning)
+// Half-float -> float conversion (shared across bs_extraction and skinning)
 // ---------------------------------------------------------------------------
 inline float HalfToFloat(uint16_t h) {
     uint32_t sign = (uint32_t)(h >> 15) << 31;

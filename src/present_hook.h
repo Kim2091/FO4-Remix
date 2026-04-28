@@ -3,7 +3,7 @@
 namespace PresentHook {
     bool Install();
     void Uninstall();
-    // Reset extraction state when a new save game is loaded.
-    // Clears tracked cells and forces re-extraction with the initial bootstrap path.
+    // Reset state when a new save game is loaded.
+    // Clears tracked skinned meshes (bone pointers invalidated) and UI RT detection.
     void ResetExtractionState();
 }

@@ -1,11 +1,14 @@
 #include "semantic_capture.h"
 #include "config.h"
 #include "fo4_diagnostics.h"
+#include "resolvers/lighting_static.h"
+#include "remix_renderer.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #include "f4se/PluginAPI.h"  // _MESSAGE
+#include "f4se/NiTypes.h"    // NiTransform, NiMatrix33, NiPoint3
 #include "MinHook.h"
 
 #include <atomic>
@@ -43,6 +46,26 @@ PassKey ComputePassKey(const void* geo, const void* prop, const void* mat) {
     return h;
 }
 
+// -------- BuildRemixTransform -- shared by resolvers --------
+// Defined here so resolvers link against semantic_capture.obj rather than
+// pulling in the full bs_extraction.obj.
+
+} // namespace (close anonymous so we define in SemanticCapture:: scope)
+
+void SemanticCapture::BuildRemixTransform(const NiTransform& xf, float out[3][4]) {
+    const float scale = xf.scale;
+    for (int r = 0; r < 3; ++r) {
+        out[r][0] = xf.rot.data[r][1] * scale;
+        out[r][1] = xf.rot.data[r][0] * scale;
+        out[r][2] = xf.rot.data[r][2] * scale;
+    }
+    out[0][3] = xf.pos.y;
+    out[1][3] = xf.pos.x;
+    out[2][3] = xf.pos.z;
+}
+
+namespace { // reopen anonymous namespace
+
 // -------- Detour signature (from Phase 0 disasm + live trace) --------
 typedef void* (__fastcall *GetRenderPasses_t)(void* self,
                                               void* geometry,
@@ -60,6 +83,39 @@ std::unordered_map<PassKey, SemanticCapture::DrawableState> g_drawableMap;
 
 // -------- Sweep cadence counter (Tick() rate-limits via this) --------
 std::atomic<uint32_t> g_sweepCounter{0};
+
+// SEH wrapper for the resolver call. C++ destructors cannot live in a
+// __try scope (MSVC C2712), so we isolate the call in a non-throwing helper
+// with C-style locals only. Returns 0 on normal completion (resolver
+// returned, success or not), 1 if SEH was caught (access violation etc).
+// On SEH catch, *outExceptionCode receives GetExceptionCode().
+static int CallResolverGuarded(SemanticCapture::DrawableState* state,
+                               uint64_t key,
+                               ID3D11Device* device,
+                               unsigned long* outExceptionCode) {
+    __try {
+        Resolvers::Lighting::TryResolveStatic(*state, key, device);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outExceptionCode = GetExceptionCode();
+        return 1;
+    }
+}
+
+// SEH wrapper for ReleaseDrawable. ReleaseDrawable internally takes a
+// std::lock_guard, so we cannot put __try inside it (C2712). Instead the
+// caller wraps the entire call. Returns 0 on normal completion, 1 if SEH
+// was caught with *outExceptionCode filled.
+static int CallReleaseDrawableGuarded(uint64_t meshHash,
+                                      unsigned long* outExceptionCode) {
+    __try {
+        RemixRenderer::ReleaseDrawable(meshHash);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outExceptionCode = GetExceptionCode();
+        return 1;
+    }
+}
 
 void* __fastcall DetourGetRenderPasses(void* self,
                                        void* geometry,
@@ -81,6 +137,11 @@ void* __fastcall DetourGetRenderPasses(void* self,
         auto& state = g_drawableMap[key];  // inserts default-constructed if new
         if (state.firstSeenFrame == 0) {
             state.firstSeenFrame = now;
+            // Capture pointers once on first-seen; they're stable until eviction
+            // (TTL = 10 frames). Resolver reads them on the Remix thread.
+            state.geometry = geometry;
+            state.property = self;
+            state.material = material;
         }
         state.lastSeenFrame      = now;
         state.fireCount         += 1;
@@ -140,15 +201,98 @@ void SemanticCapture::Uninstall() {
              (unsigned long long)g_totalFires.load());
 }
 
-void SemanticCapture::Tick() {
+void SemanticCapture::Tick(ID3D11Device* device) {
     if (!g_installed.load()) return;
 
+    // Note: g_sweepCounter (atomic, relaxed) interleaves with g_drawableMutex
+    // (mutex). Single-caller invariant holds today (only hkPresent calls Tick).
+    // If multiple callers ever appeared, the sweep cadence would jitter by a
+    // frame but no data race occurs; the map access is mutex-serialized.
+
+    // Single read of the frame index, shared by the resolve-loop freshness
+    // gate and the eviction sweep below. Keeps the two reads consistent.
+    const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
+
+    // VRAM gate: skip resolves if we're close to the device budget. dxvk-remix
+    // is observed to throw C++ exceptions out of CreateX calls under VRAM
+    // pressure, and those throws corrupt its internal Vulkan command queue.
+    // Conservative threshold: skip if used > 90% of driver budget.
+    //
+    // Eviction below this gate STILL runs -- eviction frees handles, which
+    // is exactly what we want when VRAM is tight.
+    bool vramOk = true;
+    {
+        RemixRenderer::VramStats vs{};
+        if (RemixRenderer::GetVramStats(&vs) && vs.driverBudgetBytes > 0) {
+            const uint64_t threshold = (vs.driverBudgetBytes * 9) / 10;  // 90%
+            if (vs.totalAllocatedBytes > threshold) {
+                vramOk = false;
+            }
+        }
+    }
+
+    // ---- Resolve loop: every call, attempt one resolve per unsubmitted drawable ----
+    // Skyrim's pattern: cheap when state.submittedToRemix is true (early exit).
+    if (!vramOk) {
+        Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_GateVram);
+        // Skip resolve loop; eviction sweep below still runs.
+    } else {
+        // Per-Tick submission budget removed: VRAM gate above and input
+        // validation in SubmitDrawable are now the load-bearing protection
+        // against the dxvk-remix freeze. The budget cap (was 4) starved
+        // streaming during normal play (proven by the Pip-Boy-only mesh-
+        // load symptom). If the freeze recurs without those gates being
+        // sufficient, reintroduce a much higher cap (~64) here.
+
+        std::lock_guard<std::mutex> lock(g_drawableMutex);
+        for (auto& [key, state] : g_drawableMap) {
+            if (state.submittedToRemix) continue;
+            // Freshness gate: only resolve drawables the engine touched this
+            // frame or last frame. Stale pointers from older entries cause
+            // the parse_start AVs we've been catching -- skipping them avoids
+            // dereferencing freed BSGeometry memory entirely. Mirrors the
+            // uint64-safe age computation used by the eviction sweep below.
+            const uint64_t age = (currentFrame > state.lastSeenFrame)
+                ? (currentFrame - state.lastSeenFrame) : 0;
+            if (age > 1) continue;
+
+            // Note: the resolver may take a few hundred microseconds for
+            // texture readbacks. We hold the mutex during the call, which
+            // serializes resolver work with hot-path captures. If profile
+            // shows hot-path back-pressure, move this loop to a snapshot+
+            // unlock+resolve+lock-to-update pattern. Default first.
+            //
+            // SEH-guarded: stale geometry pointers from TTL-aged entries
+            // can dereference freed memory. Catch the AV, log the failing
+            // drawable + last resolver step, and mark the entry as
+            // submitted so we don't retry it endlessly.
+            unsigned long excCode = 0;
+            if (CallResolverGuarded(&state, key, device, &excCode) != 0) {
+                const int lastStep = Resolvers::Lighting::Trace::LastStep();
+                const uint64_t lastHash = Resolvers::Lighting::Trace::LastHash();
+                _MESSAGE("FO4RemixPlugin: [Resolver] CRASH CAUGHT key=0x%llX "
+                         "trace_hash=0x%llX step=%s exception=0x%08lX "
+                         "geo=%p prop=%p mat=%p -- skipping permanently",
+                         (unsigned long long)key,
+                         (unsigned long long)lastHash,
+                         Resolvers::Lighting::Trace::StepName(lastStep),
+                         excCode,
+                         state.geometry, state.property, state.material);
+                state.submittedToRemix = true;
+                state.meshHash = 0;
+            }
+        }
+    }
+
+    // ---- Sweep cadence: every kSweepPeriodFrames calls ----
     const uint32_t counter = g_sweepCounter.fetch_add(1, std::memory_order_relaxed) + 1;
     if (counter < kSweepPeriodFrames) return;
     g_sweepCounter.store(0, std::memory_order_relaxed);
 
-    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    const uint64_t now = currentFrame;
     uint32_t evicted = 0;
+    uint32_t submittedCount = 0;
+    uint32_t pendingCount = 0;
     size_t   unique  = 0;
 
     {
@@ -157,17 +301,29 @@ void SemanticCapture::Tick() {
             const uint64_t age = (now > it->second.lastSeenFrame)
                 ? (now - it->second.lastSeenFrame) : 0;
             if (age > kTTLFrames) {
+                if (it->second.submittedToRemix && it->second.meshHash != 0) {
+                    unsigned long excCode = 0;
+                    if (CallReleaseDrawableGuarded(it->second.meshHash, &excCode) != 0) {
+                        _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
+                                 "hash=0x%llX exception=0x%08lX -- continuing eviction; "
+                                 "Remix-side handles may leak",
+                                 (unsigned long long)it->second.meshHash, excCode);
+                    }
+                }
                 it = g_drawableMap.erase(it);
                 ++evicted;
             } else {
+                if (it->second.submittedToRemix) ++submittedCount;
+                else                              ++pendingCount;
                 ++it;
             }
         }
         unique = g_drawableMap.size();
     }
 
-    _MESSAGE("FO4RemixPlugin: [SemCapture] uniqueDrawables=%zu totalFires=%llu evictedThisSweep=%u",
+    _MESSAGE("FO4RemixPlugin: [SemCapture] uniqueDrawables=%zu totalFires=%llu "
+             "evictedThisSweep=%u submitted=%u pending=%u",
              unique,
              (unsigned long long)g_totalFires.load(std::memory_order_relaxed),
-             evicted);
+             evicted, submittedCount, pendingCount);
 }

@@ -3,6 +3,7 @@
 #include "remix_api.h"
 #include "fo4_diagnostics.h"
 #include "semantic_capture.h"
+#include "resolvers/lighting_static.h"  // Trace::SetStep + Trace::Step constants
 
 #include "remix/remix_c.h"
 
@@ -10,12 +11,15 @@
 #include "f4se/PluginAPI.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
+#include <mutex>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <d3d11.h>
+#include <excpt.h>  // EXCEPTION_EXECUTE_HANDLER for SEH wrappers below
 
 // ---------------------------------------------------------------------------
 // DXGI -> remixapi_Format mapping
@@ -48,26 +52,70 @@ static std::wstring HashToPath(uint64_t hash) {
 }
 
 // ---------------------------------------------------------------------------
+// First-N-catches-per-callsite logger for C++ exceptions out of dxvk-remix
+// API calls. We saw 3277 caught C++ exceptions out of SubmitDrawable in the
+// last session; logging every one would balloon the log to MB. First 16 per
+// call site is enough to spot patterns and learn what's actually being thrown.
+// ---------------------------------------------------------------------------
+static std::atomic<int> g_cxxLogCount_SubmitDrawable{0};
+static std::atomic<int> g_cxxLogCount_ReleaseDrawableMesh{0};
+static std::atomic<int> g_cxxLogCount_ReleaseDrawableMaterial{0};
+static std::atomic<int> g_cxxLogCount_ReleaseDrawableTexture{0};
+static std::atomic<int> g_cxxLogCount_DrawInstance{0};
+static constexpr int kCxxLogCap = 16;
+
+// ---------------------------------------------------------------------------
+// SEH wrapper for api->DrawInstance. The OnFrame draw loop iterates
+// g_drawables under g_renderStateMutex (lock_guard's destructor would
+// conflict with __try, C2712), so we isolate the API call here. Returns
+// 0 on normal completion (with *outErr set to the API status); 1 on
+// SEH catch with *outExceptionCode set.
+// ---------------------------------------------------------------------------
+// Inner C++ helper: catches C++ exceptions thrown out of DrawInstance and
+// logs e.what() for the first kCxxLogCap occurrences. Returns 0 on clean
+// success (with *outErr set to API status), 2 if a C++ exception was
+// caught and swallowed (with *outErr forced to GENERAL_FAILURE).
+// Factored out so the outer CallDrawInstanceGuarded can wrap it in __try
+// without MSVC complaining about mixed EH forms in the same function (C2713).
+static int CallDrawInstanceCxxGuarded(remixapi_Interface* api,
+                                      const remixapi_InstanceInfo* instance,
+                                      remixapi_ErrorCode* outErr) {
+    try {
+        *outErr = api->DrawInstance(instance);
+        return 0;
+    } catch (const std::exception& e) {
+        int n = g_cxxLogCount_DrawInstance.fetch_add(1, std::memory_order_relaxed);
+        if (n < kCxxLogCap) {
+            _MESSAGE("FO4RemixPlugin: [OnFrame] DrawInstance C++ exception #%d what=%s",
+                     n, e.what());
+        }
+        *outErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        return 2;
+    } catch (...) {
+        int n = g_cxxLogCount_DrawInstance.fetch_add(1, std::memory_order_relaxed);
+        if (n < kCxxLogCap) {
+            _MESSAGE("FO4RemixPlugin: [OnFrame] DrawInstance unknown C++ exception #%d", n);
+        }
+        *outErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        return 2;
+    }
+}
+
+static int CallDrawInstanceGuarded(remixapi_Interface* api,
+                                   const remixapi_InstanceInfo* instance,
+                                   remixapi_ErrorCode* outErr,
+                                   unsigned long* outExceptionCode) {
+    __try {
+        return CallDrawInstanceCxxGuarded(api, instance, outErr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outExceptionCode = GetExceptionCode();
+        return 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Scene tracking state
 // ---------------------------------------------------------------------------
-struct SceneMeshInstance {
-    remixapi_MeshHandle handle;
-    remixapi_Transform  transform;
-    uint64_t            meshHash = 0;       // Index into g_geometryAlphaState
-    uint64_t            materialHash = 0;   // Index into g_materialCache (LRU)
-    std::unordered_set<uint64_t> textureHashes;  // Textures used by this mesh's material
-};
-
-struct CellSceneData {
-    std::vector<SceneMeshInstance> meshes;
-    std::vector<SkinnedMeshInstance> skinnedMeshInstances;  // Skinned meshes
-    std::unordered_set<uint64_t> materialHashes;   // Hashes into g_materialCache owned by this cell
-    std::vector<remixapi_LightHandle> lights;
-    std::unordered_set<uint64_t> textureHashes;
-};
-
-static std::unordered_map<uint32_t, CellSceneData> g_cellScenes;
-
 // Textures are shared across cells (same texture may appear in multiple cells)
 // so keep them global with a reference count
 struct TextureRef {
@@ -91,12 +139,40 @@ struct MaterialRef {
 };
 static std::unordered_map<uint64_t, MaterialRef> g_materialCache;
 
-// Per-hash Remix InstanceInfoBlendEXT, populated at LoadCellScene time for
+// Per-hash Remix InstanceInfoBlendEXT, populated at SubmitDrawable time for
 // meshes that have any alpha state (test or blend). OnFrame's DrawInstance
 // loop chains the stored struct onto instance.pNext so Remix honors per-
-// instance alpha state. Keyed by the mesh's `hash` field (NOT MaterialKey
-// hash) -- per-instance, not per-material.
+// instance alpha state. Keyed by the mesh's `hash` field (NOT material hash)
+// -- per-instance, not per-material.
 static std::unordered_map<uint64_t, remixapi_InstanceInfoBlendEXT> g_geometryAlphaState;
+
+// ---------------------------------------------------------------------------
+// Phase 1B: flat per-drawable map, keyed by PassKey/drawable hash.
+//
+// Flat map keyed by drawable hash (== PassKey from semantic_capture).
+// Mutated by SubmitDrawable/ReleaseDrawable on the game thread (via
+// SemanticCapture::Tick from hkPresent). Read by OnFrame draw loop on
+// the Remix thread. ALL access requires holding g_renderStateMutex.
+// ---------------------------------------------------------------------------
+namespace {
+    struct DrawableInstance {
+        remixapi_MeshHandle          meshHandle    = nullptr;
+        uint64_t                     materialHash  = 0;   // index into g_materialCache
+        std::unordered_set<uint64_t> textureHashes;       // for refcount cascade
+        uint64_t                     lastDrawnFrame = 0;  // stamped by OnFrame
+        float                        worldTransform[3][4] = {};  // row-major 3x4 matrix; populated from mesh.worldTransform at submit time
+    };
+
+    std::unordered_map<uint64_t, DrawableInstance> g_drawables;
+
+    // Protects g_drawables, g_materialCache, and g_textureHandles.
+    // Submission (SubmitDrawable / ReleaseDrawable) runs on the game thread
+    // via SemanticCapture::Tick from hkPresent; drawing (OnFrame) and sweeps
+    // (SweepStaleMaterials / SweepStaleTextures) run on the Remix thread.
+    // Without this mutex, unordered_map insertions can rehash mid-iteration
+    // and crash the iterating thread.
+    std::mutex g_renderStateMutex;
+}
 
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
 static remixapi_MeshHandle g_fallbackMesh = nullptr;
@@ -168,75 +244,58 @@ bool RemixRenderer::GetVramStats(VramStats* out) {
 // ---------------------------------------------------------------------------
 // SweepStaleMaterials -- the LEVER for VRAM reclamation.
 //
-// Materials hold Rc<DxvkImageView> refs in the Remix runtime, so cascade-
-// evicting stale materials is what actually drops texture VRAM for shared
-// texture sets. FO4 has no per-mesh RemoveGeometry yet, so the eviction unit
-// is the cell: any cell containing a mesh whose material is stale is
-// unloaded wholesale. Coarser than Skyrim's per-mesh eviction; consistent
-// with FO4's existing eviction model.
-//
-// Budget gate: when budgetBytes > 0, sweep only fires if currentMaterialTex
-// is over budget. budgetBytes == 0 means TTL-only mode (always fire, evict
-// strictly by age).
+// LRU sweep for materials. Refcount-driven: materials with refCount == 0 and
+// age > ttlFrames are destroyed. ReleaseDrawable normally drops refcounts to
+// zero when the last referencing drawable is released; this sweep is the
+// backstop for any orphan entries left behind. The cell-granular cascade was
+// deleted with the cell pipeline; the refCount + lastDrawnFrame combination
+// is the new eviction unit. cellsEvicted in the result is always 0 in Phase
+// 1B onward (kept for ABI compatibility with the periodic stats logger).
 // ---------------------------------------------------------------------------
 RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
         uint64_t currentFrameIndex,
         uint64_t ttlFrames,
         uint64_t budgetBytes,
         uint64_t currentMaterialTexBytes) {
+    std::lock_guard<std::mutex> lock(g_renderStateMutex);
+
     StaleMaterialSweepResult result{};
     result.materialCacheCount = static_cast<uint32_t>(g_materialCache.size());
 
-    const bool budgetActive = (budgetBytes > 0);
-    const bool isOverBudget = budgetActive && (currentMaterialTexBytes > budgetBytes);
-    if (budgetActive && !isOverBudget) {
-        return result;
-    }
+    auto* api = RemixAPI::GetInterface();
+    if (!api) return result;
 
-    // Pass 1: collect hashes of stale materials (no owner drew in ttlFrames).
-    std::unordered_set<uint64_t> staleMaterials;
-    staleMaterials.reserve(g_materialCache.size() / 4 + 8);
-    for (const auto& [hash, mat] : g_materialCache) {
-        const uint64_t age = (currentFrameIndex > mat.lastDrawnFrame)
-            ? (currentFrameIndex - mat.lastDrawnFrame) : 0;
-        if (age > ttlFrames) {
-            staleMaterials.insert(hash);
-        }
-    }
-    result.staleMaterialCount = static_cast<uint32_t>(staleMaterials.size());
-
-    if (staleMaterials.empty()) {
-        return result;
-    }
-
-    // Pass 2: cell-granular cascade eviction. Any cell whose meshes reference
-    // a stale material gets unloaded; UnloadCell handles the refcount math
-    // (and may drop the material entirely if no other cell still owns it).
-    std::unordered_set<uint32_t> cellsToUnload;
-    for (const auto& [cellID, cellData] : g_cellScenes) {
-        bool cellTouchesStale = false;
-        for (const auto& inst : cellData.meshes) {
-            if (inst.materialHash != 0 && staleMaterials.count(inst.materialHash)) {
-                cellTouchesStale = true;
-                break;
+    // TTL pass: destroy materials whose refCount is 0 and lastDrawn is stale.
+    // Refcount-driven destruction: ReleaseDrawable normally drops the count to
+    // zero on TTL eviction, and this sweep is the backstop for any orphan
+    // entries left behind. The cell-granular cascade was deleted with the
+    // cell pipeline; the refcount + lastDrawnFrame combination is the new
+    // eviction unit.
+    for (auto it = g_materialCache.begin(); it != g_materialCache.end();) {
+        const uint64_t age = (currentFrameIndex > it->second.lastDrawnFrame)
+            ? (currentFrameIndex - it->second.lastDrawnFrame) : 0;
+        const bool stale = (it->second.refCount == 0) && (age > ttlFrames);
+        if (stale) {
+            if (it->second.handle) {
+                api->DestroyMaterial(it->second.handle);
             }
-        }
-        if (!cellTouchesStale) {
-            for (const auto& inst : cellData.skinnedMeshInstances) {
-                if (inst.materialHash != 0 && staleMaterials.count(inst.materialHash)) {
-                    cellTouchesStale = true;
-                    break;
-                }
-            }
-        }
-        if (cellTouchesStale) {
-            cellsToUnload.insert(cellID);
+            it = g_materialCache.erase(it);
+            ++result.staleMaterialCount;
+        } else {
+            ++it;
         }
     }
-    for (uint32_t cellID : cellsToUnload) {
-        UnloadCell(cellID);
-    }
-    result.cellsEvicted = static_cast<uint32_t>(cellsToUnload.size());
+
+    // Cells are gone; cellsEvicted is always 0 in 1B onward (kept for ABI
+    // compatibility with the periodic stats logger; Task 14 commit will note
+    // this is now meaningless and can be retired in a future cleanup).
+    result.cellsEvicted = 0;
+
+    // Budget pressure on materials is handled implicitly via the texture
+    // sweep below (textures are the major VRAM consumer). Material handles
+    // themselves are tiny by comparison.
+    (void)budgetBytes;
+    (void)currentMaterialTexBytes;
 
     return result;
 }
@@ -244,23 +303,26 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
 // ---------------------------------------------------------------------------
 // SweepStaleTextures -- the BACKSTOP for the material sweep.
 //
-// Catches textures whose cache entry survives their owning materials (e.g.
-// after the material sweep cascades a cell, refcount drops handle the
-// common case, but a defensive orphan pass below mops up anything left).
+// LRU sweep for textures. Refcount-driven: textures with refCount == 0 and
+// age > ttlFrames are destroyed. ReleaseDrawable normally drops refcounts
+// to zero when the last referencing material is destroyed; this sweep is
+// the backstop for any orphans. cellsEvicted in the result struct is
+// always 0 in Phase 1B onward (cells retired with the cell pipeline).
 //
 // Two-pass eviction logic:
 //   (1) TTL pass -- collect textures un-drawn in ttlFrames.
 //   (2) Budget pass -- if currentMaterialTex is over budgetBytes, add the
 //       oldest non-stale textures (with min-age guardrail and per-sweep
 //       cap) to the eviction set.
-// Then cell-granular eviction (any cell with a mesh referencing a stale
-// texture is unloaded), then defensive orphan-handle destruction.
+// Then defensive orphan-handle destruction (refCount == 0 guard).
 // ---------------------------------------------------------------------------
 RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
         uint64_t currentFrameIndex,
         uint64_t ttlFrames,
         uint64_t budgetBytes,
         uint64_t currentMaterialTexBytes) {
+    std::lock_guard<std::mutex> lock(g_renderStateMutex);
+
     StaleTextureSweepResult result{};
     result.textureHandleCount = static_cast<uint32_t>(g_textureHandles.size());
 
@@ -306,31 +368,6 @@ RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
         return result;
     }
 
-    // Pass 3: cell-granular eviction.
-    std::unordered_set<uint32_t> cellsToUnload;
-    for (const auto& [cellID, cellData] : g_cellScenes) {
-        bool cellTouchesStale = false;
-        for (const auto& inst : cellData.meshes) {
-            for (uint64_t texHash : inst.textureHashes) {
-                if (staleTextures.count(texHash)) { cellTouchesStale = true; break; }
-            }
-            if (cellTouchesStale) break;
-        }
-        if (!cellTouchesStale) {
-            for (const auto& inst : cellData.skinnedMeshInstances) {
-                for (uint64_t texHash : inst.textureHashes) {
-                    if (staleTextures.count(texHash)) { cellTouchesStale = true; break; }
-                }
-                if (cellTouchesStale) break;
-            }
-        }
-        if (cellTouchesStale) cellsToUnload.insert(cellID);
-    }
-    for (uint32_t cellID : cellsToUnload) {
-        UnloadCell(cellID);
-    }
-    result.cellsEvicted = static_cast<uint32_t>(cellsToUnload.size());
-
     // Orphan cleanup: textures the cell-unload didn't already release. With
     // the global texture refcount, an entry only survives here if some cell
     // we did NOT unload still references it -- but defensive sweep doesn't
@@ -352,293 +389,101 @@ RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
 }
 
 // ---------------------------------------------------------------------------
-// Unload all Remix handles for a specific cell
+// Phase 1B: SubmitDrawable / ReleaseDrawable
 // ---------------------------------------------------------------------------
-void RemixRenderer::UnloadCell(uint32_t cellFormID) {
-    remixapi_Interface* api = RemixAPI::GetInterface();
-    if (!api) return;
 
-    auto it = g_cellScenes.find(cellFormID);
-    if (it == g_cellScenes.end()) return;
-
-    CellSceneData& cell = it->second;
-
-    for (auto& inst : cell.meshes) {
-        if (inst.handle) api->DestroyMesh(inst.handle);
-    }
-
-    for (auto& inst : cell.skinnedMeshInstances) {
-        if (inst.meshHandle) api->DestroyMesh(inst.meshHandle);
-    }
-
-    // Decrement refcounts in the global material cache. Destroy the
-    // material handle when the refcount hits zero; otherwise leave it
-    // for other cells that still reference it.
-    for (uint64_t matHash : cell.materialHashes) {
-        auto matIt = g_materialCache.find(matHash);
-        if (matIt != g_materialCache.end()) {
-            if (matIt->second.refCount > 0) matIt->second.refCount--;
-            if (matIt->second.refCount == 0) {
-                if (matIt->second.handle) api->DestroyMaterial(matIt->second.handle);
-                g_materialCache.erase(matIt);
-            }
+// Backout helpers for a failed SubmitDrawable. They decrement refcounts only --
+// they do NOT call DestroyTexture / DestroyMaterial even when the count reaches
+// zero. Inline destruction here is what was driving the
+// CreateTexture/DestroyTexture churn cycle: the resolver retries the same
+// failing drawable on subsequent frames, so each retry would create-then-destroy
+// the same handles, eventually corrupting dxvk-remix internal state and making
+// every later DestroyTexture / DestroyMaterial throw 0xE06D7363. Leave orphans
+// for the LRU sweep to collect naturally; the cost is a few stale entries
+// living for ttlFrames, which the existing sweep cadence handles fine.
+// Callers must hold g_renderStateMutex.
+static void DecrementTextureRefs(const std::unordered_set<uint64_t>& hashes) {
+    for (uint64_t h : hashes) {
+        auto it = g_textureHandles.find(h);
+        if (it != g_textureHandles.end() && it->second.refCount > 0) {
+            --it->second.refCount;
         }
     }
-
-    for (auto& handle : cell.lights) {
-        if (handle) api->DestroyLight(handle);
-    }
-
-    // Decrement texture refcounts; destroy if refCount hits 0
-    for (uint64_t texHash : cell.textureHashes) {
-        auto texIt = g_textureHandles.find(texHash);
-        if (texIt != g_textureHandles.end()) {
-            texIt->second.refCount--;
-            if (texIt->second.refCount == 0) {
-                if (texIt->second.handle) api->DestroyTexture(texIt->second.handle);
-                g_textureHandles.erase(texIt);
-            }
-        }
-    }
-
-    g_cellScenes.erase(it);
 }
 
-// ---------------------------------------------------------------------------
-// Unload all cells and destroy all Remix handles
-// ---------------------------------------------------------------------------
-void RemixRenderer::UnloadAllCells() {
-    remixapi_Interface* api = RemixAPI::GetInterface();
-    if (!api) return;
-
-    for (auto& [cellID, cell] : g_cellScenes) {
-        for (auto& inst : cell.meshes) {
-            if (inst.handle) api->DestroyMesh(inst.handle);
-        }
-        for (auto& inst : cell.skinnedMeshInstances) {
-            if (inst.meshHandle) api->DestroyMesh(inst.meshHandle);
-        }
-        for (auto& handle : cell.lights) {
-            if (handle) api->DestroyLight(handle);
-        }
+static void DecrementMaterialRef(uint64_t matHash) {
+    if (matHash == 0) return;
+    auto it = g_materialCache.find(matHash);
+    if (it != g_materialCache.end() && it->second.refCount > 0) {
+        --it->second.refCount;
     }
-    g_cellScenes.clear();
-
-    // Destroy every material in the global cache. Refcounts are irrelevant
-    // since every cell is being unloaded; nothing can still own these.
-    for (auto& [hash, matRef] : g_materialCache) {
-        if (matRef.handle) api->DestroyMaterial(matRef.handle);
-    }
-    g_materialCache.clear();
-
-    for (auto& [hash, texRef] : g_textureHandles) {
-        if (texRef.handle) api->DestroyTexture(texRef.handle);
-    }
-    g_textureHandles.clear();
 }
 
-// ---------------------------------------------------------------------------
-// Material key: identifies a unique material by its texture combo + emissive params
-// Defined at file scope so both CreateCellMaterials and LoadCellScene can use it.
-// ---------------------------------------------------------------------------
-struct MaterialKey {
-    uint64_t diffuse;
-    uint64_t normal;
-    uint64_t roughness;
-    uint64_t emissive;
-    float emissiveColorR, emissiveColorG, emissiveColorB;
-    float emissiveIntensity;
-    bool alphaTestEnabled;
-    int alphaTestType;       // Remix/VkCompareOp
-    uint8_t alphaTestRef;
-    bool useDrawCallAlphaState = false;  // true -> opaqueExt.useDrawCallAlphaState=1
-    uint64_t combined() const {
-        uint64_t h = diffuse;
-        h ^= normal    * 0x517CC1B727220A95ULL;
-        h ^= roughness * 0x6C62272E07BB0142ULL;
-        h ^= emissive  * 0x9E3779B97F4A7C15ULL;
-        // Include emissive color/intensity so different tints get separate materials
-        uint32_t ri, gi, bi, ii;
-        memcpy(&ri, &emissiveColorR, 4);
-        memcpy(&gi, &emissiveColorG, 4);
-        memcpy(&bi, &emissiveColorB, 4);
-        memcpy(&ii, &emissiveIntensity, 4);
-        h ^= (uint64_t)ri * 0x85EBCA6BC2B2AE35ULL;
-        h ^= (uint64_t)gi * 0xC2B2AE3D27D4EB4FULL;
-        h ^= (uint64_t)bi * 0x165667B19E3779F9ULL;
-        h ^= (uint64_t)ii * 0x27D4EB2F165667C5ULL;
-        // Distinguish materials that defer alpha to per-instance state.
-        // Different value here means a different material in cache, which
-        // is what we want -- otherwise a per-instance alpha-blend mesh
-        // would share its material with an opaque variant and the Remix
-        // fork would honor only one of the two states.
-        h ^= (uint64_t)(useDrawCallAlphaState ? 1 : 0) * 0x9FB21C651E98DF25ULL;
-        return h;
-    }
-};
+RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
+        uint64_t hash,
+        const ExtractedMesh& mesh,
+        const std::vector<ExtractedTexture>& newTextures) {
 
-// ---------------------------------------------------------------------------
-// Create Remix materials from an extraction result.
-// Collects unique MaterialKey entries from meshes and skinned meshes, then
-// creates one Remix material per unique key.  Returns material handles keyed
-// by the combined hash.
-// ---------------------------------------------------------------------------
-static std::unordered_map<uint64_t, remixapi_MaterialHandle> CreateCellMaterials(
-    remixapi_Interface* api,
-    uint32_t cellFormID,
-    const ExtractionResult& result)
-{
-    std::unordered_map<uint64_t, remixapi_MaterialHandle> materials;
+    std::lock_guard<std::mutex> lock(g_renderStateMutex);
 
-    std::unordered_map<uint64_t, MaterialKey> materialKeys;
-
-    // Collect material keys from static meshes
-    for (auto& mesh : result.meshes) {
-        if (mesh.diffuseTextureHash == 0) continue;
-        MaterialKey key { mesh.diffuseTextureHash, mesh.normalTextureHash, mesh.roughnessTextureHash,
-                          mesh.emissiveTextureHash, mesh.emissiveColorR, mesh.emissiveColorG,
-                          mesh.emissiveColorB, mesh.emissiveIntensity,
-                          mesh.alphaTestEnabled, mesh.alphaTestType, mesh.alphaTestRef };
-        key.useDrawCallAlphaState = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
-        auto it = materialKeys.find(key.combined());
-        if (it == materialKeys.end()) {
-            materialKeys.emplace(key.combined(), key);
-        } else if (mesh.alphaTestEnabled && !it->second.alphaTestEnabled) {
-            it->second.alphaTestEnabled = true;
-            it->second.alphaTestType = mesh.alphaTestType;
-            it->second.alphaTestRef = mesh.alphaTestRef;
-        }
+    // C++ exception fence: dxvk-remix API calls (CreateTexture/CreateMaterial/
+    // CreateMesh) can throw under VRAM pressure or other failure modes. Letting
+    // those bubble up corrupts dxvk-remix's internal Vulkan command queue and
+    // freezes the render thread (observed: 3277 caught C++ exceptions /
+    // 0xE06D7363 in last session). Catch here, log e.what() for the first
+    // kCxxLogCap occurrences, and return kFailed cleanly. Any partial state
+    // (texture refs bumped before the throw) leaks until LRU sweep collects;
+    // accepted cost.
+    try {
+    // Idempotent: already submitted, nothing to do
+    if (g_drawables.find(hash) != g_drawables.end()) {
+        return SubmitStatus::kSubmitted;
     }
 
-    // Collect material keys from skinned meshes
-    for (auto& sm : result.skinnedMeshes) {
-        if (sm.diffuseTextureHash == 0) continue;
-        MaterialKey key { sm.diffuseTextureHash, sm.normalTextureHash, sm.roughnessTextureHash,
-                          sm.emissiveTextureHash, sm.emissiveColorR, sm.emissiveColorG,
-                          sm.emissiveColorB, sm.emissiveIntensity,
-                          sm.alphaTestEnabled, sm.alphaTestType, sm.alphaTestRef };
-        key.useDrawCallAlphaState = sm.alphaTestEnabled || sm.alphaBlendEnabled;
-        auto it = materialKeys.find(key.combined());
-        if (it == materialKeys.end()) {
-            materialKeys.emplace(key.combined(), key);
-        } else if (sm.alphaTestEnabled && !it->second.alphaTestEnabled) {
-            it->second.alphaTestEnabled = true;
-            it->second.alphaTestType = sm.alphaTestType;
-            it->second.alphaTestRef = sm.alphaTestRef;
-        }
+    // No diffuse means no lit material — caller (resolver) is supposed to gate
+    // on this and retry next frame. Defensive guard.
+    if (mesh.diffuseTextureHash == 0) {
+        return SubmitStatus::kFailed;
     }
 
-    uint32_t matCreated = 0, matReused = 0, matFailed = 0;
-
-    for (auto& [combinedHash, key] : materialKeys) {
-        // Check the global cache first; if a previous cell already created
-        // this material, bump its refcount and skip CreateMaterial.
-        auto cacheIt = g_materialCache.find(combinedHash);
-        if (cacheIt != g_materialCache.end()) {
-            cacheIt->second.refCount++;
-            cacheIt->second.lastDrawnFrame = Diagnostics::CurrentFrameIndex();
-            materials[combinedHash] = cacheIt->second.handle;
-            matReused++;
-            continue;
-        }
-
-        std::wstring diffPath = HashToPath(key.diffuse);
-        std::wstring normalPath = key.normal ? HashToPath(key.normal) : L"";
-        std::wstring roughPath = key.roughness ? HashToPath(key.roughness) : L"";
-        std::wstring emissivePath = key.emissive ? HashToPath(key.emissive) : L"";
-
-        remixapi_MaterialInfoOpaqueEXT opaqueExt = {};
-        opaqueExt.sType             = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
-        opaqueExt.pNext             = nullptr;
-        opaqueExt.roughnessTexture  = key.roughness ? roughPath.c_str() : nullptr;
-        opaqueExt.metallicTexture   = nullptr;
-        opaqueExt.heightTexture     = nullptr;
-        opaqueExt.albedoConstant    = { 1.0f, 1.0f, 1.0f };
-        opaqueExt.opacityConstant   = 1.0f;
-        opaqueExt.roughnessConstant = key.roughness ? 0.5f : 0.8f;
-        opaqueExt.metallicConstant  = 0.0f;
-        opaqueExt.alphaTestType     = key.alphaTestEnabled ? key.alphaTestType : 7;
-        opaqueExt.alphaReferenceValue = key.alphaTestEnabled ? key.alphaTestRef : 0;
-        // Tell Remix to honor per-instance alpha state via InstanceInfoBlendEXT
-        // chained at DrawInstance time. Set when the mesh has either alpha-test
-        // or alpha-blend enabled; otherwise the material's own alpha defaults
-        // (above) win.
-        opaqueExt.useDrawCallAlphaState = key.useDrawCallAlphaState ? 1 : 0;
-
-        remixapi_MaterialInfo matInfo = {};
-        matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
-        matInfo.pNext              = &opaqueExt;
-        matInfo.hash               = combinedHash;
-        matInfo.albedoTexture      = diffPath.c_str();
-        matInfo.normalTexture      = key.normal ? normalPath.c_str() : nullptr;
-        matInfo.tangentTexture     = nullptr;
-        matInfo.emissiveTexture       = key.emissive ? emissivePath.c_str() : nullptr;
-        matInfo.emissiveIntensity     = key.emissiveIntensity * g_config.emissiveIntensity;
-        matInfo.emissiveColorConstant = { key.emissiveColorR, key.emissiveColorG, key.emissiveColorB };
-        matInfo.spriteSheetRow     = 1;
-        matInfo.spriteSheetCol     = 1;
-        matInfo.spriteSheetFps     = 0;
-        matInfo.filterMode         = 1;
-        matInfo.wrapModeU          = 1;  // Repeat (0 = Clamp)
-        matInfo.wrapModeV          = 1;
-
-        remixapi_MaterialHandle handle = nullptr;
-        remixapi_ErrorCode status = api->CreateMaterial(&matInfo, &handle);
-        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Failed to create material 0x%llX (error %d)",
-                     cellFormID, (unsigned long long)combinedHash, (int)status);
-            matFailed++;
-            continue;
-        }
-
-        g_materialCache[combinedHash] = { handle, 1, Diagnostics::CurrentFrameIndex() };
-        materials[combinedHash] = handle;
-        matCreated++;
+    // Defensive: dxvk-remix CreateMesh / CreateTexture can throw on degenerate
+    // inputs (empty vertex buffer, empty pixel data). Bail early -- saves an
+    // api->CreateX call that would just throw and corrupt dxvk-remix internal
+    // state. The trace step here lets the SEH catch (if a later call still
+    // throws on this drawable for an unrelated reason) report which gate fired.
+    if (mesh.vertices.empty()) {
+        Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_GateInputEmpty);
+        return SubmitStatus::kFailed;
     }
 
-    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Materials - created %u, reused %u, failed %u",
-             cellFormID, matCreated, matReused, matFailed);
-
-    return materials;
-}
-
-// ---------------------------------------------------------------------------
-// Load extracted textures, materials, and meshes for a specific cell
-// ---------------------------------------------------------------------------
-void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result) {
     remixapi_Interface* api = RemixAPI::GetInterface();
-    if (!api) return;
+    if (!api) return SubmitStatus::kFailed;
 
-    // If this cell already exists, clean up old data first.
-    // Preserve existing lights during refreshes (empty lights in new data = refresh).
-    std::vector<remixapi_LightHandle> preservedLights;
-    if (g_cellScenes.find(cellFormID) != g_cellScenes.end()) {
-        if (result.lights.empty()) {
-            preservedLights = std::move(g_cellScenes[cellFormID].lights);
-            g_cellScenes[cellFormID].lights.clear();
-        }
-        UnloadCell(cellFormID);
-    }
+    DrawableInstance inst;
 
-    CellSceneData cellData;
-
-    // ----- Upload textures (shared across cells with refcounting) -----
-    uint32_t texCreated = 0, texFailed = 0, texSkipped = 0;
-
-    for (auto& tex : result.textures) {
+    // ---- Texture upload + cache ----
+    // Per-texture upload + cache loop: refCount++ on hit, insert at refCount=1 on miss.
+    for (const auto& tex : newTextures) {
         auto existing = g_textureHandles.find(tex.hash);
         if (existing != g_textureHandles.end()) {
-            // Texture already loaded by another cell, just bump refcount
+            // Already cached by another cell or drawable; bump refcount.
             existing->second.refCount++;
-            cellData.textureHashes.insert(tex.hash);
+            inst.textureHashes.insert(tex.hash);
+            continue;
+        }
+
+        // Defensive: skip degenerate textures (empty pixel data / 0 dims). dxvk-remix
+        // CreateTexture has been observed to throw on these. Skipping here is safer
+        // than the throw-and-corrupt-internal-state path. Refcounts NOT bumped and
+        // g_textureHandles NOT inserted -- material lookup will just hit the
+        // hash-path-as-string fallback for this slot.
+        if (tex.pixels.empty() || tex.width == 0 || tex.height == 0) {
             continue;
         }
 
         remixapi_Format remixFmt = DxgiToRemixFormat(tex.dxgiFormat);
         if (remixFmt == (remixapi_Format)0) {
-            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Skipping texture 0x%llX - unsupported DXGI format %u",
-                     cellFormID, (unsigned long long)tex.hash, (unsigned int)tex.dxgiFormat);
-            texSkipped++;
+            // Unsupported format; skip — material will reference hash path anyway.
             continue;
         }
 
@@ -654,302 +499,298 @@ void RemixRenderer::LoadCellScene(uint32_t cellFormID, ExtractionResult&& result
         texInfo.data      = tex.pixels.data();
         texInfo.dataSize  = tex.pixels.size();
 
-        remixapi_TextureHandle handle = nullptr;
-        remixapi_ErrorCode status = api->CreateTexture(&texInfo, &handle);
-        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Failed to upload texture 0x%llX (error %d)",
-                     cellFormID, (unsigned long long)tex.hash, (int)status);
-            texFailed++;
+        remixapi_TextureHandle texHandle = nullptr;
+        Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_BeforeTextureCreate);
+        remixapi_ErrorCode status = api->CreateTexture(&texInfo, &texHandle);
+        Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_AfterTextureCreate);
+        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !texHandle) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to upload texture 0x%llX (error %d)",
+                     (unsigned long long)tex.hash, (int)status);
             continue;
         }
 
-        g_textureHandles[tex.hash] = { handle, 1 };
-        cellData.textureHashes.insert(tex.hash);
-        texCreated++;
+        g_textureHandles[tex.hash] = { texHandle, 1, Diagnostics::CurrentFrameIndex() };
+        inst.textureHashes.insert(tex.hash);
     }
 
-    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Textures - uploaded %u, failed %u, skipped %u",
-             cellFormID, texCreated, texFailed, texSkipped);
+    // ---- Validate texture upload completeness ----
+    // The resolver computed mesh.{diffuse,normal,roughness,emissive}TextureHash
+    // from raw texture data, but the per-texture upload loop above can skip
+    // textures (empty pixels, zero dims, unsupported format, CreateTexture
+    // failure). If we still build a material referencing those skipped hashes,
+    // dxvk-remix carries a dangling reference that hangs its overlay refresh
+    // (alt-tab to the Remix window walks all materials and validates refs --
+    // hundreds of dangling refs freeze the runtime). Bail if diffuse failed,
+    // and zero out optional refs so the material is built without them.
+    auto loaded = [&](uint64_t h) {
+        return h == 0 || g_textureHandles.find(h) != g_textureHandles.end();
+    };
 
-    // ----- Create materials (one per unique texture combination) -----
-    // The returned map is a local lookup of combinedHash -> handle for the
-    // mesh-creation loops below; the actual handles are owned by g_materialCache
-    // (refcounted, swept by SweepStaleMaterials).
-    auto materialsLookup = CreateCellMaterials(api, cellFormID, result);
-    for (auto& [combinedHash, _] : materialsLookup) {
-        cellData.materialHashes.insert(combinedHash);
+    if (!loaded(mesh.diffuseTextureHash)) {
+        // Diffuse missing: this drawable can't render lit. Drop refcounts on
+        // any textures we bumped during the upload loop, but DON'T destroy
+        // them here -- see DecrementTextureRefs comment for why.
+        DecrementTextureRefs(inst.textureHashes);
+        return SubmitStatus::kFailed;
     }
 
-    // ----- Create meshes -----
-    uint32_t meshCreated = 0, meshFailed = 0;
+    const uint64_t normalH    = loaded(mesh.normalTextureHash)    ? mesh.normalTextureHash    : 0;
+    const uint64_t roughnessH = loaded(mesh.roughnessTextureHash) ? mesh.roughnessTextureHash : 0;
+    const uint64_t emissiveH  = loaded(mesh.emissiveTextureHash)  ? mesh.emissiveTextureHash  : 0;
 
-    for (auto& mesh : result.meshes) {
-        if (mesh.vertices.empty()) continue;
+    // ---- Material cache ----
+    // Hash the texture combination to get a stable per-material cache key.
+    // On hit, bump refCount + lastDrawnFrame. On miss, create a new Remix
+    // material handle and insert at refCount=1.
+    uint64_t matHash = 0;
+    remixapi_MaterialHandle matHandle = nullptr;
 
-        // Look up material handle by combined texture hash
-        remixapi_MaterialHandle matHandle = nullptr;
-        uint64_t combinedHash = 0;
-        if (mesh.diffuseTextureHash != 0) {
-            MaterialKey lookupKey { mesh.diffuseTextureHash, mesh.normalTextureHash, mesh.roughnessTextureHash,
-                                    mesh.emissiveTextureHash, mesh.emissiveColorR, mesh.emissiveColorG,
-                                    mesh.emissiveColorB, mesh.emissiveIntensity,
-                                    mesh.alphaTestEnabled, mesh.alphaTestType, mesh.alphaTestRef };
-            lookupKey.useDrawCallAlphaState = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
-            combinedHash = lookupKey.combined();
-            auto it = materialsLookup.find(combinedHash);
-            if (it != materialsLookup.end())
-                matHandle = it->second;
-        }
+    if (mesh.diffuseTextureHash != 0) {
+        // Hash diffuse + normal + roughness + emissive hashes plus emissive
+        // colour components and alpha flags into a single 64-bit cache key.
+        uint64_t h = mesh.diffuseTextureHash;
+        h ^= normalH    * 0x517CC1B727220A95ULL;
+        h ^= roughnessH * 0x6C62272E07BB0142ULL;
+        h ^= emissiveH  * 0x9E3779B97F4A7C15ULL;
+        uint32_t ri, gi, bi, ii;
+        memcpy(&ri, &mesh.emissiveColorR, 4);
+        memcpy(&gi, &mesh.emissiveColorG, 4);
+        memcpy(&bi, &mesh.emissiveColorB, 4);
+        memcpy(&ii, &mesh.emissiveIntensity, 4);
+        h ^= (uint64_t)ri * 0x85EBCA6BC2B2AE35ULL;
+        h ^= (uint64_t)gi * 0xC2B2AE3D27D4EB4FULL;
+        h ^= (uint64_t)bi * 0x165667B19E3779F9ULL;
+        h ^= (uint64_t)ii * 0x27D4EB2F165667C5ULL;
+        bool useDrawCall = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
+        h ^= (uint64_t)(useDrawCall ? 1 : 0) * 0x9FB21C651E98DF25ULL;
+        matHash = h;
 
-        remixapi_MeshInfoSurfaceTriangles surface = {};
-        surface.vertices_values = mesh.vertices.data();
-        surface.vertices_count = (uint32_t)mesh.vertices.size();
-        surface.indices_values = mesh.indices.empty() ? nullptr : mesh.indices.data();
-        surface.indices_count = (uint32_t)mesh.indices.size();
-        surface.skinning_hasvalue = 0;
-        surface.material = matHandle;
-
-        remixapi_MeshInfo meshInfo = {};
-        meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-        meshInfo.hash = mesh.hash;
-        meshInfo.surfaces_values = &surface;
-        meshInfo.surfaces_count = 1;
-
-        remixapi_MeshHandle handle = nullptr;
-        remixapi_ErrorCode status = api->CreateMesh(&meshInfo, &handle);
-        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            meshFailed++;
-            continue;
-        }
-
-        // Per-instance alpha state for this mesh. If the mesh has neither
-        // test nor blend, erase any prior entry (could happen if a mesh
-        // re-uploaded with different state). Otherwise write the EXT.
-        if (mesh.alphaTestEnabled || mesh.alphaBlendEnabled) {
-            remixapi_InstanceInfoBlendEXT blend = {};
-            blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
-            blend.pNext = nullptr;
-            blend.alphaTestEnabled         = mesh.alphaTestEnabled ? 1 : 0;
-            blend.alphaTestReferenceValue  = mesh.alphaTestRef;
-            blend.alphaTestCompareOp       = (uint32_t)mesh.alphaTestType;
-            blend.alphaBlendEnabled        = mesh.alphaBlendEnabled ? 1 : 0;
-            blend.srcColorBlendFactor      = mesh.srcColorBlendFactor;
-            blend.dstColorBlendFactor      = mesh.dstColorBlendFactor;
-            blend.colorBlendOp             = 0;  // VK_BLEND_OP_ADD
-            blend.srcAlphaBlendFactor      = mesh.srcColorBlendFactor;
-            blend.dstAlphaBlendFactor      = mesh.dstColorBlendFactor;
-            blend.alphaBlendOp             = 0;  // VK_BLEND_OP_ADD
-            blend.writeMask                = 0xF;  // RGBA
-            blend.isVertexColorBakedLighting = 0;
-            // Remaining textureColorArg* and tFactor* fields stay zero --
-            // those are fixed-function emulation paths the Remix fork
-            // ignores when alphaBlend/alphaTest are the active inputs.
-            g_geometryAlphaState[mesh.hash] = blend;
+        auto cacheIt = g_materialCache.find(matHash);
+        if (cacheIt != g_materialCache.end()) {
+            // Already in cache; bump refcount.
+            cacheIt->second.refCount++;
+            cacheIt->second.lastDrawnFrame = Diagnostics::CurrentFrameIndex();
+            matHandle = cacheIt->second.handle;
         } else {
-            g_geometryAlphaState.erase(mesh.hash);
+            // Cache miss — create a new Remix material handle and insert at refCount=1.
+            std::wstring diffPath     = HashToPath(mesh.diffuseTextureHash);
+            std::wstring normalPath   = normalH    ? HashToPath(normalH)    : L"";
+            std::wstring roughPath    = roughnessH ? HashToPath(roughnessH) : L"";
+            std::wstring emissivePath = emissiveH  ? HashToPath(emissiveH)  : L"";
+
+            bool useDrawCallAlpha = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
+
+            remixapi_MaterialInfoOpaqueEXT opaqueExt = {};
+            opaqueExt.sType             = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+            opaqueExt.pNext             = nullptr;
+            opaqueExt.roughnessTexture  = roughnessH ? roughPath.c_str() : nullptr;
+            opaqueExt.metallicTexture   = nullptr;
+            opaqueExt.heightTexture     = nullptr;
+            opaqueExt.albedoConstant    = { 1.0f, 1.0f, 1.0f };
+            opaqueExt.opacityConstant   = 1.0f;
+            opaqueExt.roughnessConstant = roughnessH ? 0.5f : 0.8f;
+            opaqueExt.metallicConstant  = 0.0f;
+            opaqueExt.alphaTestType       = mesh.alphaTestEnabled ? mesh.alphaTestType : 7;
+            opaqueExt.alphaReferenceValue = mesh.alphaTestEnabled ? mesh.alphaTestRef  : 0;
+            opaqueExt.useDrawCallAlphaState = useDrawCallAlpha ? 1 : 0;
+
+            remixapi_MaterialInfo matInfo = {};
+            matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
+            matInfo.pNext              = &opaqueExt;
+            matInfo.hash               = matHash;
+            matInfo.albedoTexture      = diffPath.c_str();
+            matInfo.normalTexture      = normalH   ? normalPath.c_str()   : nullptr;
+            matInfo.tangentTexture     = nullptr;
+            matInfo.emissiveTexture       = emissiveH ? emissivePath.c_str() : nullptr;
+            matInfo.emissiveIntensity     = mesh.emissiveIntensity * g_config.emissiveIntensity;
+            matInfo.emissiveColorConstant = { mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB };
+            matInfo.spriteSheetRow     = 1;
+            matInfo.spriteSheetCol     = 1;
+            matInfo.spriteSheetFps     = 0;
+            matInfo.filterMode         = 1;
+            matInfo.wrapModeU          = 1;
+            matInfo.wrapModeV          = 1;
+
+            remixapi_MaterialHandle newHandle = nullptr;
+            Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_BeforeMaterialCreate);
+            remixapi_ErrorCode matStatus = api->CreateMaterial(&matInfo, &newHandle);
+            Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_AfterMaterialCreate);
+            if (matStatus != REMIXAPI_ERROR_CODE_SUCCESS || !newHandle) {
+                _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create material 0x%llX (error %d)",
+                         (unsigned long long)matHash, (int)matStatus);
+                DecrementTextureRefs(inst.textureHashes);
+                return SubmitStatus::kFailed;
+            }
+
+            g_materialCache[matHash] = { newHandle, 1, Diagnostics::CurrentFrameIndex() };
+            matHandle = newHandle;
         }
+    }
+    inst.materialHash = matHash;
 
-        SceneMeshInstance inst;
-        inst.handle = handle;
-        memcpy(&inst.transform.matrix, mesh.worldTransform, sizeof(mesh.worldTransform));
-        inst.meshHash = mesh.hash;
-        inst.materialHash = combinedHash;
-        if (mesh.diffuseTextureHash)   inst.textureHashes.insert(mesh.diffuseTextureHash);
-        if (mesh.normalTextureHash)    inst.textureHashes.insert(mesh.normalTextureHash);
-        if (mesh.roughnessTextureHash) inst.textureHashes.insert(mesh.roughnessTextureHash);
-        if (mesh.emissiveTextureHash)  inst.textureHashes.insert(mesh.emissiveTextureHash);
+    // ---- Mesh handle creation ----
+    // Build and register the Remix mesh handle for this drawable.
+    remixapi_MeshInfoSurfaceTriangles surface = {};
+    surface.vertices_values = mesh.vertices.data();
+    surface.vertices_count  = (uint32_t)mesh.vertices.size();
+    surface.indices_values  = mesh.indices.empty() ? nullptr : mesh.indices.data();
+    surface.indices_count   = (uint32_t)mesh.indices.size();
+    surface.skinning_hasvalue = 0;
+    surface.material = matHandle;
 
-        cellData.meshes.push_back(inst);
-        meshCreated++;
+    remixapi_MeshInfo meshInfo = {};
+    meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+    meshInfo.hash = mesh.hash;
+    meshInfo.surfaces_values = &surface;
+    meshInfo.surfaces_count  = 1;
+
+    remixapi_MeshHandle meshHandle = nullptr;
+    Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_BeforeMeshCreate);
+    remixapi_ErrorCode meshStatus = api->CreateMesh(&meshInfo, &meshHandle);
+    Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_AfterMeshCreate);
+    if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
+        _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create mesh 0x%llX (error %d)",
+                 (unsigned long long)mesh.hash, (int)meshStatus);
+        DecrementTextureRefs(inst.textureHashes);
+        DecrementMaterialRef(matHash);
+        return SubmitStatus::kFailed;
     }
 
-    _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Meshes - created %u, failed %u",
-             cellFormID, meshCreated, meshFailed);
+    inst.meshHandle     = meshHandle;
+    inst.lastDrawnFrame = Diagnostics::CurrentFrameIndex();
 
-    // ----- Create skinned meshes -----
-    uint32_t skinnedCreated = 0, skinnedFailed = 0;
+    // Save the world transform; the OnFrame draw loop reads it back per-frame.
+    // Resolver-provided in row-major 3x4 layout matching remixapi_Transform.matrix.
+    memcpy(inst.worldTransform, mesh.worldTransform, sizeof(inst.worldTransform));
 
-    for (auto& sm : result.skinnedMeshes) {
-        if (sm.vertices.empty()) continue;
-
-        // Look up material handle by combined texture hash
-        remixapi_MaterialHandle matHandle = nullptr;
-        uint64_t combinedHash = 0;
-        if (sm.diffuseTextureHash != 0) {
-            MaterialKey lookupKey { sm.diffuseTextureHash, sm.normalTextureHash, sm.roughnessTextureHash,
-                                    sm.emissiveTextureHash, sm.emissiveColorR, sm.emissiveColorG,
-                                    sm.emissiveColorB, sm.emissiveIntensity,
-                                    sm.alphaTestEnabled, sm.alphaTestType, sm.alphaTestRef };
-            lookupKey.useDrawCallAlphaState = sm.alphaTestEnabled || sm.alphaBlendEnabled;
-            combinedHash = lookupKey.combined();
-            auto it = materialsLookup.find(combinedHash);
-            if (it != materialsLookup.end())
-                matHandle = it->second;
+    g_drawables[hash] = std::move(inst);
+    return SubmitStatus::kSubmitted;
+    } catch (const std::exception& e) {
+        int n = g_cxxLogCount_SubmitDrawable.fetch_add(1, std::memory_order_relaxed);
+        if (n < kCxxLogCap) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] C++ exception #%d hash=0x%llX what=%s",
+                     n, (unsigned long long)hash, e.what());
         }
-
-        remixapi_MeshInfoSurfaceTriangles surface = {};
-        surface.vertices_values = sm.vertices.data();
-        surface.vertices_count = (uint32_t)sm.vertices.size();
-        surface.indices_values = sm.indices.empty() ? nullptr : sm.indices.data();
-        surface.indices_count = (uint32_t)sm.indices.size();
-
-        // Set skinning data
-        surface.skinning_hasvalue = 1;
-        surface.skinning_value.bonesPerVertex = kBonesPerVertex;
-        surface.skinning_value.blendWeights_values = sm.blendWeights.data();
-        surface.skinning_value.blendWeights_count  = static_cast<uint32_t>(sm.blendWeights.size());
-        surface.skinning_value.blendIndices_values = sm.blendIndices.data();
-        surface.skinning_value.blendIndices_count  = static_cast<uint32_t>(sm.blendIndices.size());
-
-        surface.material = matHandle;
-
-        remixapi_MeshInfo meshInfo = {};
-        meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-        meshInfo.hash = sm.hash;
-        meshInfo.surfaces_values = &surface;
-        meshInfo.surfaces_count = 1;
-
-        remixapi_MeshHandle handle = nullptr;
-        remixapi_ErrorCode status = api->CreateMesh(&meshInfo, &handle);
-        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Failed to create skinned mesh 0x%llX (error %d)",
-                     cellFormID, (unsigned long long)sm.hash, (int)status);
-            skinnedFailed++;
-            continue;
+        return SubmitStatus::kFailed;
+    } catch (...) {
+        int n = g_cxxLogCount_SubmitDrawable.fetch_add(1, std::memory_order_relaxed);
+        if (n < kCxxLogCap) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] unknown C++ exception #%d hash=0x%llX",
+                     n, (unsigned long long)hash);
         }
+        return SubmitStatus::kFailed;
+    }
+}
 
-        // Per-instance alpha state for this skinned mesh.
-        if (sm.alphaTestEnabled || sm.alphaBlendEnabled) {
-            remixapi_InstanceInfoBlendEXT blend = {};
-            blend.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
-            blend.pNext = nullptr;
-            blend.alphaTestEnabled         = sm.alphaTestEnabled ? 1 : 0;
-            blend.alphaTestReferenceValue  = sm.alphaTestRef;
-            blend.alphaTestCompareOp       = (uint32_t)sm.alphaTestType;
-            blend.alphaBlendEnabled        = sm.alphaBlendEnabled ? 1 : 0;
-            blend.srcColorBlendFactor      = sm.srcColorBlendFactor;
-            blend.dstColorBlendFactor      = sm.dstColorBlendFactor;
-            blend.colorBlendOp             = 0;  // VK_BLEND_OP_ADD
-            blend.srcAlphaBlendFactor      = sm.srcColorBlendFactor;
-            blend.dstAlphaBlendFactor      = sm.dstColorBlendFactor;
-            blend.alphaBlendOp             = 0;  // VK_BLEND_OP_ADD
-            blend.writeMask                = 0xF;  // RGBA
-            blend.isVertexColorBakedLighting = 0;
-            g_geometryAlphaState[sm.hash] = blend;
-        } else {
-            g_geometryAlphaState.erase(sm.hash);
+void RemixRenderer::ReleaseDrawable(uint64_t hash) {
+    std::lock_guard<std::mutex> lock(g_renderStateMutex);
+
+    auto it = g_drawables.find(hash);
+    if (it == g_drawables.end()) return;
+
+    DrawableInstance& inst = it->second;
+
+    remixapi_Interface* api = RemixAPI::GetInterface();
+
+    // Destroy mesh handle. Per-call C++ catch so a throw here doesn't
+    // skip material/texture refcount cleanup below (avoids leaks when
+    // dxvk-remix throws under VRAM pressure).
+    if (inst.meshHandle && api) {
+        try {
+            api->DestroyMesh(inst.meshHandle);
+        } catch (const std::exception& e) {
+            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
+            if (n < kCxxLogCap) {
+                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh C++ exception #%d hash=0x%llX what=%s",
+                         n, (unsigned long long)hash, e.what());
+            }
+        } catch (...) {
+            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
+            if (n < kCxxLogCap) {
+                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh unknown C++ exception #%d hash=0x%llX",
+                         n, (unsigned long long)hash);
+            }
         }
-
-        SkinnedMeshInstance inst;
-        inst.meshHandle = handle;
-        inst.materialHandle = matHandle;
-        inst.meshHash = sm.hash;
-        inst.boneCount = sm.boneCount;
-        inst.ownerFormID = sm.ownerFormID;
-        inst.isValid = true;
-        inst.materialHash = combinedHash;
-        if (sm.diffuseTextureHash)   inst.textureHashes.insert(sm.diffuseTextureHash);
-        if (sm.normalTextureHash)    inst.textureHashes.insert(sm.normalTextureHash);
-        if (sm.roughnessTextureHash) inst.textureHashes.insert(sm.roughnessTextureHash);
-        if (sm.emissiveTextureHash)  inst.textureHashes.insert(sm.emissiveTextureHash);
-        cellData.skinnedMeshInstances.push_back(inst);
-        skinnedCreated++;
+        inst.meshHandle = nullptr;
     }
 
-    if (skinnedCreated > 0 || skinnedFailed > 0) {
-        _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Skinned meshes - created %u, failed %u",
-                 cellFormID, skinnedCreated, skinnedFailed);
+    // Decrement material refcount; on zero, destroy the material handle.
+    // This is INDEPENDENT of the texture decrement below — material and texture
+    // lifecycles are tracked separately so shared resources are freed correctly.
+    // Per-call C++ catch around DestroyMaterial: refcount mutation + erase
+    // run regardless so we don't leak the cache entry when the API throws.
+    if (inst.materialHash != 0) {
+        auto matIt = g_materialCache.find(inst.materialHash);
+        if (matIt != g_materialCache.end()) {
+            if (matIt->second.refCount > 0) matIt->second.refCount--;
+            if (matIt->second.refCount == 0) {
+                if (matIt->second.handle && api) {
+                    try {
+                        api->DestroyMaterial(matIt->second.handle);
+                    } catch (const std::exception& e) {
+                        int n = g_cxxLogCount_ReleaseDrawableMaterial.fetch_add(1, std::memory_order_relaxed);
+                        if (n < kCxxLogCap) {
+                            _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMaterial C++ exception #%d matHash=0x%llX what=%s",
+                                     n, (unsigned long long)inst.materialHash, e.what());
+                        }
+                    } catch (...) {
+                        int n = g_cxxLogCount_ReleaseDrawableMaterial.fetch_add(1, std::memory_order_relaxed);
+                        if (n < kCxxLogCap) {
+                            _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMaterial unknown C++ exception #%d matHash=0x%llX",
+                                     n, (unsigned long long)inst.materialHash);
+                        }
+                    }
+                }
+                g_materialCache.erase(matIt);
+            }
+        }
     }
 
-    // ----- Create lights -----
-    uint32_t lightCreated = 0, lightFailed = 0;
-
-    if (!g_config.lightsEnabled) {
-        _MESSAGE("FO4RemixPlugin: Lights disabled by config");
+    // ALWAYS decrement this drawable's texture refcounts, independent of
+    // material lifecycle. Each drawable holds its own reference to each
+    // texture it uses (bumped in SubmitDrawable's texture-upload loop),
+    // so we must release those refs here even if the material is still
+    // alive (shared by another drawable). Nesting this inside the
+    // refCount==0 block would leak one refcount per release that doesn't
+    // destroy the material.
+    // Per-call C++ catch around DestroyTexture: refcount mutation + erase
+    // run regardless so we don't leak cache entries when the API throws.
+    if (api) {
+        for (uint64_t texHash : inst.textureHashes) {
+            auto texIt = g_textureHandles.find(texHash);
+            if (texIt != g_textureHandles.end()) {
+                if (texIt->second.refCount > 0) texIt->second.refCount--;
+                if (texIt->second.refCount == 0) {
+                    if (texIt->second.handle) {
+                        try {
+                            api->DestroyTexture(texIt->second.handle);
+                        } catch (const std::exception& e) {
+                            int n = g_cxxLogCount_ReleaseDrawableTexture.fetch_add(1, std::memory_order_relaxed);
+                            if (n < kCxxLogCap) {
+                                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyTexture C++ exception #%d texHash=0x%llX what=%s",
+                                         n, (unsigned long long)texHash, e.what());
+                            }
+                        } catch (...) {
+                            int n = g_cxxLogCount_ReleaseDrawableTexture.fetch_add(1, std::memory_order_relaxed);
+                            if (n < kCxxLogCap) {
+                                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyTexture unknown C++ exception #%d texHash=0x%llX",
+                                         n, (unsigned long long)texHash);
+                            }
+                        }
+                    }
+                    g_textureHandles.erase(texIt);
+                }
+            }
+        }
     }
 
-    for (auto& light : result.lights) {
-        if (!g_config.lightsEnabled) break;
-
-        remixapi_LightInfoSphereEXT sphere = {};
-        sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-        sphere.pNext = nullptr;
-        sphere.position = { light.position[0], light.position[1], light.position[2] };
-        sphere.radius = (std::max)(light.radius * 0.025f * g_config.lightRadius, 0.5f);
-        sphere.volumetricRadianceScale = 1.0f;
-
-        if (light.isSpotLight && light.spotFOV > 0.0f) {
-            sphere.shaping_hasvalue = true;
-            sphere.shaping_value.direction = {
-                light.spotDirection[0],
-                light.spotDirection[1],
-                light.spotDirection[2]
-            };
-            sphere.shaping_value.coneAngleDegrees = light.spotFOV * 0.5f; // FO4 FOV is full angle
-            sphere.shaping_value.coneSoftness = light.spotSoftness;
-            sphere.shaping_value.focusExponent = 0.0f;
-        } else {
-            sphere.shaping_hasvalue = false;
-        }
-
-        // Apply intensity multiplier and color strength
-        float cs = g_config.lightColorStrength;
-        float intensity = g_config.lightIntensity;
-        float r = light.radiance[0], g = light.radiance[1], b = light.radiance[2];
-        if (cs < 1.0f) {
-            // Lerp toward white (average luminance) as color strength decreases
-            float avg = (r + g + b) / 3.0f;
-            r = avg + (r - avg) * cs;
-            g = avg + (g - avg) * cs;
-            b = avg + (b - avg) * cs;
-        }
-
-        remixapi_LightInfo info = {};
-        info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
-        info.pNext = &sphere;
-        info.hash = light.hash;
-        info.radiance = { r * intensity, g * intensity, b * intensity };
-        info.isDynamic = false;
-        info.ignoreViewModel = false;
-
-        if (lightCreated < 3) {
-            _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Light[%u] configIntensity=%.4f origRadiance=(%.1f,%.1f,%.1f) "
-                     "finalRadiance=(%.1f,%.1f,%.1f) radius=%.1f",
-                     cellFormID, lightCreated, intensity,
-                     light.radiance[0], light.radiance[1], light.radiance[2],
-                     info.radiance.x, info.radiance.y, info.radiance.z,
-                     sphere.radius);
-        }
-
-        remixapi_LightHandle handle = nullptr;
-        remixapi_ErrorCode status = api->CreateLight(&info, &handle);
-        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !handle) {
-            lightFailed++;
-            continue;
-        }
-
-        cellData.lights.push_back(handle);
-        lightCreated++;
-    }
-
-    // Restore preserved lights from refresh (they weren't destroyed)
-    if (!preservedLights.empty()) {
-        cellData.lights = std::move(preservedLights);
-        _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Lights - preserved %zu from refresh",
-                 cellFormID, cellData.lights.size());
-    } else {
-        _MESSAGE("FO4RemixPlugin: [Cell 0x%X] Lights - created %u, failed %u",
-                 cellFormID, lightCreated, lightFailed);
-    }
-
-    g_cellScenes[cellFormID] = std::move(cellData);
+    g_drawables.erase(it);
 }
 
 // ---------------------------------------------------------------------------
 // Per-frame rendering
 // ---------------------------------------------------------------------------
 void RemixRenderer::OnFrame(const CameraState& cam,
-                            const std::vector<ExtractedSkinnedMesh>& skinnedMeshBoneData,
                             const OverlayData& overlay) {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
@@ -984,226 +825,84 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     camInfo.type = REMIXAPI_CAMERA_TYPE_WORLD;
     api->SetupCamera(&camInfo);
 
-    // Draw scene meshes from all loaded cells
     bool hasAnyMeshes = false;
-    uint32_t totalLightsDrawn = 0;
-    uint32_t totalLightsFailed = 0;
-    for (auto& [cellID, cellData] : g_cellScenes) {
-        for (auto& inst : cellData.meshes) {
-            remixapi_InstanceInfo instance = {};
-            instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-            instance.mesh = inst.handle;
-            instance.transform = inst.transform;
-            instance.doubleSided = 1;
-            instance.categoryFlags = 0;
 
-            // Chain per-instance alpha state if this mesh has any. Local
-            // copy of the EXT so we can clear pNext for safety (the cached
-            // entry's pNext is undefined) and so the address remains valid
-            // through DrawInstance.
-            remixapi_InstanceInfoBlendEXT blendLocal = {};
-            auto alphaIt = g_geometryAlphaState.find(inst.meshHash);
-            if (alphaIt != g_geometryAlphaState.end()) {
-                blendLocal = alphaIt->second;
-                blendLocal.pNext = nullptr;
-                instance.pNext = &blendLocal;
-            }
+    // Phase 1B: draw event-driven drawables. Stamp lastDrawnFrame on each
+    // drawable's material + textures so the LRU sweep sees them as live.
+    size_t drawableCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_renderStateMutex);
+        const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
+        drawableCount = g_drawables.size();
+        for (auto& [drawHash, inst] : g_drawables) {
+            if (!inst.meshHandle) continue;
 
-            api->DrawInstance(&instance);
-            hasAnyMeshes = true;
-
-            // Stamp lastDrawnFrame on the textures + material this mesh just
-            // drew. Read by SweepStaleMaterials / SweepStaleTextures to
-            // distinguish live entries (some owner drew them recently) from
-            // stale entries (no owner drew them in ttlFrames).
-            const uint64_t now = Diagnostics::CurrentFrameIndex();
-            for (uint64_t texHash : inst.textureHashes) {
-                auto texIt = g_textureHandles.find(texHash);
-                if (texIt != g_textureHandles.end()) {
-                    texIt->second.lastDrawnFrame = now;
+            // Use the resolver-computed world transform stored at submit time.
+            remixapi_Transform xform = {};
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    xform.matrix[r][c] = inst.worldTransform[r][c];
                 }
             }
-            if (inst.materialHash != 0) {
-                auto matIt = g_materialCache.find(inst.materialHash);
-                if (matIt != g_materialCache.end()) {
-                    matIt->second.lastDrawnFrame = now;
-                }
-            }
-        }
-
-        // Draw skinned mesh instances with real per-frame bone transforms.
-        // Bone transforms are computed by the game thread and passed in via skinnedMeshBoneData.
-        for (auto& inst : cellData.skinnedMeshInstances) {
-            if (!inst.isValid) continue;
-
-            // Find the corresponding ExtractedSkinnedMesh with current bone transforms
-            const ExtractedSkinnedMesh* matchedSM = nullptr;
-            for (const auto& sm : skinnedMeshBoneData) {
-                if (sm.hash == inst.meshHash) {
-                    matchedSM = &sm;
-                    break;
-                }
-            }
-
-            // Build bone transforms array for Remix
-            std::vector<remixapi_Transform> boneTransforms(inst.boneCount);
-
-            bool usedRealBones = false;
-            if (matchedSM && matchedSM->boneCount == inst.boneCount &&
-                matchedSM->currentBoneTransforms.size() == inst.boneCount) {
-                // Use real bone transforms from game thread
-                static_assert(sizeof(remixapi_Transform) == 12 * sizeof(float),
-                              "remixapi_Transform must be 48 bytes");
-                for (uint32_t b = 0; b < inst.boneCount; b++) {
-                    memcpy(&boneTransforms[b], matchedSM->currentBoneTransforms[b].data(),
-                           sizeof(remixapi_Transform));
-                }
-                usedRealBones = true;
-            } else {
-                // Fallback: identity bone transforms (bind pose) if no bone data available
-                for (uint32_t b = 0; b < inst.boneCount; b++) {
-                    memset(&boneTransforms[b], 0, sizeof(remixapi_Transform));
-                    boneTransforms[b].matrix[0][0] = 1.0f;
-                    boneTransforms[b].matrix[1][1] = 1.0f;
-                    boneTransforms[b].matrix[2][2] = 1.0f;
-                }
-            }
-
-            // Enhanced diagnostics: log once per skinned mesh on first frame
-            static std::unordered_set<uint64_t> s_loggedSkinnedHashes;
-            if (s_loggedSkinnedHashes.find(inst.meshHash) == s_loggedSkinnedHashes.end()) {
-                s_loggedSkinnedHashes.insert(inst.meshHash);
-                const float* b0 = boneTransforms[0].matrix[0];
-                float tx = boneTransforms[0].matrix[0][3];
-                float ty = boneTransforms[0].matrix[1][3];
-                float tz = boneTransforms[0].matrix[2][3];
-                _MESSAGE("FO4RemixPlugin: [SKINNED DRAW] hash=0x%llX bones=%u %s bone0_trans=(%.1f,%.1f,%.1f) bone0_diag=(%.4f,%.4f,%.4f)",
-                         inst.meshHash, inst.boneCount,
-                         usedRealBones ? "REAL" : "FALLBACK_IDENTITY",
-                         tx, ty, tz,
-                         boneTransforms[0].matrix[0][0],
-                         boneTransforms[0].matrix[1][1],
-                         boneTransforms[0].matrix[2][2]);
-                // Flag suspiciously large translations (>100k units = likely world-space issue)
-                for (uint32_t b = 0; b < inst.boneCount; b++) {
-                    float btx = boneTransforms[b].matrix[0][3];
-                    float bty = boneTransforms[b].matrix[1][3];
-                    float btz = boneTransforms[b].matrix[2][3];
-                    if (fabsf(btx) > 100000.f || fabsf(bty) > 100000.f || fabsf(btz) > 100000.f) {
-                        _MESSAGE("FO4RemixPlugin: [SKINNED DRAW] WARNING hash=0x%llX bone[%u] extreme translation=(%.1f,%.1f,%.1f)",
-                                 inst.meshHash, b, btx, bty, btz);
-                        break;
-                    }
-                    // Check for NaN/Inf in bone transforms
-                    bool hasBad = false;
-                    for (int rr = 0; rr < 3 && !hasBad; rr++)
-                        for (int cc = 0; cc < 4 && !hasBad; cc++)
-                            if (std::isnan(boneTransforms[b].matrix[rr][cc]) || std::isinf(boneTransforms[b].matrix[rr][cc]))
-                                hasBad = true;
-                    if (hasBad) {
-                        _MESSAGE("FO4RemixPlugin: [SKINNED DRAW] WARNING hash=0x%llX bone[%u] has NaN/Inf transform!", inst.meshHash, b);
-                        break;
-                    }
-                }
-            }
-
-            // Safety check: bone count within Remix limit
-            uint32_t boneCountToSubmit = inst.boneCount;
-            if (boneCountToSubmit > REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT) {
-                boneCountToSubmit = REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT;
-            }
-
-            // Build bone transforms extension struct
-            remixapi_InstanceInfoBoneTransformsEXT boneExt = {};
-            boneExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
-            boneExt.pNext = nullptr;
-            boneExt.boneTransforms_values = boneTransforms.data();
-            boneExt.boneTransforms_count  = boneCountToSubmit;
-
-            // Identity instance transform (bones handle world positioning)
-            remixapi_Transform identityXform = {};
-            identityXform.matrix[0][0] = 1.0f;
-            identityXform.matrix[1][1] = 1.0f;
-            identityXform.matrix[2][2] = 1.0f;
 
             remixapi_InstanceInfo instance = {};
             instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
-            instance.pNext = &boneExt;
+            instance.pNext = nullptr;
             instance.mesh = inst.meshHandle;
-            instance.transform = identityXform;
+            instance.transform = xform;
             instance.doubleSided = 1;
             instance.categoryFlags = 0;
 
-            // Extend pNext chain with per-instance alpha state if any.
-            remixapi_InstanceInfoBlendEXT skinnedBlendLocal = {};
-            auto skinnedAlphaIt = g_geometryAlphaState.find(inst.meshHash);
-            if (skinnedAlphaIt != g_geometryAlphaState.end()) {
-                skinnedBlendLocal = skinnedAlphaIt->second;
-                skinnedBlendLocal.pNext = nullptr;
-                // Append after boneExt by setting its pNext.
-                boneExt.pNext = &skinnedBlendLocal;
+            // Gate hasAnyMeshes and lastDrawnFrame stamps on DrawInstance success.
+            // SEH-guarded: a stale Remix mesh handle can fault inside DrawInstance.
+            // C++-guarded: a thrown exception (e.g. std::bad_alloc on VRAM
+            // pressure, or a dxvk-remix-internal type) is logged via e.what()
+            // by the inner CallDrawInstanceCxxGuarded helper.
+            // Pre-set drawErr to GENERAL_FAILURE so the success-gated stamping
+            // below falls through cleanly if either wrapper catches.
+            remixapi_ErrorCode drawErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+            unsigned long drawExcCode = 0;
+            int guardRc = CallDrawInstanceGuarded(api, &instance, &drawErr, &drawExcCode);
+            if (guardRc == 1) {
+                _MESSAGE("FO4RemixPlugin: [OnFrame] SEH CRASH CAUGHT in DrawInstance "
+                         "hash=0x%llX exception=0x%08lX -- nulling meshHandle to skip permanently",
+                         (unsigned long long)drawHash, drawExcCode);
+                inst.meshHandle = nullptr;  // permanent skip; LRU sweep will clean up later
+                continue;
             }
-
-            remixapi_ErrorCode err = api->DrawInstance(&instance);
-            if (err == REMIXAPI_ERROR_CODE_SUCCESS) {
+            if (guardRc == 2) {
+                // C++ exception already logged by the inner helper with what().
+                // Null meshHandle to skip permanently; LRU sweep will clean up.
+                inst.meshHandle = nullptr;
+                continue;
+            }
+            if (drawErr == REMIXAPI_ERROR_CODE_SUCCESS) {
                 hasAnyMeshes = true;
 
-                const uint64_t skinnedNow = Diagnostics::CurrentFrameIndex();
-                for (uint64_t texHash : inst.textureHashes) {
-                    auto texIt = g_textureHandles.find(texHash);
-                    if (texIt != g_textureHandles.end()) {
-                        texIt->second.lastDrawnFrame = skinnedNow;
-                    }
-                }
+                inst.lastDrawnFrame = currentFrame;
+
+                // Stamp material + textures for LRU sweep.
                 if (inst.materialHash != 0) {
                     auto matIt = g_materialCache.find(inst.materialHash);
                     if (matIt != g_materialCache.end()) {
-                        matIt->second.lastDrawnFrame = skinnedNow;
+                        matIt->second.lastDrawnFrame = currentFrame;
                     }
                 }
-            }
-        }
-
-        for (auto& handle : cellData.lights) {
-            remixapi_ErrorCode lightErr = api->DrawLightInstance(handle);
-            if (lightErr == REMIXAPI_ERROR_CODE_SUCCESS) {
-                totalLightsDrawn++;
-            } else {
-                totalLightsFailed++;
+                for (uint64_t texHash : inst.textureHashes) {
+                    auto texIt = g_textureHandles.find(texHash);
+                    if (texIt != g_textureHandles.end()) {
+                        texIt->second.lastDrawnFrame = currentFrame;
+                    }
+                }
             }
         }
     }
 
     // Periodic status log (every ~5 seconds)
     static uint32_t s_frameCounter = 0;
-    static uint32_t s_skinnedWithBones = 0;
-    static uint32_t s_skinnedFallback = 0;
-    static uint32_t s_skinnedDrawFailed = 0;
     s_frameCounter++;
     if (s_frameCounter % 300 == 0) {
-        _MESSAGE("FO4RemixPlugin: OnFrame status - %zu cells, %u lights drawn, %u lights failed",
-                 g_cellScenes.size(), totalLightsDrawn, totalLightsFailed);
-
-        // Count skinned mesh stats for this snapshot
-        uint32_t totalSkinned = 0;
-        uint32_t withRealBones = 0;
-        for (auto& [cid, cd] : g_cellScenes) {
-            for (auto& inst : cd.skinnedMeshInstances) {
-                if (!inst.isValid) continue;
-                totalSkinned++;
-                // Check if bone data was available
-                for (const auto& sm : skinnedMeshBoneData) {
-                    if (sm.hash == inst.meshHash && sm.boneCount == inst.boneCount) {
-                        withRealBones++;
-                        break;
-                    }
-                }
-            }
-        }
-        if (totalSkinned > 0) {
-            _MESSAGE("FO4RemixPlugin: [SKINNING] Draw status: %u skinned instances, %u with real bones, %u identity fallback, boneData entries=%zu",
-                     totalSkinned, withRealBones, totalSkinned - withRealBones, skinnedMeshBoneData.size());
-        }
+        _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu", drawableCount);
     }
 
     if (!hasAnyMeshes && g_fallbackMesh) {
@@ -1306,11 +1005,6 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         }
     }
 
-    // Phase 1A: tick the semantic-capture sweep (TTL + periodic stats).
-    // Internally rate-limits to once per kSweepPeriodFrames; cheap to call
-    // every frame.
-    SemanticCapture::Tick();
-
     // Present
     remixapi_PresentInfo presentInfo = {};
     presentInfo.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
@@ -1319,9 +1013,29 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 }
 
 void RemixRenderer::Shutdown() {
-    UnloadAllCells();
+    std::lock_guard<std::mutex> lock(g_renderStateMutex);
 
     remixapi_Interface* api = RemixAPI::GetInterface();
+
+    // Release all event-driven drawables
+    for (auto& [hash, inst] : g_drawables) {
+        if (inst.meshHandle && api) api->DestroyMesh(inst.meshHandle);
+    }
+    g_drawables.clear();
+
+    // Destroy all materials and textures in the shared caches
+    if (api) {
+        for (auto& [hash, matRef] : g_materialCache) {
+            if (matRef.handle) api->DestroyMaterial(matRef.handle);
+        }
+        g_materialCache.clear();
+
+        for (auto& [hash, texRef] : g_textureHandles) {
+            if (texRef.handle) api->DestroyTexture(texRef.handle);
+        }
+        g_textureHandles.clear();
+    }
+
     if (api && g_fallbackMesh) {
         api->DestroyMesh(g_fallbackMesh);
         g_fallbackMesh = nullptr;
