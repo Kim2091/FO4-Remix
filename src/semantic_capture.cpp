@@ -21,7 +21,21 @@ namespace {
 constexpr uintptr_t kHookTargetRVA = 0x02172540;
 
 // -------- TTL + sweep cadence (Skyrim defaults) --------
-constexpr uint64_t kTTLFrames           = 10;
+// Drawable eviction TTL. The engine does NOT re-fire GetRenderPasses every
+// frame for cached static draws -- distant statics typically fire on
+// visibility/cell-page-in events, not per-frame. A short TTL races that
+// cadence: distant geometry submits once, then ages out and the mesh handle
+// is destroyed before the engine re-fires for it, leaving the world looking
+// "empty in the distance" after the first camera rotation.
+//
+// 18000 frames = 5 minutes at 60fps -- effectively unbounded for normal play
+// but a backstop for multi-hour sessions so the SemCapture map and the
+// Remix-side handle caches don't grow forever.
+//
+// TODO: replace with VRAM-pressured force-eviction (oldest lastDrawnFrame
+// first) so the LRU material/texture sweeps actually have something to
+// reclaim under memory pressure.
+constexpr uint64_t kTTLFrames           = 18000;
 constexpr uint32_t kSweepPeriodFrames   = 60;
 
 // -------- PassKey: 64-bit FNV-1a hash of (geo*, prop*, mat*) --------
