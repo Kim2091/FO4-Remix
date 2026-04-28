@@ -15,6 +15,27 @@
 #include <mutex>
 #include <unordered_map>
 
+// ---------------------------------------------------------------------------
+// NiRefObject IncRef / DecRef. F4SE's NiObjects.cpp implements these but its
+// implementation passes &m_uiRefCount (volatile SInt32 = volatile int32_t in
+// our compat layer) to InterlockedIncrement which wants volatile long*. Same
+// size on Windows x64 but distinct types under MSVC. Provide our own
+// definitions with the cast made explicit so the upstream source doesn't need
+// to be patched. NiPointer<> in the F4SE header inlines these calls, so the
+// linker resolves to these implementations from any TU that uses NiPointer<>.
+// ---------------------------------------------------------------------------
+void NiRefObject::IncRef(void) {
+    InterlockedIncrement(reinterpret_cast<volatile long*>(&m_uiRefCount));
+}
+
+bool NiRefObject::Release(void) {
+    return InterlockedDecrement(reinterpret_cast<volatile long*>(&m_uiRefCount)) == 0;
+}
+
+void NiRefObject::DecRef(void) {
+    if (Release()) DeleteThis();
+}
+
 namespace {
 
 // -------- Hook target (verified by Phase 0) --------
@@ -151,9 +172,11 @@ void* __fastcall DetourGetRenderPasses(void* self,
         auto& state = g_drawableMap[key];  // inserts default-constructed if new
         if (state.firstSeenFrame == 0) {
             state.firstSeenFrame = now;
-            // Capture pointers once on first-seen; they're stable until eviction
-            // (TTL = 10 frames). Resolver reads them on the Remix thread.
-            state.geometry = geometry;
+            // Capture pointers once on first-seen. The geometry assignment goes
+            // through NiPointer<NiAVObject>::operator=(T*) which IncRefs the
+            // engine BSGeometry. Engine cannot destroy it while we hold the ref;
+            // the sweep below evicts when refCount drops to 1 (only us left).
+            state.geometry = static_cast<NiAVObject*>(geometry);
             state.property = self;
             state.material = material;
         }
@@ -261,14 +284,9 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         for (auto& [key, state] : g_drawableMap) {
             if (state.submittedToRemix) continue;
-            // Freshness gate: only resolve drawables the engine touched this
-            // frame or last frame. Stale pointers from older entries cause
-            // the parse_start AVs we've been catching -- skipping them avoids
-            // dereferencing freed BSGeometry memory entirely. Mirrors the
-            // uint64-safe age computation used by the eviction sweep below.
-            const uint64_t age = (currentFrame > state.lastSeenFrame)
-                ? (currentFrame - state.lastSeenFrame) : 0;
-            if (age > 1) continue;
+            // No freshness gate: state.geometry is a NiPointer holding an
+            // engine refcount, so the BSGeometry cannot be freed underneath us.
+            // It is always safe to dereference -- resolve at any age.
 
             // Note: the resolver may take a few hundred microseconds for
             // texture readbacks. We hold the mutex during the call, which
@@ -276,10 +294,11 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             // shows hot-path back-pressure, move this loop to a snapshot+
             // unlock+resolve+lock-to-update pattern. Default first.
             //
-            // SEH-guarded: stale geometry pointers from TTL-aged entries
-            // can dereference freed memory. Catch the AV, log the failing
-            // drawable + last resolver step, and mark the entry as
-            // submitted so we don't retry it endlessly.
+            // SEH-guarded as a defensive backstop: NiPointer eliminates the
+            // stale-pointer class of fault, but dxvk-remix may still throw
+            // 0xE06D7363 from inside SubmitDrawable. Catch the exception,
+            // log the failing drawable + last resolver step, and mark the
+            // entry as submitted so we don't retry it endlessly.
             unsigned long excCode = 0;
             if (CallResolverGuarded(&state, key, device, &excCode) != 0) {
                 const int lastStep = Resolvers::Lighting::Trace::LastStep();
@@ -291,7 +310,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                          (unsigned long long)lastHash,
                          Resolvers::Lighting::Trace::StepName(lastStep),
                          excCode,
-                         state.geometry, state.property, state.material);
+                         (void*)state.geometry.m_pObject, state.property, state.material);
                 state.submittedToRemix = true;
                 state.meshHash = 0;
             }
@@ -312,9 +331,25 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         for (auto it = g_drawableMap.begin(); it != g_drawableMap.end();) {
+            // Primary eviction signal: the engine has released its references
+            // to the BSGeometry. We hold +1 via NiPointer, so refCount<=1 means
+            // every other holder (engine scene tree, parent NiNode, cell REFR)
+            // has gone away -- the geometry is logically dead. Erasing the
+            // entry runs NiPointer::~NiPointer which DecRefs to zero and lets
+            // the engine's destructor finally run.
+            //
+            // Backstop: kTTLFrames bounds growth in case some edge case keeps
+            // the refcount above 1 indefinitely (e.g. an engine-side cache
+            // we're not aware of). Should rarely trigger; it's a safety net,
+            // not the primary mechanism.
+            const NiAVObject* geo = it->second.geometry.m_pObject;
+            const bool engineReleased = (geo == nullptr) || (geo->m_uiRefCount <= 1);
+
             const uint64_t age = (now > it->second.lastSeenFrame)
                 ? (now - it->second.lastSeenFrame) : 0;
-            if (age > kTTLFrames) {
+            const bool ageBackstop = (age > kTTLFrames);
+
+            if (engineReleased || ageBackstop) {
                 if (it->second.submittedToRemix && it->second.meshHash != 0) {
                     unsigned long excCode = 0;
                     if (CallReleaseDrawableGuarded(it->second.meshHash, &excCode) != 0) {
@@ -324,7 +359,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                                  (unsigned long long)it->second.meshHash, excCode);
                     }
                 }
-                it = g_drawableMap.erase(it);
+                it = g_drawableMap.erase(it);  // ~NiPointer here -> DecRef -> engine dtor on zero
                 ++evicted;
             } else {
                 if (it->second.submittedToRemix) ++submittedCount;

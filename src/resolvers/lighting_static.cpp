@@ -69,10 +69,11 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     ResolverTrace::g_lastHash.store(hash, std::memory_order_relaxed);
     ResolverTrace::g_lastStep.store(Trace::kEntered, std::memory_order_relaxed);
 
-    // state.geometry is void* (set by the hot-path detour). Cast through
-    // NiAVObject* so we can use Bethesda's RTTI helper to filter non-BSTriShape
-    // geometry (particle systems, etc.) that might also hit BSLightingShaderProperty.
-    NiAVObject* obj = static_cast<NiAVObject*>(state.geometry);
+    // state.geometry is NiPointer<NiAVObject>; the implicit operator T*()
+    // hands us a raw NiAVObject* that's guaranteed alive (we hold a refcount
+    // via the NiPointer). We use Bethesda's RTTI helper to filter non-
+    // BSTriShape geometry (particle systems, etc.) that also hits this hook.
+    NiAVObject* obj = state.geometry;
     if (!obj) return false;
 
     BSTriShape* tri = obj->GetAsBSTriShape();
