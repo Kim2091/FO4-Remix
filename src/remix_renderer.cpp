@@ -52,6 +52,47 @@ static std::wstring HashToPath(uint64_t hash) {
 }
 
 // ---------------------------------------------------------------------------
+// Mesh-handle cache key + content hashing
+//
+// Two drawables can share a Remix mesh handle iff their geometry bytes AND
+// their resolved material match. Material participates because dxvk-remix
+// bakes the material reference into the mesh at CreateMesh time -- two
+// drawables with same content but different materials need separate handles.
+// ---------------------------------------------------------------------------
+struct MeshCacheKey {
+    uint64_t contentHash;
+    uint64_t materialHash;
+    bool operator==(const MeshCacheKey& o) const noexcept {
+        return contentHash == o.contentHash && materialHash == o.materialHash;
+    }
+};
+struct MeshCacheKeyHash {
+    size_t operator()(const MeshCacheKey& k) const noexcept {
+        return (size_t)(k.contentHash ^ (k.materialHash * 0x9E3779B97F4A7C15ULL));
+    }
+};
+
+// FNV-1a over a byte range. Stable across drawables that share the same NIF,
+// since vertex/index data is byte-identical for shared geometry.
+static uint64_t HashBytes(const void* data, size_t size, uint64_t seed = 0xCBF29CE484222325ULL) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; i++) {
+        seed ^= p[i];
+        seed *= 0x100000001B3ULL;
+    }
+    return seed;
+}
+
+static uint64_t ContentHashOf(const ExtractedMesh& m) {
+    uint64_t h = 0xCBF29CE484222325ULL;
+    if (!m.vertices.empty())
+        h = HashBytes(m.vertices.data(), m.vertices.size() * sizeof(remixapi_HardcodedVertex), h);
+    if (!m.indices.empty())
+        h = HashBytes(m.indices.data(), m.indices.size() * sizeof(uint32_t), h);
+    return h;
+}
+
+// ---------------------------------------------------------------------------
 // First-N-catches-per-callsite logger for C++ exceptions out of dxvk-remix
 // API calls. We saw 3277 caught C++ exceptions out of SubmitDrawable in the
 // last session; logging every one would balloon the log to MB. First 16 per
@@ -156,16 +197,29 @@ static std::unordered_map<uint64_t, remixapi_InstanceInfoBlendEXT> g_geometryAlp
 // ---------------------------------------------------------------------------
 namespace {
     struct DrawableInstance {
-        remixapi_MeshHandle          meshHandle    = nullptr;
-        uint64_t                     materialHash  = 0;   // index into g_materialCache
-        std::unordered_set<uint64_t> textureHashes;       // for refcount cascade
-        uint64_t                     lastDrawnFrame = 0;  // stamped by OnFrame
+        remixapi_MeshHandle          meshHandle    = nullptr;  // alias into g_meshCache, owned there
+        MeshCacheKey                 meshCacheKey  = {};       // identity for ReleaseDrawable refcount drop
+        uint64_t                     materialHash  = 0;        // index into g_materialCache
+        std::unordered_set<uint64_t> textureHashes;            // for refcount cascade
+        uint64_t                     lastDrawnFrame = 0;       // stamped by OnFrame
         float                        worldTransform[3][4] = {};  // row-major 3x4 matrix; populated from mesh.worldTransform at submit time
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
 
-    // Protects g_drawables, g_materialCache, and g_textureHandles.
+    // Mesh-handle cache keyed by (contentHash, materialHash). Refcounted; a
+    // SubmitDrawable that finds a matching key reuses the existing handle and
+    // bumps refCount, ReleaseDrawable drops it, on zero we DestroyMesh + erase.
+    // When g_config.gpuInstancingEnabled is false the cache key has the
+    // drawable hash in `contentHash`, so each drawable lands in its own bucket
+    // and no sharing happens -- preserves pre-instancing behavior for rollback.
+    struct MeshRef {
+        remixapi_MeshHandle handle;
+        uint32_t            refCount;
+    };
+    std::unordered_map<MeshCacheKey, MeshRef, MeshCacheKeyHash> g_meshCache;
+
+    // Protects g_drawables, g_meshCache, g_materialCache, and g_textureHandles.
     // Submission (SubmitDrawable / ReleaseDrawable) runs on the game thread
     // via SemanticCapture::Tick from hkPresent; drawing (OnFrame) and sweeps
     // (SweepStaleMaterials / SweepStaleTextures) run on the Remix thread.
@@ -419,6 +473,39 @@ static void DecrementMaterialRef(uint64_t matHash) {
     }
 }
 
+// Drop a refCount on a g_meshCache entry. On zero we DestroyMesh and erase.
+// Same per-call try/catch idiom as the texture/material destroy paths so a
+// throw out of dxvk-remix is logged once and does not corrupt our state.
+// Caller must hold g_renderStateMutex.
+static void DecrementMeshCacheRef(const MeshCacheKey& key) {
+    auto it = g_meshCache.find(key);
+    if (it == g_meshCache.end()) return;
+    if (it->second.refCount > 0) --it->second.refCount;
+    if (it->second.refCount != 0) return;
+
+    remixapi_Interface* api = RemixAPI::GetInterface();
+    if (api && it->second.handle) {
+        try {
+            api->DestroyMesh(it->second.handle);
+        } catch (const std::exception& e) {
+            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
+            if (n < kCxxLogCap) {
+                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh (cache) C++ exception #%d content=0x%llX mat=0x%llX what=%s",
+                         n, (unsigned long long)key.contentHash,
+                         (unsigned long long)key.materialHash, e.what());
+            }
+        } catch (...) {
+            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
+            if (n < kCxxLogCap) {
+                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh (cache) unknown C++ exception #%d content=0x%llX mat=0x%llX",
+                         n, (unsigned long long)key.contentHash,
+                         (unsigned long long)key.materialHash);
+            }
+        }
+    }
+    g_meshCache.erase(it);
+}
+
 RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         uint64_t hash,
         const ExtractedMesh& mesh,
@@ -628,35 +715,56 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     }
     inst.materialHash = matHash;
 
-    // ---- Mesh handle creation ----
-    // Build and register the Remix mesh handle for this drawable.
-    remixapi_MeshInfoSurfaceTriangles surface = {};
-    surface.vertices_values = mesh.vertices.data();
-    surface.vertices_count  = (uint32_t)mesh.vertices.size();
-    surface.indices_values  = mesh.indices.empty() ? nullptr : mesh.indices.data();
-    surface.indices_count   = (uint32_t)mesh.indices.size();
-    surface.skinning_hasvalue = 0;
-    surface.material = matHandle;
-
-    remixapi_MeshInfo meshInfo = {};
-    meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-    meshInfo.hash = mesh.hash;
-    meshInfo.surfaces_values = &surface;
-    meshInfo.surfaces_count  = 1;
+    // ---- Mesh handle (shared via g_meshCache) ----
+    // Build cache key. When GpuInstancing is disabled, slot the drawable hash
+    // into contentHash so each drawable gets its own cache entry (no sharing,
+    // preserving pre-instancing behavior). When enabled, contentHash is a
+    // byte-stable hash over (vertices, indices), so identical NIF instances
+    // with identical materials share a single cached handle.
+    MeshCacheKey meshKey{};
+    meshKey.contentHash  = g_config.gpuInstancingEnabled ? ContentHashOf(mesh) : hash;
+    meshKey.materialHash = matHash;
 
     remixapi_MeshHandle meshHandle = nullptr;
-    Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_BeforeMeshCreate);
-    remixapi_ErrorCode meshStatus = api->CreateMesh(&meshInfo, &meshHandle);
-    Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_AfterMeshCreate);
-    if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
-        _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create mesh 0x%llX (error %d)",
-                 (unsigned long long)mesh.hash, (int)meshStatus);
-        DecrementTextureRefs(inst.textureHashes);
-        DecrementMaterialRef(matHash);
-        return SubmitStatus::kFailed;
+    auto cacheIt = g_meshCache.find(meshKey);
+    if (cacheIt != g_meshCache.end()) {
+        cacheIt->second.refCount++;
+        meshHandle = cacheIt->second.handle;
+    } else {
+        // Cache miss -- create a new Remix mesh handle. Use the content hash
+        // as the Remix-side mesh hash so USD replacement matching is stable
+        // across game runs (instead of the per-drawable PassKey, which isn't).
+        remixapi_MeshInfoSurfaceTriangles surface = {};
+        surface.vertices_values = mesh.vertices.data();
+        surface.vertices_count  = (uint32_t)mesh.vertices.size();
+        surface.indices_values  = mesh.indices.empty() ? nullptr : mesh.indices.data();
+        surface.indices_count   = (uint32_t)mesh.indices.size();
+        surface.skinning_hasvalue = 0;
+        surface.material = matHandle;
+
+        remixapi_MeshInfo meshInfo = {};
+        meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+        meshInfo.hash = meshKey.contentHash;
+        meshInfo.surfaces_values = &surface;
+        meshInfo.surfaces_count  = 1;
+
+        Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_BeforeMeshCreate);
+        remixapi_ErrorCode meshStatus = api->CreateMesh(&meshInfo, &meshHandle);
+        Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_AfterMeshCreate);
+        if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create mesh content=0x%llX mat=0x%llX (error %d)",
+                     (unsigned long long)meshKey.contentHash,
+                     (unsigned long long)meshKey.materialHash, (int)meshStatus);
+            DecrementTextureRefs(inst.textureHashes);
+            DecrementMaterialRef(matHash);
+            return SubmitStatus::kFailed;
+        }
+
+        g_meshCache[meshKey] = { meshHandle, 1 };
     }
 
     inst.meshHandle     = meshHandle;
+    inst.meshCacheKey   = meshKey;
     inst.lastDrawnFrame = Diagnostics::CurrentFrameIndex();
 
     // Save the world transform; the OnFrame draw loop reads it back per-frame.
@@ -692,25 +800,11 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
 
     remixapi_Interface* api = RemixAPI::GetInterface();
 
-    // Destroy mesh handle. Per-call C++ catch so a throw here doesn't
-    // skip material/texture refcount cleanup below (avoids leaks when
-    // dxvk-remix throws under VRAM pressure).
-    if (inst.meshHandle && api) {
-        try {
-            api->DestroyMesh(inst.meshHandle);
-        } catch (const std::exception& e) {
-            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
-            if (n < kCxxLogCap) {
-                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh C++ exception #%d hash=0x%llX what=%s",
-                         n, (unsigned long long)hash, e.what());
-            }
-        } catch (...) {
-            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
-            if (n < kCxxLogCap) {
-                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh unknown C++ exception #%d hash=0x%llX",
-                         n, (unsigned long long)hash);
-            }
-        }
+    // Drop our refCount on the cached mesh handle. DestroyMesh only fires when
+    // the last drawable using this (content, material) bucket releases. The
+    // alias in inst.meshHandle is cleared to avoid any double-touch later.
+    if (inst.meshHandle) {
+        DecrementMeshCacheRef(inst.meshCacheKey);
         inst.meshHandle = nullptr;
     }
 
@@ -827,31 +921,76 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
     bool hasAnyMeshes = false;
 
-    // Phase 1B: draw event-driven drawables. Stamp lastDrawnFrame on each
-    // drawable's material + textures so the LRU sweep sees them as live.
+    // Phase 1B: draw event-driven drawables. Bucket by Remix mesh handle so
+    // drawables sharing a cached handle (identical content + material) collapse
+    // into a single DrawInstance via remixapi_InstanceInfoGpuInstancingEXT.
+    // Buckets of size 1 fall through to the simple path. Stamp lastDrawnFrame
+    // on each successful draw's material + textures so the LRU sweep sees them
+    // as live.
     size_t drawableCount = 0;
+    size_t bucketCount = 0;
+    size_t batchedBucketCount = 0;
     {
         std::lock_guard<std::mutex> lock(g_renderStateMutex);
         const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
         drawableCount = g_drawables.size();
+
+        struct DrawBucket {
+            std::vector<DrawableInstance*> members;
+            std::vector<remixapi_Transform> transforms;  // built only for batched path
+        };
+        std::unordered_map<remixapi_MeshHandle, DrawBucket> buckets;
+        buckets.reserve(g_drawables.size());
+
         for (auto& [drawHash, inst] : g_drawables) {
             if (!inst.meshHandle) continue;
+            buckets[inst.meshHandle].members.push_back(&inst);
+        }
+        bucketCount = buckets.size();
 
-            // Use the resolver-computed world transform stored at submit time.
-            remixapi_Transform xform = {};
-            for (int r = 0; r < 3; ++r) {
-                for (int c = 0; c < 4; ++c) {
-                    xform.matrix[r][c] = inst.worldTransform[r][c];
-                }
-            }
+        for (auto& [meshHandle, bucket] : buckets) {
+            if (bucket.members.empty()) continue;
 
             remixapi_InstanceInfo instance = {};
             instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
             instance.pNext = nullptr;
-            instance.mesh = inst.meshHandle;
-            instance.transform = xform;
+            instance.mesh = meshHandle;
             instance.doubleSided = 1;
             instance.categoryFlags = 0;
+
+            remixapi_InstanceInfoGpuInstancingEXT gpuExt = {};
+
+            if (bucket.members.size() == 1) {
+                // Simple path: base transform carries the world placement.
+                const DrawableInstance* member = bucket.members[0];
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 4; ++c) {
+                        instance.transform.matrix[r][c] = member->worldTransform[r][c];
+                    }
+                }
+            } else {
+                // Batched path: identity base, per-instance transforms in pNext.
+                ++batchedBucketCount;
+                bucket.transforms.reserve(bucket.members.size());
+                for (const DrawableInstance* member : bucket.members) {
+                    remixapi_Transform xform = {};
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 4; ++c) {
+                            xform.matrix[r][c] = member->worldTransform[r][c];
+                        }
+                    }
+                    bucket.transforms.push_back(xform);
+                }
+                instance.transform.matrix[0][0] = 1.0f;
+                instance.transform.matrix[1][1] = 1.0f;
+                instance.transform.matrix[2][2] = 1.0f;
+
+                gpuExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT;
+                gpuExt.pNext = nullptr;
+                gpuExt.instanceTransforms_values = bucket.transforms.data();
+                gpuExt.instanceTransforms_count  = (uint32_t)bucket.transforms.size();
+                instance.pNext = &gpuExt;
+            }
 
             // Gate hasAnyMeshes and lastDrawnFrame stamps on DrawInstance success.
             // SEH-guarded: a stale Remix mesh handle can fault inside DrawInstance.
@@ -865,33 +1004,32 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             int guardRc = CallDrawInstanceGuarded(api, &instance, &drawErr, &drawExcCode);
             if (guardRc == 1) {
                 _MESSAGE("FO4RemixPlugin: [OnFrame] SEH CRASH CAUGHT in DrawInstance "
-                         "hash=0x%llX exception=0x%08lX -- nulling meshHandle to skip permanently",
-                         (unsigned long long)drawHash, drawExcCode);
-                inst.meshHandle = nullptr;  // permanent skip; LRU sweep will clean up later
+                         "meshHandle=%p batchSize=%zu exception=0x%08lX -- nulling member meshHandles to skip permanently",
+                         (void*)meshHandle, bucket.members.size(), drawExcCode);
+                for (DrawableInstance* member : bucket.members) member->meshHandle = nullptr;
                 continue;
             }
             if (guardRc == 2) {
                 // C++ exception already logged by the inner helper with what().
-                // Null meshHandle to skip permanently; LRU sweep will clean up.
-                inst.meshHandle = nullptr;
+                // Null member meshHandles to skip permanently; LRU sweep will clean up.
+                for (DrawableInstance* member : bucket.members) member->meshHandle = nullptr;
                 continue;
             }
             if (drawErr == REMIXAPI_ERROR_CODE_SUCCESS) {
                 hasAnyMeshes = true;
-
-                inst.lastDrawnFrame = currentFrame;
-
-                // Stamp material + textures for LRU sweep.
-                if (inst.materialHash != 0) {
-                    auto matIt = g_materialCache.find(inst.materialHash);
-                    if (matIt != g_materialCache.end()) {
-                        matIt->second.lastDrawnFrame = currentFrame;
+                for (DrawableInstance* member : bucket.members) {
+                    member->lastDrawnFrame = currentFrame;
+                    if (member->materialHash != 0) {
+                        auto matIt = g_materialCache.find(member->materialHash);
+                        if (matIt != g_materialCache.end()) {
+                            matIt->second.lastDrawnFrame = currentFrame;
+                        }
                     }
-                }
-                for (uint64_t texHash : inst.textureHashes) {
-                    auto texIt = g_textureHandles.find(texHash);
-                    if (texIt != g_textureHandles.end()) {
-                        texIt->second.lastDrawnFrame = currentFrame;
+                    for (uint64_t texHash : member->textureHashes) {
+                        auto texIt = g_textureHandles.find(texHash);
+                        if (texIt != g_textureHandles.end()) {
+                            texIt->second.lastDrawnFrame = currentFrame;
+                        }
                     }
                 }
             }
@@ -902,7 +1040,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     static uint32_t s_frameCounter = 0;
     s_frameCounter++;
     if (s_frameCounter % 300 == 0) {
-        _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu", drawableCount);
+        _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu",
+                 drawableCount, bucketCount, batchedBucketCount);
     }
 
     if (!hasAnyMeshes && g_fallbackMesh) {
@@ -1017,14 +1156,18 @@ void RemixRenderer::Shutdown() {
 
     remixapi_Interface* api = RemixAPI::GetInterface();
 
-    // Release all event-driven drawables
-    for (auto& [hash, inst] : g_drawables) {
-        if (inst.meshHandle && api) api->DestroyMesh(inst.meshHandle);
-    }
+    // Drop drawable entries first; their meshHandle members alias g_meshCache,
+    // so we don't DestroyMesh here -- the cache loop below does that once per
+    // unique handle.
     g_drawables.clear();
 
-    // Destroy all materials and textures in the shared caches
+    // Destroy all cached meshes, materials, and textures.
     if (api) {
+        for (auto& [key, mref] : g_meshCache) {
+            if (mref.handle) api->DestroyMesh(mref.handle);
+        }
+        g_meshCache.clear();
+
         for (auto& [hash, matRef] : g_materialCache) {
             if (matRef.handle) api->DestroyMaterial(matRef.handle);
         }

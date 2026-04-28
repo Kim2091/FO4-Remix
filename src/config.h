@@ -111,6 +111,14 @@ struct PluginConfig {
     // Trade-off: dev-menu raw-input hotkeys (Alt+X, etc.) stop working. Set
     // false if you need the dev menu and don't mind losing game keyboard.
     bool restoreLegacyInput;
+
+    // [Performance]
+    // Share Remix mesh handles across drawables with byte-identical geometry
+    // and material, and batch identical drawables in OnFrame via
+    // remixapi_InstanceInfoGpuInstancingEXT. Saves BLAS/VRAM and per-frame
+    // DrawInstance count. Default true; flip false to fall back to a
+    // unique-mesh-per-drawable rendering path if a regression appears.
+    bool gpuInstancingEnabled;
 };
 
 // Global config instance

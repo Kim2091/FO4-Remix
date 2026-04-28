@@ -89,6 +89,10 @@ void LoadConfig() {
     _MESSAGE("FO4RemixPlugin: Overlay - HudOverlayEnabled=%d RestoreLegacyInput=%d",
              g_config.hudOverlayEnabled, g_config.restoreLegacyInput);
 
+    // [Performance]
+    g_config.gpuInstancingEnabled = GetIniBool("Performance", "GpuInstancing", true, dllPath);
+    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d", g_config.gpuInstancingEnabled);
+
     _MESSAGE("FO4RemixPlugin: Config loaded - LogShapeInfo=%d LogLargeShapes=%d LogRejections=%d "
              "LogTextures=%d LogLights=%d MaxExtent=%.0f",
              g_config.logShapeInfo, g_config.logLargeShapes, g_config.logRejections,
