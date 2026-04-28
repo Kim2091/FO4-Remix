@@ -376,3 +376,33 @@ void SemanticCapture::Tick(ID3D11Device* device) {
              (unsigned long long)g_totalFires.load(std::memory_order_relaxed),
              evicted, submittedCount, pendingCount);
 }
+
+void SemanticCapture::ClearDrawableMap() {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+
+    const size_t totalCount = g_drawableMap.size();
+    size_t submittedCount = 0;
+
+    // Release Remix-side handles for every submitted entry first. ~NiPointer
+    // below will only release engine refs; it doesn't know about g_drawables
+    // / g_meshCache / g_materialCache / g_textureHandles.
+    for (auto& [key, state] : g_drawableMap) {
+        if (state.submittedToRemix && state.meshHash != 0) {
+            unsigned long excCode = 0;
+            if (CallReleaseDrawableGuarded(state.meshHash, &excCode) != 0) {
+                _MESSAGE("FO4RemixPlugin: [Reload] CRASH CAUGHT in ReleaseDrawable "
+                         "hash=0x%llX exception=0x%08lX -- continuing wipe",
+                         (unsigned long long)state.meshHash, excCode);
+            }
+            ++submittedCount;
+        }
+    }
+
+    // ~DrawableState -> ~NiPointer -> DecRef on every entry. For drawables
+    // where the engine's already released its refs (refcount == 1, just us),
+    // the engine destructor runs inline here and frees the BSGeometry.
+    g_drawableMap.clear();
+
+    _MESSAGE("FO4RemixPlugin: [Reload] cleared %zu drawables (%zu submitted) on PreLoadGame",
+             totalCount, submittedCount);
+}

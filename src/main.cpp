@@ -51,6 +51,12 @@ void OnF4SEMessage(F4SEMessagingInterface::Message* msg) {
     case F4SEMessagingInterface::kMessage_PreLoadGame:
         _MESSAGE("FO4RemixPlugin: PreLoadGame - resetting extraction state");
         PresentHook::ResetExtractionState();
+        // Drop every tracked drawable + release Remix handles. The engine's
+        // reload sequence stalls waiting for BSGeometry destructors that
+        // cannot run while we hold +1 NiPointer refs; releasing here lets
+        // the old world fully tear down. Submission resumes naturally as
+        // hooks fire for the new world.
+        SemanticCapture::ClearDrawableMap();
         break;
     }
 }
