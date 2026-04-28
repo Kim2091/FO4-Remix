@@ -61,12 +61,16 @@ namespace SemanticCapture {
     // device is the D3D11 device used by texture readback inside resolvers.
     void Tick(ID3D11Device* device);
 
-    // Drop every tracked drawable: release its Remix-side handles and
-    // destruct its NiPointer<NiAVObject> (DecRef cascade). Called from the
-    // F4SE PreLoadGame handler. The engine's reload sequence can stall
-    // indefinitely waiting for BSGeometry destructors that cannot run while
-    // we hold +1 refs; releasing here lets the engine fully tear down the
-    // old world. Submission resumes naturally as new drawables fire post-
-    // load.
+    // Drop every tracked drawable: release Remix-side handles and clear
+    // g_drawableMap. Called from the F4SE PreLoadGame handler.
     void ClearDrawableMap();
+
+    // Build the set of submitted drawable hashes whose state.lastSeenFrame
+    // is within `maxAge` of `currentFrame`. Caller passes an empty set;
+    // function locks g_drawableMutex briefly and fills it. Used by OnFrame
+    // to skip drawing drawables the engine stopped firing for (LOD swaps,
+    // off-frustum culling) without evicting their cached mesh handles.
+    void SnapshotActiveDrawables(uint64_t currentFrame,
+                                 uint64_t maxAge,
+                                 std::unordered_set<uint64_t>& out);
 }

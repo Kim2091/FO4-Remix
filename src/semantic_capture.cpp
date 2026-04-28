@@ -371,3 +371,16 @@ void SemanticCapture::ClearDrawableMap() {
     _MESSAGE("FO4RemixPlugin: [Reload] cleared %zu drawables (%zu submitted) on PreLoadGame",
              totalCount, submittedCount);
 }
+
+void SemanticCapture::SnapshotActiveDrawables(uint64_t currentFrame,
+                                              uint64_t maxAge,
+                                              std::unordered_set<uint64_t>& out) {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    out.reserve(g_drawableMap.size());
+    for (const auto& [hash, state] : g_drawableMap) {
+        if (!state.submittedToRemix) continue;
+        const uint64_t age = (currentFrame > state.lastSeenFrame)
+            ? (currentFrame - state.lastSeenFrame) : 0;
+        if (age <= maxAge) out.insert(hash);
+    }
+}

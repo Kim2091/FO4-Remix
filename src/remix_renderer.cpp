@@ -921,6 +921,19 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
     bool hasAnyMeshes = false;
 
+    // Snapshot the set of "engine-active" drawables -- those whose
+    // GetRenderPasses hook has fired within the last kActiveAgeFrames frames.
+    // The engine simply stops firing the hook for drawables it no longer
+    // wants drawn (LOD swapped to full-detail, geometry off-frustum). Without
+    // this filter, our cached mesh handles would keep rendering, producing
+    // LOD-over-full-detail overlaps and ghost geometry behind the player.
+    // Done before acquiring g_renderStateMutex so we don't violate the
+    // existing g_drawableMutex -> g_renderStateMutex lock order.
+    constexpr uint64_t kActiveAgeFrames = 60;  // 1 second @ 60fps
+    std::unordered_set<uint64_t> activeSet;
+    SemanticCapture::SnapshotActiveDrawables(Diagnostics::CurrentFrameIndex(),
+                                             kActiveAgeFrames, activeSet);
+
     // Phase 1B: draw event-driven drawables. Bucket by Remix mesh handle so
     // drawables sharing a cached handle (identical content + material) collapse
     // into a single DrawInstance via remixapi_InstanceInfoGpuInstancingEXT.
@@ -930,6 +943,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t drawableCount = 0;
     size_t bucketCount = 0;
     size_t batchedBucketCount = 0;
+    size_t skippedInactive = 0;
     {
         std::lock_guard<std::mutex> lock(g_renderStateMutex);
         const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
@@ -944,6 +958,13 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
         for (auto& [drawHash, inst] : g_drawables) {
             if (!inst.meshHandle) continue;
+            // Engine-active filter: skip drawables the engine stopped firing
+            // for. Their mesh handles stay cached in g_meshCache so we resume
+            // drawing instantly when the engine starts firing again.
+            if (activeSet.find(drawHash) == activeSet.end()) {
+                ++skippedInactive;
+                continue;
+            }
             buckets[inst.meshHandle].members.push_back(&inst);
         }
         bucketCount = buckets.size();
@@ -1040,8 +1061,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     static uint32_t s_frameCounter = 0;
     s_frameCounter++;
     if (s_frameCounter % 300 == 0) {
-        _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu",
-                 drawableCount, bucketCount, batchedBucketCount);
+        _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu",
+                 drawableCount, bucketCount, batchedBucketCount, skippedInactive);
     }
 
     if (!hasAnyMeshes && g_fallbackMesh) {
