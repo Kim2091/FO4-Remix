@@ -3,8 +3,6 @@
 #include <cstdint>
 #include <unordered_set>
 
-#include "f4se/NiObjects.h"  // NiAVObject + NiPointer (via NiTypes.h)
-
 struct ID3D11Device;
 struct NiTransform;
 
@@ -21,14 +19,7 @@ namespace SemanticCapture {
         uint32_t lastTechniqueFlags  = 0;
 
         // ---- 1B: pointers captured by the hot-path detour on first-seen ----
-        // geometry is held via NiPointer so we own a refcount on the engine
-        // BSGeometry. The engine cannot destroy it underneath us; when the
-        // engine releases its own refs (cell unload, LOD swap, REFR disable),
-        // m_uiRefCount drops to 1 (just our ref) and the sweep evicts the
-        // entry, releasing our ref and letting the destructor finally run.
-        // property/material stay raw void* -- BSGeometry holds them via
-        // NiPointer internally, so they live as long as geometry does.
-        NiPointer<NiAVObject> geometry;          // was void*; refcount-owned
+        void*    geometry            = nullptr;  // BSGeometry*  (rdx)
         void*    property            = nullptr;  // BSLightingShaderProperty* (rcx)
         void*    material            = nullptr;  // [property+0x48]
 
