@@ -313,9 +313,29 @@ static bool ReadbackAllMips(ID3D11Device* device, ID3D11Texture2D* tex2D,
     outMips.clear();
     outMips.reserve(srcMipCount);
 
+    // BC formats use 4x4 pixel blocks. D3D11 rejects CreateTexture2D for
+    // standalone BC textures with width<4 or height<4 (E_INVALIDARG /
+    // 0x80070057): sub-block dimensions are only legal as part of a parent
+    // texture's mip chain, not as a standalone resource. Truncating the
+    // chain at the 4x4 boundary produces a valid partial chain and lets
+    // dxvk-remix sample the lower mips it has. Practical visual cost is
+    // zero: a BC mip below 4x4 is at most 4 texels of pre-filtered detail
+    // -- noise to the path tracer's screen-space sampler. Without this
+    // gate, every BC texture's small-mip readback failed and the whole
+    // texture was rejected and re-attempted every frame, producing a 1 FPS
+    // regression with most terrain missing (observed 2026-04-29).
+    uint32_t blockSize = 0;
+    bool isBC = IsBlockCompressed(desc.Format, blockSize);
+
     for (uint32_t i = 0; i < srcMipCount; i++) {
         uint32_t mipW = desc.Width  >> i; if (mipW == 0) mipW = 1;
         uint32_t mipH = desc.Height >> i; if (mipH == 0) mipH = 1;
+
+        if (isBC && (mipW < 4 || mipH < 4)) {
+            // Stop here -- subsequent mips would also be sub-block. We've
+            // collected mips 0..i-1, which is what dxvk-remix will use.
+            break;
+        }
 
         ExtractedTexture mip;
         if (!ReadbackOneMip(ctx.Get(), device, tex2D, desc.Format,
@@ -324,6 +344,11 @@ static bool ReadbackAllMips(ID3D11Device* device, ID3D11Texture2D* tex2D,
             return false;
         }
         outMips.push_back(std::move(mip));
+    }
+
+    if (outMips.empty()) {
+        // Source texture had no usable mips (degenerate input).
+        return false;
     }
 
     return true;
