@@ -173,15 +173,26 @@ static void* DetourGetRenderPassesShared(void* self,
     const PassKey key = ComputePassKey(geometry, self, material);
     const uint64_t now = Diagnostics::CurrentFrameIndex();
 
-    // Snapshot live NiAVObject::flags + parent chain + world transform.
+    // Snapshot live NiAVObject::flags (offset 0x108 -- verified against
+    // f4se NiObjects.h). Safe to read here: engine is mid-call into
+    // GetRenderPasses on this geometry, so the object is live.
     uint64_t niFlags = 0;
     void* p1 = nullptr;
     void* p2 = nullptr;
+    // Live world transform (NiAVObject::m_worldTransform at offset 0x70 --
+    // verified against f4se NiObjects.h). Read at hook time because the
+    // engine has already evaluated scene-graph controllers (animated
+    // statics: doors, gates, etc.) and the leaf BSGeometry's transform
+    // reflects the current pose. Converted to Remix row-major 3x4 via
+    // BuildRemixTransform (Beth X/Y swap built in).
     float liveXf[3][4] = {};
     bool  liveXfValid  = false;
     if (geometry) {
         niFlags = *reinterpret_cast<uint64_t*>(
             reinterpret_cast<uintptr_t>(geometry) + 0x108);
+        // Walk the parent chain two levels (NiAVObject::m_parent at +0x28).
+        // Used for the up-close-overlap diagnostic -- the LOD-or-similar
+        // marker may sit on a grouping parent rather than the leaf shape.
         p1 = *reinterpret_cast<void**>(
             reinterpret_cast<uintptr_t>(geometry) + 0x28);
         if (p1) {
@@ -196,7 +207,7 @@ static void* DetourGetRenderPassesShared(void* self,
 
     {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
-        auto& state = g_drawableMap[key];
+        auto& state = g_drawableMap[key];  // inserts default-constructed if new
         if (state.firstSeenFrame == 0) {
             state.firstSeenFrame = now;
             state.geometry = geometry;
@@ -269,6 +280,12 @@ bool SemanticCapture::Install() {
         if (MH_EnableHook(t.address) != MH_OK) {
             _MESSAGE("FO4RemixPlugin: [SemCapture] ERROR: MH_EnableHook failed for target %zu (RVA 0x%llX)",
                      i, (unsigned long long)t.rva);
+            // Clean up the trampoline allocated by MH_CreateHook above.
+            // Uninstall would handle this via the t.address gate, but doing
+            // it locally keeps the partial-install state explicit and lets
+            // a retried Install() see this slot as not-yet-created.
+            MH_RemoveHook(t.address);
+            t.address = nullptr;
             continue;
         }
         ++installedCount;
