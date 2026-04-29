@@ -2,6 +2,7 @@
 #include "config.h"
 #include "fo4_diagnostics.h"
 #include "resolvers/lighting_static.h"
+#include "resolvers/water.h"
 #include "remix_renderer.h"
 
 #define WIN32_LEAN_AND_MEAN
@@ -127,7 +128,14 @@ static int CallResolverGuarded(SemanticCapture::DrawableState* state,
                                ID3D11Device* device,
                                unsigned long* outExceptionCode) {
     __try {
-        Resolvers::Lighting::TryResolveStatic(*state, key, device);
+        switch (state->resolverKind) {
+            case SemanticCapture::ResolverKind::Lighting:
+                Resolvers::Lighting::TryResolveStatic(*state, key, device);
+                break;
+            case SemanticCapture::ResolverKind::Water:
+                Resolvers::Water::TryResolve(*state, key, device);
+                break;
+        }
         return 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         *outExceptionCode = GetExceptionCode();

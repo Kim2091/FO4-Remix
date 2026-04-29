@@ -80,6 +80,8 @@ add_library(FO4RemixPlugin SHARED
     src/semantic_capture.cpp
     src/resolvers/lighting_static.h
     src/resolvers/lighting_static.cpp
+    src/resolvers/water.h
+    src/resolvers/water.cpp
     src/f4se_compat.h
 )
 
