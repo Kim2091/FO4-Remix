@@ -793,13 +793,10 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.chunkOriginY = mesh.chunkOriginY;
     inst.chunkExtent  = mesh.chunkExtent;
 
-    g_drawables[hash] = std::move(inst);
-
-    // Per-instance alpha blend state. Populated AFTER g_drawables insert so
-    // the invariant "if it's in g_geometryAlphaState, it's in g_drawables"
-    // holds structurally — ReleaseDrawable's erase will always reach the
-    // entry. Stored as a complete struct (not a pointer to mesh.*) because
-    // the resolver's ExtractedMesh is destroyed after submit.
+    // Per-instance alpha blend state. Populated when mesh.alphaBlendEnabled is
+    // true so OnFrame's bucket dispatch can chain InstanceInfoBlendEXT into
+    // instance.pNext. Stored as a complete struct (not a pointer to mesh.*)
+    // because the resolver's ExtractedMesh is destroyed after submit.
     if (mesh.alphaBlendEnabled) {
         remixapi_InstanceInfoBlendEXT blendExt = {};
         blendExt.sType                = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
@@ -820,6 +817,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         g_geometryAlphaState[hash] = blendExt;
     }
 
+    g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
     } catch (const std::exception& e) {
         int n = g_cxxLogCount_SubmitDrawable.fetch_add(1, std::memory_order_relaxed);
