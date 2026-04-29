@@ -7,9 +7,11 @@
 #include "../fo4_diagnostics.h"
 #include "f4se/NiObjects.h"
 #include "f4se/BSGeometry.h"
+#include "f4se/NiMaterials.h"  // BSWaterShaderMaterial
 #include "f4se/PluginAPI.h"  // _MESSAGE
 #include "lighting_static.h"  // for Resolvers::Trace
 
+#include <atomic>
 #include <cmath>
 #include <vector>
 
@@ -24,6 +26,13 @@ constexpr uint64_t kSyntheticDiffuseHash = 0xFA11FA11FA11FA11ULL;
 bool TryResolve(SemanticCapture::DrawableState& state,
                 uint64_t hash,
                 ID3D11Device* device) {
+    static std::atomic<uint64_t> sDispatchCount{0};
+    const uint64_t n = sDispatchCount.fetch_add(1, std::memory_order_relaxed);
+    if (n < 10) {
+        _MESSAGE("FO4RemixPlugin: [ResolverWater] DISPATCH #%llu hash=0x%llX geo=%p prop=%p submitted=%d",
+                 (unsigned long long)n, (unsigned long long)hash,
+                 state.geometry, state.property, state.submittedToRemix ? 1 : 0);
+    }
     if (state.submittedToRemix) return true;
 
     Resolvers::Trace::SetStep(Resolvers::Trace::kEntered);
@@ -80,18 +89,29 @@ bool TryResolve(SemanticCapture::DrawableState& state,
 
     Resolvers::Trace::SetStep(Resolvers::Trace::kBuildMeshOK);
 
-    // Synthetic 1x1 RGBA8 blue texture. Sentinel hash is stable across runs
-    // so USD replacement targets a known value. The diffuse exists solely to
-    // pass SubmitDrawable's `mesh.diffuseTextureHash != 0` gate.
+    // Pull spNormalMap01 from the water material as the diffuse slot. Hash
+    // is content-derived inside ExtractMaterialTexture (deterministic over
+    // the .dds bytes), so it stays stable across game restarts -- toolkit
+    // USD replacements keyed by this hash will keep working session-to-
+    // session. Fall back to a synthetic 1x1 blue if the material slot is
+    // null (defensive; lets us still pass SubmitDrawable's diffuseHash gate
+    // for water without a normal map).
     std::vector<ExtractedTexture> newTextures;
-    ExtractedTexture synth;
-    synth.width      = 1;
-    synth.height     = 1;
-    synth.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-    synth.pixels     = { 64, 96, 160, 255 };  // RGBA(0.25, 0.38, 0.63, 1.0) -- solid blue
-    synth.hash       = kSyntheticDiffuseHash;
-    newTextures.push_back(synth);
-    mesh.diffuseTextureHash = kSyntheticDiffuseHash;
+    auto* waterMat = static_cast<BSWaterShaderMaterial*>(state.material);
+    if (waterMat) {
+        mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
+            waterMat->spNormalMap01, "water_normal", device, newTextures);
+    }
+    if (mesh.diffuseTextureHash == 0) {
+        ExtractedTexture synth;
+        synth.width      = 1;
+        synth.height     = 1;
+        synth.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+        synth.pixels     = { 64, 96, 160, 255 };  // RGBA(0.25, 0.38, 0.63, 1.0) -- solid blue
+        synth.hash       = kSyntheticDiffuseHash;
+        newTextures.push_back(synth);
+        mesh.diffuseTextureHash = kSyntheticDiffuseHash;
+    }
 
     Resolvers::Trace::SetStep(Resolvers::Trace::kTexturesExtracted);
 

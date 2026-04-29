@@ -260,6 +260,12 @@ void* __fastcall DetourGetRenderPasses_Lighting(void* self, void* geometry,
 
 void* __fastcall DetourGetRenderPasses_Water(void* self, void* geometry,
                                              uint32_t technique, void* arg4) {
+    static std::atomic<uint64_t> sFireCount{0};
+    const uint64_t n = sFireCount.fetch_add(1, std::memory_order_relaxed);
+    if (n < 10) {
+        _MESSAGE("FO4RemixPlugin: [DetourWater] fire #%llu self=%p geom=%p",
+                 (unsigned long long)n, self, geometry);
+    }
     return DetourGetRenderPassesShared(self, geometry, technique, arg4,
                                        SemanticCapture::ResolverKind::Water,
                                        g_hookTargets[1].original);
@@ -416,6 +422,21 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                          state.geometry, state.property, state.material);
                 state.submittedToRemix = true;
                 state.meshHash = 0;
+            }
+
+            // Diagnostic: log every water entry's post-resolver state so we
+            // can pinpoint exactly where it exits.
+            if (state.resolverKind == SemanticCapture::ResolverKind::Water) {
+                static std::atomic<uint64_t> sWaterExitCnt{0};
+                const uint64_t en = sWaterExitCnt.fetch_add(1, std::memory_order_relaxed);
+                if (en < 15) {
+                    _MESSAGE("FO4RemixPlugin: [WaterExit] #%llu key=0x%llX submitted=%d step=%s excCode=0x%08lX",
+                             (unsigned long long)en,
+                             (unsigned long long)key,
+                             state.submittedToRemix ? 1 : 0,
+                             Resolvers::Trace::StepName(Resolvers::Trace::LastStep()),
+                             excCode);
+                }
             }
 
             // Snapshot the gate that rejected this drawable so the periodic
