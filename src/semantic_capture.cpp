@@ -350,7 +350,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     // ---- Resolve loop: every call, attempt one resolve per unsubmitted drawable ----
     // Skyrim's pattern: cheap when state.submittedToRemix is true (early exit).
     if (!vramOk) {
-        Resolvers::Lighting::Trace::SetStep(Resolvers::Lighting::Trace::kSubmit_GateVram);
+        Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_GateVram);
         // Skip resolve loop; eviction sweep below still runs.
     } else {
         // Per-Tick submission budget removed: VRAM gate above and input
@@ -384,14 +384,14 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             // submitted so we don't retry it endlessly.
             unsigned long excCode = 0;
             if (CallResolverGuarded(&state, key, device, &excCode) != 0) {
-                const int lastStep = Resolvers::Lighting::Trace::LastStep();
-                const uint64_t lastHash = Resolvers::Lighting::Trace::LastHash();
+                const int lastStep = Resolvers::Trace::LastStep();
+                const uint64_t lastHash = Resolvers::Trace::LastHash();
                 _MESSAGE("FO4RemixPlugin: [Resolver] CRASH CAUGHT key=0x%llX "
                          "trace_hash=0x%llX step=%s exception=0x%08lX "
                          "geo=%p prop=%p mat=%p -- skipping permanently",
                          (unsigned long long)key,
                          (unsigned long long)lastHash,
-                         Resolvers::Lighting::Trace::StepName(lastStep),
+                         Resolvers::Trace::StepName(lastStep),
                          excCode,
                          state.geometry, state.property, state.material);
                 state.submittedToRemix = true;
@@ -403,7 +403,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             // SEH-caught crashes both flip submittedToRemix=true and bypass.
             if (!state.submittedToRemix) {
                 state.lastFailedResolverStep =
-                    Resolvers::Lighting::Trace::LastStep();
+                    Resolvers::Trace::LastStep();
             }
         }
     }
@@ -458,7 +458,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                     ++submittedCount;
                 } else {
                     ++pendingCount;
-                    using Resolvers::Lighting::Trace::Step;
+                    using Resolvers::Trace::Step;
                     switch (it->second.lastFailedResolverStep) {
                         case Step::kIdle:              ++pendNotResolved;  break;
                         case Step::kEntered:           ++pendNotTriShape;  break;

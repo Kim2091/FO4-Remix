@@ -16,7 +16,6 @@
 #include <cstring>
 
 namespace Resolvers {
-namespace Lighting {
 
 // In-flight resolver state. Updated at each gate inside TryResolveStatic
 // AND inside RemixRenderer::SubmitDrawable (via Trace::SetStep). Read by
@@ -62,6 +61,8 @@ namespace ResolverTrace {
         }
     }
 }
+
+namespace Lighting {
 
 bool TryResolveStatic(SemanticCapture::DrawableState& state,
                       uint64_t hash,
@@ -312,6 +313,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     return true;
 }
 
+}  // namespace Lighting
+
 // ---- Trace accessors (for SEH handler in semantic_capture.cpp) ----
 namespace Trace {
     int LastStep() {
@@ -328,5 +331,4 @@ namespace Trace {
     }
 }
 
-}  // namespace Lighting
 }  // namespace Resolvers

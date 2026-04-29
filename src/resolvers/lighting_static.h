@@ -6,23 +6,6 @@ struct ID3D11Device;
 namespace SemanticCapture { struct DrawableState; }
 
 namespace Resolvers {
-namespace Lighting {
-
-    // Try to resolve a captured-but-not-yet-submitted DrawableState into a
-    // Remix mesh submission for static lit (non-skinned) drawables.
-    //
-    // - state: the DrawableState produced by the hot-path detour. The
-    //          resolver mutates state.submittedToRemix / meshHash /
-    //          materialHash / textureHashes on success.
-    // - hash:  the PassKey for this drawable (== state.meshHash on submit)
-    // - device: D3D11 device used for texture readback
-    //
-    // Returns true on submission success. False on cast failure, parse
-    // failure, missing diffuse, or any other condition that should retry
-    // next frame (or never; the caller's TTL handles permanent failures).
-    bool TryResolveStatic(SemanticCapture::DrawableState& state,
-                          uint64_t hash,
-                          ID3D11Device* device);
 
     // In-flight resolver trace. Updated at each gate inside TryResolveStatic
     // (and inside RemixRenderer::SubmitDrawable via Trace::SetStep) so an
@@ -77,5 +60,23 @@ namespace Lighting {
         void SetStep(int s);
     }
 
-}  // namespace Lighting
+    namespace Lighting {
+
+    // Try to resolve a captured-but-not-yet-submitted DrawableState into a
+    // Remix mesh submission for static lit (non-skinned) drawables.
+    //
+    // - state: the DrawableState produced by the hot-path detour. The
+    //          resolver mutates state.submittedToRemix / meshHash /
+    //          materialHash / textureHashes on success.
+    // - hash:  the PassKey for this drawable (== state.meshHash on submit)
+    // - device: D3D11 device used for texture readback
+    //
+    // Returns true on submission success. False on cast failure, parse
+    // failure, missing diffuse, or any other condition that should retry
+    // next frame (or never; the caller's TTL handles permanent failures).
+    bool TryResolveStatic(SemanticCapture::DrawableState& state,
+                          uint64_t hash,
+                          ID3D11Device* device);
+
+    }  // namespace Lighting
 }  // namespace Resolvers
