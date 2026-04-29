@@ -690,12 +690,15 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
             opaqueExt.metallicConstant  = 0.0f;
             opaqueExt.alphaTestType       = mesh.alphaTestEnabled ? mesh.alphaTestType : 7;
             opaqueExt.alphaReferenceValue = mesh.alphaTestEnabled ? mesh.alphaTestRef  : 0;
-            // useDrawCallAlphaState=1 makes Remix use InstanceInfoBlendEXT for
-            // alpha state instead of the static alphaTestType/alphaReferenceValue
-            // material fields. Required for alpha-blend drawables (glass, water).
-            // Alpha-test-only drawables (foliage cutouts) keep =0 -- the working
-            // alpha-test path uses the explicit material alpha fields.
-            opaqueExt.useDrawCallAlphaState = mesh.alphaBlendEnabled ? 1 : 0;
+            // Per remix_c.h: useDrawCallAlphaState=1 means "use InstanceInfoBlendEXT
+            // as alpha state source." We submit DrawInstance with InstanceInfoGpu-
+            // InstancingEXT only (no blend ext), so =1 made Remix ignore the
+            // alphaTestType/alphaReferenceValue above and render fully opaque.
+            // Setting =0 makes Remix use the explicit alpha fields, restoring
+            // alpha-test cutouts on foliage / decals / perforated geometry.
+            // Alpha BLEND (glass, smoke) is still unaddressed -- needs an
+            // InstanceInfoBlendEXT submission path in OnFrame, follow-up work.
+            opaqueExt.useDrawCallAlphaState = 0;
 
             remixapi_MaterialInfo matInfo = {};
             matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
@@ -792,30 +795,6 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.chunkOriginX = mesh.chunkOriginX;
     inst.chunkOriginY = mesh.chunkOriginY;
     inst.chunkExtent  = mesh.chunkExtent;
-
-    // Per-instance alpha blend state. Populated when mesh.alphaBlendEnabled is
-    // true so OnFrame's bucket dispatch can chain InstanceInfoBlendEXT into
-    // instance.pNext. Stored as a complete struct (not a pointer to mesh.*)
-    // because the resolver's ExtractedMesh is destroyed after submit.
-    if (mesh.alphaBlendEnabled) {
-        remixapi_InstanceInfoBlendEXT blendExt = {};
-        blendExt.sType                = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
-        blendExt.pNext                = nullptr;
-        blendExt.alphaTestEnabled     = mesh.alphaTestEnabled ? 1 : 0;
-        blendExt.alphaTestReferenceValue = mesh.alphaTestRef;
-        blendExt.alphaTestCompareOp   = (uint32_t)mesh.alphaTestType;
-        blendExt.alphaBlendEnabled    = 1;
-        blendExt.srcColorBlendFactor  = mesh.srcColorBlendFactor;
-        blendExt.dstColorBlendFactor  = mesh.dstColorBlendFactor;
-        blendExt.colorBlendOp         = 0;  // VK_BLEND_OP_ADD
-        blendExt.srcAlphaBlendFactor  = mesh.srcColorBlendFactor;
-        blendExt.dstAlphaBlendFactor  = mesh.dstColorBlendFactor;
-        blendExt.alphaBlendOp         = 0;  // VK_BLEND_OP_ADD
-        blendExt.writeMask            = 0xF;  // RGBA
-        blendExt.isTextureFactorBlend = 0;
-        blendExt.isVertexColorBakedLighting = 0;
-        g_geometryAlphaState[hash] = blendExt;
-    }
 
     g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
@@ -923,10 +902,6 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
             }
         }
     }
-
-    // Drop the per-instance blend state entry. Keyed by drawable hash, NOT
-    // material/mesh hash, so erase is straightforward -- one entry per drawable.
-    g_geometryAlphaState.erase(hash);
 
     g_drawables.erase(it);
 }
@@ -1109,62 +1084,6 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 gpuExt.instanceTransforms_values = bucket.transforms.data();
                 gpuExt.instanceTransforms_count  = (uint32_t)bucket.transforms.size();
                 instance.pNext = &gpuExt;
-            }
-
-            // Per-instance alpha blend chain. If any member of this bucket has a
-            // stored InstanceInfoBlendEXT, chain it into instance.pNext. The
-            // material-cache key already factors useDrawCall (alphaTestEnabled
-            // || alphaBlendEnabled) into the hash, so all members of any single
-            // bucket share identical alpha state -- looking up the first member's
-            // entry is sufficient. The invariant assertion below catches any
-            // future drift.
-            remixapi_InstanceInfoBlendEXT blendExtCopy = {};
-            bool haveBlend = false;
-            {
-                const uint64_t firstHash = [&]() -> uint64_t {
-                    // Find the drawable hash for the first member by reverse-lookup.
-                    // bucket.members[0] is a DrawableInstance*; we need its key.
-                    for (auto& [k, v] : g_drawables) {
-                        if (&v == bucket.members[0]) return k;
-                    }
-                    return 0;
-                }();
-                if (firstHash != 0) {
-                    auto it = g_geometryAlphaState.find(firstHash);
-                    if (it != g_geometryAlphaState.end()) {
-                        blendExtCopy = it->second;
-                        haveBlend = true;
-                    }
-                }
-            }
-            if (haveBlend) {
-                // Invariant: all bucket members share identical blend state.
-                // Sanity check that holds by construction of the cache key.
-                #ifndef NDEBUG
-                for (size_t i = 1; i < bucket.members.size(); ++i) {
-                    uint64_t memberHash = 0;
-                    for (auto& [k, v] : g_drawables) {
-                        if (&v == bucket.members[i]) { memberHash = k; break; }
-                    }
-                    auto memberIt = g_geometryAlphaState.find(memberHash);
-                    if (memberIt == g_geometryAlphaState.end() ||
-                        std::memcmp(&memberIt->second, &blendExtCopy,
-                                    sizeof(remixapi_InstanceInfoBlendEXT)) != 0) {
-                        _MESSAGE("FO4RemixPlugin: [OnFrame] BLEND INVARIANT VIOLATION "
-                                 "bucket member %zu hash=0x%llX has divergent blend state",
-                                 i, (unsigned long long)memberHash);
-                        break;
-                    }
-                }
-                #endif
-                // Chain at the head of pNext. If a batched bucket already set
-                // instance.pNext = &gpuExt, splice blendExt after gpuExt.
-                if (instance.pNext == nullptr) {
-                    instance.pNext = &blendExtCopy;
-                } else {
-                    // pNext currently points to gpuExt; chain blend after gpuExt.
-                    gpuExt.pNext = &blendExtCopy;
-                }
             }
 
             // Gate hasAnyMeshes and lastDrawnFrame stamps on DrawInstance success.
