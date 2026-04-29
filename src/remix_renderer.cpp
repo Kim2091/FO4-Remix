@@ -203,6 +203,19 @@ namespace {
         std::unordered_set<uint64_t> textureHashes;            // for refcount cascade
         uint64_t                     lastDrawnFrame = 0;       // stamped by OnFrame
         float                        worldTransform[3][4] = {};  // row-major 3x4 matrix; populated from mesh.worldTransform at submit time
+
+        // Worldspace LOD chunk metadata (2026-04-28). Copied from
+        // ExtractedMesh at submit time. OnFrame applies a spatial filter:
+        // when isLODChunk is true and the player's world position is inside
+        // [chunkOriginXY, chunkOriginXY + chunkExtent] in raw Beth coords,
+        // skip drawing this instance (the in-cell static refs are already
+        // rendering that region with full detail). Avoids the close-up
+        // multi-LOD-level overlap symptom while keeping distant LOD chunks
+        // (player outside coverage) rendering normally.
+        bool                         isLODChunk    = false;
+        float                        chunkOriginX  = 0.0f;
+        float                        chunkOriginY  = 0.0f;
+        float                        chunkExtent   = 0.0f;
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
@@ -771,6 +784,12 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     // Resolver-provided in row-major 3x4 layout matching remixapi_Transform.matrix.
     memcpy(inst.worldTransform, mesh.worldTransform, sizeof(inst.worldTransform));
 
+    // Worldspace LOD chunk metadata for the OnFrame spatial filter.
+    inst.isLODChunk   = mesh.isLODChunk;
+    inst.chunkOriginX = mesh.chunkOriginX;
+    inst.chunkOriginY = mesh.chunkOriginY;
+    inst.chunkExtent  = mesh.chunkExtent;
+
     g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
     } catch (const std::exception& e) {
@@ -923,16 +942,23 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
     // Snapshot the set of "engine-active" drawables -- those whose
     // GetRenderPasses hook has fired within the last kActiveAgeFrames frames.
-    // The engine simply stops firing the hook for drawables it no longer
-    // wants drawn (LOD swapped to full-detail, geometry off-frustum). Without
-    // this filter, our cached mesh handles would keep rendering, producing
-    // LOD-over-full-detail overlaps and ghost geometry behind the player.
+    // 2026-04-29: window widened from 60 to TTL. Engine fires GetRenderPasses
+    // roughly once per cell-load for HQ static refs, not per-frame; a tight
+    // 60-frame window starved them after ~1 second of silence and produced
+    // the "LOD vanishes but no HQ replacement" symptom (data: active=328 of
+    // 5331 submitted, 94% silenced). The chunk-spatial filter handles the
+    // worldspace-LOD-overlap case the active-set filter was originally added
+    // for. With the window matched to TTL, this snapshot is now equivalent
+    // to "every cached drawable" and could be elided in a follow-up; kept
+    // for now to retain the per-flag activeStats diagnostic.
     // Done before acquiring g_renderStateMutex so we don't violate the
     // existing g_drawableMutex -> g_renderStateMutex lock order.
-    constexpr uint64_t kActiveAgeFrames = 60;  // 1 second @ 60fps
+    constexpr uint64_t kActiveAgeFrames = 18000;  // == kTTLFrames; effectively unbounded for play
     std::unordered_set<uint64_t> activeSet;
+    SemanticCapture::ActiveFlagStats activeStats;
     SemanticCapture::SnapshotActiveDrawables(Diagnostics::CurrentFrameIndex(),
-                                             kActiveAgeFrames, activeSet);
+                                             kActiveAgeFrames, activeSet,
+                                             &activeStats);
 
     // Phase 1B: draw event-driven drawables. Bucket by Remix mesh handle so
     // drawables sharing a cached handle (identical content + material) collapse
@@ -944,10 +970,20 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t bucketCount = 0;
     size_t batchedBucketCount = 0;
     size_t skippedInactive = 0;
+    size_t skippedChunkPlayerInside = 0;
     {
         std::lock_guard<std::mutex> lock(g_renderStateMutex);
         const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
         drawableCount = g_drawables.size();
+
+        // Worldspace LOD chunk spatial filter: skip drawing chunks whose
+        // coverage area contains the player. The in-cell static refs render
+        // the player's immediate area at full detail; rendering the chunk
+        // on top causes the visible up-close low-quality overlay symptom.
+        // playerWorldPos is in raw Beth coords (camera.cpp populates it
+        // directly from the player ref's pos at +0xD0).
+        const float playerX = cam.playerWorldPos[0];
+        const float playerY = cam.playerWorldPos[1];
 
         struct DrawBucket {
             std::vector<DrawableInstance*> members;
@@ -964,6 +1000,18 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             if (activeSet.find(drawHash) == activeSet.end()) {
                 ++skippedInactive;
                 continue;
+            }
+            // Spatial filter for worldspace LOD chunks: skip if player is
+            // inside the chunk's coverage box. (Beth coords; chunk pivot is
+            // the chunk's origin corner, extent is its side length.)
+            if (inst.isLODChunk && inst.chunkExtent > 0.0f) {
+                const float chunkMaxX = inst.chunkOriginX + inst.chunkExtent;
+                const float chunkMaxY = inst.chunkOriginY + inst.chunkExtent;
+                if (playerX >= inst.chunkOriginX && playerX <= chunkMaxX &&
+                    playerY >= inst.chunkOriginY && playerY <= chunkMaxY) {
+                    ++skippedChunkPlayerInside;
+                    continue;
+                }
             }
             buckets[inst.meshHandle].members.push_back(&inst);
         }
@@ -1061,8 +1109,15 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     static uint32_t s_frameCounter = 0;
     s_frameCounter++;
     if (s_frameCounter % 300 == 0) {
-        _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu",
-                 drawableCount, bucketCount, batchedBucketCount, skippedInactive);
+        _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu "
+                 "skippedChunkPlayerInside=%zu "
+                 "active=%u isLod=%u fadedIn=%u notVisible=%u lodFadingOut=%u forcedFadeOut=%u "
+                 "player=(%.0f,%.0f,%.0f)",
+                 drawableCount, bucketCount, batchedBucketCount, skippedInactive,
+                 skippedChunkPlayerInside,
+                 activeStats.total, activeStats.isLod, activeStats.fadedIn,
+                 activeStats.notVisible, activeStats.lodFadingOut, activeStats.forcedFadeOut,
+                 cam.playerWorldPos[0], cam.playerWorldPos[1], cam.playerWorldPos[2]);
     }
 
     if (!hasAnyMeshes && g_fallbackMesh) {

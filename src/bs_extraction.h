@@ -40,6 +40,19 @@ struct ExtractedMesh {
     bool alphaBlendEnabled = false;
     uint32_t srcColorBlendFactor = 1;  // VK_BLEND_FACTOR_ONE
     uint32_t dstColorBlendFactor = 0;  // VK_BLEND_FACTOR_ZERO
+
+    // Worldspace LOD chunk metadata (2026-04-28). When isLODChunk is true,
+    // OnFrame applies a spatial filter: skip drawing if the player's world
+    // position is INSIDE the chunk's coverage area (the in-cell static refs
+    // are already rendering that region with full detail). chunkOriginXY
+    // is the chunk's pivot in raw Beth coords; chunkExtent is its side
+    // length in Beth units. Set by the resolver from the parent NiNode chain
+    // (parent1.name == "chunk" with parent2.name == "4|8|16|32" for terrain
+    // LOD; parent2.name == "obj" for object LOD).
+    bool  isLODChunk    = false;
+    float chunkOriginX  = 0.0f;
+    float chunkOriginY  = 0.0f;
+    float chunkExtent   = 0.0f;
 };
 
 struct CellInfo {

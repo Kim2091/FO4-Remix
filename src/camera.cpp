@@ -1,4 +1,5 @@
 #include "camera.h"
+#include "bs_extraction.h"
 
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
@@ -71,6 +72,18 @@ CameraState Camera::Get() {
     state.aspectRatio = 16.0f / 9.0f;
     state.nearPlane = 5.0f;
     state.farPlane = 100000.0f;
+
+    // Snapshot player world position (Beth coords, not swapped) for the
+    // worldspace LOD chunk spatial filter in OnFrame. Cheap; reads
+    // PlayerCharacter+0xD0 with internal null guards. Defaults to (0,0,0)
+    // if player is unavailable.
+    state.playerWorldPos[0] = 0.0f;
+    state.playerWorldPos[1] = 0.0f;
+    state.playerWorldPos[2] = 0.0f;
+    BsExtraction::GetPlayerPosition(state.playerWorldPos[0],
+                                    state.playerWorldPos[1],
+                                    state.playerWorldPos[2]);
+
     state.valid = true;
 
     // Log camera state once every ~5 seconds (300 frames at 60fps)

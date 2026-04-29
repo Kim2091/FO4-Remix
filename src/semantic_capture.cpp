@@ -146,6 +146,26 @@ void* __fastcall DetourGetRenderPasses(void* self,
     const PassKey key = ComputePassKey(geometry, self, material);
     const uint64_t now = Diagnostics::CurrentFrameIndex();
 
+    // Snapshot live NiAVObject::flags (offset 0x108 -- verified against
+    // f4se NiObjects.h). Safe to read here: engine is mid-call into
+    // GetRenderPasses on this geometry, so the object is live.
+    uint64_t niFlags = 0;
+    void* p1 = nullptr;
+    void* p2 = nullptr;
+    if (geometry) {
+        niFlags = *reinterpret_cast<uint64_t*>(
+            reinterpret_cast<uintptr_t>(geometry) + 0x108);
+        // Walk the parent chain two levels (NiAVObject::m_parent at +0x28).
+        // Used for the up-close-overlap diagnostic -- the LOD-or-similar
+        // marker may sit on a grouping parent rather than the leaf shape.
+        p1 = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(geometry) + 0x28);
+        if (p1) {
+            p2 = *reinterpret_cast<void**>(
+                reinterpret_cast<uintptr_t>(p1) + 0x28);
+        }
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         auto& state = g_drawableMap[key];  // inserts default-constructed if new
@@ -156,8 +176,12 @@ void* __fastcall DetourGetRenderPasses(void* self,
             state.geometry = geometry;
             state.property = self;
             state.material = material;
+            state.initialFlags = niFlags;
+            state.parent1 = p1;
+            state.parent2 = p2;
         }
         state.lastSeenFrame      = now;
+        state.lastFlags          = niFlags;
         state.fireCount         += 1;
         state.lastTechniqueFlags = technique;
     }
@@ -295,6 +319,14 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 state.submittedToRemix = true;
                 state.meshHash = 0;
             }
+
+            // Snapshot the gate that rejected this drawable so the periodic
+            // stats can break `pending` down by reason. Successful submits and
+            // SEH-caught crashes both flip submittedToRemix=true and bypass.
+            if (!state.submittedToRemix) {
+                state.lastFailedResolverStep =
+                    Resolvers::Lighting::Trace::LastStep();
+            }
         }
     }
 
@@ -308,6 +340,23 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     uint32_t submittedCount = 0;
     uint32_t pendingCount = 0;
     size_t   unique  = 0;
+    size_t   distinctGeoPtrs = 0;
+    size_t   entriesWithGeo = 0;
+
+    // Per-gate breakdown of pending entries. Mirrors the resolver's
+    // Trace::Step enum -- each non-submitted drawable lands in exactly one
+    // bucket according to its lastFailedResolverStep.
+    uint32_t pendNotResolved   = 0;  // step==kIdle (resolver freshness gate skipped it)
+    uint32_t pendNotTriShape   = 0;  // step==kEntered (cast or BSTriShape check failed)
+    uint32_t pendSkinned       = 0;  // step==kSkinSkipped
+    uint32_t pendLod           = 0;  // step==kLODSkipped (kFlagIsMeshLOD filter)
+    uint32_t pendParseFailed   = 0;  // step==kParseStart (ParseShapeGeometry returned false)
+    uint32_t pendExtentReject  = 0;  // step==kExtentRejected
+    uint32_t pendNoMaterial    = 0;  // step==kBuildMeshOK (mat fetch returned null)
+    uint32_t pendLandscape     = 0;  // step==kLandscapeSkipped
+    uint32_t pendNoDiffuse     = 0;  // step==kMaterialFetched (diffuseTextureHash==0)
+    uint32_t pendSubmitFailed  = 0;  // step==kSubmitFailed
+    uint32_t pendOther         = 0;
 
     {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
@@ -327,19 +376,63 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 it = g_drawableMap.erase(it);
                 ++evicted;
             } else {
-                if (it->second.submittedToRemix) ++submittedCount;
-                else                              ++pendingCount;
+                if (it->second.submittedToRemix) {
+                    ++submittedCount;
+                } else {
+                    ++pendingCount;
+                    using Resolvers::Lighting::Trace::Step;
+                    switch (it->second.lastFailedResolverStep) {
+                        case Step::kIdle:              ++pendNotResolved;  break;
+                        case Step::kEntered:           ++pendNotTriShape;  break;
+                        case Step::kSkinSkipped:       ++pendSkinned;      break;
+                        case Step::kLODSkipped:        ++pendLod;          break;
+                        case Step::kParseStart:        ++pendParseFailed;  break;
+                        case Step::kExtentRejected:    ++pendExtentReject; break;
+                        case Step::kBuildMeshOK:       ++pendNoMaterial;   break;
+                        case Step::kLandscapeSkipped:  ++pendLandscape;    break;
+                        case Step::kMaterialFetched:   ++pendNoDiffuse;    break;
+                        case Step::kSubmitFailed:      ++pendSubmitFailed; break;
+                        default:                       ++pendOther;        break;
+                    }
+                }
                 ++it;
             }
         }
         unique = g_drawableMap.size();
+
+        // Geometry-pointer dedup count: how many map entries share a
+        // geometry pointer. >0 means the same BSGeometry is being submitted
+        // under multiple PassKeys (different property/material variants),
+        // which would render N times -- a candidate cause for the "two
+        // versions of the same object" overlap symptom.
+        std::unordered_set<void*> distinct;
+        distinct.reserve(g_drawableMap.size());
+        for (const auto& [k, st] : g_drawableMap) {
+            if (st.geometry) {
+                distinct.insert(st.geometry);
+                ++entriesWithGeo;
+            }
+        }
+        distinctGeoPtrs = distinct.size();
     }
 
+    const size_t geoDups = (entriesWithGeo > distinctGeoPtrs)
+        ? (entriesWithGeo - distinctGeoPtrs) : 0;
     _MESSAGE("FO4RemixPlugin: [SemCapture] uniqueDrawables=%zu totalFires=%llu "
-             "evictedThisSweep=%u submitted=%u pending=%u",
+             "evictedThisSweep=%u submitted=%u pending=%u "
+             "distinctGeoPtrs=%zu entriesWithGeo=%zu geoDups=%zu",
              unique,
              (unsigned long long)g_totalFires.load(std::memory_order_relaxed),
-             evicted, submittedCount, pendingCount);
+             evicted, submittedCount, pendingCount,
+             distinctGeoPtrs, entriesWithGeo, geoDups);
+
+    _MESSAGE("FO4RemixPlugin: [SemCapture] pendingByGate "
+             "notResolved=%u notTriShape=%u skinned=%u lod=%u "
+             "parseFailed=%u extentRejected=%u noMaterial=%u "
+             "landscape=%u noDiffuse=%u submitFailed=%u other=%u",
+             pendNotResolved, pendNotTriShape, pendSkinned, pendLod,
+             pendParseFailed, pendExtentReject, pendNoMaterial,
+             pendLandscape, pendNoDiffuse, pendSubmitFailed, pendOther);
 }
 
 void SemanticCapture::ClearDrawableMap() {
@@ -374,13 +467,24 @@ void SemanticCapture::ClearDrawableMap() {
 
 void SemanticCapture::SnapshotActiveDrawables(uint64_t currentFrame,
                                               uint64_t maxAge,
-                                              std::unordered_set<uint64_t>& out) {
+                                              std::unordered_set<uint64_t>& out,
+                                              ActiveFlagStats* stats) {
     std::lock_guard<std::mutex> lock(g_drawableMutex);
     out.reserve(g_drawableMap.size());
     for (const auto& [hash, state] : g_drawableMap) {
         if (!state.submittedToRemix) continue;
         const uint64_t age = (currentFrame > state.lastSeenFrame)
             ? (currentFrame - state.lastSeenFrame) : 0;
-        if (age <= maxAge) out.insert(hash);
+        if (age > maxAge) continue;
+        out.insert(hash);
+        if (stats) {
+            const uint64_t f = state.lastFlags;
+            ++stats->total;
+            if (f & (1ULL << 12)) ++stats->isLod;
+            if (f & (1ULL << 37)) ++stats->fadedIn;
+            if (f & (1ULL << 39)) ++stats->notVisible;
+            if (f & (1ULL << 36)) ++stats->lodFadingOut;
+            if (f & (1ULL << 38)) ++stats->forcedFadeOut;
+        }
     }
 }

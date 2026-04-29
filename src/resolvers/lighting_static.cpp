@@ -13,6 +13,7 @@
 #include <atomic>
 #include <vector>
 #include <cmath>
+#include <cstring>
 
 namespace Resolvers {
 namespace Lighting {
@@ -54,6 +55,9 @@ namespace ResolverTrace {
             case Trace::kSubmit_GateInputEmpty:       return "submit_gate_input_empty";
             case Trace::kSubmit_GateVram:             return "submit_gate_vram";
             case Trace::kSubmit_GateBudget:           return "submit_gate_budget";
+            case Trace::kLODSkipped:                  return "lod_skipped";
+            case Trace::kTopFadeNodeSkipped:          return "topfadenode_skipped";
+            case Trace::kWorldLODChunkSkipped:        return "world_lod_chunk_skipped";
             default: return "unknown";
         }
     }
@@ -84,6 +88,40 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         return false;
     }
 
+    // Drop engine LOD chunks. NiAVObject::kFlagIsMeshLOD (1<<12) is set at NIF
+    // load time on level-of-detail meshes; the engine fires GetRenderPasses
+    // for them concurrently with full-detail counterparts during streaming and
+    // at distance, producing visible LOD-over-full-detail overlap. Diagnostic
+    // run on 2026-04-28 measured 25-45% of all active drawables flagged as
+    // LOD across multiple cells. Filtering at submit means these never become
+    // Remix mesh handles. Visible cost: cells outside uGridsToLoad render no
+    // distant geometry (path tracer handles atmospheric distance).
+    //
+    // 2026-04-29: DISABLED. The pendingByGate breakdown showed lod=2016 of
+    // pending drawables near the player at Concord -- ~40% of all rejections.
+    // Visual symptom: HQ structural meshes (walls/floors/roofs) absent while
+    // clutter/debris/doors are submitted normally. Hypothesis under test:
+    // kFlagIsMeshLOD on FO4 means "geometry participates in the LOD system,"
+    // not "geometry IS a low-detail variant" -- so the engine sets it on HQ
+    // statics that have LOD counterparts, and our blanket filter dropped them.
+    // The chunk-spatial filter (in OnFrame) handles the worldspace-LOD-overlap
+    // case this filter was originally added for. If overlap returns visibly,
+    // we'll add a smarter discriminator (e.g., require chunk parent metadata).
+    // if (state.initialFlags & (1ULL << 12)) {
+    //     ResolverTrace::g_lastStep.store(Trace::kLODSkipped, std::memory_order_relaxed);
+    //     return false;
+    // }
+
+    // NOTE (2026-04-28): two additional filters were tried and reverted.
+    //   1. Filter on parent1 kFlagTopFadeNode (bit 14) -- killed buildings,
+    //      because TopFadeNode is the engine's general fade-management for
+    //      most static refs, not specifically LOD-swap groups.
+    //   2. Filter on parent name "chunk" / "obj" -- killed worldspace LOD
+    //      chunks (BTR/BTO) which are the WANTED distant rendering, not
+    //      the unwanted close-up overlap.
+    // The up-close low-quality+low-quality-texture overlap user reports
+    // remains unidentified. Hypothesis space narrowed but not resolved.
+
     ResolverTrace::g_lastStep.store(Trace::kCastOK, std::memory_order_relaxed);
 
     // ---- Parse vertex / index data ----
@@ -113,6 +151,40 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     mesh.indices  = std::move(parsed.indices);
     SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
     BsExtraction::ExtractAlphaState(tri, mesh);
+
+    // Detect FO4 worldspace LOD chunk and tag the mesh so OnFrame can apply
+    // a spatial filter (skip-when-player-is-inside-coverage). Two patterns
+    // identified by the 2026-04-28 parent-chain diagnostic:
+    //   parent1.name == "chunk", parent2.name in {"4","8","16","32"} -> terrain LOD
+    //     chunkExtent = level * 4096 (one cell == 4096 Beth units)
+    //   parent2.name == "obj"                                        -> object LOD
+    //     chunkExtent = 16384 (level-4 equivalent; refine if logs show otherwise)
+    {
+        const char* p1Name = nullptr;
+        const char* p2Name = nullptr;
+        if (state.parent1) {
+            p1Name = static_cast<NiAVObject*>(state.parent1)->m_name.c_str();
+        }
+        if (state.parent2) {
+            p2Name = static_cast<NiAVObject*>(state.parent2)->m_name.c_str();
+        }
+        float lodLevel = 0.0f;
+        if (p1Name && p2Name && std::strcmp(p1Name, "chunk") == 0) {
+            // parent2.name is a digit string identifying LOD level.
+            if      (std::strcmp(p2Name, "4")  == 0) lodLevel = 4.0f;
+            else if (std::strcmp(p2Name, "8")  == 0) lodLevel = 8.0f;
+            else if (std::strcmp(p2Name, "16") == 0) lodLevel = 16.0f;
+            else if (std::strcmp(p2Name, "32") == 0) lodLevel = 32.0f;
+        } else if (p2Name && std::strcmp(p2Name, "obj") == 0) {
+            lodLevel = 4.0f;  // assumed; refine with diagnostic if wrong
+        }
+        if (lodLevel > 0.0f) {
+            mesh.isLODChunk   = true;
+            mesh.chunkOriginX = tri->m_worldTransform.pos.x;
+            mesh.chunkOriginY = tri->m_worldTransform.pos.y;
+            mesh.chunkExtent  = lodLevel * 4096.0f;
+        }
+    }
 
     ResolverTrace::g_lastStep.store(Trace::kBuildMeshOK, std::memory_order_relaxed);
 
@@ -163,7 +235,46 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // For 1B, ReleaseDrawable looks up by `hash` and finds the materialHash
     // via g_drawables, so leaving state.materialHash at 0 is fine -- the
     // refcount cleanup goes through g_drawables anyway.
-    _MESSAGE("FO4RemixPlugin: [Resolver] submitted hash=0x%llX", (unsigned long long)hash);
+    // LOD-overlap diagnostic (2026-04-28): include geometry name, the
+    // static IsMeshLOD bit (from initialFlags captured on first-seen),
+    // the live flag word at submit time, technique flag from the hook
+    // arg, world position, and the parent NiNode chain (2 levels up,
+    // captured in the detour). Parent reads are guarded by null checks;
+    // the resolver is wrapped in SEH at the caller, so a stale parent
+    // pointer that survived freshness gating gets caught upstream.
+    const char* meshName = obj->m_name.c_str();
+    const bool  isLOD = ((state.initialFlags >> 12) & 1ULL) != 0;
+
+    const char* p1Name = "";
+    uint64_t    p1Flags = 0;
+    const char* p2Name = "";
+    uint64_t    p2Flags = 0;
+    if (state.parent1) {
+        auto* pn = static_cast<NiAVObject*>(state.parent1);
+        const char* n = pn->m_name.c_str();
+        p1Name = n ? n : "";
+        p1Flags = pn->flags;
+    }
+    if (state.parent2) {
+        auto* pn = static_cast<NiAVObject*>(state.parent2);
+        const char* n = pn->m_name.c_str();
+        p2Name = n ? n : "";
+        p2Flags = pn->flags;
+    }
+
+    _MESSAGE("FO4RemixPlugin: [Resolver] submitted hash=0x%llX name=\"%s\" "
+             "isLOD=%d flags=0x%016llX tech=0x%08X pos=(%.1f,%.1f,%.1f) "
+             "p1=\"%s\"(0x%016llX) p2=\"%s\"(0x%016llX)",
+             (unsigned long long)hash,
+             meshName ? meshName : "(null)",
+             isLOD ? 1 : 0,
+             (unsigned long long)state.lastFlags,
+             state.lastTechniqueFlags,
+             tri->m_worldTransform.pos.x,
+             tri->m_worldTransform.pos.y,
+             tri->m_worldTransform.pos.z,
+             p1Name, (unsigned long long)p1Flags,
+             p2Name, (unsigned long long)p2Flags);
     for (const auto& t : newTextures) {
         state.textureHashes.insert(t.hash);
     }

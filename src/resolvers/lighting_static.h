@@ -62,6 +62,10 @@ namespace Lighting {
             kSubmit_GateInputEmpty       = 20,  // skipped due to empty pixels/vertices
             kSubmit_GateVram             = 21,  // skipped due to VRAM gate (set in semantic_capture)
             kSubmit_GateBudget           = 22,  // skipped due to per-Tick budget
+
+            kLODSkipped                  = 23,  // dropped: NiAVObject::kFlagIsMeshLOD set
+            kTopFadeNodeSkipped          = 24,  // dropped: parent1 is kFlagTopFadeNode (LOD-fade group)
+            kWorldLODChunkSkipped        = 25,  // dropped: parent chain identifies WRLD LOD chunk
         };
 
         int LastStep();

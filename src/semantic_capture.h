@@ -23,6 +23,26 @@ namespace SemanticCapture {
         void*    property            = nullptr;  // BSLightingShaderProperty* (rcx)
         void*    material            = nullptr;  // [property+0x48]
 
+        // ---- LOD-overlap diagnostic (2026-04-28) ----
+        // NiAVObject::flags snapshot taken on the game thread inside the hook
+        // detour. Read directly via geometry+0x108 -- safe at hook fire time
+        // because the engine is in the middle of a GetRenderPasses call on
+        // this geometry. initialFlags is the value at first-seen (captures
+        // the static kFlagIsMeshLOD bit; never changes per-geometry).
+        // lastFlags is refreshed every fire (captures the dynamic
+        // kFlagFadedIn / kFlagLODFadingOut / kFlagNotVisible bits).
+        uint64_t initialFlags        = 0;
+        uint64_t lastFlags           = 0;
+
+        // Parent NiNode chain captured on first-seen. NiAVObject::m_parent
+        // lives at offset 0x28 of the geometry. Two levels up because the
+        // distinguishing flag (LOD / TopFadeNode / etc.) is often set on a
+        // grouping parent rather than the leaf BSTriShape we capture. The
+        // resolver reads names + flags off these at submit time; both reads
+        // run inside the same SEH frame as the rest of resolver work.
+        void*    parent1             = nullptr;  // NiAVObject* — geometry->m_parent
+        void*    parent2             = nullptr;  // NiAVObject* — parent1->m_parent
+
         // ---- 1B: submission state (mutated on Remix thread only) ----
         // Field order: 8-byte aligned types first to avoid padding around the bool.
         uint64_t meshHash            = 0;        // == PassKey, used as Remix submission key
@@ -33,6 +53,13 @@ namespace SemanticCapture {
         // inside remix_renderer.cpp. This field is populated by the resolver as a
         // secondary record; ReleaseDrawable does not consult it.
         std::unordered_set<uint64_t> textureHashes;
+
+        // Last resolver gate that returned false. Snapshotted from
+        // Resolvers::Lighting::Trace::LastStep() after each resolver call when
+        // submittedToRemix is still false. 0 (kIdle) means "never been resolved"
+        // (resolver loop's freshness gate skipped this entry, or it's brand-new).
+        // Used by the sweep stats to break down `pending` by gate.
+        int lastFailedResolverStep   = 0;
     };
 
     // Convert a Bethesda NiTransform (right-handed, X/Y in Bethesda order)
@@ -65,12 +92,29 @@ namespace SemanticCapture {
     // g_drawableMap. Called from the F4SE PreLoadGame handler.
     void ClearDrawableMap();
 
+    // Aggregate flag-bit counters over the set of drawables that pass the
+    // active filter in SnapshotActiveDrawables. Diagnostic-only -- helps
+    // tell whether the engine signals LOD-vs-full-detail visibility via
+    // NiAVObject::flags before we commit to a flag-based draw filter.
+    struct ActiveFlagStats {
+        uint32_t total          = 0;
+        uint32_t isLod          = 0;  // kFlagIsMeshLOD     (1 << 12)
+        uint32_t fadedIn        = 0;  // kFlagFadedIn       (1LL << 37)
+        uint32_t notVisible     = 0;  // kFlagNotVisible    (1LL << 39)
+        uint32_t lodFadingOut   = 0;  // kFlagLODFadingOut  (1LL << 36)
+        uint32_t forcedFadeOut  = 0;  // kFlagForcedFadeOut (1LL << 38)
+    };
+
     // Build the set of submitted drawable hashes whose state.lastSeenFrame
     // is within `maxAge` of `currentFrame`. Caller passes an empty set;
     // function locks g_drawableMutex briefly and fills it. Used by OnFrame
     // to skip drawing drawables the engine stopped firing for (LOD swaps,
     // off-frustum culling) without evicting their cached mesh handles.
+    //
+    // If `stats` is non-null, populates per-flag counters over the same set
+    // (only counts drawables that pass the active-age filter).
     void SnapshotActiveDrawables(uint64_t currentFrame,
                                  uint64_t maxAge,
-                                 std::unordered_set<uint64_t>& out);
+                                 std::unordered_set<uint64_t>& out,
+                                 ActiveFlagStats* stats = nullptr);
 }
