@@ -262,9 +262,35 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         p2Flags = pn->flags;
     }
 
+    // Alpha-test diagnostic (2026-04-29): emit material type, BSShaderProperty
+    // shader-flags, and the contents of geo->effectState (the NiAlphaProperty
+    // slot at offset 0x130 on BSGeometry per f4se BSGeometry.h). For foliage
+    // drawables that render as solid alpha cards, we want to know which
+    // alpha-test signal source the engine is using -- NiAlphaProperty (geo
+    // level), BSLightingShaderProperty::flags (shader level), or BSLighting-
+    // ShaderMaterialBase fields (material level, requires GetType discriminator).
+    const uint32_t matType = mat ? mat->GetType() : 0xFFFFFFFFu;
+    uint64_t       propFlags = 0;
+    if (state.property) {
+        propFlags = *reinterpret_cast<uint64_t*>(
+            reinterpret_cast<uintptr_t>(state.property) + 0x30);
+    }
+    void*    effectState     = *reinterpret_cast<void**>(
+        reinterpret_cast<uintptr_t>(tri) + 0x130);
+    uint16_t alphaFlags      = 0;
+    uint8_t  alphaThreshold  = 0;
+    if (effectState) {
+        alphaFlags     = *reinterpret_cast<uint16_t*>(
+            reinterpret_cast<uintptr_t>(effectState) + 0x28);
+        alphaThreshold = *reinterpret_cast<uint8_t*>(
+            reinterpret_cast<uintptr_t>(effectState) + 0x2A);
+    }
+
     _MESSAGE("FO4RemixPlugin: [Resolver] submitted hash=0x%llX name=\"%s\" "
              "isLOD=%d flags=0x%016llX tech=0x%08X pos=(%.1f,%.1f,%.1f) "
-             "p1=\"%s\"(0x%016llX) p2=\"%s\"(0x%016llX)",
+             "p1=\"%s\"(0x%016llX) p2=\"%s\"(0x%016llX) "
+             "matType=%u propFlags=0x%016llX effectState=%p "
+             "alphaFlags=0x%04X alphaThreshold=%u alphaTestEnabled=%d",
              (unsigned long long)hash,
              meshName ? meshName : "(null)",
              isLOD ? 1 : 0,
@@ -274,7 +300,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
              tri->m_worldTransform.pos.y,
              tri->m_worldTransform.pos.z,
              p1Name, (unsigned long long)p1Flags,
-             p2Name, (unsigned long long)p2Flags);
+             p2Name, (unsigned long long)p2Flags,
+             matType, (unsigned long long)propFlags, effectState,
+             alphaFlags, alphaThreshold, mesh.alphaTestEnabled ? 1 : 0);
     for (const auto& t : newTextures) {
         state.textureHashes.insert(t.hash);
     }

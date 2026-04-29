@@ -678,8 +678,6 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
             std::wstring roughPath    = roughnessH ? HashToPath(roughnessH) : L"";
             std::wstring emissivePath = emissiveH  ? HashToPath(emissiveH)  : L"";
 
-            bool useDrawCallAlpha = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
-
             remixapi_MaterialInfoOpaqueEXT opaqueExt = {};
             opaqueExt.sType             = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
             opaqueExt.pNext             = nullptr;
@@ -692,7 +690,15 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
             opaqueExt.metallicConstant  = 0.0f;
             opaqueExt.alphaTestType       = mesh.alphaTestEnabled ? mesh.alphaTestType : 7;
             opaqueExt.alphaReferenceValue = mesh.alphaTestEnabled ? mesh.alphaTestRef  : 0;
-            opaqueExt.useDrawCallAlphaState = useDrawCallAlpha ? 1 : 0;
+            // Per remix_c.h: useDrawCallAlphaState=1 means "use InstanceInfoBlendEXT
+            // as alpha state source." We submit DrawInstance with InstanceInfoGpu-
+            // InstancingEXT only (no blend ext), so =1 made Remix ignore the
+            // alphaTestType/alphaReferenceValue above and render fully opaque.
+            // Setting =0 makes Remix use the explicit alpha fields, restoring
+            // alpha-test cutouts on foliage / decals / perforated geometry.
+            // Alpha BLEND (glass, smoke) is still unaddressed -- needs an
+            // InstanceInfoBlendEXT submission path in OnFrame, follow-up work.
+            opaqueExt.useDrawCallAlphaState = 0;
 
             remixapi_MaterialInfo matInfo = {};
             matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
@@ -956,9 +962,14 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     constexpr uint64_t kActiveAgeFrames = 18000;  // == kTTLFrames; effectively unbounded for play
     std::unordered_set<uint64_t> activeSet;
     SemanticCapture::ActiveFlagStats activeStats;
+    // Per-frame live poses (animated statics: doors, gates, machinery).
+    // Populated from DrawableState::liveWorldTransform (refreshed on every
+    // hook fire). Applied to DrawableInstance::worldTransform below before
+    // bucket-build so animated drawables render at their current pose.
+    std::unordered_map<uint64_t, std::array<float, 12>> livePoses;
     SemanticCapture::SnapshotActiveDrawables(Diagnostics::CurrentFrameIndex(),
                                              kActiveAgeFrames, activeSet,
-                                             &activeStats);
+                                             &activeStats, &livePoses);
 
     // Phase 1B: draw event-driven drawables. Bucket by Remix mesh handle so
     // drawables sharing a cached handle (identical content + material) collapse
@@ -1000,6 +1011,20 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             if (activeSet.find(drawHash) == activeSet.end()) {
                 ++skippedInactive;
                 continue;
+            }
+            // Apply live world transform if the hook captured one this frame
+            // (or recently). Animated statics evaluate their controllers
+            // before GetRenderPasses fires, so the live transform reflects
+            // the current pose. Drawables without a live transform fall back
+            // to the baked transform from SubmitDrawable.
+            auto poseIt = livePoses.find(drawHash);
+            if (poseIt != livePoses.end()) {
+                const auto& pose = poseIt->second;
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 4; ++c) {
+                        inst.worldTransform[r][c] = pose[r * 4 + c];
+                    }
+                }
             }
             // Spatial filter for worldspace LOD chunks: skip if player is
             // inside the chunk's coverage box. (Beth coords; chunk pivot is

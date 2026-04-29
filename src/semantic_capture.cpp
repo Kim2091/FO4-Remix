@@ -152,6 +152,14 @@ void* __fastcall DetourGetRenderPasses(void* self,
     uint64_t niFlags = 0;
     void* p1 = nullptr;
     void* p2 = nullptr;
+    // Live world transform (NiAVObject::m_worldTransform at offset 0x70 --
+    // verified against f4se NiObjects.h). Read at hook time because the
+    // engine has already evaluated scene-graph controllers (animated
+    // statics: doors, gates, etc.) and the leaf BSGeometry's transform
+    // reflects the current pose. Converted to Remix row-major 3x4 via
+    // BuildRemixTransform (Beth X/Y swap built in).
+    float liveXf[3][4] = {};
+    bool  liveXfValid  = false;
     if (geometry) {
         niFlags = *reinterpret_cast<uint64_t*>(
             reinterpret_cast<uintptr_t>(geometry) + 0x108);
@@ -164,6 +172,10 @@ void* __fastcall DetourGetRenderPasses(void* self,
             p2 = *reinterpret_cast<void**>(
                 reinterpret_cast<uintptr_t>(p1) + 0x28);
         }
+        const NiTransform& worldXf = *reinterpret_cast<const NiTransform*>(
+            reinterpret_cast<uintptr_t>(geometry) + 0x70);
+        SemanticCapture::BuildRemixTransform(worldXf, liveXf);
+        liveXfValid = true;
     }
 
     {
@@ -184,6 +196,14 @@ void* __fastcall DetourGetRenderPasses(void* self,
         state.lastFlags          = niFlags;
         state.fireCount         += 1;
         state.lastTechniqueFlags = technique;
+        if (liveXfValid) {
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    state.liveWorldTransform[r][c] = liveXf[r][c];
+                }
+            }
+            state.liveTransformValid = true;
+        }
     }
 
     g_totalFires.fetch_add(1, std::memory_order_relaxed);
@@ -468,15 +488,26 @@ void SemanticCapture::ClearDrawableMap() {
 void SemanticCapture::SnapshotActiveDrawables(uint64_t currentFrame,
                                               uint64_t maxAge,
                                               std::unordered_set<uint64_t>& out,
-                                              ActiveFlagStats* stats) {
+                                              ActiveFlagStats* stats,
+                                              std::unordered_map<uint64_t, std::array<float, 12>>* livePoses) {
     std::lock_guard<std::mutex> lock(g_drawableMutex);
     out.reserve(g_drawableMap.size());
+    if (livePoses) livePoses->reserve(g_drawableMap.size());
     for (const auto& [hash, state] : g_drawableMap) {
         if (!state.submittedToRemix) continue;
         const uint64_t age = (currentFrame > state.lastSeenFrame)
             ? (currentFrame - state.lastSeenFrame) : 0;
         if (age > maxAge) continue;
         out.insert(hash);
+        if (livePoses && state.liveTransformValid) {
+            std::array<float, 12> pose;
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    pose[r * 4 + c] = state.liveWorldTransform[r][c];
+                }
+            }
+            livePoses->emplace(hash, pose);
+        }
         if (stats) {
             const uint64_t f = state.lastFlags;
             ++stats->total;

@@ -1,6 +1,8 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 
 struct ID3D11Device;
@@ -60,6 +62,18 @@ namespace SemanticCapture {
         // (resolver loop's freshness gate skipped this entry, or it's brand-new).
         // Used by the sweep stats to break down `pending` by gate.
         int lastFailedResolverStep   = 0;
+
+        // ---- Live transform (animated statics) ----
+        // Refreshed on every hook fire from BSGeometry::m_worldTransform
+        // (offset 0x70 on NiAVObject). The engine evaluates scene-graph
+        // controllers (NiTransformController etc.) before GetRenderPasses
+        // fires, so this reflects the current animated pose. OnFrame
+        // applies it to DrawInstance so animated statics (doors, gates,
+        // machinery) render at their live pose instead of the captured-
+        // at-resolver-time baked transform. Layout matches Remix's row-
+        // major 3x4 (Beth->Remix coord swap already applied).
+        float liveWorldTransform[3][4] = {};
+        bool  liveTransformValid       = false;
     };
 
     // Convert a Bethesda NiTransform (right-handed, X/Y in Bethesda order)
@@ -116,5 +130,6 @@ namespace SemanticCapture {
     void SnapshotActiveDrawables(uint64_t currentFrame,
                                  uint64_t maxAge,
                                  std::unordered_set<uint64_t>& out,
-                                 ActiveFlagStats* stats = nullptr);
+                                 ActiveFlagStats* stats = nullptr,
+                                 std::unordered_map<uint64_t, std::array<float, 12>>* livePoses = nullptr);
 }
