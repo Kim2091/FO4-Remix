@@ -17,9 +17,6 @@
 
 namespace {
 
-// -------- Hook target (verified by Phase 0) --------
-constexpr uintptr_t kHookTargetRVA = 0x02172540;
-
 // -------- TTL + sweep cadence (Skyrim defaults) --------
 // Drawable eviction TTL. The engine does NOT re-fire GetRenderPasses every
 // frame for cached static draws -- distant statics typically fire on
@@ -87,8 +84,30 @@ typedef void* (__fastcall *GetRenderPasses_t)(void* self,
                                               void* arg4);
 
 // -------- File-scope shared state --------
-GetRenderPasses_t     g_originalGetRenderPasses = nullptr;
-LPVOID                g_hookedTarget            = nullptr;
+// Per-hook-target state. One entry per registered shader property class.
+// Populated by Install(); read by detours to call the original via the
+// matching original-fn pointer.
+struct HookTarget {
+    uintptr_t                rva;
+    LPVOID                   address;        // hMod + rva, set in Install
+    GetRenderPasses_t        original;       // populated by MH_CreateHook
+    LPVOID                   detour;         // function pointer
+    SemanticCapture::ResolverKind kind;
+};
+
+// Forward declarations -- actual detour functions defined below.
+void* __fastcall DetourGetRenderPasses_Lighting(void* self, void* geometry,
+                                                uint32_t technique, void* arg4);
+
+// Hook target registry. Static array, initialised in Install(); ordered so the
+// detour functions can index into it by their compile-time constant.
+constexpr size_t kHookTargetCount = 1;  // Task 5 increments to 2 for water.
+static HookTarget g_hookTargets[kHookTargetCount] = {
+    { 0x02172540, nullptr, nullptr,
+      reinterpret_cast<LPVOID>(&DetourGetRenderPasses_Lighting),
+      SemanticCapture::ResolverKind::Lighting },
+};
+
 std::atomic<bool>     g_installed{false};
 std::atomic<uint64_t> g_totalFires{0};
 
@@ -131,41 +150,38 @@ static int CallReleaseDrawableGuarded(uint64_t meshHash,
     }
 }
 
-void* __fastcall DetourGetRenderPasses(void* self,
-                                       void* geometry,
-                                       uint32_t technique,
-                                       void* arg4) {
-    // Material lives at [self + 0x48] on FO4 (port delta from Skyrim's 0x180).
-    // Read defensively: if self is null somehow, skip capture and call original.
+// Shared detour body. The per-target wrappers above pass their compile-time
+// resolver kind; the body uses it to tag the DrawableState and to call
+// through the right original-fn pointer for the tail call.
+static void* DetourGetRenderPassesShared(void* self,
+                                         void* geometry,
+                                         uint32_t technique,
+                                         void* arg4,
+                                         SemanticCapture::ResolverKind kind,
+                                         GetRenderPasses_t original) {
+    // Material lives at [self + 0x58] for ALL BSShaderProperty subclasses
+    // (Lighting / Water / Effect) -- the slot is inherited from the base
+    // class. F4SE NiProperties.h:108-136 confirms layout. Previous code
+    // read +0x48 (which is BSFadeNode* pFadeNode); see findings doc
+    // 2026-04-29-bswatershaderproperty-re.md for the bug analysis.
     void* material = nullptr;
     if (self) {
         material = *reinterpret_cast<void**>(
-            reinterpret_cast<uintptr_t>(self) + 0x48);
+            reinterpret_cast<uintptr_t>(self) + 0x58);
     }
 
     const PassKey key = ComputePassKey(geometry, self, material);
     const uint64_t now = Diagnostics::CurrentFrameIndex();
 
-    // Snapshot live NiAVObject::flags (offset 0x108 -- verified against
-    // f4se NiObjects.h). Safe to read here: engine is mid-call into
-    // GetRenderPasses on this geometry, so the object is live.
+    // Snapshot live NiAVObject::flags + parent chain + world transform.
     uint64_t niFlags = 0;
     void* p1 = nullptr;
     void* p2 = nullptr;
-    // Live world transform (NiAVObject::m_worldTransform at offset 0x70 --
-    // verified against f4se NiObjects.h). Read at hook time because the
-    // engine has already evaluated scene-graph controllers (animated
-    // statics: doors, gates, etc.) and the leaf BSGeometry's transform
-    // reflects the current pose. Converted to Remix row-major 3x4 via
-    // BuildRemixTransform (Beth X/Y swap built in).
     float liveXf[3][4] = {};
     bool  liveXfValid  = false;
     if (geometry) {
         niFlags = *reinterpret_cast<uint64_t*>(
             reinterpret_cast<uintptr_t>(geometry) + 0x108);
-        // Walk the parent chain two levels (NiAVObject::m_parent at +0x28).
-        // Used for the up-close-overlap diagnostic -- the LOD-or-similar
-        // marker may sit on a grouping parent rather than the leaf shape.
         p1 = *reinterpret_cast<void**>(
             reinterpret_cast<uintptr_t>(geometry) + 0x28);
         if (p1) {
@@ -180,17 +196,16 @@ void* __fastcall DetourGetRenderPasses(void* self,
 
     {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
-        auto& state = g_drawableMap[key];  // inserts default-constructed if new
+        auto& state = g_drawableMap[key];
         if (state.firstSeenFrame == 0) {
             state.firstSeenFrame = now;
-            // Capture pointers once on first-seen; they're stable until eviction
-            // (TTL = 10 frames). Resolver reads them on the Remix thread.
             state.geometry = geometry;
             state.property = self;
             state.material = material;
             state.initialFlags = niFlags;
             state.parent1 = p1;
             state.parent2 = p2;
+            state.resolverKind = kind;  // tag once on first-seen
         }
         state.lastSeenFrame      = now;
         state.lastFlags          = niFlags;
@@ -207,7 +222,16 @@ void* __fastcall DetourGetRenderPasses(void* self,
     }
 
     g_totalFires.fetch_add(1, std::memory_order_relaxed);
-    return g_originalGetRenderPasses(self, geometry, technique, arg4);
+    return original(self, geometry, technique, arg4);
+}
+
+// Per-target wrappers. Each captures its kind as a compile-time constant
+// and calls through with the matching original-fn pointer from g_hookTargets.
+void* __fastcall DetourGetRenderPasses_Lighting(void* self, void* geometry,
+                                                uint32_t technique, void* arg4) {
+    return DetourGetRenderPassesShared(self, geometry, technique, arg4,
+                                       SemanticCapture::ResolverKind::Lighting,
+                                       g_hookTargets[0].original);
 }
 
 }  // namespace
@@ -224,36 +248,53 @@ bool SemanticCapture::Install() {
         _MESSAGE("FO4RemixPlugin: [SemCapture] ERROR: GetModuleHandle(Fallout4.exe) failed");
         return false;
     }
-    g_hookedTarget = reinterpret_cast<LPVOID>(
-        reinterpret_cast<uintptr_t>(hMod) + kHookTargetRVA);
 
     MH_STATUS mhInit = MH_Initialize();
     if (mhInit != MH_OK && mhInit != MH_ERROR_ALREADY_INITIALIZED) {
         _MESSAGE("FO4RemixPlugin: [SemCapture] ERROR: MH_Initialize failed (%d)", (int)mhInit);
         return false;
     }
-    if (MH_CreateHook(g_hookedTarget,
-                      reinterpret_cast<LPVOID>(&DetourGetRenderPasses),
-                      reinterpret_cast<LPVOID*>(&g_originalGetRenderPasses)) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] ERROR: MH_CreateHook failed");
-        return false;
+
+    size_t installedCount = 0;
+    for (size_t i = 0; i < kHookTargetCount; ++i) {
+        HookTarget& t = g_hookTargets[i];
+        t.address = reinterpret_cast<LPVOID>(
+            reinterpret_cast<uintptr_t>(hMod) + t.rva);
+        if (MH_CreateHook(t.address, t.detour,
+                          reinterpret_cast<LPVOID*>(&t.original)) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] ERROR: MH_CreateHook failed for target %zu (RVA 0x%llX)",
+                     i, (unsigned long long)t.rva);
+            continue;
+        }
+        if (MH_EnableHook(t.address) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] ERROR: MH_EnableHook failed for target %zu (RVA 0x%llX)",
+                     i, (unsigned long long)t.rva);
+            continue;
+        }
+        ++installedCount;
+        _MESSAGE("FO4RemixPlugin: [SemCapture] installed target %zu kind=%d at VA 0x%llX (RVA 0x%llX)",
+                 i, (int)t.kind,
+                 (unsigned long long)reinterpret_cast<uintptr_t>(t.address),
+                 (unsigned long long)t.rva);
     }
-    if (MH_EnableHook(g_hookedTarget) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] ERROR: MH_EnableHook failed");
+
+    if (installedCount == 0) {
+        _MESSAGE("FO4RemixPlugin: [SemCapture] FATAL: zero hooks installed; aborting");
         return false;
     }
 
     g_installed.store(true);
-    _MESSAGE("FO4RemixPlugin: [SemCapture] installed at VA 0x%llX (RVA 0x%llX)",
-             (unsigned long long)reinterpret_cast<uintptr_t>(g_hookedTarget),
-             (unsigned long long)kHookTargetRVA);
     return true;
 }
 
 void SemanticCapture::Uninstall() {
-    if (!g_installed.load() || !g_hookedTarget) return;
-    MH_DisableHook(g_hookedTarget);
-    MH_RemoveHook(g_hookedTarget);
+    if (!g_installed.load()) return;
+    for (size_t i = 0; i < kHookTargetCount; ++i) {
+        HookTarget& t = g_hookTargets[i];
+        if (!t.address) continue;
+        MH_DisableHook(t.address);
+        MH_RemoveHook(t.address);
+    }
     g_installed.store(false);
     _MESSAGE("FO4RemixPlugin: [SemCapture] uninstalled (final fires: %llu)",
              (unsigned long long)g_totalFires.load());

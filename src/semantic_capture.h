@@ -10,6 +10,14 @@ struct NiTransform;
 
 namespace SemanticCapture {
 
+    // Tag for which resolver should process this DrawableState. Set on
+    // first-seen by whichever hook detour fired; never changes for the
+    // life of the entry. Tick's resolve loop dispatches by this enum.
+    enum class ResolverKind : uint8_t {
+        Lighting = 0,   // BSLightingShaderProperty hook (RVA 0x02172540)
+        Water    = 1,   // BSWaterShaderProperty hook (RVA 0x021D15A0)
+    };
+
     // Per-drawable state tracked in g_drawableMap. Exposed in the header so
     // future phases (1B onward) can extend it without a forward-declaration
     // dance.
@@ -19,11 +27,12 @@ namespace SemanticCapture {
         uint64_t lastSeenFrame       = 0;
         uint32_t fireCount           = 0;
         uint32_t lastTechniqueFlags  = 0;
+        ResolverKind resolverKind = ResolverKind::Lighting;
 
         // ---- 1B: pointers captured by the hot-path detour on first-seen ----
         void*    geometry            = nullptr;  // BSGeometry*  (rdx)
         void*    property            = nullptr;  // BSLightingShaderProperty* (rcx)
-        void*    material            = nullptr;  // [property+0x48]
+        void*    material            = nullptr;  // [property+0x58] (BSShaderProperty::shaderMaterial)
 
         // ---- LOD-overlap diagnostic (2026-04-28) ----
         // NiAVObject::flags snapshot taken on the game thread inside the hook
