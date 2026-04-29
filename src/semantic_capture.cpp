@@ -99,14 +99,19 @@ struct HookTarget {
 // Forward declarations -- actual detour functions defined below.
 void* __fastcall DetourGetRenderPasses_Lighting(void* self, void* geometry,
                                                 uint32_t technique, void* arg4);
+void* __fastcall DetourGetRenderPasses_Water(void* self, void* geometry,
+                                             uint32_t technique, void* arg4);
 
 // Hook target registry. Static array, initialised in Install(); ordered so the
 // detour functions can index into it by their compile-time constant.
-constexpr size_t kHookTargetCount = 1;  // Task 5 increments to 2 for water.
+constexpr size_t kHookTargetCount = 2;
 static HookTarget g_hookTargets[kHookTargetCount] = {
     { 0x02172540, nullptr, nullptr,
       reinterpret_cast<LPVOID>(&DetourGetRenderPasses_Lighting),
       SemanticCapture::ResolverKind::Lighting },
+    { 0x021D15A0, nullptr, nullptr,
+      reinterpret_cast<LPVOID>(&DetourGetRenderPasses_Water),
+      SemanticCapture::ResolverKind::Water },
 };
 
 std::atomic<bool>     g_installed{false};
@@ -251,6 +256,13 @@ void* __fastcall DetourGetRenderPasses_Lighting(void* self, void* geometry,
     return DetourGetRenderPassesShared(self, geometry, technique, arg4,
                                        SemanticCapture::ResolverKind::Lighting,
                                        g_hookTargets[0].original);
+}
+
+void* __fastcall DetourGetRenderPasses_Water(void* self, void* geometry,
+                                             uint32_t technique, void* arg4) {
+    return DetourGetRenderPassesShared(self, geometry, technique, arg4,
+                                       SemanticCapture::ResolverKind::Water,
+                                       g_hookTargets[1].original);
 }
 
 }  // namespace
