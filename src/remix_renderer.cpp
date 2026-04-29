@@ -663,6 +663,19 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         h ^= (uint64_t)ii * 0x27D4EB2F165667C5ULL;
         bool useDrawCall = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
         h ^= (uint64_t)(useDrawCall ? 1 : 0) * 0x9FB21C651E98DF25ULL;
+        // Fold water tag + transmittance into the cache key so opaque and
+        // translucent variants of the same texture set never share a Remix
+        // material handle (the underlying pNext extension struct differs).
+        h ^= (uint64_t)(mesh.isWater ? 1 : 0) * 0xD6E8FEB86659FD93ULL;
+        if (mesh.isWater) {
+            uint32_t wri, wgi, wbi;
+            memcpy(&wri, &mesh.waterTransmittanceR, 4);
+            memcpy(&wgi, &mesh.waterTransmittanceG, 4);
+            memcpy(&wbi, &mesh.waterTransmittanceB, 4);
+            h ^= (uint64_t)wri * 0xBF58476D1CE4E5B9ULL;
+            h ^= (uint64_t)wgi * 0x94D049BB133111EBULL;
+            h ^= (uint64_t)wbi * 0xCBF29CE484222325ULL;
+        }
         matHash = h;
 
         auto cacheIt = g_materialCache.find(matHash);
@@ -678,31 +691,73 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
             std::wstring roughPath    = roughnessH ? HashToPath(roughnessH) : L"";
             std::wstring emissivePath = emissiveH  ? HashToPath(emissiveH)  : L"";
 
-            remixapi_MaterialInfoOpaqueEXT opaqueExt = {};
-            opaqueExt.sType             = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
-            opaqueExt.pNext             = nullptr;
-            opaqueExt.roughnessTexture  = roughnessH ? roughPath.c_str() : nullptr;
-            opaqueExt.metallicTexture   = nullptr;
-            opaqueExt.heightTexture     = nullptr;
-            opaqueExt.albedoConstant    = { 1.0f, 1.0f, 1.0f };
-            opaqueExt.opacityConstant   = 1.0f;
-            opaqueExt.roughnessConstant = roughnessH ? 0.5f : 0.8f;
-            opaqueExt.metallicConstant  = 0.0f;
-            opaqueExt.alphaTestType       = mesh.alphaTestEnabled ? mesh.alphaTestType : 7;
-            opaqueExt.alphaReferenceValue = mesh.alphaTestEnabled ? mesh.alphaTestRef  : 0;
-            // Per remix_c.h: useDrawCallAlphaState=1 means "use InstanceInfoBlendEXT
-            // as alpha state source." We submit DrawInstance with InstanceInfoGpu-
-            // InstancingEXT only (no blend ext), so =1 made Remix ignore the
-            // alphaTestType/alphaReferenceValue above and render fully opaque.
-            // Setting =0 makes Remix use the explicit alpha fields, restoring
-            // alpha-test cutouts on foliage / decals / perforated geometry.
-            // Alpha BLEND (glass, smoke) is still unaddressed -- needs an
-            // InstanceInfoBlendEXT submission path in OnFrame, follow-up work.
-            opaqueExt.useDrawCallAlphaState = 0;
+            // Build the appropriate pNext extension chain: translucent for
+            // water surfaces (Fresnel-reflective refractive medium), opaque
+            // for everything else. Both feed the same MaterialInfo parent.
+            remixapi_MaterialInfoOpaqueEXT      opaqueExt      = {};
+            remixapi_MaterialInfoTranslucentEXT translucentExt = {};
+            void* pNext = nullptr;
+
+            if (mesh.isWater) {
+                // Translucent BRDF parameters. transmittanceColor comes from
+                // BSWaterShaderMaterial::kDeepColor, captured at extraction
+                // time -- per-worldspace water tinting (Far Harbor swamp
+                // green, Sanctuary blue, Glowing Sea sludge) flows through
+                // automatically without us baking constants per region.
+                //
+                // refractiveIndex 1.33: water IOR (physical constant). The
+                // path tracer uses it for Fresnel + refraction angle.
+                //
+                // transmittanceMeasurementDistance 500.0 (cm): "thickness
+                // over which transmittanceColor saturates." Water bodies in
+                // FO4 are deep enough that 5m gives a solid tint. Tunable.
+                //
+                // thinWallThickness_hasvalue 0: water is a volume, not a
+                // pane. Setting hasvalue=1 would model a glass-like sheet.
+                //
+                // useDiffuseLayer 0: don't sample the synthetic blue albedo.
+                // The synth diffuse exists only to satisfy SubmitDrawable's
+                // diffuse-loaded gate; it would muddy the refractive look
+                // if the BRDF mixed it in.
+                translucentExt.sType                            = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_TRANSLUCENT_EXT;
+                translucentExt.pNext                            = nullptr;
+                translucentExt.transmittanceTexture             = nullptr;
+                translucentExt.refractiveIndex                  = 1.33f;
+                translucentExt.transmittanceColor               = { mesh.waterTransmittanceR,
+                                                                    mesh.waterTransmittanceG,
+                                                                    mesh.waterTransmittanceB };
+                translucentExt.transmittanceMeasurementDistance = 500.0f;
+                translucentExt.thinWallThickness_hasvalue       = 0;
+                translucentExt.thinWallThickness_value          = 0.0f;
+                translucentExt.useDiffuseLayer                  = 0;
+                pNext = &translucentExt;
+            } else {
+                opaqueExt.sType             = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO_OPAQUE_EXT;
+                opaqueExt.pNext             = nullptr;
+                opaqueExt.roughnessTexture  = roughnessH ? roughPath.c_str() : nullptr;
+                opaqueExt.metallicTexture   = nullptr;
+                opaqueExt.heightTexture     = nullptr;
+                opaqueExt.albedoConstant    = { 1.0f, 1.0f, 1.0f };
+                opaqueExt.opacityConstant   = 1.0f;
+                opaqueExt.roughnessConstant = roughnessH ? 0.5f : 0.8f;
+                opaqueExt.metallicConstant  = 0.0f;
+                opaqueExt.alphaTestType       = mesh.alphaTestEnabled ? mesh.alphaTestType : 7;
+                opaqueExt.alphaReferenceValue = mesh.alphaTestEnabled ? mesh.alphaTestRef  : 0;
+                // Per remix_c.h: useDrawCallAlphaState=1 means "use InstanceInfoBlendEXT
+                // as alpha state source." We submit DrawInstance with InstanceInfoGpu-
+                // InstancingEXT only (no blend ext), so =1 made Remix ignore the
+                // alphaTestType/alphaReferenceValue above and render fully opaque.
+                // Setting =0 makes Remix use the explicit alpha fields, restoring
+                // alpha-test cutouts on foliage / decals / perforated geometry.
+                // Alpha BLEND (glass, smoke) is still unaddressed -- needs an
+                // InstanceInfoBlendEXT submission path in OnFrame, follow-up work.
+                opaqueExt.useDrawCallAlphaState = 0;
+                pNext = &opaqueExt;
+            }
 
             remixapi_MaterialInfo matInfo = {};
             matInfo.sType              = REMIXAPI_STRUCT_TYPE_MATERIAL_INFO;
-            matInfo.pNext              = &opaqueExt;
+            matInfo.pNext              = pNext;
             matInfo.hash               = matHash;
             matInfo.albedoTexture      = diffPath.c_str();
             matInfo.normalTexture      = normalH   ? normalPath.c_str()   : nullptr;

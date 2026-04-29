@@ -53,6 +53,21 @@ struct ExtractedMesh {
     float chunkOriginX  = 0.0f;
     float chunkOriginY  = 0.0f;
     float chunkExtent   = 0.0f;
+
+    // Water tag (2026-04-29). When true, SubmitDrawable builds the material
+    // with MaterialInfoTranslucentEXT instead of MaterialInfoOpaqueEXT, so
+    // the path tracer treats the surface as a refractive medium (Fresnel
+    // reflections + transmittance through to whatever's below). Set only by
+    // the water resolver; the renderer is otherwise shader-agnostic.
+    // waterTransmittance{R,G,B} are pulled from BSWaterShaderMaterial's
+    // kDeepColor at extraction time and become the transmittanceColor of
+    // the translucent material -- this lets per-worldspace water tinting
+    // (Far Harbor swamp green vs Sanctuary blue vs Glowing Sea sludge)
+    // come through automatically from the .esm-authored color slots.
+    bool  isWater              = false;
+    float waterTransmittanceR  = 0.0f;
+    float waterTransmittanceG  = 0.0f;
+    float waterTransmittanceB  = 0.0f;
 };
 
 struct CellInfo {

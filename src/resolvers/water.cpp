@@ -89,20 +89,39 @@ bool TryResolve(SemanticCapture::DrawableState& state,
 
     Resolvers::Trace::SetStep(Resolvers::Trace::kBuildMeshOK);
 
-    // Pull spNormalMap01 from the water material as the diffuse slot. Hash
-    // is content-derived inside ExtractMaterialTexture (deterministic over
-    // the .dds bytes), so it stays stable across game restarts -- toolkit
-    // USD replacements keyed by this hash will keep working session-to-
-    // session. Fall back to a synthetic 1x1 blue if the material slot is
-    // null (defensive; lets us still pass SubmitDrawable's diffuseHash gate
-    // for water without a normal map).
+    // Pull spNormalMap01 from the water material into the actual normal slot
+    // so the path tracer reads ripple bump as surface perturbation (Fresnel
+    // glints, refraction angle variation) instead of as flat diffuse color.
+    // Hash is content-derived inside ExtractMaterialTexture (deterministic
+    // over the .dds bytes), so it stays stable across game restarts --
+    // toolkit USD replacements keyed by this hash keep working session-to-
+    // session.
+    //
+    // Post-process: None (NOT Octahedral). Lighting normals from
+    // BSLightingShaderMaterialBase ride through the engine's tangent-space
+    // packer that produces octahedral-encoded XY-with-Z-reconstructed maps;
+    // BSWaterShaderMaterial's spNormalMapNN are loaded directly as standard
+    // tangent-space DDS (XYZ in RGB), so passing them through the octahedral
+    // unpacker would smear them.
+    //
+    // Diffuse always gets the synthetic 1x1 blue. Path-tracer translucent
+    // BRDF (useDiffuseLayer=0 in SubmitDrawable below) won't sample it, but
+    // SubmitDrawable's diffuse-loaded gate requires a non-zero hash; the
+    // synth keeps that gate passing without leaking color into the water
+    // surface. The g_textureHandles cache dedupes the synth across all
+    // water drawables, so pushing it every call is essentially free.
     std::vector<ExtractedTexture> newTextures;
     auto* waterMat = static_cast<BSWaterShaderMaterial*>(state.material);
     if (waterMat) {
-        mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
-            waterMat->spNormalMap01, "water_normal", device, newTextures);
+        mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
+            waterMat->spNormalMap01, "water_normal", device, newTextures,
+            TexturePostProcess::None);
+        mesh.isWater             = true;
+        mesh.waterTransmittanceR = waterMat->kDeepColor.r;
+        mesh.waterTransmittanceG = waterMat->kDeepColor.g;
+        mesh.waterTransmittanceB = waterMat->kDeepColor.b;
     }
-    if (mesh.diffuseTextureHash == 0) {
+    {
         ExtractedTexture synth;
         synth.width      = 1;
         synth.height     = 1;
@@ -126,7 +145,9 @@ bool TryResolve(SemanticCapture::DrawableState& state,
 
     state.submittedToRemix = true;
     state.meshHash = hash;
-    state.textureHashes.insert(kSyntheticDiffuseHash);
+    for (const auto& t : newTextures) {
+        state.textureHashes.insert(t.hash);
+    }
 
     _MESSAGE("FO4RemixPlugin: [ResolverWater] submitted hash=0x%llX name=\"%s\" "
              "pos=(%.1f,%.1f,%.1f)",
