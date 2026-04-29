@@ -43,27 +43,6 @@ bool TryResolve(SemanticCapture::DrawableState& state,
     BSTriShape* tri = obj->GetAsBSTriShape();
     if (!tri) return false;
 
-    // Filter: skip procedurally-generated water LOD grid tiles. These have
-    // empty geometry names (engine-generated, not loaded from a named NIF)
-    // and tile across the worldspace at z=0 around the player to provide
-    // distant water coverage. In vanilla they blend with real water via
-    // engine compositing; in Remix's path tracer they render as an extra
-    // translucent layer that sits on top of real water meshes -- the
-    // "flat surface on top" visual bug. Named water meshes
-    // (DefaultProceduralWater:N, Water2048:0, Water1024:0, etc) are real
-    // placed water refs and keep rendering.
-    //
-    // Pattern ported from the Skyrim Remix port (semantic_capture.cpp's
-    // TryResolveWater empty-name filter, around line 1235). Live FO4 logs
-    // showed the same name pattern: empty-name water at huge worldspace
-    // coords with z=0 vs named water at realistic positions.
-    {
-        const char* gname = obj->m_name.c_str();
-        if (!gname || gname[0] == '\0') {
-            return false;
-        }
-    }
-
     // Skip skinned (out of scope; lighting resolver same).
     if (tri->vertexDesc & BSGeometry::kFlag_Skinned) {
         Resolvers::Trace::SetStep(Resolvers::Trace::kSkinSkipped);
