@@ -97,12 +97,16 @@ bool TryResolve(SemanticCapture::DrawableState& state,
     // toolkit USD replacements keyed by this hash keep working session-to-
     // session.
     //
-    // Post-process: None (NOT Octahedral). Lighting normals from
-    // BSLightingShaderMaterialBase ride through the engine's tangent-space
-    // packer that produces octahedral-encoded XY-with-Z-reconstructed maps;
-    // BSWaterShaderMaterial's spNormalMapNN are loaded directly as standard
-    // tangent-space DDS (XYZ in RGB), so passing them through the octahedral
-    // unpacker would smear them.
+    // Post-process: Octahedral. dxvk-remix's translucent and opaque material
+    // shaders both unconditionally octahedral-decode normalSample.xy via
+    // unsignedOctahedralToHemisphereDirection (see translucent_surface_
+    // material_interaction.slangh). Submitting raw tangent-space normals
+    // gives the BRDF an arbitrary direction that happens to look "wave-ish"
+    // at oblique angles but is wrong everywhere else -- and it blocks the
+    // animated-water path because the dual-layer normal blend (normalBlendRNM)
+    // expects properly decoded hemisphere normals. ConvertNormalToOctahedral
+    // works on standard tangent-space DDS input (BC5 or RGB) and emits the
+    // RG-only octahedral encoding the shader expects.
     //
     // Diffuse always gets the synthetic 1x1 blue. Path-tracer translucent
     // BRDF (useDiffuseLayer=0 in SubmitDrawable below) won't sample it, but
@@ -115,7 +119,7 @@ bool TryResolve(SemanticCapture::DrawableState& state,
     if (waterMat) {
         mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
             waterMat->spNormalMap01, "water_normal", device, newTextures,
-            TexturePostProcess::None);
+            TexturePostProcess::Octahedral);
         mesh.isWater             = true;
         mesh.waterTransmittanceR = waterMat->kDeepColor.r;
         mesh.waterTransmittanceG = waterMat->kDeepColor.g;

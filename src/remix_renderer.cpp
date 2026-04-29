@@ -216,6 +216,18 @@ namespace {
         float                        chunkOriginX  = 0.0f;
         float                        chunkOriginY  = 0.0f;
         float                        chunkExtent   = 0.0f;
+
+        // Water tag (2026-04-29). Copied from ExtractedMesh::isWater at
+        // submit time. OnFrame reads this to OR the
+        // REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER bit into the
+        // remixapi_InstanceInfo::categoryFlags, which makes dxvk-remix's
+        // translucent shader run its built-in dual-layer scrolling-normal
+        // animation path (cf. translucent_surface_material_interaction.slangh
+        // line 56 onward). Scroll velocities live on the dxvk-remix side as
+        // RtxOptions::translucentMaterial::animatedWaterPrimary/Secondary-
+        // NormalMotion -- we don't pass Bethesda's kNormalsScrollN through;
+        // dxvk-remix's defaults are reasonable for any water surface.
+        bool                         isWater       = false;
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
@@ -850,6 +862,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.chunkOriginX = mesh.chunkOriginX;
     inst.chunkOriginY = mesh.chunkOriginY;
     inst.chunkExtent  = mesh.chunkExtent;
+    inst.isWater      = mesh.isWater;
 
     g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
@@ -1106,6 +1119,19 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             instance.mesh = meshHandle;
             instance.doubleSided = 1;
             instance.categoryFlags = 0;
+
+            // Animated water tag. Bucket members all share materialHash, and
+            // matHash folds isWater (see SubmitDrawable cache-key code), so a
+            // bucket is either all-water or all-not -- testing the first
+            // member is sufficient. Setting the bit makes dxvk-remix's
+            // translucent shader run its dual-layer scrolling-normal path
+            // (cf. translucent_surface_material_interaction.slangh L56-81).
+            // Scroll velocities + enable flag are dxvk-remix runtime config;
+            // defaults (0.05/0.05 primary, -0.03/-0.06 secondary, enabled)
+            // produce convincing water motion without per-game tuning.
+            if (!bucket.members.empty() && bucket.members[0]->isWater) {
+                instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER;
+            }
 
             remixapi_InstanceInfoGpuInstancingEXT gpuExt = {};
 
