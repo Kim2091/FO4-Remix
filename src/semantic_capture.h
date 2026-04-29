@@ -66,7 +66,7 @@ namespace SemanticCapture {
         std::unordered_set<uint64_t> textureHashes;
 
         // Last resolver gate that returned false. Snapshotted from
-        // Resolvers::Lighting::Trace::LastStep() after each resolver call when
+        // Resolvers::Trace::LastStep() after each resolver call when
         // submittedToRemix is still false. 0 (kIdle) means "never been resolved"
         // (resolver loop's freshness gate skipped this entry, or it's brand-new).
         // Used by the sweep stats to break down `pending` by gate.
