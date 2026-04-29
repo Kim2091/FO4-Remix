@@ -812,13 +812,16 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     if (!shape || shape->numVertices == 0 || shape->numTriangles == 0)
         return false;
 
-    // Skip effect shaders — not real geometry
+    // Skip effect shaders — not real geometry. Per F4SE NiMaterials.h:32,
+    // GetFeature() returns 2 for lighting and 1 for effect; water returns
+    // a different value. The original "!= 2" check over-rejected water as
+    // a side effect of being written when only lighting was hooked.
     {
         NiProperty* prop = shape->shaderProperty;
         if (prop) {
             BSShaderProperty* sp = static_cast<BSShaderProperty*>(prop);
             BSShaderMaterial* mat = sp->shaderMaterial;
-            if (!mat || mat->GetFeature() != 2)
+            if (!mat || mat->GetFeature() == 1)
                 return false;
         }
     }
