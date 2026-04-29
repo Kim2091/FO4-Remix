@@ -9,10 +9,14 @@
 
 struct ExtractedTexture {
     uint64_t hash;
-    uint32_t width;
+    uint32_t width;            // Mip 0 dimensions
     uint32_t height;
     DXGI_FORMAT dxgiFormat;
-    std::vector<uint8_t> pixels;  // Raw mip 0 data (may be block-compressed)
+    uint32_t mipLevels = 1;    // Number of mip levels packed in `pixels`. >=1.
+    std::vector<uint8_t> pixels;  // Tightly packed mip chain: mip0, mip1, ... mipN-1.
+                                  // Each mip's dimensions are max(1, w>>i) and max(1, h>>i).
+                                  // Format is uniform across all mips (post-decompression
+                                  // and post-process this is RGBA8 for BC source textures).
 };
 
 struct ExtractedMesh {

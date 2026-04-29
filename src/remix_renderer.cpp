@@ -594,7 +594,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         texInfo.width     = tex.width;
         texInfo.height    = tex.height;
         texInfo.depth     = 1;
-        texInfo.mipLevels = 1;
+        texInfo.mipLevels = tex.mipLevels > 0 ? tex.mipLevels : 1;
         texInfo.format    = remixFmt;
         texInfo.data      = tex.pixels.data();
         texInfo.dataSize  = tex.pixels.size();

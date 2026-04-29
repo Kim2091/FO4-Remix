@@ -190,33 +190,30 @@ static bool IsBlockCompressed(DXGI_FORMAT fmt, uint32_t& blockSize)
 }
 
 // ---------------------------------------------------------------------------
-// GPU readback: copy mip 0 of a texture into CPU memory
+// GPU readback: copy a single mip level of a texture into CPU memory.
+// Helper for ReadbackAllMips. Output ExtractedTexture is single-mip.
 // ---------------------------------------------------------------------------
-static bool ReadbackTexture(ID3D11Device* device, ID3D11Texture2D* tex2D,
-                            uint64_t hash, ExtractedTexture& out)
+static bool ReadbackOneMip(ID3D11DeviceContext* ctx,
+                           ID3D11Device* device,
+                           ID3D11Texture2D* tex2D,
+                           DXGI_FORMAT format,
+                           uint32_t mipLevel,
+                           uint32_t mipWidth,
+                           uint32_t mipHeight,
+                           ExtractedTexture& out)
 {
     using Microsoft::WRL::ComPtr;
 
-    ComPtr<ID3D11DeviceContext> ctx;
-    device->GetImmediateContext(&ctx);
-    if (!ctx) return false;
+    uint32_t dataSize = ComputeMip0Size(mipWidth, mipHeight, format);
+    if (dataSize == 0) return false;
 
-    D3D11_TEXTURE2D_DESC desc;
-    tex2D->GetDesc(&desc);
-
-    uint32_t dataSize = ComputeMip0Size(desc.Width, desc.Height, desc.Format);
-    if (dataSize == 0) {
-        _MESSAGE("FO4RemixPlugin: ReadbackTexture - unsupported DXGI format %u, skipping", (unsigned)desc.Format);
-        return false;
-    }
-
-    // Create staging texture matching mip 0
+    // Staging texture matching this mip's dimensions
     D3D11_TEXTURE2D_DESC stagingDesc = {};
-    stagingDesc.Width              = desc.Width;
-    stagingDesc.Height             = desc.Height;
+    stagingDesc.Width              = mipWidth;
+    stagingDesc.Height             = mipHeight;
     stagingDesc.MipLevels          = 1;
     stagingDesc.ArraySize          = 1;
-    stagingDesc.Format             = desc.Format;
+    stagingDesc.Format             = format;
     stagingDesc.SampleDesc.Count   = 1;
     stagingDesc.SampleDesc.Quality = 0;
     stagingDesc.Usage              = D3D11_USAGE_STAGING;
@@ -226,35 +223,36 @@ static bool ReadbackTexture(ID3D11Device* device, ID3D11Texture2D* tex2D,
     ComPtr<ID3D11Texture2D> staging;
     HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &staging);
     if (FAILED(hr)) {
-        _MESSAGE("FO4RemixPlugin: ReadbackTexture - CreateTexture2D staging failed hr=0x%08X", (unsigned)hr);
+        _MESSAGE("FO4RemixPlugin: ReadbackOneMip - CreateTexture2D staging failed mip=%u hr=0x%08X",
+                 mipLevel, (unsigned)hr);
         return false;
     }
 
-    // Copy mip 0 from the source texture
-    ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex2D, 0, nullptr);
+    // Copy the requested mip from the source texture into mip 0 of staging
+    ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex2D, mipLevel, nullptr);
 
     D3D11_MAPPED_SUBRESOURCE mapped = {};
     hr = ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) {
-        _MESSAGE("FO4RemixPlugin: ReadbackTexture - Map failed hr=0x%08X", (unsigned)hr);
+        _MESSAGE("FO4RemixPlugin: ReadbackOneMip - Map failed mip=%u hr=0x%08X",
+                 mipLevel, (unsigned)hr);
         return false;
     }
 
-    // Determine row layout
     uint32_t blockSize = 0;
-    bool bc = IsBlockCompressed(desc.Format, blockSize);
+    bool bc = IsBlockCompressed(format, blockSize);
 
-    uint32_t numRows;       // number of scanline-rows (or block-rows for BC)
+    uint32_t numRows;       // scanline-rows (or block-rows for BC)
     uint32_t expectedPitch; // tight row pitch
 
     if (bc) {
-        uint32_t bw = (desc.Width  + 3) / 4; if (bw < 1) bw = 1;
-        uint32_t bh = (desc.Height + 3) / 4; if (bh < 1) bh = 1;
+        uint32_t bw = (mipWidth  + 3) / 4; if (bw < 1) bw = 1;
+        uint32_t bh = (mipHeight + 3) / 4; if (bh < 1) bh = 1;
         numRows       = bh;
         expectedPitch = bw * blockSize;
     } else {
-        numRows       = desc.Height;
-        expectedPitch = desc.Width * 4; // all uncompressed formats we support are 4 bpp
+        numRows       = mipHeight;
+        expectedPitch = mipWidth * 4; // all uncompressed formats we support are 4 bpp
     }
 
     out.pixels.resize(dataSize);
@@ -269,11 +267,64 @@ static bool ReadbackTexture(ID3D11Device* device, ID3D11Texture2D* tex2D,
 
     ctx->Unmap(staging.Get(), 0);
 
-    // Fill metadata
-    out.hash       = hash;
-    out.width      = desc.Width;
-    out.height     = desc.Height;
-    out.dxgiFormat = desc.Format;
+    out.width      = mipWidth;
+    out.height     = mipHeight;
+    out.dxgiFormat = format;
+    out.mipLevels  = 1;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// GPU readback: read every mip level of a texture into CPU memory, one
+// ExtractedTexture per mip. The source texture's actual MipLevels field
+// determines the chain length (game textures typically ship full chains;
+// some procedural / runtime textures have only 1).
+//
+// Why all mips: the path tracer samples normal/diffuse maps at varying LOD
+// based on screen-space pixel footprint. Without a mip chain, a distant
+// surface fetches the full-res mip at sub-pixel rate, average-out flattens
+// the normal, and the BRDF degenerates -- most visibly on water, where a
+// flat normal + high IOR + Fresnel collapses to a perfect mirror. With the
+// chain present, distant sampling fetches a pre-filtered lower mip and
+// detail rolls off smoothly.
+//
+// Returns false on any failure (partial chain is worse than no chain --
+// dxvk-remix would render with malformed mips).
+// ---------------------------------------------------------------------------
+static bool ReadbackAllMips(ID3D11Device* device, ID3D11Texture2D* tex2D,
+                            std::vector<ExtractedTexture>& outMips)
+{
+    using Microsoft::WRL::ComPtr;
+
+    ComPtr<ID3D11DeviceContext> ctx;
+    device->GetImmediateContext(&ctx);
+    if (!ctx) return false;
+
+    D3D11_TEXTURE2D_DESC desc;
+    tex2D->GetDesc(&desc);
+
+    if (ComputeMip0Size(desc.Width, desc.Height, desc.Format) == 0) {
+        _MESSAGE("FO4RemixPlugin: ReadbackAllMips - unsupported DXGI format %u, skipping",
+                 (unsigned)desc.Format);
+        return false;
+    }
+
+    uint32_t srcMipCount = desc.MipLevels > 0 ? desc.MipLevels : 1;
+    outMips.clear();
+    outMips.reserve(srcMipCount);
+
+    for (uint32_t i = 0; i < srcMipCount; i++) {
+        uint32_t mipW = desc.Width  >> i; if (mipW == 0) mipW = 1;
+        uint32_t mipH = desc.Height >> i; if (mipH == 0) mipH = 1;
+
+        ExtractedTexture mip;
+        if (!ReadbackOneMip(ctx.Get(), device, tex2D, desc.Format,
+                            i, mipW, mipH, mip)) {
+            outMips.clear();
+            return false;
+        }
+        outMips.push_back(std::move(mip));
+    }
 
     return true;
 }
@@ -643,20 +694,32 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                                           reinterpret_cast<void**>(&tex2D));
     if (FAILED(hr) || !tex2D) return 0;
 
-    ExtractedTexture extracted;
-    bool ok = ReadbackTexture(device, tex2D, hash, extracted);
+    // Read every mip from the source D3D texture. Each entry is a single-mip
+    // ExtractedTexture so we can reuse the existing per-mip decompression and
+    // post-process functions unchanged. They get concatenated into a packed
+    // mip chain at the end.
+    std::vector<ExtractedTexture> mips;
+    bool ok = ReadbackAllMips(device, tex2D, mips);
     tex2D->Release();
 
-    if (!ok) return 0;
+    if (!ok || mips.empty()) return 0;
 
-    // BC2 (DXT3) isn't supported by Remix natively — decompress to RGBA8
-    DecompressBC2(extracted);
+    // Per-mip pipeline: BC2 (DXT3) -> RGBA8, then any further BC decompression
+    // handled by the post-process stage's BC5/BC1 decoders. Each step operates
+    // on a single mip so the existing single-mip-aware functions need no
+    // changes.
+    for (auto& mip : mips) {
+        DecompressBC2(mip);
+    }
 
     // --- Debug dump: diffuse control (no post-processing) ---
+    // Only dump mip 0 -- the lower mips are auto-generated and uninteresting
+    // for visual debugging. The dump runs at first-extraction (s_dump counter)
+    // so it captures the highest-resolution image we'll ever present.
     if (postProcess == TexturePostProcess::None) {
         static int s_dumpDiffuse = 0;
         if (s_dumpDiffuse < 2) {
-            ExtractedTexture tmp = extracted;
+            ExtractedTexture tmp = mips[0];
             // Decompress BC1 to RGBA so we can dump it
             bool isBC1tmp = (tmp.dxgiFormat == DXGI_FORMAT_BC1_UNORM ||
                              tmp.dxgiFormat == DXGI_FORMAT_BC1_UNORM_SRGB ||
@@ -675,7 +738,7 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     }
 
     // --- Debug dump: raw BC5 decode (before post-processing) ---
-    // Dump first 3 normal + first 3 roughness textures for inspection.
+    // Dump mip 0 of first 3 normal + first 3 roughness textures for inspection.
     {
         static int s_dumpNormalRaw = 0, s_dumpRoughnessRaw = 0;
         bool dumpRaw = false;
@@ -683,8 +746,8 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
         if (postProcess == TexturePostProcess::InvertRGB  && s_dumpRoughnessRaw < 3) dumpRaw = true;
 
         if (dumpRaw) {
-            // BC5 needs decompression to RGBA before we can dump, so do a temporary decode
-            ExtractedTexture tmp = extracted; // copy
+            // BC5 needs decompression to RGBA before we can dump, so do a temporary decode of mip 0
+            ExtractedTexture tmp = mips[0]; // copy mip 0
             bool isBC5tmp = (tmp.dxgiFormat == DXGI_FORMAT_BC5_UNORM ||
                              tmp.dxgiFormat == DXGI_FORMAT_BC5_SNORM ||
                              tmp.dxgiFormat == DXGI_FORMAT_BC5_TYPELESS);
@@ -704,36 +767,75 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
         }
     }
 
-    if (postProcess == TexturePostProcess::InvertRGB) {
-        SmoothnessToRoughness(extracted);
-    } else if (postProcess == TexturePostProcess::Octahedral) {
-        ConvertNormalToOctahedral(extracted);
+    // Apply post-processing per-mip. SmoothnessToRoughness and
+    // ConvertNormalToOctahedral both run BC decode internally if needed and
+    // emit RGBA8, so mips that started in different BC formats end up in a
+    // common output format -- which matters because we concatenate them
+    // into a single packed buffer below.
+    for (auto& mip : mips) {
+        if (postProcess == TexturePostProcess::InvertRGB) {
+            SmoothnessToRoughness(mip);
+        } else if (postProcess == TexturePostProcess::Octahedral) {
+            ConvertNormalToOctahedral(mip);
+        }
     }
 
-    // --- Debug dump: after post-processing ---
+    // --- Debug dump: after post-processing (mip 0 only) ---
     {
         static int s_dumpNormalPost = 0, s_dumpRoughnessPost = 0;
         bool dumpPost = false;
         if (postProcess == TexturePostProcess::Octahedral && s_dumpNormalPost < 3) dumpPost = true;
         if (postProcess == TexturePostProcess::InvertRGB  && s_dumpRoughnessPost < 3) dumpPost = true;
 
-        if (dumpPost && (extracted.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                         extracted.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
+        if (dumpPost && (mips[0].dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                         mips[0].dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
             char path[256];
             if (postProcess == TexturePostProcess::Octahedral)
                 snprintf(path, sizeof(path), "c:/temp/fo4_debug_normal_post_%d.tga", s_dumpNormalPost++);
             else
                 snprintf(path, sizeof(path), "c:/temp/fo4_debug_roughness_post_%d.tga", s_dumpRoughnessPost++);
-            DebugDumpTGA(path, extracted.pixels.data(), extracted.width, extracted.height);
-            _MESSAGE("FO4RemixPlugin: DEBUG dumped post-process -> %s (%ux%u)", path, extracted.width, extracted.height);
+            DebugDumpTGA(path, mips[0].pixels.data(), mips[0].width, mips[0].height);
+            _MESSAGE("FO4RemixPlugin: DEBUG dumped post-process -> %s (%ux%u)", path, mips[0].width, mips[0].height);
         }
+    }
+
+    // --- Sanity: every mip must share the same final dxgiFormat. The pipeline
+    // above produces RGBA8 for any BC source; uncompressed sources stay in
+    // their original (BGRA8 / RGBA8) format. Mixed formats across mips would
+    // mean a mid-chain decompression diverged -- bail rather than ship a
+    // malformed packed buffer that dxvk-remix would interpret as garbage.
+    DXGI_FORMAT chainFmt = mips[0].dxgiFormat;
+    for (auto& mip : mips) {
+        if (mip.dxgiFormat != chainFmt) {
+            _MESSAGE("FO4RemixPlugin: ExtractMaterialTexture - mip format mismatch "
+                     "(mip0=%u midmip=%u) for hash=0x%016llX, dropping",
+                     (unsigned)chainFmt, (unsigned)mip.dxgiFormat, hash);
+            return 0;
+        }
+    }
+
+    // Concatenate all mips into a single packed buffer. Remix expects the
+    // mip chain tightly packed, mip0 first, no padding.
+    ExtractedTexture extracted;
+    extracted.hash       = hash;
+    extracted.width      = mips[0].width;
+    extracted.height     = mips[0].height;
+    extracted.dxgiFormat = chainFmt;
+    extracted.mipLevels  = (uint32_t)mips.size();
+
+    size_t total = 0;
+    for (const auto& mip : mips) total += mip.pixels.size();
+    extracted.pixels.reserve(total);
+    for (auto& mip : mips) {
+        extracted.pixels.insert(extracted.pixels.end(),
+                                mip.pixels.begin(), mip.pixels.end());
     }
 
     if (g_config.logTextures) {
         const char* texName = tex->name.c_str();
-        _MESSAGE("FO4RemixPlugin: Extracted %s texture \"%s\" %ux%u fmt=%u hash=0x%016llX%s",
+        _MESSAGE("FO4RemixPlugin: Extracted %s texture \"%s\" %ux%u mips=%u fmt=%u hash=0x%016llX%s",
                  slotName, texName ? texName : "<null>",
-                 extracted.width, extracted.height,
+                 extracted.width, extracted.height, extracted.mipLevels,
                  (unsigned)extracted.dxgiFormat, hash,
                  postProcess == TexturePostProcess::InvertRGB ? " (inverted)" :
                  postProcess == TexturePostProcess::Octahedral ? " (octahedral)" : "");
