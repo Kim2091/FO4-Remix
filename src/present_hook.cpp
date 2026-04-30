@@ -294,9 +294,9 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         g_remix.sharedCamera = cam;
     }
 
-    // Push time-of-day to Remix's atmosphere config keys. Same readiness
-    // gate as the bone-update block — Remix must be initialized AND game
-    // data must be loaded before LookupFormByID can return a valid TESGlobal.
+    // Push time-of-day to Remix's atmosphere config keys. Game-data gate is
+    // load-bearing: LookupFormByID returns null until the form DB is ready.
+    // Same gate as the semantic-capture tick below.
     if (g_remix.ready && g_gameDataReady) {
         WeatherBridge::PushOncePerFrame();
     }
