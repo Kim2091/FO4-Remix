@@ -46,6 +46,7 @@ endif()
 add_library(f4se_minimal STATIC
     "${F4SE_SDK_DIR}/f4se_common/Relocation.cpp"
     "${F4SE_SDK_DIR}/f4se/GameCamera.cpp"
+    "${F4SE_SDK_DIR}/f4se/GameForms.cpp"
 )
 target_include_directories(f4se_minimal PUBLIC
     "${F4SE_SDK_DIR}"
@@ -82,6 +83,8 @@ add_library(FO4RemixPlugin SHARED
     src/resolvers/lighting_static.cpp
     src/resolvers/water.h
     src/resolvers/water.cpp
+    src/weather_bridge.h
+    src/weather_bridge.cpp
     src/f4se_compat.h
 )
 
