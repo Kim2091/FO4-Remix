@@ -92,6 +92,11 @@ static uint64_t ContentHashOf(const ExtractedMesh& m) {
     return h;
 }
 
+// Serializes Remix API mutations from any thread. Recursive so a path that
+// already holds the lock can re-acquire safely (e.g. SetConfigVariable
+// called from inside a future LoadCellScene path).
+static std::recursive_mutex g_rendererStateMutex;
+
 // ---------------------------------------------------------------------------
 // First-N-catches-per-callsite logger for C++ exceptions out of dxvk-remix
 // API calls. We saw 3277 caught C++ exceptions out of SubmitDrawable in the
@@ -979,6 +984,7 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
 // ---------------------------------------------------------------------------
 void RemixRenderer::OnFrame(const CameraState& cam,
                             const OverlayData& overlay) {
+    std::lock_guard<std::recursive_mutex> lock(g_rendererStateMutex);
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
@@ -1365,4 +1371,13 @@ void RemixRenderer::Shutdown() {
         api->DestroyMesh(g_fallbackMesh);
         g_fallbackMesh = nullptr;
     }
+}
+
+bool RemixRenderer::SetConfigVariable(const char* key, const char* value) {
+    if (!key || !value) return false;
+    remixapi_Interface* api = RemixAPI::GetInterface();
+    if (!api || !api->SetConfigVariable) return false;
+
+    std::lock_guard<std::recursive_mutex> lock(g_rendererStateMutex);
+    return api->SetConfigVariable(key, value) == REMIXAPI_ERROR_CODE_SUCCESS;
 }
