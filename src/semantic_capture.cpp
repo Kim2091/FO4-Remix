@@ -163,6 +163,81 @@ static int CallReleaseDrawableGuarded(uint64_t meshHash,
     }
 }
 
+// -------- Parent-chain RTTI diagnostic --------
+// Set in Install() once the module handle is resolved; read from the
+// GetRenderPasses detour to walk vtable->COL->TypeDescriptor and recover
+// MSVC mangled class names. kParentChainLogCap caps log volume; first N
+// fires get a chain + matrix dump.
+uintptr_t              g_moduleBase        = 0;
+constexpr size_t       kParentChainDepth   = 6;
+constexpr uint64_t     kParentChainLogCap  = 200;
+std::atomic<uint64_t>  g_parentChainLogs{0};
+
+// Walk geometry's NiAVObject::m_parent chain (offset +0x28) up to kDepth
+// levels, recovering each level's class name via MSVC RTTI: vtable[-1] -> COL
+// -> typedescriptor RVA -> module_base + RVA + 0x10 = mangled name. Strips
+// the ".?AV"/".?AU" prefix and trims at "@@" so "BSTriShape" prints clean.
+// Logs the leaf's m_worldTransform alongside the chain. SEH-guarded since
+// every step dereferences an engine pointer that could race with scene-graph
+// mutation; on a fault the chain entry stops and we keep what we got.
+static int LogParentChainGuarded(uint64_t logN, void* geometry,
+                                 uintptr_t modBase, unsigned long* outExc) {
+    __try {
+        char names[kParentChainDepth][96];
+        for (size_t i = 0; i < kParentChainDepth; ++i) names[i][0] = '\0';
+
+        void* obj = geometry;
+        for (size_t i = 0; i < kParentChainDepth; ++i) {
+            if (!obj) {
+                continue;
+            }
+            void* vtable = *reinterpret_cast<void**>(obj);
+            if (vtable) {
+                void* col = *reinterpret_cast<void**>(
+                    reinterpret_cast<uintptr_t>(vtable) - 8);
+                if (col) {
+                    uint32_t typeRva = *reinterpret_cast<uint32_t*>(
+                        reinterpret_cast<uintptr_t>(col) + 0x0C);
+                    const char* mangled = reinterpret_cast<const char*>(
+                        modBase + typeRva + 0x10);
+                    const char* p = mangled;
+                    if (p[0] == '.' && p[1] == '?' && p[2] == 'A') p += 4;
+                    size_t k = 0;
+                    while (k < 95 && p[k] != '\0' && p[k] != '@') {
+                        names[i][k] = p[k];
+                        ++k;
+                    }
+                    names[i][k] = '\0';
+                } else {
+                    names[i][0] = '?'; names[i][1] = '\0';
+                }
+            } else {
+                names[i][0] = '?'; names[i][1] = '\0';
+            }
+            obj = *reinterpret_cast<void**>(
+                reinterpret_cast<uintptr_t>(obj) + 0x28);
+        }
+
+        const NiTransform* xf = reinterpret_cast<const NiTransform*>(
+            reinterpret_cast<uintptr_t>(geometry) + 0x70);
+        _MESSAGE("FO4RemixPlugin: [ParentChain] #%llu geom=%p "
+                 "pos=(%.1f, %.1f, %.1f) "
+                 "rot=[%.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f] s=%.4f "
+                 "chain=[%s | %s | %s | %s | %s | %s]",
+                 (unsigned long long)logN, geometry,
+                 xf->pos.x, xf->pos.y, xf->pos.z,
+                 xf->rot.data[0][0], xf->rot.data[0][1], xf->rot.data[0][2],
+                 xf->rot.data[1][0], xf->rot.data[1][1], xf->rot.data[1][2],
+                 xf->rot.data[2][0], xf->rot.data[2][1], xf->rot.data[2][2],
+                 xf->scale,
+                 names[0], names[1], names[2], names[3], names[4], names[5]);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outExc = GetExceptionCode();
+        return 1;
+    }
+}
+
 // Shared detour body. The per-target wrappers above pass their compile-time
 // resolver kind; the body uses it to tag the DrawableState and to call
 // through the right original-fn pointer for the tail call.
@@ -200,6 +275,8 @@ static void* DetourGetRenderPassesShared(void* self,
     // BuildRemixTransform (Beth X/Y swap built in).
     float liveXf[3][4] = {};
     bool  liveXfValid  = false;
+    float capturedPosX = 0.0f;
+    float capturedPosY = 0.0f;
     if (geometry) {
         niFlags = *reinterpret_cast<uint64_t*>(
             reinterpret_cast<uintptr_t>(geometry) + 0x108);
@@ -216,6 +293,25 @@ static void* DetourGetRenderPassesShared(void* self,
             reinterpret_cast<uintptr_t>(geometry) + 0x70);
         SemanticCapture::BuildRemixTransform(worldXf, liveXf);
         liveXfValid = true;
+        capturedPosX = worldXf.pos.x;
+        capturedPosY = worldXf.pos.y;
+    }
+
+    // Parent-chain RTTI diag (capped). One line per qualifying fire up to
+    // kParentChainLogCap. Position filter skips player-attached meshes
+    // (Pip-Boy, body parts, weapons) whose m_worldTransform has small
+    // local-space coords -- those flood the budget during loading and char
+    // creation before the user reaches the dock area we want to inspect.
+    constexpr float kFarFromOriginThreshold = 5000.0f;
+    const bool farFromOrigin =
+        capturedPosX >  kFarFromOriginThreshold ||
+        capturedPosX < -kFarFromOriginThreshold ||
+        capturedPosY >  kFarFromOriginThreshold ||
+        capturedPosY < -kFarFromOriginThreshold;
+    if (geometry && g_moduleBase && farFromOrigin) {
+        const uint64_t logN = g_parentChainLogs.fetch_add(1, std::memory_order_relaxed);
+        unsigned long exc = 0;
+        LogParentChainGuarded(logN, geometry, g_moduleBase, &exc);
     }
 
     {
@@ -271,6 +367,93 @@ void* __fastcall DetourGetRenderPasses_Water(void* self, void* geometry,
                                        g_hookTargets[1].original);
 }
 
+// -------- Diagnostic hooks: rotation-bug investigation --------
+// SetupGeo hook (RVA 0x02233730) = BSLightingShader::SetupGeometry; reads
+// pass->geometry (rdx+0x18) and that geometry's m_worldTransform (+0x70).
+// CBWrite hook (RVA 0x022347D0) = the per-instance constant-buffer writer
+// SetupGeometry calls with the world transform it's about to upload. The
+// matrix here is the last view of NiTransform before the engine transposes
+// it row-major -> column-major, applies camera-relative shift, and writes
+// to the GPU vertex CB. Comparing both against GetRenderPasses' capture
+// tells us whether anything composes onto the matrix between the two.
+// Logging is capped per-hook to keep the F4SE log readable.
+
+typedef void (__fastcall *SetupGeometry_t)(void* self, void* pass, uint32_t flags);
+typedef void (__fastcall *WriteWorldXform_t)(void* state, void* xform);
+
+constexpr uintptr_t kSetupGeometryRVA   = 0x02233730;
+constexpr uintptr_t kWriteWorldXformRVA = 0x022347D0;
+constexpr uint64_t  kDiagLogCap         = 200;
+
+LPVOID                g_addrSetupGeo     = nullptr;
+LPVOID                g_addrWriteXform   = nullptr;
+SetupGeometry_t       g_origSetupGeo     = nullptr;
+WriteWorldXform_t     g_origWriteXform   = nullptr;
+std::atomic<uint64_t> g_setupGeoFires{0};
+std::atomic<uint64_t> g_writeXformFires{0};
+
+static int LogSetupGeoGuarded(uint64_t n, void* pass, uint32_t flags,
+                              unsigned long* outExc) {
+    __try {
+        void* geometry = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(pass) + 0x18);
+        void* property = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(pass) + 0x10);
+        if (!geometry) return 0;
+        const NiTransform* p = reinterpret_cast<const NiTransform*>(
+            reinterpret_cast<uintptr_t>(geometry) + 0x70);
+        _MESSAGE("FO4RemixPlugin: [SetupGeo] #%llu geom=%p prop=%p flags=0x%x "
+                 "pos=(%.3f, %.3f, %.3f) "
+                 "rot=[%.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f] s=%.4f",
+                 (unsigned long long)n, geometry, property, flags,
+                 p->pos.x, p->pos.y, p->pos.z,
+                 p->rot.data[0][0], p->rot.data[0][1], p->rot.data[0][2],
+                 p->rot.data[1][0], p->rot.data[1][1], p->rot.data[1][2],
+                 p->rot.data[2][0], p->rot.data[2][1], p->rot.data[2][2],
+                 p->scale);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outExc = GetExceptionCode();
+        return 1;
+    }
+}
+
+static int LogWriteXformGuarded(uint64_t n, void* xform, unsigned long* outExc) {
+    __try {
+        if (!xform) return 0;
+        const NiTransform* p = reinterpret_cast<const NiTransform*>(xform);
+        _MESSAGE("FO4RemixPlugin: [CBWrite] #%llu xform=%p "
+                 "pos=(%.3f, %.3f, %.3f) "
+                 "rot=[%.4f %.4f %.4f | %.4f %.4f %.4f | %.4f %.4f %.4f] s=%.4f",
+                 (unsigned long long)n, xform,
+                 p->pos.x, p->pos.y, p->pos.z,
+                 p->rot.data[0][0], p->rot.data[0][1], p->rot.data[0][2],
+                 p->rot.data[1][0], p->rot.data[1][1], p->rot.data[1][2],
+                 p->rot.data[2][0], p->rot.data[2][1], p->rot.data[2][2],
+                 p->scale);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outExc = GetExceptionCode();
+        return 1;
+    }
+}
+
+void __fastcall DetourSetupGeometry_Lighting(void* self, void* pass, uint32_t flags) {
+    const uint64_t n = g_setupGeoFires.fetch_add(1, std::memory_order_relaxed);
+    if (n < kDiagLogCap && pass) {
+        unsigned long exc = 0;
+        LogSetupGeoGuarded(n, pass, flags, &exc);
+    }
+    g_origSetupGeo(self, pass, flags);
+}
+
+void __fastcall DetourWriteWorldXform(void* state, void* xform) {
+    const uint64_t n = g_writeXformFires.fetch_add(1, std::memory_order_relaxed);
+    if (n < kDiagLogCap && xform) {
+        unsigned long exc = 0;
+        LogWriteXformGuarded(n, xform, &exc);
+    }
+    g_origWriteXform(state, xform);
+}
+
 }  // namespace
 
 bool SemanticCapture::Install() {
@@ -285,6 +468,7 @@ bool SemanticCapture::Install() {
         _MESSAGE("FO4RemixPlugin: [SemCapture] ERROR: GetModuleHandle(Fallout4.exe) failed");
         return false;
     }
+    g_moduleBase = reinterpret_cast<uintptr_t>(hMod);
 
     MH_STATUS mhInit = MH_Initialize();
     if (mhInit != MH_OK && mhInit != MH_ERROR_ALREADY_INITIALIZED) {
@@ -326,6 +510,41 @@ bool SemanticCapture::Install() {
         return false;
     }
 
+    // Diagnostic hooks (best-effort; never abort the install path).
+    g_addrSetupGeo = reinterpret_cast<LPVOID>(
+        reinterpret_cast<uintptr_t>(hMod) + kSetupGeometryRVA);
+    if (MH_CreateHook(g_addrSetupGeo,
+                      reinterpret_cast<LPVOID>(&DetourSetupGeometry_Lighting),
+                      reinterpret_cast<LPVOID*>(&g_origSetupGeo)) != MH_OK) {
+        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo create failed (RVA 0x%llX)",
+                 (unsigned long long)kSetupGeometryRVA);
+        g_addrSetupGeo = nullptr;
+    } else if (MH_EnableHook(g_addrSetupGeo) != MH_OK) {
+        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo enable failed");
+        MH_RemoveHook(g_addrSetupGeo);
+        g_addrSetupGeo = nullptr;
+    } else {
+        _MESSAGE("FO4RemixPlugin: [SemCapture] installed SetupGeo diag hook at RVA 0x%llX",
+                 (unsigned long long)kSetupGeometryRVA);
+    }
+
+    g_addrWriteXform = reinterpret_cast<LPVOID>(
+        reinterpret_cast<uintptr_t>(hMod) + kWriteWorldXformRVA);
+    if (MH_CreateHook(g_addrWriteXform,
+                      reinterpret_cast<LPVOID>(&DetourWriteWorldXform),
+                      reinterpret_cast<LPVOID*>(&g_origWriteXform)) != MH_OK) {
+        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite create failed (RVA 0x%llX)",
+                 (unsigned long long)kWriteWorldXformRVA);
+        g_addrWriteXform = nullptr;
+    } else if (MH_EnableHook(g_addrWriteXform) != MH_OK) {
+        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite enable failed");
+        MH_RemoveHook(g_addrWriteXform);
+        g_addrWriteXform = nullptr;
+    } else {
+        _MESSAGE("FO4RemixPlugin: [SemCapture] installed CBWrite diag hook at RVA 0x%llX",
+                 (unsigned long long)kWriteWorldXformRVA);
+    }
+
     g_installed.store(true);
     return true;
 }
@@ -338,9 +557,22 @@ void SemanticCapture::Uninstall() {
         MH_DisableHook(t.address);
         MH_RemoveHook(t.address);
     }
+    if (g_addrSetupGeo) {
+        MH_DisableHook(g_addrSetupGeo);
+        MH_RemoveHook(g_addrSetupGeo);
+        g_addrSetupGeo = nullptr;
+    }
+    if (g_addrWriteXform) {
+        MH_DisableHook(g_addrWriteXform);
+        MH_RemoveHook(g_addrWriteXform);
+        g_addrWriteXform = nullptr;
+    }
     g_installed.store(false);
-    _MESSAGE("FO4RemixPlugin: [SemCapture] uninstalled (final fires: %llu)",
-             (unsigned long long)g_totalFires.load());
+    _MESSAGE("FO4RemixPlugin: [SemCapture] uninstalled (final fires: %llu, "
+             "setupGeo=%llu cbWrite=%llu)",
+             (unsigned long long)g_totalFires.load(),
+             (unsigned long long)g_setupGeoFires.load(),
+             (unsigned long long)g_writeXformFires.load());
 }
 
 void SemanticCapture::Tick(ID3D11Device* device) {
