@@ -80,7 +80,7 @@ namespace RemixRenderer {
     void ReleaseDrawable(uint64_t hash);
 
     // Forward a key/value to Remix's runtime config registry. Takes the
-    // recursive renderer-state mutex so concurrent OnFrame draw submissions
+    // recursive Remix-API mutex so concurrent OnFrame draw submissions
     // don't race against the option write. Returns true on success;
     // false if the Remix fork lacks the slot or the value fails to parse.
     bool SetConfigVariable(const char* key, const char* value);

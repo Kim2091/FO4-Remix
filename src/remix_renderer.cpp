@@ -92,11 +92,6 @@ static uint64_t ContentHashOf(const ExtractedMesh& m) {
     return h;
 }
 
-// Serializes Remix API mutations from any thread. Recursive so a path that
-// already holds the lock can re-acquire safely (e.g. SetConfigVariable
-// called from inside a future LoadCellScene path).
-static std::recursive_mutex g_rendererStateMutex;
-
 // ---------------------------------------------------------------------------
 // First-N-catches-per-callsite logger for C++ exceptions out of dxvk-remix
 // API calls. We saw 3277 caught C++ exceptions out of SubmitDrawable in the
@@ -248,6 +243,14 @@ namespace {
         uint32_t            refCount;
     };
     std::unordered_map<MeshCacheKey, MeshRef, MeshCacheKeyHash> g_meshCache;
+
+    // Serializes Remix API mutations from any thread (option-registry writes,
+    // game-state pushes, etc.) against draw submissions on the Remix render
+    // thread. Recursive so a path that already holds it can re-acquire safely.
+    // NOTE: distinct from g_renderStateMutex below — that one guards
+    // g_drawables/g_meshCache/g_materialCache/g_textureHandles. They protect
+    // different invariants and are taken in order: g_remixApiMutex first.
+    std::recursive_mutex g_remixApiMutex;
 
     // Protects g_drawables, g_meshCache, g_materialCache, and g_textureHandles.
     // Submission (SubmitDrawable / ReleaseDrawable) runs on the game thread
@@ -984,7 +987,12 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
 // ---------------------------------------------------------------------------
 void RemixRenderer::OnFrame(const CameraState& cam,
                             const OverlayData& overlay) {
-    std::lock_guard<std::recursive_mutex> lock(g_rendererStateMutex);
+    // Serializes Remix API option-registry writes (game thread, via
+    // SetConfigVariable) against draw submissions on this thread. Held for
+    // the function's full duration. Lock order: g_remixApiMutex ->
+    // g_drawableMutex (SnapshotActiveDrawables) -> g_renderStateMutex
+    // (bucket build). Never acquire in reverse.
+    std::lock_guard<std::recursive_mutex> lock(g_remixApiMutex);
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
@@ -1378,6 +1386,6 @@ bool RemixRenderer::SetConfigVariable(const char* key, const char* value) {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api || !api->SetConfigVariable) return false;
 
-    std::lock_guard<std::recursive_mutex> lock(g_rendererStateMutex);
+    std::lock_guard<std::recursive_mutex> lock(g_remixApiMutex);
     return api->SetConfigVariable(key, value) == REMIXAPI_ERROR_CODE_SUCCESS;
 }
