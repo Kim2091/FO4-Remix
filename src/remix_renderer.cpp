@@ -244,9 +244,10 @@ namespace {
     };
     std::unordered_map<MeshCacheKey, MeshRef, MeshCacheKeyHash> g_meshCache;
 
-    // Serializes Remix API mutations from any thread (option-registry writes,
-    // game-state pushes, etc.) against draw submissions on the Remix render
-    // thread. Recursive so a path that already holds it can re-acquire safely.
+    // Serializes SetConfigVariable writes (game thread) against OnFrame draw
+    // submissions (Remix thread). Other Remix API mutations elsewhere in this
+    // file rely on g_renderStateMutex and Remix's internal sync, NOT on this
+    // mutex. Recursive so a path that already holds it can re-acquire safely.
     // NOTE: distinct from g_renderStateMutex below — that one guards
     // g_drawables/g_meshCache/g_materialCache/g_textureHandles. They protect
     // different invariants and are taken in order: g_remixApiMutex first.

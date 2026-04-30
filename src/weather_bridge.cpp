@@ -4,7 +4,6 @@
 #include "f4se/GameForms.h"
 #include "f4se/PluginAPI.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <mutex>
@@ -54,7 +53,7 @@ void WeatherBridge::PushOncePerFrame() {
         cachedGameHour = static_cast<TESGlobal*>(form);
     }
 
-    // Skyrim's day runs 0..24. Sun peaks at noon (hour 12) with elevation
+    // Bethesda's GameHour TESGlobal runs 0..24. Sun peaks at noon (hour 12) with elevation
     // ~90deg, sits at the horizon at hour 6 (dawn) and hour 18 (dusk), dips
     // negative at night. Rotation advances linearly through the full day.
     const float hour = cachedGameHour->value;
