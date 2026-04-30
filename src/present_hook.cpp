@@ -5,6 +5,7 @@
 #include "remix_renderer.h"
 #include "camera.h"
 #include "semantic_capture.h"
+#include "weather_bridge.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -291,6 +292,13 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         CameraState cam = Camera::Get();
         std::lock_guard<std::mutex> lock(g_remix.cameraMutex);
         g_remix.sharedCamera = cam;
+    }
+
+    // Push time-of-day to Remix's atmosphere config keys. Same readiness
+    // gate as the bone-update block — Remix must be initialized AND game
+    // data must be loaded before LookupFormByID can return a valid TESGlobal.
+    if (g_remix.ready && g_gameDataReady) {
+        WeatherBridge::PushOncePerFrame();
     }
 
     // Hook OMSetRenderTargets + ClearRenderTargetView on first opportunity
