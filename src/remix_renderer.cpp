@@ -228,6 +228,27 @@ namespace {
         // NormalMotion -- we don't pass Bethesda's kNormalsScrollN through;
         // dxvk-remix's defaults are reasonable for any water surface.
         bool                         isWater       = false;
+
+        // Alpha-blend state (2026-05-01). Copied from ExtractedMesh at submit
+        // time. OnFrame chains a remixapi_InstanceInfoBlendEXT onto pNext when
+        // alphaBlendEnabled is true; the material was built with
+        // useDrawCallAlphaState=1 in that case so the per-instance blend state
+        // is the source of truth. All bucket members share the same blend
+        // state because the material cache key folds blend factors in
+        // (different factors produce different materials -> different mesh
+        // handles -> different buckets).
+        bool                         alphaBlendEnabled    = false;
+        uint32_t                     srcColorBlendFactor  = 1;  // VK_BLEND_FACTOR_ONE
+        uint32_t                     dstColorBlendFactor  = 0;  // VK_BLEND_FACTOR_ZERO
+        bool                         alphaTestEnabled     = false;
+        uint32_t                     alphaTestType        = 7;  // VK_COMPARE_OP_ALWAYS
+        uint8_t                      alphaTestRef         = 128;
+
+        // Decal tag (2026-05-01). Copied from ExtractedMesh at submit time.
+        // OnFrame ORs REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC into the
+        // categoryFlags so dxvk-remix applies decal depth-offset Z-fight
+        // prevention against the underlying surface.
+        bool                         isDecal              = false;
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
