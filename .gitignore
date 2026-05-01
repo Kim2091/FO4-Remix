@@ -13,3 +13,8 @@ Desktop.ini
 
 # Superpowers worktrees
 .worktrees/
+
+# Local instructions and tooling (kept user-personal, not shipped)
+.claude/
+*.code-workspace
+CLAUDE.md
