@@ -705,6 +705,22 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         h ^= (uint64_t)ii * 0x27D4EB2F165667C5ULL;
         bool useDrawCall = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
         h ^= (uint64_t)(useDrawCall ? 1 : 0) * 0x9FB21C651E98DF25ULL;
+        // Fold blend factors so different blend modes get different material
+        // handles. (Different opaqueExt.useDrawCallAlphaState values are
+        // already covered by the useDrawCall fold above; this fold splits
+        // distinct blend modes within the alpha-blend-enabled population
+        // so all drawables in a bucket share the same blend state -- which
+        // OnFrame relies on when populating InstanceInfoBlendEXT from
+        // bucket.members[0].)
+        h ^= (uint64_t)mesh.srcColorBlendFactor * 0xCC9E2D51ULL;
+        h ^= (uint64_t)mesh.dstColorBlendFactor * 0x1B873593ULL;
+        // alphaTest fields are a material-level concern (they go on the
+        // opaqueExt itself when useDrawCallAlphaState=0, or on the per-
+        // instance blend ext when =1); fold them so test-on vs test-off
+        // and distinct test thresholds never share materials.
+        h ^= (uint64_t)(mesh.alphaTestEnabled ? 1 : 0) * 0xE6546B64ULL;
+        h ^= (uint64_t)mesh.alphaTestType * 0x85EBCA77ULL;
+        h ^= (uint64_t)mesh.alphaTestRef  * 0xC2B2AE3DULL;
         // Fold water tag + transmittance into the cache key so opaque and
         // translucent variants of the same texture set never share a Remix
         // material handle (the underlying pNext extension struct differs).
@@ -783,17 +799,32 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
                 opaqueExt.opacityConstant   = 1.0f;
                 opaqueExt.roughnessConstant = roughnessH ? 0.5f : 0.8f;
                 opaqueExt.metallicConstant  = 0.0f;
-                opaqueExt.alphaTestType       = mesh.alphaTestEnabled ? mesh.alphaTestType : 7;
-                opaqueExt.alphaReferenceValue = mesh.alphaTestEnabled ? mesh.alphaTestRef  : 0;
-                // Per remix_c.h: useDrawCallAlphaState=1 means "use InstanceInfoBlendEXT
-                // as alpha state source." We submit DrawInstance with InstanceInfoGpu-
-                // InstancingEXT only (no blend ext), so =1 made Remix ignore the
-                // alphaTestType/alphaReferenceValue above and render fully opaque.
-                // Setting =0 makes Remix use the explicit alpha fields, restoring
-                // alpha-test cutouts on foliage / decals / perforated geometry.
-                // Alpha BLEND (glass, smoke) is still unaddressed -- needs an
-                // InstanceInfoBlendEXT submission path in OnFrame, follow-up work.
-                opaqueExt.useDrawCallAlphaState = 0;
+                // Per remix_c.h: useDrawCallAlphaState=1 means "use Instance-
+                // InfoBlendEXT as alpha state source" -- Remix consumes the
+                // per-instance blend ext (chained at DrawInstance time in
+                // OnFrame) for BOTH alpha test and alpha blend; the material-
+                // level alphaTestType/alphaReferenceValue fields are ignored.
+                //
+                // alphaBlendEnabled=true: switch to per-instance state. OnFrame
+                //   builds the InstanceInfoBlendEXT from DrawableInstance's
+                //   srcColorBlendFactor/dstColorBlendFactor/alphaTest* fields.
+                //   The material-level alpha fields are zeroed because they're
+                //   ignored in this mode.
+                //
+                // alphaBlendEnabled=false: keep the material-level alpha-test
+                //   path. Remix uses opaqueExt.alphaTestType +
+                //   alphaReferenceValue, no blend ext needed. This preserves
+                //   the existing alpha-test cutout behavior on foliage and
+                //   chain-link without churning the bucket layout.
+                if (mesh.alphaBlendEnabled) {
+                    opaqueExt.useDrawCallAlphaState = 1;
+                    opaqueExt.alphaTestType         = 7;
+                    opaqueExt.alphaReferenceValue   = 0;
+                } else {
+                    opaqueExt.useDrawCallAlphaState = 0;
+                    opaqueExt.alphaTestType         = mesh.alphaTestEnabled ? mesh.alphaTestType : 7;
+                    opaqueExt.alphaReferenceValue   = mesh.alphaTestEnabled ? mesh.alphaTestRef  : 0;
+                }
                 pNext = &opaqueExt;
             }
 
@@ -893,6 +924,20 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.chunkOriginY = mesh.chunkOriginY;
     inst.chunkExtent  = mesh.chunkExtent;
     inst.isWater      = mesh.isWater;
+
+    // Alpha-blend + alpha-test state for the OnFrame InstanceInfoBlendEXT
+    // chain (only consumed when alphaBlendEnabled=true; the material was
+    // built with useDrawCallAlphaState=1 in that case so the per-instance
+    // state is the source of truth).
+    inst.alphaBlendEnabled    = mesh.alphaBlendEnabled;
+    inst.srcColorBlendFactor  = mesh.srcColorBlendFactor;
+    inst.dstColorBlendFactor  = mesh.dstColorBlendFactor;
+    inst.alphaTestEnabled     = mesh.alphaTestEnabled;
+    inst.alphaTestType        = mesh.alphaTestType;
+    inst.alphaTestRef         = mesh.alphaTestRef;
+
+    // Decal tag for the OnFrame DECAL_STATIC categoryFlag.
+    inst.isDecal              = mesh.isDecal;
 
     g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
