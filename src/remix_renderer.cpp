@@ -1214,7 +1214,54 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER;
             }
 
-            remixapi_InstanceInfoGpuInstancingEXT gpuExt = {};
+            // Decal tag (2026-05-01). All bucket members share isDecal because
+            // the static decal bit is per-mesh and the bucket key (mesh handle)
+            // implies identical mesh + material. Setting DECAL_STATIC makes
+            // dxvk-remix apply its decal depth-offset Z-fight-prevention pass
+            // against the underlying surface so the decal blends cleanly
+            // instead of fighting for the same depth.
+            if (!bucket.members.empty() && bucket.members[0]->isDecal) {
+                instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
+            }
+
+            remixapi_InstanceInfoGpuInstancingEXT gpuExt   = {};
+            remixapi_InstanceInfoBlendEXT         blendExt = {};
+
+            // Per-instance blend ext (2026-05-01). Built when the bucket's
+            // drawables need per-instance alpha state. The material was built
+            // in SubmitDrawable with useDrawCallAlphaState=1 in this case, so
+            // Remix consumes this struct as the source of BOTH alpha test and
+            // alpha blend (material-level alpha fields are ignored). All
+            // bucket members share blend state because the material cache key
+            // folds in src/dstColorBlendFactor + alpha-test fields, so reading
+            // from members[0] is correct for the whole bucket.
+            const bool needBlendExt = !bucket.members.empty() &&
+                                       bucket.members[0]->alphaBlendEnabled;
+            if (needBlendExt) {
+                const DrawableInstance* m = bucket.members[0];
+                blendExt.sType                      = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
+                blendExt.pNext                      = nullptr;
+                blendExt.alphaTestEnabled           = m->alphaTestEnabled ? 1 : 0;
+                blendExt.alphaTestReferenceValue    = m->alphaTestRef;
+                blendExt.alphaTestCompareOp         = m->alphaTestType;
+                blendExt.alphaBlendEnabled          = 1;
+                blendExt.srcColorBlendFactor        = m->srcColorBlendFactor;
+                blendExt.dstColorBlendFactor        = m->dstColorBlendFactor;
+                blendExt.colorBlendOp               = 0;   // VK_BLEND_OP_ADD
+                blendExt.textureColorArg1Source     = 0;
+                blendExt.textureColorArg2Source     = 0;
+                blendExt.textureColorOperation      = 0;
+                blendExt.textureAlphaArg1Source     = 0;
+                blendExt.textureAlphaArg2Source     = 0;
+                blendExt.textureAlphaOperation      = 0;
+                blendExt.tFactor                    = 0xFFFFFFFFu;
+                blendExt.isTextureFactorBlend       = 0;
+                blendExt.srcAlphaBlendFactor        = m->srcColorBlendFactor;
+                blendExt.dstAlphaBlendFactor        = m->dstColorBlendFactor;
+                blendExt.alphaBlendOp               = 0;   // VK_BLEND_OP_ADD
+                blendExt.writeMask                  = 0xF; // RGBA
+                blendExt.isVertexColorBakedLighting = 0;
+            }
 
             if (bucket.members.size() == 1) {
                 // Simple path: base transform carries the world placement.
@@ -1224,6 +1271,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                         instance.transform.matrix[r][c] = member->worldTransform[r][c];
                     }
                 }
+                // pNext: blendExt directly, or nullptr if not needed.
+                instance.pNext = needBlendExt ? (void*)&blendExt : nullptr;
             } else {
                 // Batched path: identity base, per-instance transforms in pNext.
                 ++batchedBucketCount;
@@ -1242,7 +1291,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 instance.transform.matrix[2][2] = 1.0f;
 
                 gpuExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT;
-                gpuExt.pNext = nullptr;
+                // pNext chain on gpuExt: blendExt -> nullptr if needed.
+                gpuExt.pNext = needBlendExt ? (void*)&blendExt : nullptr;
                 gpuExt.instanceTransforms_values = bucket.transforms.data();
                 gpuExt.instanceTransforms_count  = (uint32_t)bucket.transforms.size();
                 instance.pNext = &gpuExt;
