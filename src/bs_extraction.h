@@ -45,6 +45,12 @@ struct ExtractedMesh {
     uint32_t srcColorBlendFactor = 1;  // VK_BLEND_FACTOR_ONE
     uint32_t dstColorBlendFactor = 0;  // VK_BLEND_FACTOR_ZERO
 
+    // Decal tag (set by lighting_static resolver from BSLightingShaderProperty
+    // shader-flag bit). When true, OnFrame ORs REMIXAPI_INSTANCE_CATEGORY_BIT_
+    // DECAL_STATIC into the instance categoryFlags so dxvk-remix applies decal
+    // depth-offset Z-fight prevention.
+    bool isDecal = false;
+
     // Worldspace LOD chunk metadata (2026-04-28). When isLODChunk is true,
     // OnFrame applies a spatial filter: skip drawing if the player's world
     // position is INSIDE the chunk's coverage area (the in-cell static refs
