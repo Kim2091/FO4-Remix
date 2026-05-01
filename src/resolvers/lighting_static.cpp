@@ -153,6 +153,24 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
     BsExtraction::ExtractAlphaState(tri, mesh);
 
+    // Decal tag. BSLightingShaderProperty::flags (UInt64 at +0x30) packs
+    // shader-flags-1 in the lower 32 bits and shader-flags-2 in the upper.
+    // The decal bit is in flags1: bit 26, mask 0x04000000. Confirmed for FO4
+    // 1.10.980 by static analysis of the BGSM flag-applier at VA 0x142163480
+    // (called from BSLightingShaderProperty::SetMaterial at 0x142162D7C):
+    // it passes bit index 0x1A to SetFlag (RVA 0x02161950) for the decal
+    // path, gated on the same source byte that drives bit 27 (Dynamic_Decal,
+    // 0x08000000). Matches Skyrim's SLSF1_Decal layout. F4SE's published
+    // kShaderFlags_* enum at NiProperties.h:125-129 omits this flag.
+    if (state.property) {
+        const uint64_t propFlagsEarly = *reinterpret_cast<uint64_t*>(
+            reinterpret_cast<uintptr_t>(state.property) + 0x30);
+        constexpr uint64_t kSLSF1_Decal = 0x0000000004000000ULL;
+        if (propFlagsEarly & kSLSF1_Decal) {
+            mesh.isDecal = true;
+        }
+    }
+
     // Detect FO4 worldspace LOD chunk and tag the mesh so OnFrame can apply
     // a spatial filter (skip-when-player-is-inside-coverage). Two patterns
     // identified by the 2026-04-28 parent-chain diagnostic:
@@ -288,13 +306,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     }
 
     _MESSAGE("FO4RemixPlugin: [Resolver] submitted hash=0x%llX name=\"%s\" "
-             "isLOD=%d flags=0x%016llX tech=0x%08X pos=(%.1f,%.1f,%.1f) "
+             "isLOD=%d isDecal=%d flags=0x%016llX tech=0x%08X pos=(%.1f,%.1f,%.1f) "
              "p1=\"%s\"(0x%016llX) p2=\"%s\"(0x%016llX) "
              "matType=%u propFlags=0x%016llX effectState=%p "
-             "alphaFlags=0x%04X alphaThreshold=%u alphaTestEnabled=%d",
+             "alphaFlags=0x%04X alphaThreshold=%u alphaTestEnabled=%d "
+             "alphaBlendEnabled=%d srcFactor=%u dstFactor=%u",
              (unsigned long long)hash,
              meshName ? meshName : "(null)",
              isLOD ? 1 : 0,
+             mesh.isDecal ? 1 : 0,
              (unsigned long long)state.lastFlags,
              state.lastTechniqueFlags,
              tri->m_worldTransform.pos.x,
@@ -303,7 +323,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
              p1Name, (unsigned long long)p1Flags,
              p2Name, (unsigned long long)p2Flags,
              matType, (unsigned long long)propFlags, effectState,
-             alphaFlags, alphaThreshold, mesh.alphaTestEnabled ? 1 : 0);
+             alphaFlags, alphaThreshold, mesh.alphaTestEnabled ? 1 : 0,
+             mesh.alphaBlendEnabled ? 1 : 0,
+             mesh.srcColorBlendFactor, mesh.dstColorBlendFactor);
     for (const auto& t : newTextures) {
         state.textureHashes.insert(t.hash);
     }
