@@ -1248,12 +1248,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 blendExt.srcColorBlendFactor        = m->srcColorBlendFactor;
                 blendExt.dstColorBlendFactor        = m->dstColorBlendFactor;
                 blendExt.colorBlendOp               = 0;   // VK_BLEND_OP_ADD
-                blendExt.textureColorArg1Source     = 0;
-                blendExt.textureColorArg2Source     = 0;
-                blendExt.textureColorOperation      = 0;
-                blendExt.textureAlphaArg1Source     = 0;
-                blendExt.textureAlphaArg2Source     = 0;
-                blendExt.textureAlphaOperation      = 0;
+                // DX9-fixed-function texture stage state. dxvk-remix maps these
+                // to its internal RtTextureArgSource / DxvkRtTextureOperation
+                // enums in rtx_remix_api.cpp:914-921. Zero-initializing them
+                // produces (None / Disable) which silences the texture sampler
+                // entirely (renders untextured/black). Use the same defaults
+                // dxvk-remix bakes into RtSurface (rtx_materials.h:341-347):
+                // "modulate texture by current, alpha = SelectArg1(texture)" --
+                // i.e. plain textured passthrough that respects the diffuse
+                // texture's alpha channel for the alpha-blend equation.
+                blendExt.textureColorArg1Source     = 1;   // RtTextureArgSource::Texture
+                blendExt.textureColorArg2Source     = 0;   // RtTextureArgSource::None
+                blendExt.textureColorOperation      = 3;   // DxvkRtTextureOperation::Modulate
+                blendExt.textureAlphaArg1Source     = 1;   // RtTextureArgSource::Texture
+                blendExt.textureAlphaArg2Source     = 0;   // RtTextureArgSource::None
+                blendExt.textureAlphaOperation      = 1;   // DxvkRtTextureOperation::SelectArg1
                 blendExt.tFactor                    = 0xFFFFFFFFu;
                 blendExt.isTextureFactorBlend       = 0;
                 blendExt.srcAlphaBlendFactor        = m->srcColorBlendFactor;
