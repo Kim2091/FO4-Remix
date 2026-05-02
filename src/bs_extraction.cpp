@@ -599,6 +599,46 @@ static void InvertUncompressed(ExtractedTexture& tex)
     }
 }
 
+// Synthesize alpha = max(R,G,B) for diffuse textures whose authored alpha
+// channel is unreliable for cutout. BGS LOD foliage atlases (Commonwealth.
+// Objects.DDS) are BC1 with no alpha at all; vanilla DX11's rasterizer hides
+// this because cutout regions render as dark blobs that blend into the
+// distance, but Remix's path tracer applies our converted-from-smoothness
+// roughness map at those pixels and produces mirror-reflective rectangles
+// where vanilla showed dark.
+//
+// `forceForBC3` controls behavior on BC3/BC7/RGBA8 inputs:
+//   false (default): no-op for non-BC1, preserves their authored alpha
+//   true: ALSO decompress + overwrite alpha for BC3 inputs. Used for
+//         decal-tagged surfaces, where BGS sometimes packs non-cutout data
+//         in BC3.a so the authored alpha doesn't behave as a clean mask.
+static void DiffuseAlphaFromLuminance_Apply(ExtractedTexture& tex, bool forceForBC3)
+{
+    bool isBC1 = (tex.dxgiFormat == DXGI_FORMAT_BC1_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC1_UNORM_SRGB ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC1_TYPELESS);
+    bool isBC3 = (tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM_SRGB ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC3_TYPELESS);
+
+    if (!isBC1 && !(forceForBC3 && isBC3)) return;
+
+    // Reuse DecompressBC with BCTransform::None to get RGBA8.
+    if (!DecompressBC(tex, BCTransform::None)) return;
+
+    for (uint32_t i = 0; i < tex.width * tex.height; i++) {
+        uint8_t r = tex.pixels[i * 4 + 0];
+        uint8_t g = tex.pixels[i * 4 + 1];
+        uint8_t b = tex.pixels[i * 4 + 2];
+        // max(R,G,B) instead of perceptual luminance (0.299R+0.587G+0.114B):
+        // BGS atlases pack the silhouette as "dark = cutout, any color = leaf",
+        // so the brightest channel is the most reliable cutout signal. A
+        // perceptual weighting would discard mid-bright red/blue pixels.
+        uint8_t a = (r > g) ? (r > b ? r : b) : (g > b ? g : b);
+        tex.pixels[i * 4 + 3] = a;
+    }
+}
+
 // Convert FO4 smoothness/spec mask → Remix roughness by inverting RGB
 static void SmoothnessToRoughness(ExtractedTexture& tex)
 {
@@ -690,7 +730,8 @@ static void ConvertNormalToOctahedral(ExtractedTexture& tex)
 uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                        ID3D11Device* device,
                                        std::vector<ExtractedTexture>& newTextures,
-                                       TexturePostProcess postProcess)
+                                       TexturePostProcess postProcess,
+                                       uint8_t minRoughness)
 {
     if (!tex) return 0;
 
@@ -704,8 +745,15 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     const char* texName = tex->name.c_str();
     uint64_t hash = FnvHash(texName ? texName : "");
     // Include post-processing mode so variants don't collide
-    if (postProcess == TexturePostProcess::InvertRGB)  hash = FnvHashCombine(hash, 1);
-    if (postProcess == TexturePostProcess::Octahedral) hash = FnvHashCombine(hash, 2);
+    if (postProcess == TexturePostProcess::InvertRGB)                         hash = FnvHashCombine(hash, 1);
+    if (postProcess == TexturePostProcess::Octahedral)                        hash = FnvHashCombine(hash, 2);
+    if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminance)         hash = FnvHashCombine(hash, 3);
+    if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminanceForceBC3) hash = FnvHashCombine(hash, 5);
+    // Fold roughness clamp into the cache key so a roughness texture extracted
+    // for a decal (clamped) and the same texture for a non-decal (un-clamped)
+    // hash differently. Otherwise the first-seen variant would poison the
+    // cache for the other case.
+    if (minRoughness > 0)                                             hash = FnvHashCombine(hash, 4 | (uint64_t)minRoughness << 8);
 
     // Check cache first
     auto it = g_textureCache.find(hash);
@@ -800,8 +848,33 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     for (auto& mip : mips) {
         if (postProcess == TexturePostProcess::InvertRGB) {
             SmoothnessToRoughness(mip);
+            // Clamp roughness for decal surfaces. Bethesda's smoothness map is
+            // often set to "very smooth" on decals; after InvertRGB that
+            // becomes near-zero roughness (mirror) which the path tracer
+            // renders literally. Vanilla DX11 hides this with specular
+            // highlights. Clamping the RGB channels (which carry roughness
+            // after our inversion) to >= minRoughness prevents mirror surfaces
+            // while preserving relative variation. Only applied on the BC1/
+            // BC3/BC5 -> RGBA8 path; BC7 / unknown formats fall through
+            // SmoothnessToRoughness as-is and are not clamped here (acceptable
+            // since they're rare).
+            if (minRoughness > 0 &&
+                (mip.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                 mip.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                 mip.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                 mip.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
+                for (uint32_t i = 0; i < mip.width * mip.height; i++) {
+                    if (mip.pixels[i * 4 + 0] < minRoughness) mip.pixels[i * 4 + 0] = minRoughness;
+                    if (mip.pixels[i * 4 + 1] < minRoughness) mip.pixels[i * 4 + 1] = minRoughness;
+                    if (mip.pixels[i * 4 + 2] < minRoughness) mip.pixels[i * 4 + 2] = minRoughness;
+                }
+            }
         } else if (postProcess == TexturePostProcess::Octahedral) {
             ConvertNormalToOctahedral(mip);
+        } else if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminance) {
+            DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/false);
+        } else if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminanceForceBC3) {
+            DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/true);
         }
     }
 

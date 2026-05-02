@@ -220,12 +220,45 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     ResolverTrace::g_lastStep.store(Trace::kMaterialFetched, std::memory_order_relaxed);
 
     std::vector<ExtractedTexture> newTextures;
+    // For alpha-tested or alpha-blended geometry: synthesize alpha from RGB
+    // luminance if the diffuse is BC1 (no alpha channel). BGS LOD foliage
+    // atlases are stored as BC1; vanilla DX11's rasterizer hides the lack of
+    // alpha (cutout regions render as dark blobs), but Remix's path tracer
+    // applies our smoothness-derived roughness map at those pixels and
+    // produces mirror-reflective rectangles. The synthesized alpha gives the
+    // path tracer a real channel to test against.
+    //
+    // Decals additionally force synthesis on BC3 diffuses: BGS sometimes
+    // packs non-cutout data in BC3.a so the authored alpha doesn't behave as
+    // a clean mask. Overriding it with luminance gives a usable cutout for
+    // the path tracer.
+    // Reverted (2026-05-02): forcing luminance synthesis on BC3 decals turned
+    // out to destroy perfectly-good authored alpha. Verified by extracting
+    // and decoding DecalDebrise05_d.DDS: BC3 alpha is a proper cutout mask
+    // (10% near-zero, 23% near-255, full spread across buckets, 17% pass the
+    // alphaTest=241 threshold). Bethesda's authored alpha is clean for these
+    // BC3 decals; synthesis would replace it with worse luminance-derived
+    // values. Use the BC1-only synthesis: BC1 inputs (no alpha at all) get
+    // the synthesized cutout, BC3/BC7 inputs preserve their authored alpha.
+    const TexturePostProcess diffusePostProcess =
+        (mesh.alphaTestEnabled || mesh.alphaBlendEnabled)
+            ? TexturePostProcess::DiffuseAlphaFromLuminance
+            : TexturePostProcess::None;
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spDiffuseTexture, "diffuse", device, newTextures);
+        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
+    // For decals, clamp the lower bound of the resulting roughness texture
+    // so the surface can't be more reflective than ~30% rough (76/255).
+    // Bethesda's smoothness map is often "very smooth" on decals; after our
+    // InvertRGB conversion that becomes roughness near 0 (mirror), which the
+    // path tracer renders literally. Vanilla DX11 hides this with specular
+    // highlights. The clamp preserves authoring intent (relative variation)
+    // while preventing literal-mirror decals.
+    const uint8_t roughnessFloor = mesh.isDecal ? 76 : 0;
     mesh.roughnessTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures, TexturePostProcess::InvertRGB);
+        mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures,
+        TexturePostProcess::InvertRGB, roughnessFloor);
     BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
                                       mesh.emissiveTextureHash,
                                       mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,

@@ -88,7 +88,40 @@ struct CellInfo {
 // ---------------------------------------------------------------------------
 // Texture post-processing modes (shared between bs_extraction and skinning)
 // ---------------------------------------------------------------------------
-enum class TexturePostProcess { None, InvertRGB, Octahedral };
+// Texture post-processing modes applied during ExtractMaterialTexture.
+//
+// - None: pass-through, preserve source format (BC1/BC3/BC7 stay compressed,
+//   RGBA8 stays uncompressed). Used for plain diffuse textures.
+//
+// - InvertRGB: smoothness->roughness conversion. RGB channels are inverted so
+//   smoothness=1 (mirror) becomes roughness=0. Decompresses BC1/BC3/BC5 to
+//   RGBA8 first; BC7/other passes through unchanged. Used for the
+//   spSmoothnessSpecMaskTexture slot.
+//
+// - Octahedral: tangent-space normal -> hemispherical octahedral encoding.
+//   Decompresses BC1/BC3/BC5 to RGBA8 first; BC7/other passes through.
+//   Used for the spNormalTexture slot.
+//
+// - DiffuseAlphaFromLuminance: ONLY for BC1 source format -- decompress to
+//   RGBA8 and synthesize alpha = max(R, G, B) so the cutout regions of an
+//   atlas (near-black RGB) become transparent. Bethesda's LOD foliage
+//   atlases (e.g. Commonwealth.Objects.DDS) are stored as BC1 with no
+//   alpha channel; vanilla DX11's rasterizer hides this because cutout
+//   regions render as dark blobs that blend into the distance, but Remix's
+//   path tracer applies our converted-from-smoothness roughness map at
+//   those pixels and produces mirror-reflective rectangles where vanilla
+//   showed dark. Synthesizing alpha from luminance gives the path tracer a
+//   real alpha channel to test against.
+//   Non-BC1 inputs (BC3/BC7/RGBA8) are passed through unchanged because
+//   they already have a usable alpha channel. Used for diffuse on
+//   alpha-tested or alpha-blended geometry.
+// (See full comment block above.)
+//
+// - DiffuseAlphaFromLuminanceForceBC3: like DiffuseAlphaFromLuminance but
+//   also overrides BC3.a on BC3 inputs. Used for decal-tagged surfaces
+//   specifically, where BGS sometimes packs non-cutout data in the BC3
+//   alpha channel so the authored alpha doesn't behave as a clean mask.
+enum class TexturePostProcess { None, InvertRGB, Octahedral, DiffuseAlphaFromLuminance, DiffuseAlphaFromLuminanceForceBC3 };
 
 // ---------------------------------------------------------------------------
 // Common vertex/index extraction result -- shared between static and skinned paths
@@ -136,11 +169,21 @@ namespace BsExtraction {
     // Get the BSLightingShaderMaterialBase from a shape, or nullptr
     BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape);
 
-    // Generic texture extraction from any NiTexture slot
+    // Generic texture extraction from any NiTexture slot.
+    //
+    // minRoughness: when non-zero AND postProcess == InvertRGB, clamps the
+    // resulting RGB channels (the roughness output) to >= this value. Used
+    // for decal surfaces, where Bethesda's smoothness map is often set to
+    // "very smooth" which after InvertRGB becomes roughness near 0 (mirror)
+    // -- vanilla DX11 hides this with specular highlights, but the path
+    // tracer treats it as a literal mirror. Clamping to ~30% roughness
+    // keeps glossy variation while preventing decals from being more
+    // reflective than a polished surface should be.
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,
                                     std::vector<ExtractedTexture>& newTextures,
-                                    TexturePostProcess postProcess = TexturePostProcess::None);
+                                    TexturePostProcess postProcess = TexturePostProcess::None,
+                                    uint8_t minRoughness = 0);
 
     // Extract emissive data from a shape's shader property and material
     void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
