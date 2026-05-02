@@ -733,13 +733,27 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                                        TexturePostProcess postProcess,
                                        uint8_t minRoughness)
 {
-    if (!tex) return 0;
+    // Early-bail diagnostic: log when diffuse texture extraction fails because
+    // the D3D resource isn't available. Helps distinguish "decal not extracted
+    // because path doesn't reach here" vs "decal not extracted because the
+    // NiTexture has no backing D3D resource".
+    auto bailLog = [&](const char* reason) {
+        static int s_bailCount = 0;
+        const bool isDiffuseSlot = slotName && std::strcmp(slotName, "diffuse") == 0;
+        if (isDiffuseSlot && s_bailCount < 50) {
+            _MESSAGE("FO4RemixPlugin: DEBUG diffuse-extract BAIL reason='%s' tex_ptr=%p",
+                     reason, (void*)tex);
+            s_bailCount++;
+        }
+    };
+
+    if (!tex) { bailLog("null NiTexture"); return 0; }
 
     BSRenderData* renderData = tex->rendererData;
-    if (!renderData) return 0;
+    if (!renderData) { bailLog("null renderData"); return 0; }
 
     ID3D11Resource* resource = renderData->resource;
-    if (!resource) return 0;
+    if (!resource) { bailLog("null resource"); return 0; }
 
     // Stable hash from texture name so hashes are consistent across runs
     const char* texName = tex->name.c_str();
@@ -783,6 +797,75 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // changes.
     for (auto& mip : mips) {
         DecompressBC2(mip);
+    }
+
+    // --- Debug dump: BC3 alpha cutout (right after readback) ---
+    // Captures the EXACT BC3 alpha bytes that ReadbackAllMips produced.
+    // If dump shows a clean cutout matching the BA2 file -> bytes leaving
+    // this plugin function are intact, bug is downstream (upload or Remix
+    // sampling). If dump shows all-1.0 white -> Bethesda's runtime handed
+    // us a BC3 texture with alpha stripped/replaced, and the readback path
+    // needs investigation. Fires for diffuse textures on BC3 inputs only,
+    // first 3 dumps per process. Also logs format/dims for first 5 diffuse
+    // extractions regardless of format so we can confirm whether decal
+    // diffuse comes back as BC3 at all.
+    {
+        static int s_dumpBC3Alpha = 0;
+        static int s_logDiffuseFormat = 0;
+        // Filter on slotName == "diffuse" so we see ALL diffuse extractions.
+        const bool isDiffuseSlot = slotName && std::strcmp(slotName, "diffuse") == 0;
+        if (isDiffuseSlot) {
+            const auto& mip0 = mips[0];
+            if (s_logDiffuseFormat < 9999) {
+                _MESSAGE("FO4RemixPlugin: DEBUG diffuse-extract tex='%s' fmt=%u %ux%u mips=%zu pp=%d",
+                         texName ? texName : "(null)",
+                         (unsigned)mip0.dxgiFormat,
+                         mip0.width, mip0.height, mips.size(),
+                         (int)postProcess);
+                s_logDiffuseFormat++;
+            }
+            const bool isBC3 = (mip0.dxgiFormat == DXGI_FORMAT_BC3_UNORM ||
+                                mip0.dxgiFormat == DXGI_FORMAT_BC3_UNORM_SRGB ||
+                                mip0.dxgiFormat == DXGI_FORMAT_BC3_TYPELESS);
+            // Dump first 30 BC3 diffuses regardless of name. The "decal" name
+            // filter was too restrictive -- DebrisPile/TrashDecal etc don't
+            // necessarily have "decal" in the texture FILENAME.
+            if (s_dumpBC3Alpha < 30 && isBC3 && mip0.width >= 4 && mip0.height >= 4) {
+                const uint32_t numBlocksX = mip0.width / 4;
+                const uint32_t numBlocksY = mip0.height / 4;
+                std::vector<uint8_t> rgba(mip0.width * mip0.height * 4, 0);
+                uint32_t aMin = 255, aMax = 0, aSum = 0, aCount = 0;
+
+                for (uint32_t by = 0; by < numBlocksY; by++) {
+                    for (uint32_t bx = 0; bx < numBlocksX; bx++) {
+                        const uint8_t* block = mip0.pixels.data() + (by * numBlocksX + bx) * 16;
+                        uint8_t alphas[4][4];
+                        DecodeBC3AlphaBlock(block, alphas);
+                        for (uint32_t y = 0; y < 4; y++) {
+                            for (uint32_t x = 0; x < 4; x++) {
+                                const uint8_t a = alphas[y][x];
+                                const uint32_t px = (by * 4 + y) * mip0.width + (bx * 4 + x);
+                                rgba[px * 4 + 0] = a;
+                                rgba[px * 4 + 1] = a;
+                                rgba[px * 4 + 2] = a;
+                                rgba[px * 4 + 3] = 255;
+                                if (a < aMin) aMin = a;
+                                if (a > aMax) aMax = a;
+                                aSum += a;
+                                aCount++;
+                            }
+                        }
+                    }
+                }
+
+                char path[256];
+                snprintf(path, sizeof(path), "c:/temp/fo4_debug_bc3_alpha_%d.tga", s_dumpBC3Alpha++);
+                DebugDumpTGA(path, rgba.data(), mip0.width, mip0.height);
+                const uint32_t aMean = aCount > 0 ? aSum / aCount : 0;
+                _MESSAGE("FO4RemixPlugin: DEBUG dumped BC3 alpha -> %s tex='%s' min=%u max=%u mean=%u",
+                         path, texName ? texName : "(null)", aMin, aMax, aMean);
+            }
+        }
     }
 
     // --- Debug dump: diffuse control (no post-processing) ---
@@ -1173,6 +1256,19 @@ void BsExtraction::ExtractAlphaState(BSGeometry* geo, ExtractedMesh& mesh) {
     bool testEnabled = (alphaProp->alphaFlags >> 9) & 1;
     if (testEnabled) {
         int niTestFunc = (alphaProp->alphaFlags >> 10) & 7;
+        // Bethesda quirk: many alpha-tested surfaces (rubble, roof debris,
+        // postwar-house support posts) ship NiAlphaProperty with function=Always
+        // despite needing real cutout. Vanilla DX11's shader appears to apply
+        // a hardcoded discard against the threshold regardless of the function
+        // field. Translating Always literally to VK_COMPARE_OP_ALWAYS makes
+        // Remix's path tracer reject nothing -> surfaces render as solid
+        // opaque rectangles. Override Always->Greater when the artist set a
+        // meaningful reference value, matching what vanilla actually does.
+        // Foliage and workshop supports already ship with function=Greater
+        // and aren't affected.
+        if (niTestFunc == 0 && alphaProp->alphaThreshold > 0) {
+            niTestFunc = 4;  // NI Greater
+        }
         // NI:  Always=0, Less=1, Equal=2, LessEq=3, Greater=4, NotEq=5, GreaterEq=6, Never=7
         // VK:  Never=0,  Less=1, Equal=2, LessEq=3, Greater=4, NotEq=5, GreaterEq=6, Always=7
         static const int niToVk[] = { 7, 1, 2, 3, 4, 5, 6, 0 };
