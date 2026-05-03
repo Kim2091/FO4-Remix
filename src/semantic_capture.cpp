@@ -238,6 +238,59 @@ static int LogParentChainGuarded(uint64_t logN, void* geometry,
     }
 }
 
+// SEH-guarded leaf class name lookup. Same vtable->COL->TypeDescriptor walk
+// as the parent-chain logger, but for a single object. Writes empty string
+// on null input, "?" on fault.
+static int GetLeafClassNameGuarded(void* obj, uintptr_t modBase,
+                                   char* out, size_t outSize) {
+    __try {
+        if (!obj) {
+            out[0] = '\0';
+            return 0;
+        }
+        void* vtable = *reinterpret_cast<void**>(obj);
+        if (!vtable) {
+            out[0] = '?'; out[1] = '\0';
+            return 0;
+        }
+        void* col = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(vtable) - 8);
+        if (!col) {
+            out[0] = '?'; out[1] = '\0';
+            return 0;
+        }
+        uint32_t typeRva = *reinterpret_cast<uint32_t*>(
+            reinterpret_cast<uintptr_t>(col) + 0x0C);
+        const char* mangled = reinterpret_cast<const char*>(
+            modBase + typeRva + 0x10);
+        const char* p = mangled;
+        if (p[0] == '.' && p[1] == '?' && p[2] == 'A') p += 4;
+        size_t k = 0;
+        while (k + 1 < outSize && p[k] != '\0' && p[k] != '@') {
+            out[k] = p[k];
+            ++k;
+        }
+        out[k] = '\0';
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (outSize > 0) {
+            out[0] = '?';
+            if (outSize > 1) out[1] = '\0';
+        }
+        return 1;
+    }
+}
+
+} // close anonymous namespace before exporting public function
+
+void SemanticCapture::GetLeafClassName(void* obj, char* out, size_t outSize) {
+    if (outSize == 0 || !out) return;
+    out[0] = '\0';
+    GetLeafClassNameGuarded(obj, g_moduleBase, out, outSize);
+}
+
+namespace { // reopen anonymous namespace
+
 // Shared detour body. The per-target wrappers above pass their compile-time
 // resolver kind; the body uses it to tag the DrawableState and to call
 // through the right original-fn pointer for the tail call.

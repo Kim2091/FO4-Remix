@@ -338,14 +338,29 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             reinterpret_cast<uintptr_t>(effectState) + 0x2A);
     }
 
+    // Rotation+scale dump (PROBE 2026-05-03): roads/statics rendering flat
+    // when bUsePreCombines=0; need to see whether m_worldTransform.rot
+    // arrives as identity (rotation lost upstream) or with the slope intact
+    // (then BuildRemixTransform / Remix submission is the leak).
+    const auto& rot = tri->m_worldTransform.rot;
+    const float scale = tri->m_worldTransform.scale;
+    // Leaf RTTI class name (PROBE 2026-05-03): identify whether road/static
+    // sub-meshes are plain BSTriShape vs BSMergeInstancedTriShape vs another
+    // subclass with per-instance transform attributes we don't handle.
+    char leafClass[64] = "";
+    SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
+                                      leafClass, sizeof(leafClass));
     _MESSAGE("FO4RemixPlugin: [Resolver] submitted hash=0x%llX name=\"%s\" "
+             "leafClass=\"%s\" "
              "isLOD=%d isDecal=%d flags=0x%016llX tech=0x%08X pos=(%.1f,%.1f,%.1f) "
              "p1=\"%s\"(0x%016llX) p2=\"%s\"(0x%016llX) "
              "matType=%u propFlags=0x%016llX effectState=%p "
              "alphaFlags=0x%04X alphaThreshold=%u alphaTestEnabled=%d "
-             "alphaBlendEnabled=%d srcFactor=%u dstFactor=%u",
+             "alphaBlendEnabled=%d srcFactor=%u dstFactor=%u "
+             "rot=[%.3f,%.3f,%.3f|%.3f,%.3f,%.3f|%.3f,%.3f,%.3f] scale=%.3f",
              (unsigned long long)hash,
              meshName ? meshName : "(null)",
+             leafClass[0] ? leafClass : "(unknown)",
              isLOD ? 1 : 0,
              mesh.isDecal ? 1 : 0,
              (unsigned long long)state.lastFlags,
@@ -358,7 +373,11 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
              matType, (unsigned long long)propFlags, effectState,
              alphaFlags, alphaThreshold, mesh.alphaTestEnabled ? 1 : 0,
              mesh.alphaBlendEnabled ? 1 : 0,
-             mesh.srcColorBlendFactor, mesh.dstColorBlendFactor);
+             mesh.srcColorBlendFactor, mesh.dstColorBlendFactor,
+             rot.data[0][0], rot.data[0][1], rot.data[0][2],
+             rot.data[1][0], rot.data[1][1], rot.data[1][2],
+             rot.data[2][0], rot.data[2][1], rot.data[2][2],
+             scale);
     for (const auto& t : newTextures) {
         state.textureHashes.insert(t.hash);
     }

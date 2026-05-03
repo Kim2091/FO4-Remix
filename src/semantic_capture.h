@@ -91,6 +91,14 @@ namespace SemanticCapture {
     // mesh.worldTransform[3][4].
     void BuildRemixTransform(const NiTransform& niXf, float out[3][4]);
 
+    // Recover the MSVC-mangled class name of a NiAVObject (or any C++ object
+    // with a vtable in the loaded Fallout4.exe module). Walks
+    // vtable[-1] -> COL -> TypeDescriptor RVA -> module_base + RVA + 0x10 =
+    // mangled string, strips ".?AV"/".?AU" prefix, trims at "@@". SEH-guarded
+    // so a stale vtable pointer doesn't crash the caller. Writes "?" on fault
+    // or empty/null input. Requires Install() to have run (sets module base).
+    void GetLeafClassName(void* obj, char* out, size_t outSize);
+
     // Install the BSLightingShaderProperty render-pass-equivalent hook
     // (slot 0x2B at Fallout4.exe RVA 0x02172540) and start tracking
     // captured drawables in the DrawableMap.
