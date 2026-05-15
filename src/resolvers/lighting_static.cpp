@@ -150,7 +150,11 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     mesh.hash = hash;
     mesh.vertices = std::move(parsed.vertices);
     mesh.indices  = std::move(parsed.indices);
-    SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
+    if (state.liveTransformValid) {
+        std::memcpy(mesh.worldTransform, state.liveWorldTransform, sizeof(mesh.worldTransform));
+    } else {
+        SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
+    }
     BsExtraction::ExtractAlphaState(tri, mesh);
 
     // Decal tag. BSLightingShaderProperty::flags (UInt64 at +0x30) packs

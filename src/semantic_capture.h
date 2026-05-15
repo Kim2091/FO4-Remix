@@ -83,6 +83,16 @@ namespace SemanticCapture {
         // major 3x4 (Beth->Remix coord swap already applied).
         float liveWorldTransform[3][4] = {};
         bool  liveTransformValid       = false;
+
+        // Lighting drawables normally key on (geometry, property, material)
+        // captured from GetRenderPasses. FO4 precombined/instanced statics can
+        // reuse that same tuple for multiple placed refs and only reveal the
+        // real per-ref transform in BSLightingShader::SetupGeometry's world-
+        // transform upload. Final-transform-keyed entries represent those
+        // per-ref placements; the base entry is marked superseded so it does
+        // not submit an extra copy using the stale NiAVObject transform.
+        bool  capturedFromFinalTransform = false;
+        bool  supersededByFinalTransform = false;
     };
 
     // Convert a Bethesda NiTransform (right-handed, X/Y in Bethesda order)

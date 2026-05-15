@@ -13,6 +13,8 @@
 #include "MinHook.h"
 
 #include <atomic>
+#include <cmath>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
 
@@ -56,6 +58,54 @@ PassKey ComputePassKey(const void* geo, const void* prop, const void* mat) {
         }
     }
     return h;
+}
+
+void HashBytesInto(PassKey& h, const void* data, size_t size) {
+    constexpr uint64_t kFnvPrime = 0x100000001B3ULL;
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < size; ++i) {
+        h ^= p[i];
+        h *= kFnvPrime;
+    }
+}
+
+int32_t QuantizeTransformComponent(float value, bool translation) {
+    if (!std::isfinite(value)) return 0;
+    const double scale = translation ? 16.0 : 10000.0;
+    double scaled = static_cast<double>(value) * scale;
+    if (scaled > 2147483647.0) return 2147483647;
+    if (scaled < -2147483648.0) return (-2147483647 - 1);
+    scaled += (scaled >= 0.0) ? 0.5 : -0.5;
+    return static_cast<int32_t>(scaled);
+}
+
+PassKey ComputePassKeyWithTransform(const void* geo,
+                                    const void* prop,
+                                    const void* mat,
+                                    const float xf[3][4]) {
+    PassKey h = ComputePassKey(geo, prop, mat);
+    const uint64_t marker = 0x46494E414C58464DULL; // "FINALXFM"
+    HashBytesInto(h, &marker, sizeof(marker));
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            const bool translation = (c == 3);
+            const int32_t q = QuantizeTransformComponent(xf[r][c], translation);
+            HashBytesInto(h, &q, sizeof(q));
+        }
+    }
+    return h;
+}
+
+bool RemixTransformsNearlyEqual(const float a[3][4], const float b[3][4]) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            const float eps = (c == 3) ? 0.0625f : 0.0001f;
+            if (std::fabs(a[r][c] - b[r][c]) > eps) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 // -------- BuildRemixTransform -- shared by resolvers --------
@@ -119,6 +169,73 @@ std::atomic<uint64_t> g_totalFires{0};
 
 std::mutex g_drawableMutex;
 std::unordered_map<PassKey, SemanticCapture::DrawableState> g_drawableMap;
+
+struct CapturedDrawable {
+    void* geometry = nullptr;
+    void* property = nullptr;
+    void* material = nullptr;
+    void* parent1 = nullptr;
+    void* parent2 = nullptr;
+    uint64_t flags = 0;
+    uint32_t techniqueFlags = 0;
+    SemanticCapture::ResolverKind kind = SemanticCapture::ResolverKind::Lighting;
+    float transform[3][4] = {};
+    bool transformValid = false;
+};
+
+void UpsertDrawableLocked(PassKey key,
+                          const CapturedDrawable& capture,
+                          uint64_t frame,
+                          bool capturedFromFinalTransform) {
+    auto& state = g_drawableMap[key];
+    if (state.firstSeenFrame == 0) {
+        state.firstSeenFrame = frame;
+        state.geometry = capture.geometry;
+        state.property = capture.property;
+        state.material = capture.material;
+        state.initialFlags = capture.flags;
+        state.parent1 = capture.parent1;
+        state.parent2 = capture.parent2;
+        state.resolverKind = capture.kind;
+        state.capturedFromFinalTransform = capturedFromFinalTransform;
+    }
+
+    state.lastSeenFrame = frame;
+    state.lastFlags = capture.flags;
+    state.fireCount += 1;
+    state.lastTechniqueFlags = capture.techniqueFlags;
+    state.supersededByFinalTransform = false;
+
+    if (capture.transformValid) {
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                state.liveWorldTransform[r][c] = capture.transform[r][c];
+            }
+        }
+        state.liveTransformValid = true;
+    }
+}
+
+void MarkDrawableSupersededLocked(PassKey key,
+                                  const CapturedDrawable& capture,
+                                  uint64_t frame) {
+    auto& state = g_drawableMap[key];
+    if (state.firstSeenFrame == 0) {
+        state.firstSeenFrame = frame;
+        state.geometry = capture.geometry;
+        state.property = capture.property;
+        state.material = capture.material;
+        state.initialFlags = capture.flags;
+        state.parent1 = capture.parent1;
+        state.parent2 = capture.parent2;
+        state.resolverKind = capture.kind;
+    }
+    state.lastSeenFrame = frame;
+    state.lastFlags = capture.flags;
+    state.fireCount += 1;
+    state.lastTechniqueFlags = capture.techniqueFlags;
+    state.supersededByFinalTransform = true;
+}
 
 // -------- Sweep cadence counter (Tick() rate-limits via this) --------
 std::atomic<uint32_t> g_sweepCounter{0};
@@ -369,29 +486,20 @@ static void* DetourGetRenderPassesShared(void* self,
 
     {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
-        auto& state = g_drawableMap[key];  // inserts default-constructed if new
-        if (state.firstSeenFrame == 0) {
-            state.firstSeenFrame = now;
-            state.geometry = geometry;
-            state.property = self;
-            state.material = material;
-            state.initialFlags = niFlags;
-            state.parent1 = p1;
-            state.parent2 = p2;
-            state.resolverKind = kind;  // tag once on first-seen
-        }
-        state.lastSeenFrame      = now;
-        state.lastFlags          = niFlags;
-        state.fireCount         += 1;
-        state.lastTechniqueFlags = technique;
+        CapturedDrawable capture{};
+        capture.geometry = geometry;
+        capture.property = self;
+        capture.material = material;
+        capture.parent1 = p1;
+        capture.parent2 = p2;
+        capture.flags = niFlags;
+        capture.techniqueFlags = technique;
+        capture.kind = kind;
+        capture.transformValid = liveXfValid;
         if (liveXfValid) {
-            for (int r = 0; r < 3; ++r) {
-                for (int c = 0; c < 4; ++c) {
-                    state.liveWorldTransform[r][c] = liveXf[r][c];
-                }
-            }
-            state.liveTransformValid = true;
+            std::memcpy(capture.transform, liveXf, sizeof(capture.transform));
         }
+        UpsertDrawableLocked(key, capture, now, false);
     }
 
     g_totalFires.fetch_add(1, std::memory_order_relaxed);
@@ -420,16 +528,17 @@ void* __fastcall DetourGetRenderPasses_Water(void* self, void* geometry,
                                        g_hookTargets[1].original);
 }
 
-// -------- Diagnostic hooks: rotation-bug investigation --------
+// -------- Final draw-transform hooks --------
 // SetupGeo hook (RVA 0x02233730) = BSLightingShader::SetupGeometry; reads
 // pass->geometry (rdx+0x18) and that geometry's m_worldTransform (+0x70).
 // CBWrite hook (RVA 0x022347D0) = the per-instance constant-buffer writer
 // SetupGeometry calls with the world transform it's about to upload. The
 // matrix here is the last view of NiTransform before the engine transposes
 // it row-major -> column-major, applies camera-relative shift, and writes
-// to the GPU vertex CB. Comparing both against GetRenderPasses' capture
-// tells us whether anything composes onto the matrix between the two.
-// Logging is capped per-hook to keep the F4SE log readable.
+// to the GPU vertex CB. FO4 precombined/instanced statics can share the same
+// BSGeometry/property tuple while receiving distinct transforms here, so this
+// hook promotes the final upload transform into the drawable key/pose.
+// Diagnostic logging remains capped per-hook to keep the F4SE log readable.
 
 typedef void (__fastcall *SetupGeometry_t)(void* self, void* pass, uint32_t flags);
 typedef void (__fastcall *WriteWorldXform_t)(void* state, void* xform);
@@ -444,6 +553,80 @@ SetupGeometry_t       g_origSetupGeo     = nullptr;
 WriteWorldXform_t     g_origWriteXform   = nullptr;
 std::atomic<uint64_t> g_setupGeoFires{0};
 std::atomic<uint64_t> g_writeXformFires{0};
+std::atomic<uint64_t> g_finalTransformCaptures{0};
+std::atomic<uint64_t> g_finalTransformKeyedCaptures{0};
+
+struct SetupGeometryContext {
+    void* geometry = nullptr;
+    void* property = nullptr;
+    void* material = nullptr;
+    uint32_t flags = 0;
+    bool valid = false;
+};
+
+thread_local SetupGeometryContext g_tlsSetupGeometryContext{};
+
+static int ReadSetupGeometryContextGuarded(void* pass,
+                                           uint32_t flags,
+                                           SetupGeometryContext* out,
+                                           unsigned long* outExc) {
+    __try {
+        if (!pass || !out) return 0;
+        void* geometry = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(pass) + 0x18);
+        void* property = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(pass) + 0x10);
+        void* material = nullptr;
+        if (property) {
+            material = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(property) + 0x58);
+        }
+        out->geometry = geometry;
+        out->property = property;
+        out->material = material;
+        out->flags = flags;
+        out->valid = (geometry != nullptr && property != nullptr);
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outExc = GetExceptionCode();
+        return 1;
+    }
+}
+
+static int ReadFinalTransformCaptureGuarded(const SetupGeometryContext* ctx,
+                                            void* xform,
+                                            CapturedDrawable* out,
+                                            float nodeTransform[3][4],
+                                            unsigned long* outExc) {
+    __try {
+        if (!ctx || !ctx->valid || !xform || !out) return 0;
+
+        const uintptr_t geo = reinterpret_cast<uintptr_t>(ctx->geometry);
+        void* p1 = *reinterpret_cast<void**>(geo + 0x28);
+        void* p2 = nullptr;
+        if (p1) {
+            p2 = *reinterpret_cast<void**>(reinterpret_cast<uintptr_t>(p1) + 0x28);
+        }
+
+        const uint64_t niFlags = *reinterpret_cast<uint64_t*>(geo + 0x108);
+        const NiTransform& nodeXf = *reinterpret_cast<const NiTransform*>(geo + 0x70);
+        const NiTransform& finalXf = *reinterpret_cast<const NiTransform*>(xform);
+
+        SemanticCapture::BuildRemixTransform(nodeXf, nodeTransform);
+        SemanticCapture::BuildRemixTransform(finalXf, out->transform);
+
+        out->geometry = ctx->geometry;
+        out->property = ctx->property;
+        out->material = ctx->material;
+        out->parent1 = p1;
+        out->parent2 = p2;
+        out->flags = niFlags;
+        out->techniqueFlags = ctx->flags;
+        out->kind = SemanticCapture::ResolverKind::Lighting;
+        out->transformValid = true;
+        return 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        *outExc = GetExceptionCode();
+        return 1;
+    }
+}
 
 static int LogSetupGeoGuarded(uint64_t n, void* pass, uint32_t flags,
                               unsigned long* outExc) {
@@ -495,7 +678,16 @@ void __fastcall DetourSetupGeometry_Lighting(void* self, void* pass, uint32_t fl
         unsigned long exc = 0;
         LogSetupGeoGuarded(n, pass, flags, &exc);
     }
+
+    SetupGeometryContext previousContext = g_tlsSetupGeometryContext;
+    SetupGeometryContext currentContext{};
+    if (pass) {
+        unsigned long exc = 0;
+        ReadSetupGeometryContextGuarded(pass, flags, &currentContext, &exc);
+    }
+    g_tlsSetupGeometryContext = currentContext;
     g_origSetupGeo(self, pass, flags);
+    g_tlsSetupGeometryContext = previousContext;
 }
 
 void __fastcall DetourWriteWorldXform(void* state, void* xform) {
@@ -504,6 +696,45 @@ void __fastcall DetourWriteWorldXform(void* state, void* xform) {
         unsigned long exc = 0;
         LogWriteXformGuarded(n, xform, &exc);
     }
+
+    if (g_tlsSetupGeometryContext.valid && xform) {
+        CapturedDrawable capture{};
+        float nodeTransform[3][4] = {};
+        unsigned long exc = 0;
+        if (ReadFinalTransformCaptureGuarded(&g_tlsSetupGeometryContext,
+                                             xform,
+                                             &capture,
+                                             nodeTransform,
+                                             &exc) == 0 &&
+            capture.geometry && capture.property && capture.material &&
+            capture.transformValid) {
+            const bool transformDiffers =
+                !RemixTransformsNearlyEqual(capture.transform, nodeTransform);
+            const PassKey baseKey = ComputePassKey(capture.geometry,
+                                                   capture.property,
+                                                   capture.material);
+            const PassKey key = transformDiffers
+                ? ComputePassKeyWithTransform(capture.geometry,
+                                              capture.property,
+                                              capture.material,
+                                              capture.transform)
+                : baseKey;
+            const uint64_t now = Diagnostics::CurrentFrameIndex();
+            {
+                std::lock_guard<std::mutex> lock(g_drawableMutex);
+                UpsertDrawableLocked(key, capture, now, transformDiffers);
+                if (transformDiffers) {
+                    MarkDrawableSupersededLocked(baseKey, capture, now);
+                }
+            }
+
+            g_finalTransformCaptures.fetch_add(1, std::memory_order_relaxed);
+            if (transformDiffers) {
+                g_finalTransformKeyedCaptures.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
     g_origWriteXform(state, xform);
 }
 
@@ -563,7 +794,7 @@ bool SemanticCapture::Install() {
         return false;
     }
 
-    // Diagnostic hooks (best-effort; never abort the install path).
+    // Final-transform hooks (best-effort; never abort the install path).
     g_addrSetupGeo = reinterpret_cast<LPVOID>(
         reinterpret_cast<uintptr_t>(hMod) + kSetupGeometryRVA);
     if (MH_CreateHook(g_addrSetupGeo,
@@ -577,7 +808,7 @@ bool SemanticCapture::Install() {
         MH_RemoveHook(g_addrSetupGeo);
         g_addrSetupGeo = nullptr;
     } else {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] installed SetupGeo diag hook at RVA 0x%llX",
+        _MESSAGE("FO4RemixPlugin: [SemCapture] installed SetupGeo final-transform hook at RVA 0x%llX",
                  (unsigned long long)kSetupGeometryRVA);
     }
 
@@ -594,7 +825,7 @@ bool SemanticCapture::Install() {
         MH_RemoveHook(g_addrWriteXform);
         g_addrWriteXform = nullptr;
     } else {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] installed CBWrite diag hook at RVA 0x%llX",
+        _MESSAGE("FO4RemixPlugin: [SemCapture] installed CBWrite final-transform hook at RVA 0x%llX",
                  (unsigned long long)kWriteWorldXformRVA);
     }
 
@@ -622,10 +853,12 @@ void SemanticCapture::Uninstall() {
     }
     g_installed.store(false);
     _MESSAGE("FO4RemixPlugin: [SemCapture] uninstalled (final fires: %llu, "
-             "setupGeo=%llu cbWrite=%llu)",
+             "setupGeo=%llu cbWrite=%llu finalXf=%llu keyedFinalXf=%llu)",
              (unsigned long long)g_totalFires.load(),
              (unsigned long long)g_setupGeoFires.load(),
-             (unsigned long long)g_writeXformFires.load());
+             (unsigned long long)g_writeXformFires.load(),
+             (unsigned long long)g_finalTransformCaptures.load(),
+             (unsigned long long)g_finalTransformKeyedCaptures.load());
 }
 
 void SemanticCapture::Tick(ID3D11Device* device) {
@@ -673,6 +906,19 @@ void SemanticCapture::Tick(ID3D11Device* device) {
 
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         for (auto& [key, state] : g_drawableMap) {
+            if (state.supersededByFinalTransform) {
+                if (state.submittedToRemix && state.meshHash != 0) {
+                    unsigned long excCode = 0;
+                    if (CallReleaseDrawableGuarded(state.meshHash, &excCode) != 0) {
+                        _MESSAGE("FO4RemixPlugin: [Resolver] CRASH CAUGHT releasing superseded "
+                                 "hash=0x%llX exception=0x%08lX -- continuing",
+                                 (unsigned long long)state.meshHash, excCode);
+                    }
+                    state.meshHash = 0;
+                    state.submittedToRemix = false;
+                }
+                continue;
+            }
             if (state.submittedToRemix) continue;
             // Freshness gate: only resolve drawables the engine touched this
             // frame or last frame. Stale pointers from older entries cause
@@ -743,6 +989,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     uint32_t evicted = 0;
     uint32_t submittedCount = 0;
     uint32_t pendingCount = 0;
+    uint32_t supersededCount = 0;
     size_t   unique  = 0;
     size_t   distinctGeoPtrs = 0;
     size_t   entriesWithGeo = 0;
@@ -780,7 +1027,9 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 it = g_drawableMap.erase(it);
                 ++evicted;
             } else {
-                if (it->second.submittedToRemix) {
+                if (it->second.supersededByFinalTransform) {
+                    ++supersededCount;
+                } else if (it->second.submittedToRemix) {
                     ++submittedCount;
                 } else {
                     ++pendingCount;
@@ -823,11 +1072,11 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     const size_t geoDups = (entriesWithGeo > distinctGeoPtrs)
         ? (entriesWithGeo - distinctGeoPtrs) : 0;
     _MESSAGE("FO4RemixPlugin: [SemCapture] uniqueDrawables=%zu totalFires=%llu "
-             "evictedThisSweep=%u submitted=%u pending=%u "
+             "evictedThisSweep=%u submitted=%u pending=%u superseded=%u "
              "distinctGeoPtrs=%zu entriesWithGeo=%zu geoDups=%zu",
              unique,
              (unsigned long long)g_totalFires.load(std::memory_order_relaxed),
-             evicted, submittedCount, pendingCount,
+             evicted, submittedCount, pendingCount, supersededCount,
              distinctGeoPtrs, entriesWithGeo, geoDups);
 
     _MESSAGE("FO4RemixPlugin: [SemCapture] pendingByGate "
@@ -878,6 +1127,7 @@ void SemanticCapture::SnapshotActiveDrawables(uint64_t currentFrame,
     out.reserve(g_drawableMap.size());
     if (livePoses) livePoses->reserve(g_drawableMap.size());
     for (const auto& [hash, state] : g_drawableMap) {
+        if (state.supersededByFinalTransform) continue;
         if (!state.submittedToRemix) continue;
         const uint64_t age = (currentFrame > state.lastSeenFrame)
             ? (currentFrame - state.lastSeenFrame) : 0;
