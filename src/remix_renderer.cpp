@@ -289,6 +289,16 @@ namespace {
     // Without this mutex, unordered_map insertions can rehash mid-iteration
     // and crash the iterating thread.
     std::mutex g_renderStateMutex;
+
+    // Pending config writes queued by game-thread callers (QueueConfigVariable)
+    // and drained at the top of OnFrame on the Remix thread. Last write per key
+    // wins. Guarded by its own lightweight mutex -- held only for the map
+    // operation on either side, never across a Remix API call, so the game
+    // thread can never block behind OnFrame's frame-long g_remixApiMutex hold.
+    std::mutex g_configQueueMutex;
+    std::unordered_map<std::string, std::string> g_pendingConfigVars;
+    // Per-key failure dedup for the drain site: first failure logs, then silent.
+    std::unordered_set<std::string> g_configFailedKeys;
 }
 
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
@@ -614,6 +624,15 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     // ---- Texture upload + cache ----
     // Per-texture upload + cache loop: refCount++ on hit, insert at refCount=1 on miss.
     for (const auto& tex : newTextures) {
+        // Dupe guard: the extraction cache re-supplies pixels whenever the
+        // Remix-side handle is missing, so a drawable that references the
+        // same texture in two slots (diffuse reused as glow map) can list
+        // the hash twice in one submit. Processing it twice would bump the
+        // refcount twice against a single textureHashes entry -- a refcount
+        // the drawable's release could never return.
+        if (inst.textureHashes.count(tex.hash)) {
+            continue;
+        }
         auto existing = g_textureHandles.find(tex.hash);
         if (existing != g_textureHandles.end()) {
             // Already cached by another cell or drawable; bump refcount.
@@ -680,6 +699,21 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         // Diffuse missing: this drawable can't render lit. Drop refcounts on
         // any textures we bumped during the upload loop, but DON'T destroy
         // them here -- see DecrementTextureRefs comment for why.
+        //
+        // Capped log: this was the ONLY silent kFailed path, and it hid the
+        // 2026-07-02 post-load poisoning (extraction cache hit returned a
+        // hash with no pixels after the PreLoadGame release wave destroyed
+        // the Remix-side handle -- thousands of drawables failing here with
+        // zero log evidence).
+        static std::atomic<int> s_diffuseMissLogs{0};
+        const int n = s_diffuseMissLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 20 || (n % 500) == 0) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] #%d diffuse 0x%llX has no "
+                     "Remix handle and no pixel data was supplied -- kFailed "
+                     "(drawable hash=0x%llX)",
+                     n, (unsigned long long)mesh.diffuseTextureHash,
+                     (unsigned long long)hash);
+        }
         DecrementTextureRefs(inst.textureHashes);
         return SubmitStatus::kFailed;
     }
@@ -1089,6 +1123,30 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     const PerfClock::time_point tLocked = PerfClock::now();
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
+
+    // Apply config writes queued by game-thread callers (weather bridge et
+    // al). Swap the map out under the queue mutex so the Remix API calls run
+    // without it -- QueueConfigVariable on the game thread only ever waits
+    // for the swap, never for the API.
+    {
+        std::unordered_map<std::string, std::string> pending;
+        {
+            std::lock_guard<std::mutex> qlock(g_configQueueMutex);
+            pending.swap(g_pendingConfigVars);
+        }
+        for (const auto& [key, value] : pending) {
+            const bool ok = api->SetConfigVariable &&
+                api->SetConfigVariable(key.c_str(), value.c_str()) == REMIXAPI_ERROR_CODE_SUCCESS;
+            if (!ok) {
+                std::lock_guard<std::mutex> qlock(g_configQueueMutex);
+                if (g_configFailedKeys.insert(key).second) {
+                    _MESSAGE("FO4RemixPlugin: [ConfigQueue] SetConfigVariable failed for "
+                             "key '%s' = '%s' (key not registered in Remix fork?)",
+                             key.c_str(), value.c_str());
+                }
+            }
+        }
+    }
 
     // Camera setup
     remixapi_CameraInfoParameterizedEXT camParams = {};
@@ -1605,4 +1663,15 @@ bool RemixRenderer::SetConfigVariable(const char* key, const char* value) {
 
     std::lock_guard<std::recursive_mutex> lock(g_remixApiMutex);
     return api->SetConfigVariable(key, value) == REMIXAPI_ERROR_CODE_SUCCESS;
+}
+
+void RemixRenderer::QueueConfigVariable(const char* key, const char* value) {
+    if (!key || !value) return;
+    std::lock_guard<std::mutex> lock(g_configQueueMutex);
+    g_pendingConfigVars[key] = value;
+}
+
+bool RemixRenderer::HasTextureHandle(uint64_t hash) {
+    std::lock_guard<std::mutex> lock(g_renderStateMutex);
+    return g_textureHandles.find(hash) != g_textureHandles.end();
 }

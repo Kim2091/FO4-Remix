@@ -1,10 +1,12 @@
 #pragma once
 
 namespace WeatherBridge {
-    // Reads the GameHour TESGlobal (formID 0x00000038) each frame and pushes
-    // derived sun-position values to Remix via RemixRenderer::SetConfigVariable.
-    // Safe to call every frame; no-op until the form database is ready. All
-    // SetConfigVariable failures logged once per key, then silenced.
+    // Reads the GameHour TESGlobal (formID 0x00000038) each frame and queues
+    // derived sun-position values via RemixRenderer::QueueConfigVariable
+    // (never the blocking SetConfigVariable -- see the game-freeze note in
+    // weather_bridge.cpp). Safe to call every frame; no-op until the form
+    // database is ready. Config-write failures logged once per key at the
+    // OnFrame drain site, then silenced.
     //
     // Currently scoped to time-of-day only. Weather signals (rain/snow/fog/
     // volumetric fog/isInterior) are NOT wired up — see

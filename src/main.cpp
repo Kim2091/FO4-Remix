@@ -50,6 +50,10 @@ void OnF4SEMessage(F4SEMessagingInterface::Message* msg) {
         break;
     case F4SEMessagingInterface::kMessage_PreLoadGame:
         _MESSAGE("FO4RemixPlugin: PreLoadGame - resetting extraction state");
+        // Gate resolves BEFORE the wipe so no resolve loop races the
+        // engine's teardown/rebuild of the destination world (mid-load
+        // parse AVs). PostLoadGame lifts the gate.
+        SemanticCapture::SetLoadingScreenActive(true);
         PresentHook::ResetExtractionState();
         // Drop every tracked drawable + release Remix handles. The engine's
         // reload sequence stalls waiting for BSGeometry destructors that
@@ -57,6 +61,13 @@ void OnF4SEMessage(F4SEMessagingInterface::Message* msg) {
         // the old world fully tear down. Submission resumes naturally as
         // hooks fire for the new world.
         SemanticCapture::ClearDrawableMap();
+        break;
+    case F4SEMessagingInterface::kMessage_PostLoadGame:
+        // data is a bool: true = load succeeded, false = load failed/aborted.
+        // Lift the gate either way -- whatever world is now active is stable.
+        _MESSAGE("FO4RemixPlugin: PostLoadGame (success=%d) - resuming resolves",
+                 msg->data ? 1 : 0);
+        SemanticCapture::SetLoadingScreenActive(false);
         break;
     }
 }

@@ -83,5 +83,27 @@ namespace RemixRenderer {
     // recursive Remix-API mutex so concurrent OnFrame draw submissions
     // don't race against the option write. Returns true on success;
     // false if the Remix fork lacks the slot or the value fails to parse.
+    //
+    // WARNING: blocks on g_remixApiMutex, which OnFrame holds for its entire
+    // frame (including the multi-ms Present). Never call from the game thread
+    // -- unfair lock acquisition against a ~95% duty-cycle holder starves the
+    // caller for seconds (observed as multi-second game freezes that only an
+    // alt-tab's scheduling perturbation would break). Game-thread callers must
+    // use QueueConfigVariable instead.
     bool SetConfigVariable(const char* key, const char* value);
+
+    // Non-blocking config write for game-thread callers: stores the pair in a
+    // small pending map (last write per key wins) under a dedicated lightweight
+    // mutex; OnFrame drains the map on the Remix thread while it already holds
+    // the Remix-API mutex. Failures (key not registered in the fork) are
+    // logged once per key at the drain site, then silenced.
+    void QueueConfigVariable(const char* key, const char* value);
+
+    // True if a Remix-side texture handle currently exists for `hash`.
+    // Used by the extraction cache to decide whether a cache hit must
+    // re-supply pixel data so SubmitDrawable can recreate a handle that was
+    // destroyed (PreLoadGame release wave, orphan LRU sweep). Takes
+    // g_renderStateMutex briefly; callers may hold g_drawableMutex
+    // (drawable -> renderState is the established lock order).
+    bool HasTextureHandle(uint64_t hash);
 }

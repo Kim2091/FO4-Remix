@@ -1,6 +1,7 @@
 #include "bs_extraction.h"
 #include "config.h"
 #include "fo4_diagnostics.h"  // Diagnostics::CurrentFrameIndex for readback aging
+#include "remix_renderer.h"   // HasTextureHandle for cache-hit handle recreation
 
 #include "f4se_common/f4se_version.h"
 #include "f4se_common/Relocation.h"
@@ -842,9 +843,22 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // cache for the other case.
     if (minRoughness > 0)                                             hash = FnvHashCombine(hash, 4 | (uint64_t)minRoughness << 8);
 
-    // Check cache first
+    // Check cache first. A hit normally returns just the hash -- the pixels
+    // were already handed to SubmitDrawable when the texture was first
+    // extracted. But the Remix-side handle can be destroyed while this cache
+    // entry lives on: the PreLoadGame release wave drops every drawable's
+    // refcounts (observed 2026-07-02: 547 -> 6 texture handles across a save
+    // load), and the orphan LRU sweep reaps refcount-zero handles mid-session.
+    // If we return hash-only in that state, SubmitDrawable's diffuse-loaded
+    // gate fails silently and the drawable can NEVER submit again (the
+    // "player's area empty after loading a save" + submitFailed-retry-storm
+    // symptom). Re-supply the cached pixels so SubmitDrawable recreates the
+    // handle; the copy only happens in the handle-missing case.
     auto it = g_textureCache.find(hash);
     if (it != g_textureCache.end()) {
+        if (!RemixRenderer::HasTextureHandle(hash)) {
+            newTextures.push_back(it->second);
+        }
         return hash;
     }
 

@@ -138,6 +138,25 @@ std::vector<PassKey> g_dirtyPoses;
 // -------- Sweep cadence counter (Tick() rate-limits via this) --------
 std::atomic<uint32_t> g_sweepCounter{0};
 
+// -------- Load-screen resolve gate (see SetLoadingScreenActive) --------
+// Set on the F4SE messaging thread, read on the render thread in Tick.
+std::atomic<bool>     g_loadingScreenActive{false};
+std::atomic<uint64_t> g_loadingScreenSinceFrame{0};
+constexpr uint64_t    kLoadingGateFailsafeFrames = 3600;  // ~60s: clear a stuck flag
+
+// -------- Resolve retry backoff --------
+// Attempts 1-4 retry next frame (async readback polling stays tight), then
+// the delay doubles per attempt: 2, 4, 8, ... capped at 512 frames.
+constexpr uint64_t kMaxRetryDelayFrames   = 512;
+constexpr uint64_t kCrashRetryDelayFrames = 120;
+
+static uint64_t RetryDelayFrames(uint32_t attempts) {
+    if (attempts <= 4) return 1;
+    const uint32_t shift = (attempts - 4u < 10u) ? (attempts - 4u) : 10u;
+    const uint64_t delay = 1ull << shift;
+    return delay < kMaxRetryDelayFrames ? delay : kMaxRetryDelayFrames;
+}
+
 // SEH wrapper for the resolver call. C++ destructors cannot live in a
 // __try scope (MSVC C2712), so we isolate the call in a non-throwing helper
 // with C-style locals only. Returns 0 on normal completion (resolver
@@ -702,9 +721,29 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         }
     }
 
+    // Load-screen gate: never resolve against a world the engine is still
+    // building/freeing on its loader thread (see SetLoadingScreenActive).
+    // Fires accumulate in g_drawableMap during the load; the first post-load
+    // tick resolves them against stable engine state. Failsafe: if
+    // PostLoadGame never arrives (load aborted to menu), clear after ~60s so
+    // the resolve loop can't stay off for the rest of the session.
+    bool loadingGate = g_loadingScreenActive.load(std::memory_order_relaxed);
+    if (loadingGate) {
+        const uint64_t since = g_loadingScreenSinceFrame.load(std::memory_order_relaxed);
+        if (currentFrame > since + kLoadingGateFailsafeFrames) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] loading gate stuck for %llu frames "
+                     "(no PostLoadGame?) -- failsafe clear",
+                     (unsigned long long)(currentFrame - since));
+            g_loadingScreenActive.store(false, std::memory_order_relaxed);
+            loadingGate = false;
+        }
+    }
+
     // ---- Resolve loop: every call, attempt one resolve per unsubmitted drawable ----
     // Skyrim's pattern: cheap when state.submittedToRemix is true (early exit).
-    if (!vramOk) {
+    if (loadingGate) {
+        // Skip resolve loop; eviction sweep below still runs.
+    } else if (!vramOk) {
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_GateVram);
         // Skip resolve loop; eviction sweep below still runs.
     } else {
@@ -741,30 +780,47 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 ? (currentFrame - state.lastSeenFrame) : 0;
             if (age > g_config.resolveRetryWindowFrames) continue;
 
+            // Backoff gate: a prior failure scheduled this entry's next
+            // attempt; skip until due. See DrawableState::resolveAttempts.
+            if (currentFrame < state.nextRetryFrame) continue;
+
             // Note: the resolver may take a few hundred microseconds for
             // texture readbacks. We hold the mutex during the call, which
             // serializes resolver work with hot-path captures. If profile
             // shows hot-path back-pressure, move this loop to a snapshot+
             // unlock+resolve+lock-to-update pattern. Default first.
             //
-            // SEH-guarded: stale geometry pointers from TTL-aged entries
-            // can dereference freed memory. Catch the AV, log the failing
-            // drawable + last resolver step, and mark the entry as
-            // submitted so we don't retry it endlessly.
+            // SEH-guarded: stale geometry pointers (freed while the entry
+            // sat inside the retry window) can dereference freed memory.
+            // Catch the AV and back off HARD -- but do NOT permanently
+            // blacklist the key. The engine reuses those exact pointer
+            // values when it rebuilds the world (same PassKey), so a
+            // permanent skip turned one transient mid-load race into "this
+            // drawable can never render again this session" (the missing-
+            // destination-cell-after-load report). If the geometry stays
+            // dead, its fires stop and the retry-window gate above retires
+            // the entry naturally.
             unsigned long excCode = 0;
-            if (CallResolverGuarded(&state, key, device, &excCode) != 0) {
-                const int lastStep = Resolvers::Trace::LastStep();
-                const uint64_t lastHash = Resolvers::Trace::LastHash();
-                _MESSAGE("FO4RemixPlugin: [Resolver] CRASH CAUGHT key=0x%llX "
-                         "trace_hash=0x%llX step=%s exception=0x%08lX "
-                         "geo=%p prop=%p mat=%p -- skipping permanently",
-                         (unsigned long long)key,
-                         (unsigned long long)lastHash,
-                         Resolvers::Trace::StepName(lastStep),
-                         excCode,
-                         state.geometry, state.property, state.material);
-                state.submittedToRemix = true;
-                state.meshHash = 0;
+            const bool crashed = CallResolverGuarded(&state, key, device, &excCode) != 0;
+            if (crashed) {
+                static std::atomic<uint64_t> sCrashLogs{0};
+                const uint64_t n = sCrashLogs.fetch_add(1, std::memory_order_relaxed);
+                if (n < 50 || (n % 50) == 0) {
+                    const int lastStep = Resolvers::Trace::LastStep();
+                    const uint64_t lastHash = Resolvers::Trace::LastHash();
+                    _MESSAGE("FO4RemixPlugin: [Resolver] CRASH CAUGHT #%llu key=0x%llX "
+                             "trace_hash=0x%llX step=%s exception=0x%08lX "
+                             "geo=%p prop=%p mat=%p -- backing off %llu frames",
+                             (unsigned long long)n,
+                             (unsigned long long)key,
+                             (unsigned long long)lastHash,
+                             Resolvers::Trace::StepName(lastStep),
+                             excCode,
+                             state.geometry, state.property, state.material,
+                             (unsigned long long)kCrashRetryDelayFrames);
+                }
+                state.resolveAttempts++;
+                state.nextRetryFrame = currentFrame + kCrashRetryDelayFrames;
             }
 
             // Diagnostic: log every water entry's post-resolver state so we
@@ -783,11 +839,16 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             }
 
             // Snapshot the gate that rejected this drawable so the periodic
-            // stats can break `pending` down by reason. Successful submits and
-            // SEH-caught crashes both flip submittedToRemix=true and bypass.
+            // stats can break `pending` down by reason, and schedule the
+            // next retry (crashes already scheduled theirs above).
             if (!state.submittedToRemix) {
                 state.lastFailedResolverStep =
                     Resolvers::Trace::LastStep();
+                if (!crashed) {
+                    state.resolveAttempts++;
+                    state.nextRetryFrame =
+                        currentFrame + RetryDelayFrames(state.resolveAttempts);
+                }
             }
         }
     }
@@ -895,6 +956,16 @@ void SemanticCapture::Tick(ID3D11Device* device) {
              pendNotResolved, pendNotTriShape, pendSkinned, pendLod,
              pendParseFailed, pendExtentReject, pendNoMaterial,
              pendLandscape, pendNoDiffuse, pendSubmitFailed, pendOther);
+}
+
+void SemanticCapture::SetLoadingScreenActive(bool active) {
+    if (active) {
+        g_loadingScreenSinceFrame.store(Diagnostics::CurrentFrameIndex(),
+                                        std::memory_order_relaxed);
+    }
+    g_loadingScreenActive.store(active, std::memory_order_relaxed);
+    _MESSAGE("FO4RemixPlugin: [SemCapture] loading gate %s",
+             active ? "ON (resolves suspended)" : "OFF (resolves resumed)");
 }
 
 void SemanticCapture::ClearDrawableMap() {

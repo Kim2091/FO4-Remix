@@ -72,6 +72,20 @@ namespace SemanticCapture {
         // Used by the sweep stats to break down `pending` by gate.
         int lastFailedResolverStep   = 0;
 
+        // ---- Resolve retry backoff (2026-07-02) ----
+        // Every failed resolve used to be retried on EVERY tick for as long
+        // as the entry stayed inside the retry window -- with a persistent
+        // failure class (post-load submitFailed storm) that meant thousands
+        // of full parse+extract attempts per frame on the game thread
+        // (measured 30-62ms/frame Tick, game fps collapse, user-visible
+        // freezes). Failures now schedule their next attempt: the first 4
+        // retries stay at 1-frame spacing (async texture readback completes
+        // within a few ticks), then the delay doubles per attempt up to a
+        // 512-frame cap, so a broken entry costs ~one resolve per 8.5s
+        // instead of 60/s. Crash-caught resolves get a flat 120-frame delay.
+        uint32_t resolveAttempts     = 0;
+        uint64_t nextRetryFrame      = 0;
+
         // ---- Live transform (animated statics) ----
         // Refreshed on every hook fire from BSGeometry::m_worldTransform
         // (offset 0x70 on NiAVObject). The engine evaluates scene-graph
@@ -129,6 +143,19 @@ namespace SemanticCapture {
     // Drop every tracked drawable: release Remix-side handles and clear
     // g_drawableMap. Called from the F4SE PreLoadGame handler.
     void ClearDrawableMap();
+
+    // Suspend (true) / resume (false) the resolve loop across a save-game
+    // load. Set from the F4SE PreLoadGame / PostLoadGame handlers. The
+    // destination cell fires GetRenderPasses DURING the load screen while
+    // the engine is still building/freeing that world on its loader thread;
+    // resolving against that half-built state caused parse_start access
+    // violations that permanently blacklisted the player's own cell
+    // (2026-07-02: 37 "CRASH CAUGHT ... skipping permanently" during one
+    // load = the "area I'm standing in never loads" report). While active,
+    // Tick still runs its sweep + stats; only resolves are skipped. A
+    // 3600-frame failsafe clears a stuck flag (PostLoadGame never firing,
+    // e.g. load aborted to main menu) so the world can't stay empty.
+    void SetLoadingScreenActive(bool active);
 
     // Aggregate flag-bit counters over the set of drawables that pass the
     // active filter in SnapshotActiveDrawables. Diagnostic-only -- helps
