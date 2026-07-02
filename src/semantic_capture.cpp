@@ -14,8 +14,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -128,6 +130,10 @@ std::atomic<uint64_t> g_tickNs{0};
 
 std::mutex g_drawableMutex;
 std::unordered_map<PassKey, SemanticCapture::DrawableState> g_drawableMap;
+
+// Keys whose liveWorldTransform changed since the last DrainDirtyPoses.
+// Guarded by g_drawableMutex; deduped via DrawableState::poseDirty.
+std::vector<PassKey> g_dirtyPoses;
 
 // -------- Sweep cadence counter (Tick() rate-limits via this) --------
 std::atomic<uint32_t> g_sweepCounter{0};
@@ -401,12 +407,20 @@ static void* DetourGetRenderPassesShared(void* self,
         state.fireCount         += 1;
         state.lastTechniqueFlags = technique;
         if (liveXfValid) {
-            for (int r = 0; r < 3; ++r) {
-                for (int c = 0; c < 4; ++c) {
-                    state.liveWorldTransform[r][c] = liveXf[r][c];
+            // Store + queue only on actual change (bitwise). Static geometry
+            // re-fires with an identical transform and costs one memcmp;
+            // animating objects (doors, gates) differ every frame and get
+            // queued for OnFrame's DrainDirtyPoses.
+            const bool changed = !state.liveTransformValid ||
+                std::memcmp(state.liveWorldTransform, liveXf, sizeof(liveXf)) != 0;
+            if (changed) {
+                std::memcpy(state.liveWorldTransform, liveXf, sizeof(liveXf));
+                state.liveTransformValid = true;
+                if (!state.poseDirty) {
+                    state.poseDirty = true;
+                    g_dirtyPoses.push_back(key);
                 }
             }
-            state.liveTransformValid = true;
         }
     }
 
@@ -894,6 +908,7 @@ void SemanticCapture::ClearDrawableMap() {
     // where the engine's already released its refs (refcount == 1, just us),
     // the engine destructor runs inline here and frees the BSGeometry.
     g_drawableMap.clear();
+    g_dirtyPoses.clear();
 
     _MESSAGE("FO4RemixPlugin: [Reload] cleared %zu drawables (%zu submitted) on PreLoadGame",
              totalCount, submittedCount);
@@ -932,6 +947,24 @@ void SemanticCapture::SnapshotActiveDrawables(uint64_t currentFrame,
             if (f & (1ULL << 38)) ++stats->forcedFadeOut;
         }
     }
+}
+
+void SemanticCapture::DrainDirtyPoses(std::unordered_map<uint64_t, std::array<float, 12>>& out) {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    for (const PassKey key : g_dirtyPoses) {
+        auto it = g_drawableMap.find(key);
+        if (it == g_drawableMap.end()) continue;  // evicted while queued
+        DrawableState& state = it->second;
+        state.poseDirty = false;
+        std::array<float, 12> pose;
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                pose[r * 4 + c] = state.liveWorldTransform[r][c];
+            }
+        }
+        out.emplace(key, pose);
+    }
+    g_dirtyPoses.clear();
 }
 
 SemanticCapture::PerfCounters SemanticCapture::GetPerfCounters() {

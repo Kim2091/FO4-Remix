@@ -1109,36 +1109,28 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
     bool hasAnyMeshes = false;
 
-    // Snapshot the set of "engine-active" drawables -- those whose
-    // GetRenderPasses hook has fired within the last kActiveAgeFrames frames.
-    // 2026-04-29: window widened from 60 to TTL. Engine fires GetRenderPasses
-    // roughly once per cell-load for HQ static refs, not per-frame; a tight
-    // 60-frame window starved them after ~1 second of silence and produced
-    // the "LOD vanishes but no HQ replacement" symptom (data: active=328 of
-    // 5331 submitted, 94% silenced). The chunk-spatial filter handles the
-    // worldspace-LOD-overlap case the active-set filter was originally added
-    // for. With the window matched to TTL, this snapshot is now equivalent
-    // to "every cached drawable" and could be elided in a follow-up; kept
-    // for now to retain the per-flag activeStats diagnostic.
-    // Done before acquiring g_renderStateMutex so we don't violate the
-    // existing g_drawableMutex -> g_renderStateMutex lock order.
+    // The full-map "engine-active" snapshot that used to live here is gone.
+    // 2026-04-29 widened its window to TTL, making it equivalent to "every
+    // cached drawable" (measured skippedInactive=0 in every session window),
+    // yet it still walked the entire g_drawableMap under g_drawableMutex
+    // every Remix frame -- 4-5ms/frame in dense scenes, and its long mutex
+    // holds stalled the game thread's hook fires. Live poses for animated
+    // statics (the one thing it actually delivered) now arrive through
+    // DrainDirtyPoses: the fire hook queues a key only when the transform
+    // actually changed, so this is O(animating) instead of O(map).
+    // kActiveAgeFrames survives for the stats-only diagnostic snapshot taken
+    // on log frames below.
     constexpr uint64_t kActiveAgeFrames = 18000;  // == kTTLFrames; effectively unbounded for play
-    // static + clear(): both containers are rebuilt every frame; reusing them
-    // keeps their bucket/node capacity across frames instead of reallocating
-    // hundreds of entries at 60Hz. Safe: OnFrame runs only on the Remix thread.
-    static std::unordered_set<uint64_t> activeSet;
-    activeSet.clear();
     SemanticCapture::ActiveFlagStats activeStats;
-    // Per-frame live poses (animated statics: doors, gates, machinery).
-    // Populated from DrawableState::liveWorldTransform (refreshed on every
-    // hook fire). Applied to DrawableInstance::worldTransform below before
-    // bucket-build so animated drawables render at their current pose.
+    // Poses that changed since last frame (animated statics: doors, gates,
+    // machinery). Applied to DrawableInstance::worldTransform below, which
+    // persists them -- unchanged drawables keep their last-applied pose.
+    // static + clear(): reuses node capacity instead of reallocating at 60Hz.
+    // Safe: OnFrame runs only on the Remix thread.
     static std::unordered_map<uint64_t, std::array<float, 12>> livePoses;
     livePoses.clear();
     const PerfClock::time_point tSnap0 = PerfClock::now();
-    SemanticCapture::SnapshotActiveDrawables(Diagnostics::CurrentFrameIndex(),
-                                             kActiveAgeFrames, activeSet,
-                                             &activeStats, &livePoses);
+    SemanticCapture::DrainDirtyPoses(livePoses);
     const PerfClock::time_point tSnap1 = PerfClock::now();
     PerfClock::duration dBucket{}, dDraw{};
 
@@ -1177,13 +1169,9 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
         for (auto& [drawHash, inst] : g_drawables) {
             if (!inst.meshHandle) continue;
-            // Engine-active filter: skip drawables the engine stopped firing
-            // for. Their mesh handles stay cached in g_meshCache so we resume
-            // drawing instantly when the engine starts firing again.
-            if (activeSet.find(drawHash) == activeSet.end()) {
-                ++skippedInactive;
-                continue;
-            }
+            // (Engine-active filter removed 2026-07-02 -- with the window at
+            // TTL it never skipped anything; skippedInactive stays in the
+            // status log as a tombstone and always reads 0.)
             // Apply live world transform if the hook captured one this frame
             // (or recently). Animated statics evaluate their controllers
             // before GetRenderPasses fires, so the live transform reflects
@@ -1386,6 +1374,14 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     static uint32_t s_frameCounter = 0;
     s_frameCounter++;
     if (s_frameCounter % 300 == 0) {
+        // Stats-only full-map snapshot, once per window (diagnostic). The
+        // per-frame snapshot this replaced ran 300x as often for the same
+        // information.
+        static std::unordered_set<uint64_t> statsScratch;
+        statsScratch.clear();
+        SemanticCapture::SnapshotActiveDrawables(Diagnostics::CurrentFrameIndex(),
+                                                 kActiveAgeFrames, statsScratch,
+                                                 &activeStats, nullptr);
         _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu "
                  "skippedChunkPlayerInside=%zu "
                  "active=%u isLod=%u fadedIn=%u notVisible=%u lodFadingOut=%u forcedFadeOut=%u "

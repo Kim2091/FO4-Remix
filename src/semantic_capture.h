@@ -83,6 +83,13 @@ namespace SemanticCapture {
         // major 3x4 (Beth->Remix coord swap already applied).
         float liveWorldTransform[3][4] = {};
         bool  liveTransformValid       = false;
+
+        // Set by the fire hook when liveWorldTransform actually CHANGED
+        // (bitwise) since the last DrainDirtyPoses; the key is queued once
+        // on the dirty list. Cleared when drained. Static geometry never
+        // sets this, so per-frame pose propagation is O(animating objects)
+        // instead of O(entire map).
+        bool  poseDirty                = false;
     };
 
     // Convert a Bethesda NiTransform (right-handed, X/Y in Bethesda order)
@@ -149,6 +156,15 @@ namespace SemanticCapture {
                                  std::unordered_set<uint64_t>& out,
                                  ActiveFlagStats* stats = nullptr,
                                  std::unordered_map<uint64_t, std::array<float, 12>>* livePoses = nullptr);
+
+    // Drain poses that changed since the last call into `out` (appends;
+    // caller clears). O(changed-this-frame) instead of O(map): the fire hook
+    // queues a key only when the captured world transform differs bitwise
+    // from the stored one, i.e. animated statics mid-motion. Replaces the
+    // per-frame full-map SnapshotActiveDrawables walk in OnFrame (measured
+    // 4-5ms/frame in dense scenes); SnapshotActiveDrawables remains for
+    // periodic diagnostics.
+    void DrainDirtyPoses(std::unordered_map<uint64_t, std::array<float, 12>>& out);
 
     // Cumulative game-thread perf counters; consumers diff across reporting
     // windows. fires/fireNs cover the GetRenderPasses detour body (our
