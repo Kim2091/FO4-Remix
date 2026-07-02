@@ -149,4 +149,17 @@ namespace SemanticCapture {
                                  std::unordered_set<uint64_t>& out,
                                  ActiveFlagStats* stats = nullptr,
                                  std::unordered_map<uint64_t, std::array<float, 12>>* livePoses = nullptr);
+
+    // Cumulative game-thread perf counters; consumers diff across reporting
+    // windows. fires/fireNs cover the GetRenderPasses detour body (our
+    // overhead only, not the engine's original). ticks/tickNs cover
+    // Tick() -- one tick per hkPresent, so `ticks` doubles as a game-frame
+    // counter for normalization.
+    struct PerfCounters {
+        uint64_t fires  = 0;
+        uint64_t fireNs = 0;
+        uint64_t ticks  = 0;
+        uint64_t tickNs = 0;
+    };
+    PerfCounters GetPerfCounters();
 }

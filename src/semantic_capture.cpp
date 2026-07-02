@@ -13,6 +13,7 @@
 #include "MinHook.h"
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <unordered_map>
 
@@ -116,6 +117,14 @@ static HookTarget g_hookTargets[kHookTargetCount] = {
 
 std::atomic<bool>     g_installed{false};
 std::atomic<uint64_t> g_totalFires{0};
+
+// -------- Perf counters (cumulative; consumers diff across windows) --------
+// fireNs measures ONLY our detour body, not the engine's original
+// GetRenderPasses. tickNs measures the whole Tick (resolve loop + sweep).
+// All relaxed: these are statistics, not synchronization.
+std::atomic<uint64_t> g_fireNs{0};
+std::atomic<uint64_t> g_tickCount{0};
+std::atomic<uint64_t> g_tickNs{0};
 
 std::mutex g_drawableMutex;
 std::unordered_map<PassKey, SemanticCapture::DrawableState> g_drawableMap;
@@ -300,6 +309,8 @@ static void* DetourGetRenderPassesShared(void* self,
                                          void* arg4,
                                          SemanticCapture::ResolverKind kind,
                                          GetRenderPasses_t original) {
+    const auto tFire0 = std::chrono::steady_clock::now();
+
     // Material lives at [self + 0x58] for ALL BSShaderProperty subclasses
     // (Lighting / Water / Effect) -- the slot is inherited from the base
     // class. F4SE NiProperties.h:108-136 confirms layout. Previous code
@@ -400,6 +411,8 @@ static void* DetourGetRenderPassesShared(void* self,
     }
 
     g_totalFires.fetch_add(1, std::memory_order_relaxed);
+    g_fireNs.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - tFire0).count(), std::memory_order_relaxed);
     return original(self, geometry, technique, arg4);
 }
 
@@ -635,6 +648,18 @@ void SemanticCapture::Uninstall() {
 
 void SemanticCapture::Tick(ID3D11Device* device) {
     if (!g_installed.load()) return;
+
+    // RAII so every return path accumulates. tickCount also serves as the
+    // game-frame counter for normalizing fires/frame (Tick runs once per
+    // hkPresent).
+    g_tickCount.fetch_add(1, std::memory_order_relaxed);
+    struct TickNsGuard {
+        std::chrono::steady_clock::time_point t0;
+        ~TickNsGuard() {
+            g_tickNs.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count(), std::memory_order_relaxed);
+        }
+    } tickGuard{ std::chrono::steady_clock::now() };
 
     // Note: g_sweepCounter (atomic, relaxed) interleaves with g_drawableMutex
     // (mutex). Single-caller invariant holds today (only hkPresent calls Tick).
@@ -907,4 +932,13 @@ void SemanticCapture::SnapshotActiveDrawables(uint64_t currentFrame,
             if (f & (1ULL << 38)) ++stats->forcedFadeOut;
         }
     }
+}
+
+SemanticCapture::PerfCounters SemanticCapture::GetPerfCounters() {
+    PerfCounters c;
+    c.fires  = g_totalFires.load(std::memory_order_relaxed);
+    c.fireNs = g_fireNs.load(std::memory_order_relaxed);
+    c.ticks  = g_tickCount.load(std::memory_order_relaxed);
+    c.tickNs = g_tickNs.load(std::memory_order_relaxed);
+    return c;
 }

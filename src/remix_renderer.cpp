@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -1054,12 +1055,25 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
 // ---------------------------------------------------------------------------
 void RemixRenderer::OnFrame(const CameraState& cam,
                             const OverlayData& overlay) {
+    // Per-phase CPU timing, reported through the every-300-frame status log.
+    // ~10 steady_clock reads per frame -- negligible. Static accumulators are
+    // safe: OnFrame runs only on the Remix thread.
+    using PerfClock = std::chrono::steady_clock;
+    auto nsSince = [](PerfClock::time_point t0, PerfClock::time_point t1) {
+        return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count();
+    };
+    static uint64_t s_accLockWaitNs = 0, s_accSnapNs = 0, s_accBucketNs = 0,
+                    s_accDrawNs = 0, s_accPresentNs = 0, s_accTotalNs = 0;
+    static SemanticCapture::PerfCounters s_lastGameCounters = {};
+    const PerfClock::time_point tEnter = PerfClock::now();
+
     // Serializes Remix API option-registry writes (game thread, via
     // SetConfigVariable) against draw submissions on this thread. Held for
     // the function's full duration. Lock order: g_remixApiMutex ->
     // g_drawableMutex (SnapshotActiveDrawables) -> g_renderStateMutex
     // (bucket build). Never acquire in reverse.
     std::lock_guard<std::recursive_mutex> lock(g_remixApiMutex);
+    const PerfClock::time_point tLocked = PerfClock::now();
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
@@ -1109,16 +1123,24 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // Done before acquiring g_renderStateMutex so we don't violate the
     // existing g_drawableMutex -> g_renderStateMutex lock order.
     constexpr uint64_t kActiveAgeFrames = 18000;  // == kTTLFrames; effectively unbounded for play
-    std::unordered_set<uint64_t> activeSet;
+    // static + clear(): both containers are rebuilt every frame; reusing them
+    // keeps their bucket/node capacity across frames instead of reallocating
+    // hundreds of entries at 60Hz. Safe: OnFrame runs only on the Remix thread.
+    static std::unordered_set<uint64_t> activeSet;
+    activeSet.clear();
     SemanticCapture::ActiveFlagStats activeStats;
     // Per-frame live poses (animated statics: doors, gates, machinery).
     // Populated from DrawableState::liveWorldTransform (refreshed on every
     // hook fire). Applied to DrawableInstance::worldTransform below before
     // bucket-build so animated drawables render at their current pose.
-    std::unordered_map<uint64_t, std::array<float, 12>> livePoses;
+    static std::unordered_map<uint64_t, std::array<float, 12>> livePoses;
+    livePoses.clear();
+    const PerfClock::time_point tSnap0 = PerfClock::now();
     SemanticCapture::SnapshotActiveDrawables(Diagnostics::CurrentFrameIndex(),
                                              kActiveAgeFrames, activeSet,
                                              &activeStats, &livePoses);
+    const PerfClock::time_point tSnap1 = PerfClock::now();
+    PerfClock::duration dBucket{}, dDraw{};
 
     // Phase 1B: draw event-driven drawables. Bucket by Remix mesh handle so
     // drawables sharing a cached handle (identical content + material) collapse
@@ -1133,6 +1155,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t skippedChunkPlayerInside = 0;
     {
         std::lock_guard<std::mutex> lock(g_renderStateMutex);
+        const PerfClock::time_point tBucket0 = PerfClock::now();
         const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
         drawableCount = g_drawables.size();
 
@@ -1190,6 +1213,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             buckets[inst.meshHandle].members.push_back(&inst);
         }
         bucketCount = buckets.size();
+        const PerfClock::time_point tBucket1 = PerfClock::now();
+        dBucket = tBucket1 - tBucket0;
 
         for (auto& [meshHandle, bucket] : buckets) {
             if (bucket.members.empty()) continue;
@@ -1349,7 +1374,13 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 }
             }
         }
+        dDraw = PerfClock::now() - tBucket1;
     }
+
+    s_accLockWaitNs += nsSince(tEnter, tLocked);
+    s_accSnapNs     += nsSince(tSnap0, tSnap1);
+    s_accBucketNs   += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dBucket).count();
+    s_accDrawNs     += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dDraw).count();
 
     // Periodic status log (every ~5 seconds)
     static uint32_t s_frameCounter = 0;
@@ -1364,6 +1395,32 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                  activeStats.total, activeStats.isLod, activeStats.fadedIn,
                  activeStats.notVisible, activeStats.lodFadingOut, activeStats.forcedFadeOut,
                  cam.playerWorldPos[0], cam.playerWorldPos[1], cam.playerWorldPos[2]);
+
+        // Perf: Remix-thread averages over the window (present/total lag one
+        // frame -- they accumulate at the end of OnFrame). Game-thread costs
+        // come from SemanticCapture's cumulative counters, diffed across the
+        // window and normalized per game frame (Tick == one hkPresent).
+        const auto game = SemanticCapture::GetPerfCounters();
+        const uint64_t dTicks  = game.ticks  - s_lastGameCounters.ticks;
+        const uint64_t dFires  = game.fires  - s_lastGameCounters.fires;
+        const uint64_t dFireNs = game.fireNs - s_lastGameCounters.fireNs;
+        const uint64_t dTickNs = game.tickNs - s_lastGameCounters.tickNs;
+        s_lastGameCounters = game;
+        _MESSAGE("FO4RemixPlugin: OnFrame perf (avg us/frame over 300) - "
+                 "lockWait=%llu snap=%llu bucket=%llu draw=%llu present=%llu total=%llu | "
+                 "game thread: fires/frame=%llu fireUs/frame=%llu tickUs/frame=%llu gameFrames=%llu",
+                 (unsigned long long)(s_accLockWaitNs / 300 / 1000),
+                 (unsigned long long)(s_accSnapNs     / 300 / 1000),
+                 (unsigned long long)(s_accBucketNs   / 300 / 1000),
+                 (unsigned long long)(s_accDrawNs     / 300 / 1000),
+                 (unsigned long long)(s_accPresentNs  / 300 / 1000),
+                 (unsigned long long)(s_accTotalNs    / 300 / 1000),
+                 (unsigned long long)(dTicks ? dFires  / dTicks        : 0),
+                 (unsigned long long)(dTicks ? dFireNs / dTicks / 1000 : 0),
+                 (unsigned long long)(dTicks ? dTickNs / dTicks / 1000 : 0),
+                 (unsigned long long)dTicks);
+        s_accLockWaitNs = s_accSnapNs = s_accBucketNs = 0;
+        s_accDrawNs = s_accPresentNs = s_accTotalNs = 0;
     }
 
     if (!hasAnyMeshes && g_fallbackMesh) {
@@ -1470,7 +1527,11 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     remixapi_PresentInfo presentInfo = {};
     presentInfo.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
     presentInfo.hwndOverride = nullptr;
+    const PerfClock::time_point tPresent0 = PerfClock::now();
     api->Present(&presentInfo);
+    const PerfClock::time_point tEnd = PerfClock::now();
+    s_accPresentNs += nsSince(tPresent0, tEnd);
+    s_accTotalNs   += nsSince(tEnter, tEnd);
 }
 
 void RemixRenderer::Shutdown() {
