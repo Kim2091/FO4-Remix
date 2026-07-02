@@ -1,5 +1,6 @@
 #include "bs_extraction.h"
 #include "config.h"
+#include "fo4_diagnostics.h"  // Diagnostics::CurrentFrameIndex for readback aging
 
 #include "f4se_common/f4se_version.h"
 #include "f4se_common/Relocation.h"
@@ -190,168 +191,229 @@ static bool IsBlockCompressed(DXGI_FORMAT fmt, uint32_t& blockSize)
 }
 
 // ---------------------------------------------------------------------------
-// GPU readback: copy a single mip level of a texture into CPU memory.
-// Helper for ReadbackAllMips. Output ExtractedTexture is single-mip.
-// ---------------------------------------------------------------------------
-static bool ReadbackOneMip(ID3D11DeviceContext* ctx,
-                           ID3D11Device* device,
-                           ID3D11Texture2D* tex2D,
-                           DXGI_FORMAT format,
-                           uint32_t mipLevel,
-                           uint32_t mipWidth,
-                           uint32_t mipHeight,
-                           ExtractedTexture& out)
-{
-    using Microsoft::WRL::ComPtr;
-
-    uint32_t dataSize = ComputeMip0Size(mipWidth, mipHeight, format);
-    if (dataSize == 0) return false;
-
-    // Staging texture matching this mip's dimensions
-    D3D11_TEXTURE2D_DESC stagingDesc = {};
-    stagingDesc.Width              = mipWidth;
-    stagingDesc.Height             = mipHeight;
-    stagingDesc.MipLevels          = 1;
-    stagingDesc.ArraySize          = 1;
-    stagingDesc.Format             = format;
-    stagingDesc.SampleDesc.Count   = 1;
-    stagingDesc.SampleDesc.Quality = 0;
-    stagingDesc.Usage              = D3D11_USAGE_STAGING;
-    stagingDesc.BindFlags          = 0;
-    stagingDesc.CPUAccessFlags     = D3D11_CPU_ACCESS_READ;
-
-    ComPtr<ID3D11Texture2D> staging;
-    HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &staging);
-    if (FAILED(hr)) {
-        _MESSAGE("FO4RemixPlugin: ReadbackOneMip - CreateTexture2D staging failed mip=%u hr=0x%08X",
-                 mipLevel, (unsigned)hr);
-        return false;
-    }
-
-    // Copy the requested mip from the source texture into mip 0 of staging
-    ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, tex2D, mipLevel, nullptr);
-
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    hr = ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) {
-        _MESSAGE("FO4RemixPlugin: ReadbackOneMip - Map failed mip=%u hr=0x%08X",
-                 mipLevel, (unsigned)hr);
-        return false;
-    }
-
-    uint32_t blockSize = 0;
-    bool bc = IsBlockCompressed(format, blockSize);
-
-    uint32_t numRows;       // scanline-rows (or block-rows for BC)
-    uint32_t expectedPitch; // tight row pitch
-
-    if (bc) {
-        uint32_t bw = (mipWidth  + 3) / 4; if (bw < 1) bw = 1;
-        uint32_t bh = (mipHeight + 3) / 4; if (bh < 1) bh = 1;
-        numRows       = bh;
-        expectedPitch = bw * blockSize;
-    } else {
-        numRows       = mipHeight;
-        expectedPitch = mipWidth * 4; // all uncompressed formats we support are 4 bpp
-    }
-
-    out.pixels.resize(dataSize);
-    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
-    uint8_t* dst = out.pixels.data();
-
-    for (uint32_t row = 0; row < numRows; row++) {
-        memcpy(dst, src, expectedPitch);
-        src += mapped.RowPitch;
-        dst += expectedPitch;
-    }
-
-    ctx->Unmap(staging.Get(), 0);
-
-    out.width      = mipWidth;
-    out.height     = mipHeight;
-    out.dxgiFormat = format;
-    out.mipLevels  = 1;
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// GPU readback: read every mip level of a texture into CPU memory, one
-// ExtractedTexture per mip. The source texture's actual MipLevels field
-// determines the chain length (game textures typically ship full chains;
-// some procedural / runtime textures have only 1).
+// Async GPU readback (2026-07-02): read every mip level of a texture into CPU
+// memory across ticks, without stalling the game thread.
+//
+// The old synchronous path did CopySubresourceRegion + an immediate
+// Map(READ, 0) once PER MIP per texture; Map with no flags blocks the CPU
+// until the GPU drains the copy -- a full pipeline stall. Cell streaming
+// resolves dozens of textures, so a load burst meant hundreds of stalls
+// (the measured multi-ms SemanticCapture::Tick spikes and hitching).
+//
+// Two-phase protocol, keyed by the extraction cache hash:
+//   phase 1 (first attempt): allocate ONE staging texture holding the whole
+//     usable mip chain, queue one CopySubresourceRegion per mip, park it in
+//     g_pendingReadbacks. Returns Pending -- no waiting.
+//   phase 2 (later ticks):  Map mip 0 with D3D11_MAP_FLAG_DO_NOT_WAIT.
+//     WAS_STILL_DRAWING -> still Pending, try next tick. Success means every
+//     queued copy has completed (one in-order command stream), so the
+//     remaining mips map without blocking.
+// The resolver already retries unresolved textures every tick, so Pending
+// costs one gate check per tick and nothing else.
 //
 // Why all mips: the path tracer samples normal/diffuse maps at varying LOD
 // based on screen-space pixel footprint. Without a mip chain, a distant
 // surface fetches the full-res mip at sub-pixel rate, average-out flattens
 // the normal, and the BRDF degenerates -- most visibly on water, where a
-// flat normal + high IOR + Fresnel collapses to a perfect mirror. With the
-// chain present, distant sampling fetches a pre-filtered lower mip and
-// detail rolls off smoothly.
+// flat normal + high IOR + Fresnel collapses to a perfect mirror.
 //
-// Returns false on any failure (partial chain is worse than no chain --
-// dxvk-remix would render with malformed mips).
+// BC chains truncate at the 4x4 block boundary: D3D11 rejects standalone BC
+// resources below one block, and a BC mip below 4x4 is at most 4 texels of
+// pre-filtered detail -- noise to the path tracer's sampler. Without the
+// gate, every BC texture was rejected and re-attempted every frame (1 FPS
+// regression with most terrain missing, observed 2026-04-29).
 // ---------------------------------------------------------------------------
-static bool ReadbackAllMips(ID3D11Device* device, ID3D11Texture2D* tex2D,
-                            std::vector<ExtractedTexture>& outMips)
+enum class ReadbackStatus { Ready, Pending, Failed };
+
+struct PendingReadback {
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> staging;
+    DXGI_FORMAT format        = DXGI_FORMAT_UNKNOWN;
+    uint32_t    width         = 0;   // mip 0 dimensions
+    uint32_t    height        = 0;
+    uint32_t    mipCount      = 0;   // usable (BC-truncated) chain length
+    uint32_t    ticksWaited   = 0;   // phase-2 attempts; TTL'd so a wedged
+                                     // copy queue can't pin the entry forever
+    uint64_t    lastTouchFrame = 0;  // last frame any caller polled this entry;
+                                     // abandoned entries (drawable evicted mid-
+                                     // readback) are swept when capacity is hit
+};
+
+static std::unordered_map<uint64_t, PendingReadback> g_pendingReadbacks;
+
+// Bound VRAM parked in staging during load bursts. Excess textures stay
+// unresolved and start their copies on a later tick via the resolver retry.
+static constexpr size_t   kMaxPendingReadbacks = 32;
+// Phase-2 attempts before an entry is abandoned (a copy that hasn't landed
+// after ~10s of ticks means the caller stopped retrying or the queue died).
+static constexpr uint32_t kPendingReadbackTTL  = 600;
+
+static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
+                                           ID3D11Texture2D* tex2D,
+                                           uint64_t cacheKey,
+                                           std::vector<ExtractedTexture>& outMips)
 {
     using Microsoft::WRL::ComPtr;
 
     ComPtr<ID3D11DeviceContext> ctx;
     device->GetImmediateContext(&ctx);
-    if (!ctx) return false;
+    if (!ctx) return ReadbackStatus::Failed;
 
-    D3D11_TEXTURE2D_DESC desc;
-    tex2D->GetDesc(&desc);
+    const uint64_t nowFrame = Diagnostics::CurrentFrameIndex();
 
-    if (ComputeMip0Size(desc.Width, desc.Height, desc.Format) == 0) {
-        _MESSAGE("FO4RemixPlugin: ReadbackAllMips - unsupported DXGI format %u, skipping",
-                 (unsigned)desc.Format);
-        return false;
+    auto pendingIt = g_pendingReadbacks.find(cacheKey);
+    if (pendingIt == g_pendingReadbacks.end()) {
+        // ---- Phase 1: queue the copies, park the staging. ----
+        if (g_pendingReadbacks.size() >= kMaxPendingReadbacks) {
+            // Sweep abandoned entries (drawable evicted mid-readback, so no
+            // caller polls them again). Without this, 32 abandoned entries
+            // would block every future readback permanently.
+            for (auto it2 = g_pendingReadbacks.begin(); it2 != g_pendingReadbacks.end();) {
+                if (nowFrame - it2->second.lastTouchFrame > kPendingReadbackTTL) {
+                    it2 = g_pendingReadbacks.erase(it2);
+                } else {
+                    ++it2;
+                }
+            }
+            if (g_pendingReadbacks.size() >= kMaxPendingReadbacks) {
+                return ReadbackStatus::Pending;
+            }
+        }
+
+        D3D11_TEXTURE2D_DESC desc;
+        tex2D->GetDesc(&desc);
+
+        if (ComputeMip0Size(desc.Width, desc.Height, desc.Format) == 0) {
+            _MESSAGE("FO4RemixPlugin: ReadbackAllMipsAsync - unsupported DXGI format %u, skipping",
+                     (unsigned)desc.Format);
+            return ReadbackStatus::Failed;
+        }
+
+        const uint32_t srcMipCount = desc.MipLevels > 0 ? desc.MipLevels : 1;
+        uint32_t blockSize = 0;
+        const bool isBC = IsBlockCompressed(desc.Format, blockSize);
+
+        uint32_t usableMips = 0;
+        for (uint32_t i = 0; i < srcMipCount; i++) {
+            uint32_t mipW = desc.Width  >> i; if (mipW == 0) mipW = 1;
+            uint32_t mipH = desc.Height >> i; if (mipH == 0) mipH = 1;
+            if (isBC && (mipW < 4 || mipH < 4)) break;
+            usableMips++;
+        }
+        if (usableMips == 0) return ReadbackStatus::Failed;
+
+        D3D11_TEXTURE2D_DESC stagingDesc = {};
+        stagingDesc.Width              = desc.Width;
+        stagingDesc.Height             = desc.Height;
+        stagingDesc.MipLevels          = usableMips;
+        stagingDesc.ArraySize          = 1;
+        stagingDesc.Format             = desc.Format;
+        stagingDesc.SampleDesc.Count   = 1;
+        stagingDesc.SampleDesc.Quality = 0;
+        stagingDesc.Usage              = D3D11_USAGE_STAGING;
+        stagingDesc.BindFlags          = 0;
+        stagingDesc.CPUAccessFlags     = D3D11_CPU_ACCESS_READ;
+
+        ComPtr<ID3D11Texture2D> staging;
+        HRESULT hr = device->CreateTexture2D(&stagingDesc, nullptr, &staging);
+        if (FAILED(hr)) {
+            _MESSAGE("FO4RemixPlugin: ReadbackAllMipsAsync - staging CreateTexture2D failed hr=0x%08X",
+                     (unsigned)hr);
+            return ReadbackStatus::Failed;
+        }
+
+        // Queue all copies; the D3D11 runtime holds a reference on both
+        // resources until the commands execute, so the engine freeing the
+        // source texture later is safe.
+        for (uint32_t i = 0; i < usableMips; i++) {
+            ctx->CopySubresourceRegion(staging.Get(), i, 0, 0, 0, tex2D, i, nullptr);
+        }
+
+        PendingReadback pr;
+        pr.staging        = staging;
+        pr.format         = desc.Format;
+        pr.width          = desc.Width;
+        pr.height         = desc.Height;
+        pr.mipCount       = usableMips;
+        pr.lastTouchFrame = nowFrame;
+        g_pendingReadbacks.emplace(cacheKey, std::move(pr));
+        return ReadbackStatus::Pending;
     }
 
-    uint32_t srcMipCount = desc.MipLevels > 0 ? desc.MipLevels : 1;
-    outMips.clear();
-    outMips.reserve(srcMipCount);
+    // ---- Phase 2: non-blocking poll, then drain the chain. ----
+    PendingReadback& pr = pendingIt->second;
+    pr.lastTouchFrame = nowFrame;
 
-    // BC formats use 4x4 pixel blocks. D3D11 rejects CreateTexture2D for
-    // standalone BC textures with width<4 or height<4 (E_INVALIDARG /
-    // 0x80070057): sub-block dimensions are only legal as part of a parent
-    // texture's mip chain, not as a standalone resource. Truncating the
-    // chain at the 4x4 boundary produces a valid partial chain and lets
-    // dxvk-remix sample the lower mips it has. Practical visual cost is
-    // zero: a BC mip below 4x4 is at most 4 texels of pre-filtered detail
-    // -- noise to the path tracer's screen-space sampler. Without this
-    // gate, every BC texture's small-mip readback failed and the whole
-    // texture was rejected and re-attempted every frame, producing a 1 FPS
-    // regression with most terrain missing (observed 2026-04-29).
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    HRESULT hr = ctx->Map(pr.staging.Get(), 0, D3D11_MAP_READ,
+                          D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+        if (++pr.ticksWaited > kPendingReadbackTTL) {
+            g_pendingReadbacks.erase(pendingIt);
+            return ReadbackStatus::Failed;
+        }
+        return ReadbackStatus::Pending;
+    }
+    if (FAILED(hr)) {
+        _MESSAGE("FO4RemixPlugin: ReadbackAllMipsAsync - Map failed hr=0x%08X", (unsigned)hr);
+        g_pendingReadbacks.erase(pendingIt);
+        return ReadbackStatus::Failed;
+    }
+
     uint32_t blockSize = 0;
-    bool isBC = IsBlockCompressed(desc.Format, blockSize);
+    const bool bc = IsBlockCompressed(pr.format, blockSize);
 
-    for (uint32_t i = 0; i < srcMipCount; i++) {
-        uint32_t mipW = desc.Width  >> i; if (mipW == 0) mipW = 1;
-        uint32_t mipH = desc.Height >> i; if (mipH == 0) mipH = 1;
+    outMips.clear();
+    outMips.reserve(pr.mipCount);
 
-        if (isBC && (mipW < 4 || mipH < 4)) {
-            // Stop here -- subsequent mips would also be sub-block. We've
-            // collected mips 0..i-1, which is what dxvk-remix will use.
-            break;
+    // Mip 0 mapped without waiting, so every queued copy in the chain has
+    // completed (single in-order command stream) -- mips 1+ map instantly.
+    for (uint32_t i = 0; i < pr.mipCount; i++) {
+        uint32_t mipW = pr.width  >> i; if (mipW == 0) mipW = 1;
+        uint32_t mipH = pr.height >> i; if (mipH == 0) mipH = 1;
+
+        if (i > 0) {
+            hr = ctx->Map(pr.staging.Get(), i, D3D11_MAP_READ, 0, &mapped);
+            if (FAILED(hr)) {
+                _MESSAGE("FO4RemixPlugin: ReadbackAllMipsAsync - Map mip=%u failed hr=0x%08X",
+                         i, (unsigned)hr);
+                outMips.clear();
+                g_pendingReadbacks.erase(pendingIt);
+                return ReadbackStatus::Failed;
+            }
+        }
+
+        uint32_t numRows;       // scanline-rows (or block-rows for BC)
+        uint32_t expectedPitch; // tight row pitch
+        if (bc) {
+            uint32_t bw = (mipW + 3) / 4; if (bw < 1) bw = 1;
+            uint32_t bh = (mipH + 3) / 4; if (bh < 1) bh = 1;
+            numRows       = bh;
+            expectedPitch = bw * blockSize;
+        } else {
+            numRows       = mipH;
+            expectedPitch = mipW * 4; // all supported uncompressed formats are 4 bpp
         }
 
         ExtractedTexture mip;
-        if (!ReadbackOneMip(ctx.Get(), device, tex2D, desc.Format,
-                            i, mipW, mipH, mip)) {
-            outMips.clear();
-            return false;
+        mip.pixels.resize(ComputeMip0Size(mipW, mipH, pr.format));
+        const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
+        uint8_t* dst = mip.pixels.data();
+        for (uint32_t row = 0; row < numRows; row++) {
+            memcpy(dst, src, expectedPitch);
+            src += mapped.RowPitch;
+            dst += expectedPitch;
         }
+        ctx->Unmap(pr.staging.Get(), i);
+
+        mip.width      = mipW;
+        mip.height     = mipH;
+        mip.dxgiFormat = pr.format;
+        mip.mipLevels  = 1;
         outMips.push_back(std::move(mip));
     }
 
-    if (outMips.empty()) {
-        // Source texture had no usable mips (degenerate input).
-        return false;
-    }
-
-    return true;
+    g_pendingReadbacks.erase(pendingIt);
+    return outMips.empty() ? ReadbackStatus::Failed : ReadbackStatus::Ready;
 }
 
 // ---------------------------------------------------------------------------
@@ -785,11 +847,16 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // ExtractedTexture so we can reuse the existing per-mip decompression and
     // post-process functions unchanged. They get concatenated into a packed
     // mip chain at the end.
+    //
+    // Async: the first attempt queues GPU copies and returns Pending; the
+    // resolver's retry loop calls back next tick(s) until the copies have
+    // landed. Returning 0 here is the existing "no texture yet" signal the
+    // resolver already handles by retrying -- no stalls on the game thread.
     std::vector<ExtractedTexture> mips;
-    bool ok = ReadbackAllMips(device, tex2D, mips);
+    ReadbackStatus rbStatus = ReadbackAllMipsAsync(device, tex2D, hash, mips);
     tex2D->Release();
 
-    if (!ok || mips.empty()) return 0;
+    if (rbStatus != ReadbackStatus::Ready || mips.empty()) return 0;
 
     // Per-mip pipeline: BC2 (DXT3) -> RGBA8, then any further BC decompression
     // handled by the post-process stage's BC5/BC1 decoders. Each step operates
