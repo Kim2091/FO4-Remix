@@ -59,6 +59,23 @@ void WeatherBridge::PushOncePerFrame() {
     const float hour = cachedGameHour->value;
     const float sunElevation = std::sin((hour - 6.0f) / 12.0f * kPi) * 90.0f;
     const float sunRotation  = (hour / 24.0f) * 360.0f;
+
+    // Only push when the sun actually moved. SetConfigVariable takes
+    // g_remixApiMutex, which OnFrame holds for its entire frame including the
+    // path-trace submit -- pushing every game frame serialized the game render
+    // thread against the Remix frame. At default timescale the sun moves
+    // ~0.13 deg/sec, so a 0.05 deg threshold re-pushes every few hundred ms;
+    // imperceptible against the 0.5 deg sun disk.
+    static float s_lastElevation = -1000.0f;
+    static float s_lastRotation  = -1000.0f;
+    constexpr float kMinDeltaDeg = 0.05f;
+    if (std::fabs(sunElevation - s_lastElevation) < kMinDeltaDeg &&
+        std::fabs(sunRotation  - s_lastRotation)  < kMinDeltaDeg) {
+        return;
+    }
+    s_lastElevation = sunElevation;
+    s_lastRotation  = sunRotation;
+
     PushFloat("rtx.atmosphere.sunElevation", sunElevation);
     PushFloat("rtx.atmosphere.sunRotation",  sunRotation);
 }
