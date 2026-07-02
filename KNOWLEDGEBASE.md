@@ -106,8 +106,8 @@ Mutexes:
 | `g_overlay.mutex` (`present_hook.cpp:63`) | `std::mutex` | shared | the captured UI overlay pixel buffer |
 | `g_drawableMutex` (`semantic_capture.cpp:120`) | `std::mutex` | shared | `g_drawableMap` (PassKey -> DrawableState) |
 | `g_renderStateMutex` (`remix_renderer.cpp:262`) | `std::mutex` | shared | `g_drawables`, `g_meshCache`, `g_materialCache`, `g_textureHandles` |
-| `g_remixApiMutex` (`remix_renderer.cpp:254`) | `std::recursive_mutex` | shared | Remix-API option-registry writes vs. `OnFrame` draw submissions |
-| `g_failMutex` (`weather_bridge.cpp:17`) | `std::mutex` | weather bridge | the failed-key dedup set |
+| `g_remixApiMutex` (`remix_renderer.cpp:254`) | `std::recursive_mutex` | Remix thread only | Remix-API option-registry writes vs. `OnFrame` draw submissions. NEVER acquire from the game thread: OnFrame holds it for the whole frame (incl. the multi-ms Present) and re-acquires immediately, so an unfair-lock waiter starves for seconds (the 2026-07-02 "freezes until alt-tab" bug) |
+| `g_configQueueMutex` (`remix_renderer.cpp`) | `std::mutex` | shared | `g_pendingConfigVars` + `g_configFailedKeys`; held only for map ops, never across a Remix API call. Game-thread config writes go through `QueueConfigVariable`; OnFrame drains |
 
 Lock-order rules (documented in `remix_renderer.cpp:253-263` and
 `remix_renderer.cpp:993-995`):
@@ -121,9 +121,10 @@ Lock-order rules (documented in `remix_renderer.cpp:253-263` and
    call to `SubmitDrawable`, takes `g_renderStateMutex`. This is consistent
    with the OnFrame order.
 4. `WeatherBridge::PushOncePerFrame` calls
-   `RemixRenderer::SetConfigVariable`, which acquires `g_remixApiMutex`. It
-   is invoked from `hkPresent` *outside* any other plugin mutex
-   (`present_hook.cpp:300-302`), preserving the lock order.
+   `RemixRenderer::QueueConfigVariable`, which takes only the lightweight
+   `g_configQueueMutex` (a map insert). OnFrame drains the queue on the
+   Remix thread while it already holds `g_remixApiMutex`. The blocking
+   `SetConfigVariable` is Remix-thread-only (see mutex table).
 
 The Present hook itself does not hold any plugin mutex while calling the
 original `IDXGISwapChain::Present` (`present_hook.cpp:464`).
@@ -282,12 +283,23 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
    and finally calls `SemanticCapture::Tick(device)`.
 
 3. **`SemanticCapture::Tick`** (`semantic_capture.cpp:578`) does:
+   - Load-screen gate: skip the resolve loop between PreLoadGame and
+     PostLoadGame (60s failsafe) so the destination cell is never parsed
+     against the loader thread's half-built world.
    - VRAM gate: skip the resolve loop if `totalAllocatedBytes > 90% *
      driverBudgetBytes`.
    - Resolve loop: iterate `g_drawableMap`. For each entry where
-     `submittedToRemix == false` and `lastSeenFrame` is within 1 frame of
-     current, call `Resolvers::Lighting::TryResolveStatic` or
+     `submittedToRemix == false`, `lastSeenFrame` is within
+     `[SemanticCapture] ResolveRetryWindowFrames` (default 600) of current,
+     and the entry's retry-backoff `nextRetryFrame` is due, call
+     `Resolvers::Lighting::TryResolveStatic` or
      `Resolvers::Water::TryResolve`, both wrapped in an SEH handler.
+     Failed resolves schedule exponential-backoff retries (4 fast attempts
+     for async readback polling, then doubling to a 512-frame cap);
+     SEH-caught crashes back off a flat 120 frames rather than being
+     skipped permanently (the engine reuses pointer identities when it
+     rebuilds a world, so a permanent skip blanked the drawable for the
+     whole session).
    - Sweep cadence: every 60 frames, evict entries whose age exceeds
      `kTTLFrames = 18000` (5 minutes at 60 fps), calling
      `RemixRenderer::ReleaseDrawable` for each submitted entry under SEH.
@@ -315,7 +327,12 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
      1. Computes a stable hash from the texture *name* (FNV1a) plus the
         post-process mode.
      2. Hits the per-plugin `g_textureCache` to skip already-extracted
-        textures.
+        textures. On a hit it checks `RemixRenderer::HasTextureHandle`:
+        if the Remix-side handle was destroyed (PreLoadGame release wave,
+        orphan LRU sweep) it re-supplies the cached pixels so
+        `SubmitDrawable` recreates the handle — without this, a hash-only
+        hit made the drawable fail its diffuse-loaded gate silently and
+        permanently (the 2026-07-02 empty-world-after-save-load bug).
      3. Reads every mip via `ReadbackAllMips` (creates a per-mip staging
         texture, `CopySubresourceRegion`, `Map`, copies pixels honouring
         block-compressed row pitch). BC textures truncate the chain at the
