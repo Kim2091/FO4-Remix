@@ -1298,6 +1298,16 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             } else {
                 // Batched path: identity base, per-instance transforms in pNext.
                 ++batchedBucketCount;
+                // Deterministic member order. The runtime folds the WHOLE
+                // per-instance transform array (content AND order) into the
+                // external draw identity hash (computeExternalDrawIdentityHash
+                // -> gpuInstancingHash, rtx_scene_manager.cpp). Members arrive
+                // in g_drawables iteration order, which permutes on rehash
+                // (any insertion), churning the identity and breaking the
+                // runtime's frame-over-frame RtInstance matching. Pointers are
+                // node-stable in unordered_map, so sorting by pointer is
+                // deterministic for a drawable's lifetime.
+                std::sort(bucket.members.begin(), bucket.members.end());
                 bucket.transforms.reserve(bucket.members.size());
                 for (const DrawableInstance* member : bucket.members) {
                     remixapi_Transform xform = {};
