@@ -51,6 +51,14 @@ struct ExtractedMesh {
     // depth-offset Z-fight prevention.
     bool isDecal = false;
 
+    // Two-sided tag (set by lighting_static resolver from BSShaderProperty
+    // flag bit 36, kTwoSided per CommonLibF4; sanity-anchored by kOwnEmit=22
+    // and kDecal=26 which match our confirmed bits). Drives per-instance
+    // doubleSided at DrawInstance time so ray traversal keeps backface
+    // culling on ordinary opaque geometry -- the previous hardcoded
+    // doubleSided=1 paid any-hit/backface cost on every wall and rock.
+    bool isTwoSided = false;
+
     // Worldspace LOD chunk metadata (2026-04-28). When isLODChunk is true,
     // OnFrame applies a spatial filter: skip drawing if the player's world
     // position is INSIDE the chunk's coverage area (the in-cell static refs

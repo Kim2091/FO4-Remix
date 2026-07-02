@@ -166,8 +166,16 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         const uint64_t propFlagsEarly = *reinterpret_cast<uint64_t*>(
             reinterpret_cast<uintptr_t>(state.property) + 0x30);
         constexpr uint64_t kSLSF1_Decal = 0x0000000004000000ULL;
+        // Two-sided: bit 36 of the merged 64-bit flag word (flags2 bit 4).
+        // CommonLibF4 BSShaderProperty::EShaderPropertyFlag kTwoSided = 1<<36;
+        // layout cross-checked against kOwnEmit (22) and kDecal (26), both of
+        // which match our independently confirmed bits.
+        constexpr uint64_t kFlag_TwoSided = 0x0000001000000000ULL;
         if (propFlagsEarly & kSLSF1_Decal) {
             mesh.isDecal = true;
+        }
+        if (propFlagsEarly & kFlag_TwoSided) {
+            mesh.isTwoSided = true;
         }
     }
 

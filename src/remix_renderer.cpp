@@ -250,6 +250,13 @@ namespace {
         // categoryFlags so dxvk-remix applies decal depth-offset Z-fight
         // prevention against the underlying surface.
         bool                         isDecal              = false;
+
+        // Two-sided tag (2026-07-02). Copied from ExtractedMesh (shader-flag
+        // bit 36) at submit time. OnFrame sets instance.doubleSided from this
+        // (OR water/decal) instead of the old hardcoded doubleSided=1, so ray
+        // traversal backface-culls ordinary opaque geometry. Folded into the
+        // material cache key so bucket members agree.
+        bool                         isTwoSided           = false;
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
@@ -726,6 +733,11 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         // translucent variants of the same texture set never share a Remix
         // material handle (the underlying pNext extension struct differs).
         h ^= (uint64_t)(mesh.isWater ? 1 : 0) * 0xD6E8FEB86659FD93ULL;
+        // Fold the two-sided tag so single- and double-sided variants of the
+        // same texture set never share a material handle -- OnFrame reads
+        // doubleSided from bucket.members[0] and relies on bucket homogeneity
+        // (buckets share mesh handles, which bake in the material).
+        h ^= (uint64_t)(mesh.isTwoSided ? 1 : 0) * 0x9E3779B97F4A7C15ULL;
         if (mesh.isWater) {
             uint32_t wri, wgi, wbi;
             memcpy(&wri, &mesh.waterTransmittanceR, 4);
@@ -939,6 +951,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
     // Decal tag for the OnFrame DECAL_STATIC categoryFlag.
     inst.isDecal              = mesh.isDecal;
+    inst.isTwoSided           = mesh.isTwoSided;
 
     g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
@@ -1211,7 +1224,18 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
             instance.pNext = nullptr;
             instance.mesh = meshHandle;
-            instance.doubleSided = 1;
+            // Backface culling (2026-07-02). Previously hardcoded
+            // doubleSided=1, which defeated backface culling in ray traversal
+            // for the whole scene -- extra hit evaluations on every opaque
+            // wall and rock. Honor the authored two-sided shader flag
+            // (foliage, hair, fences), and keep water (visible from beneath)
+            // and decals (planar; both faces kept so slight camera/parent
+            // misalignment can't cull them) double-sided. Bucket members
+            // share the flag because it's folded into the material cache key.
+            {
+                const DrawableInstance* rep = bucket.members[0];
+                instance.doubleSided = (rep->isTwoSided || rep->isWater || rep->isDecal) ? 1 : 0;
+            }
             instance.categoryFlags = 0;
 
             // Animated water tag. Bucket members all share materialHash, and
