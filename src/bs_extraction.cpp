@@ -1212,7 +1212,17 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         }
     }
 
-    // Index conversion (uint16 -> uint32)
+    // Index conversion (uint16 -> uint32), with per-triangle winding flip.
+    //
+    // Winding flip: BuildRemixTransform swaps Bethesda's X/Y axes, which is a
+    // reflection (determinant -1). A mirroring transform inverts triangle
+    // winding, so the game's front faces arrive at Remix as back faces. That
+    // was invisible while every instance was submitted doubleSided=1; with
+    // backface culling honored (2026-07-02 two-sided fix), the mirrored
+    // winding culled the VISIBLE side of every single-sided mesh (hollow
+    // terrain shells). Swapping the 2nd/3rd index of each triangle restores
+    // the authored facing under the mirrored transform, and also makes
+    // geometric normals (derived from winding) agree with the vertex normals.
     uint32_t indexCount = shape->numTriangles * 3;
     uint16_t* indices16 = reinterpret_cast<uint16_t*>(ibData);
     out.indices.resize(indexCount);
@@ -1224,7 +1234,11 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
                          shapeName ? shapeName : "<null>", i, idx, shape->numVertices);
             return false;
         }
-        out.indices[i] = idx;
+        // Destination slot swaps indices 1<->2 within each triangle.
+        const uint32_t tri = i / 3;
+        const uint32_t corner = i % 3;
+        const uint32_t dst = tri * 3 + (corner == 0 ? 0 : (corner == 1 ? 2 : 1));
+        out.indices[dst] = idx;
     }
 
     out.vertexDesc = desc;
