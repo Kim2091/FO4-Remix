@@ -56,9 +56,15 @@
 #define REMIXAPI_VERSION_GET_MINOR(version) (((uint64_t)(version) >> 16) & (uint64_t)0xFFFFFFFF)
 #define REMIXAPI_VERSION_GET_PATCH(version) (((uint64_t)(version)      ) & (uint64_t)0xFFFF)
 
+// Remix Plus carries its own ABI line, distinct from stock NVIDIA dxvk-remix
+// (which is 0.6.x). The reserved MINOR (1000) marks this fork and, because the
+// compat check treats every minor as breaking while MAJOR==0, makes the runtime
+// reject binaries built against stock Remix 0.6.x or older Remix Plus 0.6.x —
+// the struct layout and category-bit ABI differ. Bump MINOR again on any
+// further breaking ABI change.
 #define REMIXAPI_VERSION_MAJOR 0
-#define REMIXAPI_VERSION_MINOR 6
-#define REMIXAPI_VERSION_PATCH 2
+#define REMIXAPI_VERSION_MINOR 1000
+#define REMIXAPI_VERSION_PATCH 0
 
 
 // External
@@ -131,7 +137,8 @@ extern "C" {
     REMIXAPI_STRUCT_TYPE_DEPRECATED_LEGACY_PARTICLE_SYSTEM    = 24,
     REMIXAPI_STRUCT_TYPE_TEXTURE_INFO                         = 25,
     REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_PARTICLE_SYSTEM_EXT    = 26,
-    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT    = 27,
+    REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT     = 27,
+    REMIXAPI_STRUCT_TYPE_CAMERA_MEDIUM_INFO                   = 28,
     // NOTE: if adding a new struct, register it in 'rtx_remix_specialization.inl'
     //       and only extend this enum by appending, never adjust the order of these 
     //       as that will break backwards compatibility.
@@ -412,6 +419,15 @@ extern "C" {
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetupCamera)(
     const remixapi_CameraInfo* info);
 
+  typedef struct remixapi_CameraMediumInfo {
+    remixapi_StructType     sType;
+    void*                   pNext;
+    remixapi_MaterialHandle medium;
+  } remixapi_CameraMediumInfo;
+
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetCameraMediumMaterial)(
+    const remixapi_CameraMediumInfo* info);
+
 
 
 #define REMIXAPI_INSTANCE_INFO_MAX_BONES_COUNT 256
@@ -455,6 +471,11 @@ extern "C" {
     uint32_t                       objectPickingValue;
   } remixapi_InstanceInfoObjectPickingEXT;
 
+  // Bit values match upstream NVIDIA dxvk-remix exactly. These are a published
+  // ABI contract — do NOT reorder or reassign. (An earlier fork build shifted
+  // IGNORE_ALPHA_CHANNEL to bit 8 to mirror the internal InstanceCategories
+  // order; that was reverted because the C<->internal mapping is by-name in
+  // toRtCategories(), so the bit values are free to match upstream and must.)
   typedef enum remixapi_InstanceCategoryBit {
     REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_UI                  = 1 << 0,
     REMIXAPI_INSTANCE_CATEGORY_BIT_WORLD_MATTE               = 1 << 1,
@@ -464,23 +485,23 @@ extern "C" {
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ANTI_CULLING       = 1 << 5,
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_MOTION_BLUR        = 1 << 6,
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_OPACITY_MICROMAP   = 1 << 7,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL      = 1 << 8,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN                    = 1 << 9,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE                  = 1 << 10,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_BEAM                      = 1 << 11,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC              = 1 << 12,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_DYNAMIC             = 1 << 13,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET       = 1 << 14,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_NO_OFFSET           = 1 << 15,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT     = 1 << 16,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_TERRAIN                   = 1 << 17,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER            = 1 << 18,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL = 1 << 19,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY  = 1 << 20,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING     = 1 << 21,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_HIDDEN                    = 1 << 8,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE                  = 1 << 9,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_BEAM                      = 1 << 10,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC              = 1 << 11,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_DYNAMIC             = 1 << 12,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_SINGLE_OFFSET       = 1 << 13,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_NO_OFFSET           = 1 << 14,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_ALPHA_BLEND_TO_CUTOUT     = 1 << 15,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_TERRAIN                   = 1 << 16,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER            = 1 << 17,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_MODEL = 1 << 18,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_THIRD_PERSON_PLAYER_BODY  = 1 << 19,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_BAKED_LIGHTING     = 1 << 20,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_ALPHA_CHANNEL      = 1 << 21,
     REMIXAPI_INSTANCE_CATEGORY_BIT_IGNORE_TRANSPARENCY_LAYER = 1 << 22,
     REMIXAPI_INSTANCE_CATEGORY_BIT_PARTICLE_EMITTER          = 1 << 23,
-    REMIXAPI_INSTANCE_CATEGORY_BIT_LEGACY_EMISSIVE           = 1 << 24,
+    REMIXAPI_INSTANCE_CATEGORY_BIT_SMOOTH_NORMALS            = 1 << 24,
   } remixapi_InstanceCategoryBit;
 
   typedef uint32_t remixapi_InstanceCategoryFlags;
@@ -720,6 +741,36 @@ extern "C" {
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_SetGameValue)(
     const char*               key,
     const char*               value);
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_SetGameValue(
+    const char*               key,
+    const char*               value);
+
+  // Plugin-driven game-state read. Looks up `key` in the fork-owned
+  // thread-safe string/string map populated by remixapi_SetGameValue and graph
+  // components.
+  //
+  // Returns:
+  //   REMIXAPI_ERROR_CODE_SUCCESS — read attempt completed (whether or not the
+  //     key existed). The caller checks *out_actual_size == 0 to detect missing
+  //     keys, and compares it against in_buffer_size to detect buffer
+  //     truncation.
+  //   REMIXAPI_ERROR_CODE_INVALID_ARGUMENTS — null/empty key, null
+  //     out_actual_size, or in_buffer_size > 0 with null out_buffer.
+  //
+  // On success when the key exists:
+  //   *out_actual_size = strlen(value) + 1 (incl. null terminator)
+  //   if in_buffer_size >= *out_actual_size: out_buffer is filled with value + '\0'
+  //   if in_buffer_size <  *out_actual_size: out_buffer is left untouched
+  typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_GetGameValue)(
+    const char* key,
+    char*       out_buffer,
+    uint32_t    in_buffer_size,
+    uint32_t*   out_actual_size);
+  REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_GetGameValue(
+    const char* key,
+    char*       out_buffer,
+    uint32_t    in_buffer_size,
+    uint32_t*   out_actual_size);
 
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_AddTextureHash)(
     const char* textureCategory,
@@ -873,6 +924,9 @@ extern "C" {
     uint64_t            version;
   } remixapi_InitializeLibraryInfo;
 
+  // NOTE: If adding a new function, append at the end of the struct.
+  //       Reordering breaks backwards compatibility.
+
   // Force the RtxTextureManager to demote/clear textures not currently needed.
   // Hooks SceneManager::requestTextureVramFree, which sets an atomic flag
   // consumed next render-thread tick; the tick calls textureManager.clear(),
@@ -940,6 +994,8 @@ extern "C" {
   typedef remixapi_ErrorCode(REMIXAPI_PTR* PFN_remixapi_GetVramStats)(
     remixapi_VramStats* out_stats);
 
+  // NOTE: If adding a new function, append it at the END of the struct.
+  //       Reordering or inserting in the middle breaks backwards compatibility.
   typedef struct remixapi_Interface {
     PFN_remixapi_Shutdown           Shutdown;
     PFN_remixapi_CreateMaterial     CreateMaterial;
@@ -974,8 +1030,19 @@ extern "C" {
 
     PFN_remixapi_Startup            Startup;
     PFN_remixapi_Present            Present;
-    remixapi_UIState                (*GetUIState)(void);
-    remixapi_ErrorCode              (*SetUIState)(remixapi_UIState state);
+    // Camera-in-medium material. Kept adjacent to Present to mirror the
+    // canonical upstream layout (upstream commit 2bac8874 moved it here to
+    // fix backwards-compat); fork extension functions are appended below.
+    PFN_remixapi_SetCameraMediumMaterial SetCameraMediumMaterial;
+
+    // NOTE: REMIXAPI_PTR is required so the calling convention matches the
+    // actual remixapi_GetUIState / remixapi_SetUIState entry functions
+    // (which are __stdcall via REMIXAPI_CALL). On x64 this is moot — there's
+    // a single calling convention — but on x86 (bridge client) the bare
+    // `(*Fn)(...)` syntax defaulted to __cdecl and silently corrupted the
+    // stack when callers invoked the __stdcall entry through the field.
+    remixapi_UIState                (REMIXAPI_PTR *GetUIState)(void);
+    remixapi_ErrorCode              (REMIXAPI_PTR *SetUIState)(remixapi_UIState state);
 
     // Optional extension functions (present starting in v0.5.1+)
     PFN_remixapi_RegisterCallbacks          RegisterCallbacks;
@@ -986,6 +1053,7 @@ extern "C" {
     PFN_remixapi_RequestVramCompaction      RequestVramCompaction;
     PFN_remixapi_GetVramStats               GetVramStats;
     PFN_remixapi_RequestTextureVramFree     RequestTextureVramFree;
+    PFN_remixapi_GetGameValue               GetGameValue;
   } remixapi_Interface;
 
   REMIXAPI remixapi_ErrorCode REMIXAPI_CALL remixapi_InitializeLibrary(
