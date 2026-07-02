@@ -361,10 +361,15 @@ static void* DetourGetRenderPassesShared(void* self,
         capturedPosX < -kFarFromOriginThreshold ||
         capturedPosY >  kFarFromOriginThreshold ||
         capturedPosY < -kFarFromOriginThreshold;
-    if (geometry && g_moduleBase && farFromOrigin) {
+    if (geometry && g_moduleBase && farFromOrigin &&
+        g_parentChainLogs.load(std::memory_order_relaxed) < kParentChainLogCap) {
         const uint64_t logN = g_parentChainLogs.fetch_add(1, std::memory_order_relaxed);
-        unsigned long exc = 0;
-        LogParentChainGuarded(logN, geometry, g_moduleBase, &exc);
+        // Re-check after the increment: two threads can pass the pre-check
+        // simultaneously; only tickets below the cap may log.
+        if (logN < kParentChainLogCap) {
+            unsigned long exc = 0;
+            LogParentChainGuarded(logN, geometry, g_moduleBase, &exc);
+        }
     }
 
     {
