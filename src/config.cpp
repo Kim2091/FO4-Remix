@@ -91,7 +91,9 @@ void LoadConfig() {
 
     // [Performance]
     g_config.gpuInstancingEnabled = GetIniBool("Performance", "GpuInstancing", true, dllPath);
-    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d", g_config.gpuInstancingEnabled);
+    g_config.remixMaxFPS = (uint32_t)GetIniInt("Performance", "RemixMaxFPS", 120, dllPath);
+    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d RemixMaxFPS=%u",
+             g_config.gpuInstancingEnabled, g_config.remixMaxFPS);
 
     _MESSAGE("FO4RemixPlugin: Config loaded - LogShapeInfo=%d LogLargeShapes=%d LogRejections=%d "
              "LogTextures=%d LogLights=%d MaxExtent=%.0f",

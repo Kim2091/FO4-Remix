@@ -102,6 +102,7 @@ target_link_libraries(FO4RemixPlugin PRIVATE
     dxgi
     shell32
     psapi
+    winmm
 )
 
 target_compile_definitions(FO4RemixPlugin PRIVATE

@@ -119,6 +119,11 @@ struct PluginConfig {
     // DrawInstance count. Default true; flip false to fall back to a
     // unique-mesh-per-drawable rendering path if a regression appears.
     bool gpuInstancingEnabled;
+
+    // Frame-rate target for the Remix render thread. The thread loop paces to
+    // this by sleeping only the unused remainder of the frame budget after
+    // OnFrame returns. 0 = uncapped (yield-only between frames).
+    uint32_t remixMaxFPS;
 };
 
 // Global config instance

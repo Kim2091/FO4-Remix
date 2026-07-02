@@ -12,9 +12,11 @@
 #include <MinHook.h>
 #include <thread>
 #include <atomic>
+#include <chrono>
 #include <mutex>
 #include <vector>
 #include <algorithm>
+#include <timeapi.h>   // timeBeginPeriod/timeEndPeriod (links winmm)
 
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
@@ -203,7 +205,16 @@ static void RemixThreadFunc() {
 
     g_remix.ready = true;
 
+    // 1ms Sleep granularity for the frame pacing below. Without this, Sleep
+    // rounds up to the default 15.6ms timer tick (often two ticks), which is
+    // exactly how the old flat Sleep(16) added ~16-31ms to every frame.
+    // Matched by timeEndPeriod after the loop.
+    timeBeginPeriod(1);
+
+    using PaceClock = std::chrono::steady_clock;
     while (g_remix.running) {
+        const PaceClock::time_point frameStart = PaceClock::now();
+
         // Grab latest camera from main thread
         CameraState cam;
         {
@@ -231,9 +242,25 @@ static void RemixThreadFunc() {
         // Pump again after rendering
         PumpMessages();
 
-        // ~60fps cap to avoid spinning
-        Sleep(16);
+        // Pace to RemixMaxFPS by sleeping only the UNUSED remainder of the
+        // frame budget. The previous flat Sleep(16) added a full budget on
+        // top of every frame's render time (16ms render + 16ms sleep = 31fps,
+        // not the intended "60fps cap"). RemixMaxFPS=0 = uncapped; Sleep(0)
+        // still yields the timeslice so a trivial frame (menu, empty scene)
+        // doesn't monopolize a core.
+        if (g_config.remixMaxFPS > 0) {
+            const auto budget = std::chrono::microseconds(1000000u / g_config.remixMaxFPS);
+            const auto elapsed = PaceClock::now() - frameStart;
+            if (elapsed < budget) {
+                std::this_thread::sleep_for(budget - elapsed);
+            } else {
+                Sleep(0);
+            }
+        } else {
+            Sleep(0);
+        }
     }
+    timeEndPeriod(1);
 
     _MESSAGE("FO4RemixPlugin: Remix thread shutting down");
     RemixRenderer::Shutdown();
@@ -301,8 +328,12 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         WeatherBridge::PushOncePerFrame();
     }
 
-    // Hook OMSetRenderTargets + ClearRenderTargetView on first opportunity
-    if (!g_ui.contextHooked) {
+    // Hook OMSetRenderTargets + ClearRenderTargetView on first opportunity.
+    // Only when the HUD overlay is enabled: these hooks exist solely to find
+    // the UI render target for overlay capture, and hkOMSetRenderTargets runs
+    // on every game render-target bind — pure overhead when the capture below
+    // is gated off anyway.
+    if (!g_ui.contextHooked && g_config.hudOverlayEnabled) {
         ID3D11Device* hookDevice = nullptr;
         swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&hookDevice);
         if (hookDevice) {
@@ -345,7 +376,12 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     bool uiDrawn = g_ui.drawnThisFrame.exchange(false);
     bool uiActiveThisFrame = uiCleared && uiDrawn;
 
-    if (g_remix.ready && g_ui.renderTarget && uiActiveThisFrame) {
+    // Gate on hudOverlayEnabled: without it this block ran the full capture
+    // every frame — CopyResource + Map(READ) on a just-copied staging texture
+    // (a forced CPU<->GPU pipeline stall on the game's render thread) plus a
+    // ~1M-pixel un-premultiply pass — only for OnFrame to discard the result
+    // because submission is gated on the same flag.
+    if (g_config.hudOverlayEnabled && g_remix.ready && g_ui.renderTarget && uiActiveThisFrame) {
         ID3D11Device* device = nullptr;
         swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&device);
         if (device) {
