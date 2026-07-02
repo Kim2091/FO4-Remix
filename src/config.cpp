@@ -70,7 +70,9 @@ void LoadConfig() {
 
     // [SemanticCapture]
     g_config.semanticCaptureEnabled = GetIniBool("SemanticCapture", "Enabled", false, dllPath);
-    _MESSAGE("FO4RemixPlugin: SemanticCapture - Enabled=%d", g_config.semanticCaptureEnabled);
+    g_config.resolveRetryWindowFrames = (uint32_t)GetIniInt("SemanticCapture", "ResolveRetryWindowFrames", 600, dllPath);
+    _MESSAGE("FO4RemixPlugin: SemanticCapture - Enabled=%d ResolveRetryWindowFrames=%u",
+             g_config.semanticCaptureEnabled, g_config.resolveRetryWindowFrames);
 
     // [Culling]
     g_config.cullingTextureLRUGraceFrames  = (uint32_t)GetIniInt("Culling", "TextureLRUGraceFrames",  600, dllPath);
@@ -92,8 +94,10 @@ void LoadConfig() {
     // [Performance]
     g_config.gpuInstancingEnabled = GetIniBool("Performance", "GpuInstancing", true, dllPath);
     g_config.remixMaxFPS = (uint32_t)GetIniInt("Performance", "RemixMaxFPS", 120, dllPath);
-    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d RemixMaxFPS=%u",
-             g_config.gpuInstancingEnabled, g_config.remixMaxFPS);
+    g_config.maxPendingTextureReadbacks = (uint32_t)GetIniInt("Performance", "MaxPendingTextureReadbacks", 256, dllPath);
+    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d RemixMaxFPS=%u MaxPendingTextureReadbacks=%u",
+             g_config.gpuInstancingEnabled, g_config.remixMaxFPS,
+             g_config.maxPendingTextureReadbacks);
 
     _MESSAGE("FO4RemixPlugin: Config loaded - LogShapeInfo=%d LogLargeShapes=%d LogRejections=%d "
              "LogTextures=%d LogLights=%d MaxExtent=%.0f",

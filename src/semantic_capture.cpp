@@ -718,14 +718,28 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         for (auto& [key, state] : g_drawableMap) {
             if (state.submittedToRemix) continue;
-            // Freshness gate: only resolve drawables the engine touched this
-            // frame or last frame. Stale pointers from older entries cause
-            // the parse_start AVs we've been catching -- skipping them avoids
-            // dereferencing freed BSGeometry memory entirely. Mirrors the
-            // uint64-safe age computation used by the eviction sweep below.
+            // Freshness gate (widened 2026-07-02, was age > 1). The engine
+            // fires GetRenderPasses roughly once per cell ATTACH -- passes
+            // are cached afterwards. Loading a save into a different area
+            // fires the destination cell's geometry DURING the load screen,
+            // when extraction fails (texture rendererData/resources not
+            // backed yet); with a 2-frame window those drawables aged out
+            // before becoming resolvable and, since the engine never
+            // re-fires cached passes, the player's own cell stayed
+            // permanently empty while later-attaching neighbor cells
+            // appeared (user-reported symptom). The async texture readback
+            // (Pending on first attempt) needs the wider window for the
+            // same reason.
+            //
+            // Pointer-safety: the old tight gate was a pre-filter against
+            // dereferencing freed BSGeometry (parse_start AVs). Entries
+            // whose cell detaches inside the window are now caught by the
+            // CallResolverGuarded SEH backstop below and marked permanently
+            // skipped -- bounded risk, and the window is ini-tunable
+            // ([SemanticCapture] ResolveRetryWindowFrames).
             const uint64_t age = (currentFrame > state.lastSeenFrame)
                 ? (currentFrame - state.lastSeenFrame) : 0;
-            if (age > 1) continue;
+            if (age > g_config.resolveRetryWindowFrames) continue;
 
             // Note: the resolver may take a few hundred microseconds for
             // texture readbacks. We hold the mutex during the call, which

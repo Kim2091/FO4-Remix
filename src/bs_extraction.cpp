@@ -242,7 +242,18 @@ static std::unordered_map<uint64_t, PendingReadback> g_pendingReadbacks;
 
 // Bound VRAM parked in staging during load bursts. Excess textures stay
 // unresolved and start their copies on a later tick via the resolver retry.
-static constexpr size_t   kMaxPendingReadbacks = 32;
+// Sizing: a fresh area resolves hundreds of unique texture variants, and a
+// pipeline slot turns over in ~2-3 ticks, so the cap directly sets scene
+// pop-in time (32 slots measured ~20s of visible pop-in; the staging VRAM is
+// transient -- a 1K BC7 chain is ~1.4MB, so even 256 in flight is a few
+// hundred MB that drains within a second or two). Ini-tunable via
+// [Performance] MaxPendingTextureReadbacks.
+static constexpr size_t   kDefaultMaxPendingReadbacks = 256;
+static size_t MaxPendingReadbacks() {
+    return g_config.maxPendingTextureReadbacks > 0
+        ? (size_t)g_config.maxPendingTextureReadbacks
+        : kDefaultMaxPendingReadbacks;
+}
 // Phase-2 attempts before an entry is abandoned (a copy that hasn't landed
 // after ~10s of ticks means the caller stopped retrying or the queue died).
 static constexpr uint32_t kPendingReadbackTTL  = 600;
@@ -263,10 +274,10 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
     auto pendingIt = g_pendingReadbacks.find(cacheKey);
     if (pendingIt == g_pendingReadbacks.end()) {
         // ---- Phase 1: queue the copies, park the staging. ----
-        if (g_pendingReadbacks.size() >= kMaxPendingReadbacks) {
+        if (g_pendingReadbacks.size() >= MaxPendingReadbacks()) {
             // Sweep abandoned entries (drawable evicted mid-readback, so no
-            // caller polls them again). Without this, 32 abandoned entries
-            // would block every future readback permanently.
+            // caller polls them again). Without this, a full map of abandoned
+            // entries would block every future readback permanently.
             for (auto it2 = g_pendingReadbacks.begin(); it2 != g_pendingReadbacks.end();) {
                 if (nowFrame - it2->second.lastTouchFrame > kPendingReadbackTTL) {
                     it2 = g_pendingReadbacks.erase(it2);
@@ -274,7 +285,7 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
                     ++it2;
                 }
             }
-            if (g_pendingReadbacks.size() >= kMaxPendingReadbacks) {
+            if (g_pendingReadbacks.size() >= MaxPendingReadbacks()) {
                 return ReadbackStatus::Pending;
             }
         }

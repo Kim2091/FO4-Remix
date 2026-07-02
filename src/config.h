@@ -89,6 +89,13 @@ struct PluginConfig {
     // [SemanticCapture]
     bool semanticCaptureEnabled;  // [Phase 1A] Install BSLightingShaderProperty event-capture hook (default false)
 
+    // Frames an UNRESOLVED drawable stays retry-eligible after the engine
+    // last fired for it. The engine fires GetRenderPasses ~once per cell
+    // attach (passes cached afterwards), and save-loads fire the destination
+    // cell during the load screen when extraction can't succeed yet -- a
+    // tight window permanently orphaned the player's own cell. 600 ~= 10s.
+    uint32_t resolveRetryWindowFrames;
+
     // [Culling]
     uint32_t cullingTextureLRUGraceFrames;   // Frames a texture can go un-drawn before sweep cascades owner meshes (default 600)
     uint32_t cullingTextureLRUSweepPeriod;   // Frames between sweep invocations (default 60)
@@ -124,6 +131,12 @@ struct PluginConfig {
     // this by sleeping only the unused remainder of the frame budget after
     // OnFrame returns. 0 = uncapped (yield-only between frames).
     uint32_t remixMaxFPS;
+
+    // Max concurrent async texture readbacks (staging textures in flight).
+    // Directly sets scene pop-in time after a load: a slot turns over in
+    // ~2-3 ticks, so N slots resolve ~N textures per few frames. Staging
+    // VRAM is transient (~1.4MB per 1K BC7 chain). 0 = built-in default.
+    uint32_t maxPendingTextureReadbacks;
 };
 
 // Global config instance
