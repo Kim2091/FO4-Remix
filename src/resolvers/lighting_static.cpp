@@ -35,6 +35,40 @@ static bool PeekQwordsGuarded(const void* src, uint64_t* dst, int count) {
     }
 }
 
+// InstDiag v4 transform-stream scanner. Sweeps up to scanBytes behind a
+// candidate buffer pointer looking for windows that LOOK like per-instance
+// transform data: several rotation-range values (|v| <= 1.01) interleaved
+// with cluster-offset/world-range values (5 < |v| < 300000), plus an exact
+// 1.0f somewhere in the window (matrix diagonal / scale). Reports up to
+// maxHits hit offsets into outOffsets. Chunked SEH peeks so an unmapped
+// tail aborts the scan instead of crashing the resolve.
+static int ScanForTransformsGuarded(uint64_t base, int scanBytes,
+                                    int* outOffsets, int maxHits) {
+    int hits = 0;
+    float chunk[128];  // 512 bytes
+    for (int off = 0; off + 512 <= scanBytes && hits < maxHits; off += 512) {
+        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(base + off),
+                               reinterpret_cast<uint64_t*>(chunk), 64)) {
+            break;
+        }
+        for (int w = 0; w + 16 <= 128 && hits < maxHits; w += 4) {
+            int rotRange = 0, posRange = 0, exactOne = 0;
+            for (int i = 0; i < 16; ++i) {
+                const float v = chunk[w + i];
+                const float a = v < 0.0f ? -v : v;
+                if (a <= 1.01f) ++rotRange;
+                if (a > 5.0f && a < 300000.0f) ++posRange;
+                if (v == 1.0f) ++exactOne;
+            }
+            if (posRange >= 2 && rotRange >= 6 && exactOne >= 1) {
+                outOffsets[hits++] = off + w * 4;
+                w += 60;  // skip past this window before rescanning
+            }
+        }
+    }
+    return hits;
+}
+
 // In-flight resolver state. Updated at each gate inside TryResolveStatic
 // AND inside RemixRenderer::SubmitDrawable (via Trace::SetStep). Read by
 // the SEH handler in semantic_capture.cpp's Tick when an access violation
@@ -317,6 +351,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         // Wrappers of interest: A(+0x170)=raw[2], B(+0x178)=
                         // raw[3], and the per-shape unknowns +0x1D0/+0x1D8 =
                         // raw[14]/raw[15].
+                        //
+                        // v4: for every heap-like member of each wrapper,
+                        // (a) type it by its first qword (module-space q0 =
+                        // C++ object vtable, e.g. a d3d11.dll COM buffer --
+                        // meaning the instance data is GPU-only), and
+                        // (b) run the transform-stream scanner over 16KB
+                        // behind it. v3's fixed 24-float windows found an
+                        // identity-matrix pattern behind wrap+1D8.q5 but
+                        // were too small to prove an array follows.
                         const int wrapperIdx[4] = { 2, 3, 14, 15 };
                         for (int wi = 0; wi < 4; ++wi) {
                             const uint64_t wq = raw[wrapperIdx[wi]];
@@ -332,23 +375,42 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                      (unsigned long long)wbody[2], (unsigned long long)wbody[3],
                                      (unsigned long long)wbody[4], (unsigned long long)wbody[5],
                                      (unsigned long long)wbody[6], (unsigned long long)wbody[7]);
-                            int floatDumps = 0;
-                            for (int bi = 0; bi < 8 && floatDumps < 4; ++bi) {
+                            for (int bi = 0; bi < 8; ++bi) {
                                 if (!heapLike(wbody[bi])) continue;
-                                uint64_t fq[12] = {};
-                                if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wbody[bi]), fq, 12)) {
+                                uint64_t head[4] = {};
+                                if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wbody[bi]), head, 4)) {
                                     continue;
                                 }
-                                ++floatDumps;
-                                const float* ff = reinterpret_cast<const float*>(fq);
-                                _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     wrap+%X.q%d->f=[%.2f %.2f %.2f %.2f %.2f %.2f "
-                                         "%.2f %.2f %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f %.2f %.2f "
-                                         "%.2f %.2f %.2f %.2f %.2f %.2f]",
+                                const bool vtObj = head[0] >= 0x00007FF000000000ULL;
+                                int hitOff[4] = {};
+                                const int nHits = ScanForTransformsGuarded(wbody[bi], 16384, hitOff, 4);
+                                _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     wrap+%X.q%d=%016llX head=[%016llX %016llX] "
+                                         "%s scanHits=%d at[%X %X %X %X]",
                                          n, 0x160 + wrapperIdx[wi] * 8, bi,
-                                         ff[0], ff[1], ff[2], ff[3], ff[4], ff[5],
-                                         ff[6], ff[7], ff[8], ff[9], ff[10], ff[11],
-                                         ff[12], ff[13], ff[14], ff[15], ff[16], ff[17],
-                                         ff[18], ff[19], ff[20], ff[21], ff[22], ff[23]);
+                                         (unsigned long long)wbody[bi],
+                                         (unsigned long long)head[0], (unsigned long long)head[1],
+                                         vtObj ? "VTOBJ" : "data", nHits,
+                                         nHits > 0 ? hitOff[0] : 0, nHits > 1 ? hitOff[1] : 0,
+                                         nHits > 2 ? hitOff[2] : 0, nHits > 3 ? hitOff[3] : 0);
+                                // Print the first hit's 24 floats so the
+                                // stride/layout is readable straight from
+                                // the log.
+                                if (nHits > 0) {
+                                    uint64_t fq[12] = {};
+                                    if (PeekQwordsGuarded(
+                                            reinterpret_cast<const void*>(wbody[bi] + (uint64_t)hitOff[0]),
+                                            fq, 12)) {
+                                        const float* ff = reinterpret_cast<const float*>(fq);
+                                        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d       hit+%X f=[%.2f %.2f %.2f %.2f %.2f %.2f "
+                                                 "%.2f %.2f %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f %.2f %.2f "
+                                                 "%.2f %.2f %.2f %.2f %.2f %.2f]",
+                                                 n, hitOff[0],
+                                                 ff[0], ff[1], ff[2], ff[3], ff[4], ff[5],
+                                                 ff[6], ff[7], ff[8], ff[9], ff[10], ff[11],
+                                                 ff[12], ff[13], ff[14], ff[15], ff[16], ff[17],
+                                                 ff[18], ff[19], ff[20], ff[21], ff[22], ff[23]);
+                                    }
+                                }
                             }
                         }
                     }
