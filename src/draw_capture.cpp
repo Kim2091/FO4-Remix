@@ -39,16 +39,21 @@ constexpr uint64_t kDeadlineMs       = 15000;  // then the caller falls back
 // at shape+0x170) is bound at VS t8 -- t7 gets the same SRV too, most
 // likely as the previous-frame copy for motion vectors -- and the draws
 // are NOT hardware-instanced: 161k DrawIndexedInstanced calls never had a
-// watched SRV bound (only stray inst=1 draws with leftover bindings, e.g.
-// idx offset 91880 into a large SHARED index buffer, correctly rejected by
-// validation). The engine CPU-instances the merged shape: plain
+// watched SRV bound. The engine CPU-instances the merged shape: plain
 // DrawIndexed per instance with the record index fed via constant buffer.
-// So the capture is: while a desc-verified watched SRV sits at t7/t8,
-// count identical DrawIndexed tuples per frame -- each unique index range
-// is a sub-model (possibly at a shared-IB offset; the consumer normalizes
-// by the smallest captured start), and its per-frame repeat count is that
-// sub-model's instance count (times the number of render passes, which
-// the consumer divides out).
+//
+// Attribution (run-4 lesson): D3D11 bindings are STICKY -- t8 keeps the
+// record SRV across later unrelated draws whose shaders never touch t8,
+// so sampling VSGetShaderResources at draw time attributed random scene
+// draws (e.g. an 11k-tri mesh against a 7-record shape) to the watch.
+// Instead: the VSSetShaderResources hook tracks WHICH watch's SRV is
+// currently at t8 (ordered, same-thread bind events), and hkDrawIndexed
+// counts a draw for that watch ONLY if its IndexCount equals one of the
+// shape's known per-LOD triangle counts (+0x1A0 table) times 3. Each
+// unique surviving index range is a sub-model (offset into a shared IB;
+// the consumer normalizes by the smallest start), and its per-frame
+// repeat count is that sub-model's instance count times the number of
+// render passes, which the consumer divides out.
 // Safety: every pointer match desc-verifies (structured, stride 80,
 // ByteWidth == recordCount*80) -- recycled pointers produced false
 // captures in run 2 and cannot pass that check.
@@ -72,6 +77,8 @@ struct Watch {
     uint32_t registeredFrame = 0;
     uint32_t bindCount = 0;      // times a Set*ShaderResources bound us
     uint32_t rearms = 0;         // invalid-frame retries granted so far
+    uint32_t expectedIdx[4] = {};  // segTris[s]*3 for nonzero, sane slots
+    int      nExpected = 0;
     // Draws accumulate per frame in cur[]; the previous frame's complete
     // list rolls into done[] so Query never reads a half-recorded frame.
     uint32_t curFrame = 0;
@@ -86,6 +93,11 @@ static std::mutex            g_lock;
 static Watch                 g_watches[kMaxWatches];
 static std::atomic<int>      g_activeCount{0};
 static std::atomic<uint32_t> g_frame{1};
+// The watch whose (desc-verified) record SRV is currently bound at VS t8.
+// Set/cleared by the VSSetShaderResources hook, consumed by hkDrawIndexed
+// on the same render thread; Watch storage is static so the pointer is
+// always dereferenceable and state is re-checked under the lock.
+static std::atomic<Watch*>   g_boundT8{nullptr};
 
 static void RollFrame(Watch& w) {
     if (w.curCount > 0) {
@@ -206,61 +218,58 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
 }
 
 // The merge-shape draw path: one plain DrawIndexed per instance with the
-// record SRV at VS t7/t8. Hot -- DrawIndexed is the game's most frequent
-// draw call -- so the peek is exactly two slots and pointer-compares
-// against the watch table before anything heavier runs.
+// record SRV at VS t8. Attribution comes from the bind-event tracking in
+// hkVSSetShaderResources (g_boundT8), NOT from sampling bound state here
+// -- bindings are sticky and draw-time sampling attributed unrelated
+// scene draws to the watch (run 4). The per-LOD IndexCount filter kills
+// what stickiness remains: only draws sized exactly like one of the
+// shape's +0x1A0 sub-ranges can belong to it. No D3D calls on the fast
+// path at all.
 static void STDMETHODCALLTYPE hkDrawIndexed(
     ID3D11DeviceContext* ctx, UINT idxCount, UINT startIdx, INT baseVtx)
 {
-    if (g_activeCount.load(std::memory_order_relaxed) > 0) {
-        ID3D11ShaderResourceView* srvs[2] = {};
-        ctx->VSGetShaderResources(7, 2, srvs);  // t7..t8, the proven slots
-        for (int i = 0; i < 2; ++i) {
-            ID3D11ShaderResourceView* srv = srvs[i];
-            if (!srv) continue;
-            // Unlocked pointer pre-filter; races here only cost a
-            // GetResource on a stale candidate, never a wrong capture
-            // (the locked pass re-checks and desc-verifies).
-            bool candidate = false;
-            for (const Watch& w : g_watches) {
-                if (w.state == Watch::kActive && srv == w.srv) {
-                    candidate = true;
-                    break;
-                }
-            }
-            if (!candidate) continue;
-            ID3D11Resource* r = nullptr;
-            srv->GetResource(&r);
-            {
-                std::lock_guard<std::mutex> g(g_lock);
-                const uint32_t f = g_frame.load(std::memory_order_relaxed);
-                for (Watch& w : g_watches) {
-                    if (w.state != Watch::kActive || srv != w.srv) continue;
-                    if (!DescMatches(r, w.expectedBytes)) continue;
-                    if (w.curFrame != f) {
-                        RollFrame(w);
-                        w.curFrame = f;
-                    }
-                    bool counted = false;
-                    for (int k = 0; k < w.curCount && !counted; ++k) {
-                        SegDraw& d = w.cur[k];
-                        if (d.kind == 1 && d.indexCount == idxCount &&
-                            d.startIndex == startIdx && d.baseVertex == baseVtx) {
-                            ++d.instanceCount;  // repeat = another instance
-                            counted = true;
-                        }
-                    }
-                    if (!counted && w.curCount < kMaxDrawsPerFrame) {
-                        w.cur[w.curCount] = { idxCount, startIdx, baseVtx,
-                                              1, 0, (uint32_t)w.curCount, 1 };
-                        ++w.curCount;
-                    }
-                }
-            }
-            if (r) r->Release();
+    Watch* w = g_boundT8.load(std::memory_order_relaxed);
+    if (w) {
+        bool sized = false;
+        for (int i = 0; i < w->nExpected && !sized; ++i) {
+            sized = (w->expectedIdx[i] == idxCount);
         }
-        for (int i = 0; i < 2; ++i) {
-            if (srvs[i]) srvs[i]->Release();
+        if (!sized) {
+            // Mixed bag by design: sticky-bound unrelated draws AND -- if
+            // the engine subdivides finer than the +0x1A0 table -- the
+            // real sub-model draws we'd be wrongly filtering out. If a
+            // run yields no ok=1 captures, read these for the true sizes.
+            static std::atomic<int> sMissLogs{0};
+            const int u = sMissLogs.fetch_add(1, std::memory_order_relaxed);
+            if (u < 40) {
+                _MESSAGE("FO4RemixPlugin: [DrawCapMiss] key=0x%llX idx=%u+%u bv=%d",
+                         (unsigned long long)w->key, startIdx, idxCount, baseVtx);
+            }
+        }
+        if (sized) {
+            std::lock_guard<std::mutex> g(g_lock);
+            if (w->state == Watch::kActive &&
+                g_boundT8.load(std::memory_order_relaxed) == w) {
+                const uint32_t f = g_frame.load(std::memory_order_relaxed);
+                if (w->curFrame != f) {
+                    RollFrame(*w);
+                    w->curFrame = f;
+                }
+                bool counted = false;
+                for (int k = 0; k < w->curCount && !counted; ++k) {
+                    SegDraw& d = w->cur[k];
+                    if (d.kind == 1 && d.indexCount == idxCount &&
+                        d.startIndex == startIdx && d.baseVertex == baseVtx) {
+                        ++d.instanceCount;  // repeat = another instance
+                        counted = true;
+                    }
+                }
+                if (!counted && w->curCount < kMaxDrawsPerFrame) {
+                    w->cur[w->curCount] = { idxCount, startIdx, baseVtx,
+                                            1, 0, (uint32_t)w->curCount, 1 };
+                    ++w->curCount;
+                }
+            }
         }
     }
     g_originalDX(ctx, idxCount, startIdx, baseVtx);
@@ -332,6 +341,29 @@ static void STDMETHODCALLTYPE hkVSSetShaderResources(
     ID3D11ShaderResourceView* const* views)
 {
     CheckBind("VS", startSlot, numViews, views);
+    // t8 ownership tracking for hkDrawIndexed: any VSSet covering slot 8
+    // re-decides which watch (if any) owns subsequent DrawIndexed calls.
+    // Unlocked watch-table reads are the usual benign pre-filter race --
+    // the draw path re-checks state under the lock.
+    if (views && startSlot <= 8 && 8 < startSlot + numViews &&
+        g_activeCount.load(std::memory_order_relaxed) > 0) {
+        ID3D11ShaderResourceView* v8 = views[8 - startSlot];
+        Watch* newBound = nullptr;
+        if (v8) {
+            for (Watch& w : g_watches) {
+                if (w.state == Watch::kActive && v8 == w.srv) {
+                    ID3D11Resource* r = nullptr;
+                    v8->GetResource(&r);
+                    if (DescMatches(r, w.expectedBytes)) newBound = &w;
+                    if (r) r->Release();
+                    break;
+                }
+            }
+        }
+        g_boundT8.store(newBound, std::memory_order_relaxed);
+    } else if (views && startSlot <= 8 && 8 < startSlot + numViews) {
+        g_boundT8.store(nullptr, std::memory_order_relaxed);
+    }
     g_originalVSSet(ctx, startSlot, numViews, views);
 }
 
@@ -407,7 +439,7 @@ void OnPresent() {
 }
 
 QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
-                  std::vector<SegDraw>& out) {
+                  const uint32_t segTris[4], std::vector<SegDraw>& out) {
     if (!Hooked()) return kUnavailable;
     const uint64_t now = GetTickCount64();
     std::lock_guard<std::mutex> g(g_lock);
@@ -441,14 +473,25 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
         victim->srv = srv;
         victim->key = key;
         victim->expectedBytes = recordCount * 80u;
+        for (int s = 0; s < 4; ++s) {
+            // garbage slot-3 values (floats/717-style) stay under this
+            // multiplier harmlessly -- an unrelated draw would have to be
+            // sized exactly segTris[s]*3 WHILE our SRV owns t8
+            if (segTris[s] && segTris[s] < 0x400000u) {
+                victim->expectedIdx[victim->nExpected++] = segTris[s] * 3u;
+            }
+        }
         victim->registeredTick = now;
         victim->registeredFrame = g_frame.load(std::memory_order_relaxed);
         g_activeCount.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<int> sWatchLogs{0};
         const int wl = sWatchLogs.fetch_add(1, std::memory_order_relaxed);
         if (wl < 24) {
-            _MESSAGE("FO4RemixPlugin: [DrawCap] watch #%d key=0x%llX buf=%p srv=%p rc=%u",
-                     wl, (unsigned long long)key, buffer, srv, recordCount);
+            _MESSAGE("FO4RemixPlugin: [DrawCap] watch #%d key=0x%llX buf=%p srv=%p "
+                     "rc=%u expIdx=[%u,%u,%u,%u]",
+                     wl, (unsigned long long)key, buffer, srv, recordCount,
+                     victim->expectedIdx[0], victim->expectedIdx[1],
+                     victim->expectedIdx[2], victim->expectedIdx[3]);
         }
         return kCapturing;
     }

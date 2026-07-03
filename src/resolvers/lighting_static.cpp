@@ -964,7 +964,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 if (nzEarly >= 2 && g_config.mergeInstanceDrawCapture && instBufPtr) {
                     std::vector<DrawCapture::SegDraw> capPeek;
                     if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
-                                           (uint32_t)instRecords.size(), capPeek) ==
+                                           (uint32_t)instRecords.size(),
+                                           instSegTris, capPeek) ==
                         DrawCapture::kCapturing) {
                         return false;
                     }
@@ -1096,7 +1097,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 if (g_config.mergeInstanceDrawCapture && instBufPtr) {
                     std::vector<DrawCapture::SegDraw> cap;
                     if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
-                                           (uint32_t)instRecords.size(), cap) ==
+                                           (uint32_t)instRecords.size(),
+                                           instSegTris, cap) ==
                             DrawCapture::kReady &&
                         !cap.empty()) {
                         const uint32_t rc = (uint32_t)instRecords.size();

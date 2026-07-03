@@ -49,9 +49,14 @@ enum QueryResult {
 // (no references held -- compared against the bound pipeline state only,
 // and desc-verified against recordCount*80 bytes before a match counts:
 // recycled pointers produced false captures in run 2).
-// `key` identifies the shape across calls (mesh hash).
+// `key` identifies the shape across calls (mesh hash). `segTris` is the
+// shape's +0x1A0 per-LOD triangle table (4 dwords, zeros/garbage in
+// unused slots): only DrawIndexed calls whose IndexCount equals one of
+// the nonzero entries times 3 can belong to the shape -- the filter that
+// keeps sticky t8 bindings from attributing unrelated scene draws
+// (run 4's noise captures) to the watch.
 QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
-                  std::vector<SegDraw>& out);
+                  const uint32_t segTris[4], std::vector<SegDraw>& out);
 
 // The captured frame didn't validate (e.g. a shadow-only frame that drew a
 // partial sub-model set): put the watch back to capturing so the next
