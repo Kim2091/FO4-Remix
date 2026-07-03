@@ -120,8 +120,11 @@ void LoadConfig() {
     // [Precombines]
     g_config.mergeInstanceExpansion = GetIniBool("Precombines", "MergeInstanceExpansion", true, dllPath);
     g_config.mergeInstanceRowVector = GetIniBool("Precombines", "MergeInstanceRowVector", true, dllPath);
-    _MESSAGE("FO4RemixPlugin: Precombines - MergeInstanceExpansion=%d MergeInstanceRowVector=%d",
-             g_config.mergeInstanceExpansion, g_config.mergeInstanceRowVector);
+    g_config.mergeInstanceConjugate = GetIniBool("Precombines", "MergeInstanceConjugate", false, dllPath);
+    _MESSAGE("FO4RemixPlugin: Precombines - MergeInstanceExpansion=%d MergeInstanceRowVector=%d "
+             "MergeInstanceConjugate=%d",
+             g_config.mergeInstanceExpansion, g_config.mergeInstanceRowVector,
+             g_config.mergeInstanceConjugate);
 
     _MESSAGE("FO4RemixPlugin: Config loaded - LogShapeInfo=%d LogLargeShapes=%d LogRejections=%d "
              "LogTextures=%d LogLights=%d MaxExtent=%.0f",

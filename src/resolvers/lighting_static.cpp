@@ -174,21 +174,31 @@ static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t
     return got;
 }
 
+static inline int PermXY(int i) { return i == 0 ? 1 : (i == 1 ? 0 : 2); }
+
 // Decode one 80-byte instance record into a Bethesda ROW-VECTOR 3x4
 // container: m[i*4 + j] (j < 3) is the 3x3 in the engine's row-vector
-// convention, m[i*4 + 3] is translation component i. rowVector=true
-// (default) uses the stored rows directly -- the records share the
-// engine's convention; false reads the transpose (fallback toggle).
-static void DecodeInstanceRecord(const float* f, bool rowVector, float m[12]) {
+// convention, m[i*4 + 3] is translation component i.
+//   rowVector: true = stored rows used directly, false = transposed.
+//   conjugate: interpret the record in the X/Y-swapped space first
+//              (M' = P*S*P, t' = P*t).
+// Net linear map fed to Remix per (rowVector, conjugate), identity leaf:
+//   (1,0) P*S^T   (0,0) P*S   (1,1) S^T*P   (0,1) S*P
+// -- all four record conventions reachable from the ini while the true
+// one is pinned down empirically.
+static void DecodeInstanceRecord(const float* f, bool rowVector, bool conjugate,
+                                 float m[12]) {
     // f[15] is 1.0 on every observed record; treat as scale but range-guard
     // so an unexpected semantic (a radius, say) can't explode geometry.
     const float s = (f[15] > 0.01f && f[15] < 20.0f) ? f[15] : 1.0f;
     for (int i = 0; i < 3; ++i) {
         for (int j = 0; j < 3; ++j) {
-            const float rij = rowVector ? f[i * 4 + j] : f[j * 4 + i];
+            const int ii = conjugate ? PermXY(i) : i;
+            const int jj = conjugate ? PermXY(j) : j;
+            const float rij = rowVector ? f[ii * 4 + jj] : f[jj * 4 + ii];
             m[i * 4 + j] = rij * s;
         }
-        m[i * 4 + 3] = f[12 + i];
+        m[i * 4 + 3] = f[12 + (conjugate ? PermXY(i) : i)];
     }
 }
 
@@ -648,14 +658,50 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             const int n = sInstLogs.fetch_add(1, std::memory_order_relaxed);
             if (n < 40) {
                 if (got && !instRecords.empty()) {
+                    // Determinant of the stored 3x3 (reading-independent up
+                    // to sign conventions): det < 0 = the record MIRRORS the
+                    // piece. Mirrored instances would render inside-out with
+                    // the shared winding-flipped mesh -- if detNeg shows up
+                    // nonzero, that's a real follow-up (split mirrored
+                    // instances onto a reversed-winding mesh clone).
+                    int detNeg = 0;
+                    int tilted = 0;  // records with a significant non-yaw part
+                    for (const auto& rec : instRecords) {
+                        const float* f = rec.data();
+                        const float det =
+                            f[0] * (f[5] * f[10] - f[6] * f[9]) -
+                            f[1] * (f[4] * f[10] - f[6] * f[8]) +
+                            f[2] * (f[4] * f[9]  - f[5] * f[8]);
+                        if (det < 0.0f) ++detNeg;
+                        if (std::fabs(f[2]) > 0.05f || std::fabs(f[6]) > 0.05f ||
+                            std::fabs(f[8]) > 0.05f || std::fabs(f[9]) > 0.05f) {
+                            ++tilted;
+                        }
+                    }
                     const float* f0 = instRecords[0].data();
                     _MESSAGE("FO4RemixPlugin: [MergeInst] #%d hash=0x%llX count=%zu "
                              "leafPos=(%.1f,%.1f,%.1f) t0=(%.1f,%.1f,%.1f) "
-                             "r0=[%.2f,%.2f,%.2f] conv=%s",
+                             "conv=%s conj=%d detNeg=%d tilted=%d s0=%.2f",
                              n, (unsigned long long)hash, instRecords.size(),
                              W.pos.x, W.pos.y, W.pos.z, f0[12], f0[13], f0[14],
-                             f0[0], f0[1], f0[2],
-                             instRowVector ? "row" : "col");
+                             instRowVector ? "row" : "col",
+                             g_config.mergeInstanceConjugate ? 1 : 0,
+                             detNeg, tilted, f0[15]);
+                    // Full record dumps for the first shapes: enough raw
+                    // data to test any decode hypothesis offline.
+                    if (n < 8) {
+                        const size_t kMax = instRecords.size() < 16 ? instRecords.size() : 16;
+                        for (size_t k = 0; k < kMax; ++k) {
+                            const float* f = instRecords[k].data();
+                            _MESSAGE("FO4RemixPlugin: [MergeInstRec] #%d k=%zu "
+                                     "r=[%.4f,%.4f,%.4f|%.4f,%.4f,%.4f|%.4f,%.4f,%.4f] "
+                                     "t=(%.2f,%.2f,%.2f) s=%.3f",
+                                     n, k,
+                                     f[0], f[1], f[2], f[4], f[5], f[6],
+                                     f[8], f[9], f[10],
+                                     f[12], f[13], f[14], f[15]);
+                        }
+                    }
                 } else {
                     _MESSAGE("FO4RemixPlugin: [MergeInst] #%d hash=0x%llX stream read "
                              "FAILED -> single-draw fallback leafPos=(%.1f,%.1f,%.1f)",
@@ -696,7 +742,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         size_t extrasFailed = 0;
         for (size_t i = 0; i < instRecords.size(); ++i) {
             float m[12], comp[12];
-            DecodeInstanceRecord(instRecords[i].data(), instRowVector, m);
+            DecodeInstanceRecord(instRecords[i].data(), instRowVector,
+                                 g_config.mergeInstanceConjugate, m);
             ComposeLeafInstance(W, m, comp);
             // Raw buffer instead of `NiTransform xf;`: f4se_minimal declares
             // but does not define NiPoint3's default ctor, so constructing

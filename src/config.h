@@ -186,13 +186,20 @@ struct PluginConfig {
     // full Remix mesh); silently inactive when that is off.
     bool mergeInstanceExpansion;
 
-    // Rotation reading of the 80-byte instance records. true (default) =
-    // the records share the engine's row-vector matrix convention (world =
-    // v * M + t; same convention the camera path anchors) and the stored
-    // rows are used as-is. false = transposed reading, kept as a fallback
-    // toggle in case instanced placements ever come out with negated
-    // rotations again.
+    // Rotation reading of the 80-byte instance records. true = the stored
+    // rows are used as-is (engine row-vector convention); false =
+    // transposed reading. Together with MergeInstanceConjugate this makes
+    // every decode variant reachable from the ini without a rebuild while
+    // the true record convention is pinned down empirically.
     bool mergeInstanceRowVector;
+
+    // Interpret the instance records in the X/Y-swapped space (M' = P*S*P,
+    // t' = P*t) before composing. Covers the hypothesis that the game
+    // authors the GPU records in its render-mirrored coordinate order
+    // rather than scene-graph order. Net linear map per (RowVector,
+    // Conjugate), for an identity leaf: (1,0) P*S^T; (0,0) P*S;
+    // (1,1) S^T*P; (0,1) S*P.
+    bool mergeInstanceConjugate;
 
     // Frame-rate target for the Remix render thread. The thread loop paces to
     // this by sleeping only the unused remainder of the frame budget after
