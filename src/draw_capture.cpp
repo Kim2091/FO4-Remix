@@ -108,6 +108,38 @@ static std::atomic<uint64_t> g_winKey{0};
 static std::atomic<uint64_t> g_lastWinKey{0};
 static std::atomic<int>      g_winCount{0};
 
+// Engine call-stack capture: resolve return addresses to module+offset so
+// the exact Fallout4.exe functions issuing binds/draws can be read out of
+// the on-disk exe afterwards. Capped callers only -- MODULE resolution per
+// frame is a loader-lock query.
+static void FormatStack(char* out, size_t cap, int skip, int frames) {
+    void* bt[16];
+    const int n = (int)CaptureStackBackTrace((ULONG)skip,
+                                             (ULONG)(frames < 16 ? frames : 16),
+                                             bt, nullptr);
+    size_t pos = 0;
+    out[0] = 0;
+    for (int i = 0; i < n; ++i) {
+        HMODULE mod = nullptr;
+        char name[MAX_PATH] = "?";
+        uint64_t off = (uint64_t)bt[i];
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)bt[i], &mod) && mod) {
+            char full[MAX_PATH] = "";
+            if (GetModuleFileNameA(mod, full, sizeof(full))) {
+                const char* base = strrchr(full, '\\');
+                strncpy_s(name, base ? base + 1 : full, _TRUNCATE);
+            }
+            off = (uint64_t)bt[i] - (uint64_t)mod;
+        }
+        const int w = snprintf(out + pos, cap - pos, "%s%s+0x%llX",
+                               i ? " " : "", name, (unsigned long long)off);
+        if (w <= 0 || (size_t)w >= cap - pos) break;
+        pos += (size_t)w;
+    }
+}
+
 static void LogWindowDraw(ID3D11DeviceContext* ctx, const char* kind,
                           UINT idxCount, UINT startIdx, INT baseVtx,
                           UINT instCount) {
@@ -121,11 +153,13 @@ static void LogWindowDraw(ID3D11DeviceContext* ctx, const char* kind,
     ctx->VSGetShaderResources(8, 1, &s8);
     Watch* owner = g_boundT8.load(std::memory_order_relaxed);
     const int ours = (owner && s8 == owner->srv) ? 1 : 0;
+    char stk[400];
+    FormatStack(stk, sizeof(stk), 2, 8);  // skip self + hook thunk
     _MESSAGE("FO4RemixPlugin: [DrawWin] %s key=0x%llX idx=%u+%u bv=%d inst=%u "
-             "ib=%p off=%u fmt=%d t8ours=%d",
+             "ib=%p off=%u fmt=%d t8ours=%d stk=[%s]",
              kind, (unsigned long long)g_winKey.load(std::memory_order_relaxed),
              startIdx, idxCount, baseVtx, instCount, (void*)ib, off, (int)fmt,
-             ours);
+             ours, stk);
     if (ib) ib->Release();
     if (s8) s8->Release();
 }
@@ -404,9 +438,11 @@ static void STDMETHODCALLTYPE hkVSSetShaderResources(
             g_winKey.store(newBound->key, std::memory_order_relaxed);
             g_lastWinKey.store(newBound->key, std::memory_order_relaxed);
             g_winCount.fetch_add(1, std::memory_order_relaxed);
-            _MESSAGE("FO4RemixPlugin: [DrawWin] open key=0x%llX f=%u",
+            char stk[400];
+            FormatStack(stk, sizeof(stk), 2, 8);
+            _MESSAGE("FO4RemixPlugin: [DrawWin] open key=0x%llX f=%u stk=[%s]",
                      (unsigned long long)newBound->key,
-                     g_frame.load(std::memory_order_relaxed));
+                     g_frame.load(std::memory_order_relaxed), stk);
             g_winRemaining.store(12, std::memory_order_relaxed);
         }
     } else if (views && startSlot <= 8 && 8 < startSlot + numViews) {
