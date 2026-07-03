@@ -86,6 +86,22 @@ struct ExtractedMesh {
     float waterTransmittanceR  = 0.0f;
     float waterTransmittanceG  = 0.0f;
     float waterTransmittanceB  = 0.0f;
+
+    // Metal conversion (2026-07-02). FO4 authors metal albedo near-black and
+    // gets the metallic look from specular color/scale + an environment map
+    // -- a pipeline the path tracer doesn't replicate, so untreated metals
+    // (chain-link fences, power-armor racks) render as black dielectric
+    // voids. The lighting resolver classifies kType_Envmap materials as
+    // metal-like and sets:
+    //   metallicConstant          > 0 -> SubmitDrawable writes it into the
+    //                                    opaque material (else default 0)
+    //   roughnessConstantOverride >= 0 -> derived from the material's scalar
+    //                                    fSmoothness (else default 0.8)
+    // The albedo itself is lifted toward the vanilla F0 (kSpecularColor *
+    // fSpecularColorScale) at texture-extraction time; see
+    // ExtractMaterialTexture's lift parameters.
+    float metallicConstant          = 0.0f;
+    float roughnessConstantOverride = -1.0f;
 };
 
 struct CellInfo {
@@ -187,11 +203,24 @@ namespace BsExtraction {
     // tracer treats it as a literal mirror. Clamping to ~30% roughness
     // keeps glossy variation while preventing decals from being more
     // reflective than a polished surface should be.
+    // liftColor/liftWeight: when liftWeight > 0, each pixel's RGB is blended
+    // toward liftColor (8-bit per channel) by liftWeight/255 AFTER the
+    // postProcess stage: albedo' = albedo*(1-w) + liftColor*w. Alpha is
+    // untouched (cutouts survive). Used by the metal conversion to raise
+    // near-black FO4 metal albedo toward the material's authored specular F0
+    // so Remix's metal BRDF has something to reflect with. BC inputs are
+    // decompressed to RGBA8 first. All three channels + the weight are
+    // folded into the texture cache hash, so metal and non-metal users of
+    // the same source texture get distinct variants.
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,
                                     std::vector<ExtractedTexture>& newTextures,
                                     TexturePostProcess postProcess = TexturePostProcess::None,
-                                    uint8_t minRoughness = 0);
+                                    uint8_t minRoughness = 0,
+                                    uint8_t liftColorR = 0,
+                                    uint8_t liftColorG = 0,
+                                    uint8_t liftColorB = 0,
+                                    uint8_t liftWeight = 0);
 
     // Extract emissive data from a shape's shader property and material
     void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,

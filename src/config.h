@@ -114,6 +114,19 @@ struct PluginConfig {
     // pause menus don't age chunks out of the Remix view.
     uint32_t cullingLodChunkStaleFrames;     // default 30
 
+    // [Materials]
+    // Spec-gloss -> metal-rough conversion for FO4 environment-mapped
+    // materials (2026-07-02). FO4 authors metal albedo near-black; the
+    // vanilla look comes from kSpecularColor/fSpecularColorScale + an env
+    // map, neither of which the path tracer replicates -- untreated metals
+    // (chain-link fences, power-armor racks) render as black voids. When
+    // enabled, kType_Envmap materials get metallicConstant/roughness derived
+    // from the material scalars and an albedo lift toward the authored F0.
+    bool  metalConversionEnabled;   // master toggle (default true)
+    float metalMetallic;            // metallicConstant at envmap scale 1.0 (default 0.9)
+    float metalAlbedoLiftWeight;    // 0..1 albedo blend toward specular F0 (default 0.5)
+    float metalMinRoughness;        // floor on (1 - fSmoothness) so metals aren't mirrors (default 0.15)
+
     // [Overlay]
     // HUD/Scaleform overlay submission via Remix's DrawScreenOverlay API.
     // Default OFF: the in-source dxvk-remix's dispatchScreenOverlay currently

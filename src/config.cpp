@@ -87,6 +87,15 @@ void LoadConfig() {
              g_config.cullingMaterialLRUGraceFrames,
              g_config.cullingLodChunkStaleFrames);
 
+    // [Materials]
+    g_config.metalConversionEnabled = GetIniBool("Materials", "MetalConversionEnabled", true, dllPath);
+    g_config.metalMetallic          = GetIniFloat("Materials", "MetalMetallic",         0.9f, dllPath);
+    g_config.metalAlbedoLiftWeight  = GetIniFloat("Materials", "MetalAlbedoLiftWeight", 0.5f, dllPath);
+    g_config.metalMinRoughness      = GetIniFloat("Materials", "MetalMinRoughness",     0.15f, dllPath);
+    _MESSAGE("FO4RemixPlugin: Materials - MetalConversionEnabled=%d MetalMetallic=%.2f MetalAlbedoLiftWeight=%.2f MetalMinRoughness=%.2f",
+             g_config.metalConversionEnabled, g_config.metalMetallic,
+             g_config.metalAlbedoLiftWeight, g_config.metalMinRoughness);
+
     // [Overlay]
     g_config.hudOverlayEnabled  = GetIniBool("Overlay", "HudOverlayEnabled",  false, dllPath);
     g_config.restoreLegacyInput = GetIniBool("Overlay", "RestoreLegacyInput", true,  dllPath);
