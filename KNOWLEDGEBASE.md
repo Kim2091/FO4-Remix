@@ -594,19 +594,10 @@ from FO4 is outstanding.
   (`lighting_static.cpp:101-124`).
 - **Smoothness/spec-mask (`_s.dds`) extraction removed (2026-07-02).** FO4's
   packed spec maps translated too inconsistently to naive roughness
-  (mirror decals, black-void metal fences/racks). The `InvertRGB`
-  post-process machinery remains in `bs_extraction.cpp` but has no caller.
-- **Metal conversion is scalar-driven (2026-07-02).** `kType_Envmap`
-  materials with `fEnvmapScale > 0.01` are classified as metal:
-  `metallicConstant = MetalMetallic * clamp(fEnvmapScale,0,1)`,
-  `roughnessConstant = clamp(1 - fSmoothness, MetalMinRoughness, 0.95)`,
-  and the diffuse texture's RGB is lifted toward
-  `clamp(kSpecularColor * fSpecularColorScale)` by `MetalAlbedoLiftWeight`
-  at extraction time (alpha/cutout untouched; lift folded into the texture
-  cache hash; BC7 diffuse can't be lifted — no decoder). Non-metal opaque
-  materials use `roughnessConstant = 0.8`, `metallicConstant = 0`. `[Materials]`
-  ini section tunes all four knobs; first 40 classifications logged as
-  `[Metal]` lines.
+  (mirror decals, black-void metal fences/racks). All opaque materials now
+  use `roughnessConstant = 0.8`; the `InvertRGB` post-process machinery
+  remains in `bs_extraction.cpp` but has no caller. Revisit only as part of
+  a real spec-gloss -> metal-rough conversion.
 - **`maxExtent` config is plumbed but unused.** `lighting_static.cpp` and
   `water.cpp` use a hard-coded `1.0e6f` extent guard instead of
   `g_config.maxExtent`.

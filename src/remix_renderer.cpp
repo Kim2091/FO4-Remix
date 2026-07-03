@@ -747,14 +747,6 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         h ^= (uint64_t)ii * 0x27D4EB2F165667C5ULL;
         bool useDrawCall = mesh.alphaTestEnabled || mesh.alphaBlendEnabled;
         h ^= (uint64_t)(useDrawCall ? 1 : 0) * 0x9FB21C651E98DF25ULL;
-        // Fold the metal-conversion constants so metal and non-metal
-        // variants sharing the same texture set never share a material
-        // handle (metallic/roughnessConstant live on the handle).
-        uint32_t mci, rci;
-        memcpy(&mci, &mesh.metallicConstant, 4);
-        memcpy(&rci, &mesh.roughnessConstantOverride, 4);
-        h ^= (uint64_t)mci * 0xA24BAED4963EE407ULL;
-        h ^= (uint64_t)rci * 0xE7037ED1A0B428DBULL;
         // Fold blend factors so different blend modes get different material
         // handles. (Different opaqueExt.useDrawCallAlphaState values are
         // already covered by the useDrawCall fold above; this fold splits
@@ -852,15 +844,8 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
                 opaqueExt.heightTexture     = nullptr;
                 opaqueExt.albedoConstant    = { 1.0f, 1.0f, 1.0f };
                 opaqueExt.opacityConstant   = 1.0f;
-                // Metal conversion: the resolver derives roughness from the
-                // material's scalar fSmoothness and metallic from the envmap
-                // scale (see lighting_static.cpp). Non-metals keep the
-                // legacy defaults (metallic 0; 0.8 rough, 0.5 if a roughness
-                // texture is ever supplied again).
-                opaqueExt.roughnessConstant = mesh.roughnessConstantOverride >= 0.0f
-                    ? mesh.roughnessConstantOverride
-                    : (roughnessH ? 0.5f : 0.8f);
-                opaqueExt.metallicConstant  = mesh.metallicConstant;
+                opaqueExt.roughnessConstant = roughnessH ? 0.5f : 0.8f;
+                opaqueExt.metallicConstant  = 0.0f;
                 // Per remix_c.h: useDrawCallAlphaState=1 means "use Instance-
                 // InfoBlendEXT as alpha state source" -- Remix consumes the
                 // per-instance blend ext (chained at DrawInstance time in

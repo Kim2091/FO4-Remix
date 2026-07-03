@@ -230,57 +230,6 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     ResolverTrace::g_lastStep.store(Trace::kMaterialFetched, std::memory_order_relaxed);
 
-    // ---- Metal conversion (spec-gloss -> metal-rough, 2026-07-02) ----
-    // FO4's metallic look = near-black albedo + kSpecularColor *
-    // fSpecularColorScale + an environment map. The path tracer replicates
-    // none of that, so untreated metals (chain-link fences, power-armor
-    // racks) render as black dielectric voids: Remix's metal BRDF takes F0
-    // from albedo, and a black F0 reflects nothing. Classify kType_Envmap
-    // materials (the vanilla shiny-metal pathway) and derive:
-    //   metallic  = MetalMetallic * clamp(fEnvmapScale, 0, 1)
-    //   roughness = clamp(1 - fSmoothness, MetalMinRoughness, 0.95)
-    //   albedo lift toward clamp(kSpecularColor * fSpecularColorScale)
-    // The scalar fSmoothness is the same value the (removed) packed _s.dds
-    // map modulated -- authored per BGSM, far more consistent than the map.
-    uint8_t liftR = 0, liftG = 0, liftB = 0, liftW = 0;
-    if (g_config.metalConversionEnabled &&
-        mat->GetType() == BSLightingShaderMaterialBase::kType_Envmap) {
-        auto* envMat = static_cast<BSLightingShaderMaterialEnvmap*>(mat);
-        const float envScale = envMat->fEnvmapScale;
-        if (envScale > 0.01f) {
-            const float envClamped = envScale > 1.0f ? 1.0f : envScale;
-            mesh.metallicConstant = g_config.metalMetallic * envClamped;
-
-            float rough = 1.0f - mat->fSmoothness;
-            if (rough < g_config.metalMinRoughness) rough = g_config.metalMinRoughness;
-            if (rough > 0.95f) rough = 0.95f;
-            mesh.roughnessConstantOverride = rough;
-
-            auto toByte = [](float v) -> uint8_t {
-                if (v <= 0.0f) return 0;
-                if (v >= 1.0f) return 255;
-                return (uint8_t)(v * 255.0f + 0.5f);
-            };
-            const float specScale = mat->fSpecularColorScale;
-            liftR = toByte(mat->kSpecularColor.r * specScale);
-            liftG = toByte(mat->kSpecularColor.g * specScale);
-            liftB = toByte(mat->kSpecularColor.b * specScale);
-            liftW = toByte(g_config.metalAlbedoLiftWeight);
-
-            static std::atomic<int> sMetalLogs{0};
-            const int mn = sMetalLogs.fetch_add(1, std::memory_order_relaxed);
-            if (mn < 40) {
-                _MESSAGE("FO4RemixPlugin: [Metal] #%d shape=\"%s\" envScale=%.2f smooth=%.2f "
-                         "spec=(%.2f,%.2f,%.2f)x%.2f -> metallic=%.2f rough=%.2f lift=(%u,%u,%u)w%u",
-                         mn, tri->m_name.c_str() ? tri->m_name.c_str() : "",
-                         envScale, mat->fSmoothness,
-                         mat->kSpecularColor.r, mat->kSpecularColor.g, mat->kSpecularColor.b,
-                         specScale, mesh.metallicConstant, rough,
-                         liftR, liftG, liftB, liftW);
-            }
-        }
-    }
-
     std::vector<ExtractedTexture> newTextures;
     // For alpha-tested or alpha-blended geometry: synthesize alpha from RGB
     // luminance if the diffuse is BC1 (no alpha channel). BGS LOD foliage
@@ -307,8 +256,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             ? TexturePostProcess::DiffuseAlphaFromLuminance
             : TexturePostProcess::None;
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
-        /*minRoughness=*/0, liftR, liftG, liftB, liftW);
+        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
     // Smoothness/spec-mask (_s.dds) extraction REMOVED (2026-07-02). FO4's
