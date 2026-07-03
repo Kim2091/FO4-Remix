@@ -275,18 +275,29 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     //     weapons toward white/sepia. Replaced by a hue-preserving
     //     luminance floor on the diffuse (dark pixels scaled up keeping
     //     their hue, bright pixels untouched) -- see AlbedoLumFloor_Apply.
+    // In-game verification (2026-07-02): the luminance floor is the piece
+    // that recovers the black objects; the metallic/roughness constants did
+    // NOT help -- Remix's metal BRDF takes F0 from albedo, so floor-lifted
+    // albedo x high metallic still reads near-black (the metallic constant
+    // fights the floor). Both derivations are therefore opt-in via
+    // [Materials] MetalMetallicEnabled / MetalRoughnessEnabled, default OFF;
+    // when off, materials keep the legacy constants (metallic 0, rough 0.8).
     uint8_t albedoLumFloor = 0;
     if (g_config.metalConversionEnabled &&
         mat->GetType() == BSLightingShaderMaterialBase::kType_Envmap) {
         float smooth = mat->fSmoothness;
         if (smooth < 0.0f) smooth = 0.0f;
         if (smooth > 1.0f) smooth = 1.0f;
-        mesh.metallicConstant = g_config.metalMetallic * (0.2f + 0.8f * smooth);
+        if (g_config.metalMetallicEnabled) {
+            mesh.metallicConstant = g_config.metalMetallic * (0.2f + 0.8f * smooth);
+        }
 
-        float rough = 1.0f - smooth;
-        if (rough < g_config.metalMinRoughness) rough = g_config.metalMinRoughness;
-        if (rough > 0.95f) rough = 0.95f;
-        mesh.roughnessConstantOverride = rough;
+        if (g_config.metalRoughnessEnabled) {
+            float rough = 1.0f - smooth;
+            if (rough < g_config.metalMinRoughness) rough = g_config.metalMinRoughness;
+            if (rough > 0.95f) rough = 0.95f;
+            mesh.roughnessConstantOverride = rough;
+        }
 
         float floorF = g_config.metalAlbedoLumFloor;
         if (floorF < 0.0f) floorF = 0.0f;
@@ -298,13 +309,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         if (mn < 40) {
             const float envScale =
                 static_cast<BSLightingShaderMaterialEnvmap*>(mat)->fEnvmapScale;
+            // metallic/rough report the APPLIED values (0 / -1 = toggle off,
+            // legacy constants in effect).
             _MESSAGE("FO4RemixPlugin: [Metal] #%d shape=\"%s\" envScale=%.2f smooth=%.2f "
                      "spec=(%.2f,%.2f,%.2f)x%.2f -> metallic=%.2f rough=%.2f lumFloor=%u",
                      mn, tri->m_name.c_str() ? tri->m_name.c_str() : "",
                      envScale, mat->fSmoothness,
                      mat->kSpecularColor.r, mat->kSpecularColor.g, mat->kSpecularColor.b,
-                     mat->fSpecularColorScale, mesh.metallicConstant, rough,
-                     (unsigned)albedoLumFloor);
+                     mat->fSpecularColorScale, mesh.metallicConstant,
+                     mesh.roughnessConstantOverride, (unsigned)albedoLumFloor);
         }
     }
 

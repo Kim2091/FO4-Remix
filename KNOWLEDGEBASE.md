@@ -629,7 +629,12 @@ from FO4 is outstanding.
   blend-toward-spec-tint that white-washed weapons. Floor folds into the
   texture cache hash (discriminant 7), metallic/roughness fold into the
   material cache key. `[Materials]` ini section; first 40 classifications
-  log as `[Metal]` lines.
+  log as `[Metal]` lines. In-game verification: the luminance floor is the
+  piece that recovers the black objects; the metallic/roughness constants
+  did NOT help (metal F0 comes from albedo, so lifted-albedo x high
+  metallic still reads near-black -- the metallic constant fights the
+  floor). Both derivations are opt-in via `MetalMetallicEnabled` /
+  `MetalRoughnessEnabled`, default OFF (legacy metallic 0 / rough 0.8).
 - **`maxExtent` config is plumbed but unused.** `lighting_static.cpp` and
   `water.cpp` use a hard-coded `1.0e6f` extent guard instead of
   `g_config.maxExtent`.

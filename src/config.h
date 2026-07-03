@@ -123,7 +123,14 @@ struct PluginConfig {
     // lamps) render as black voids. When enabled, kType_Envmap materials get
     // metallic/roughness constants derived from the material's fSmoothness
     // scalar and a hue-preserving luminance floor on the diffuse albedo.
-    bool  metalConversionEnabled;   // master toggle (default true)
+    // In-game verification (2026-07-02): the albedo luminance floor is what
+    // recovers the black objects; the metallic/roughness constants did NOT
+    // help (a metal takes F0 from albedo, so floor-lifted albedo * high
+    // metallic still reads near-black -- the metallic constant fights the
+    // floor). They are therefore opt-in, default OFF.
+    bool  metalConversionEnabled;   // master toggle: classification + albedo floor (default true)
+    bool  metalMetallicEnabled;     // apply derived metallicConstant (default false)
+    bool  metalRoughnessEnabled;    // apply derived roughnessConstant (default false)
     float metalMetallic;            // metallic at fSmoothness=1; scaled down to 0.2x of this at fSmoothness=0 (default 0.85)
     float metalAlbedoLumFloor;      // 0..1 minimum diffuse luminance, hue-preserving lift below it (default 0.25)
     float metalMinRoughness;        // floor on (1 - fSmoothness) so metals aren't mirrors (default 0.15)
