@@ -1,5 +1,7 @@
 #include "camera.h"
 #include "bs_extraction.h"
+#include "config.h"
+#include "semantic_capture.h"  // GetLeafClassName (SEH-guarded RTTI walk)
 
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
@@ -7,6 +9,116 @@
 #include "f4se/NiNodes.h"
 #include "f4se/NiObjects.h"
 #include "f4se/NiTypes.h"
+
+#include <cmath>
+#include <cstring>
+
+namespace {
+
+constexpr float kPi = 3.14159265358979323846f;
+
+// ---------------------------------------------------------------------------
+// Live NiCamera frustum (FOV fix, 2026-07-03).
+//
+// The plugin used to pass PlayerCamera::fDefaultWorldFov (the
+// fDefaultWorldFOV:Display ini value) straight into Remix's fovYInDegrees.
+// That value is the game's HORIZONTAL FOV convention, while the runtime's
+// SetupByHalfFovy treats fovYInDegrees as the full VERTICAL FOV -- so Remix
+// rendered ~112 degrees horizontal for an 80-degree game setting ("fov is
+// different than the original game", 2026-07-02). It is also a static config
+// value: aim-down-sights zoom, first-person FOV, and FOV mods never reached
+// Remix, and the aspect ratio was hardcoded 16:9.
+//
+// Ground truth is the live NiCamera's view frustum. F4SE does not declare
+// NiCamera, but the FO4 layout is long-established (CommonLibF4 NiCamera):
+//   NiAVObject                      // 0x000..0x120 (STATIC_ASSERT'd)
+//   float     worldToCam[4][4];     // 0x120
+//   NiFrustum viewFrustum;          // 0x160
+//   float     minNearPlaneDist;     // 0x17C
+//   float     maxFarNearRatio;      // 0x180
+//   NiRect<float> port;             // 0x184
+//   float     lodAdjust;            // 0x194
+// Gamebryo/Creation frustum left/right/top/bottom are UNIT-DISTANCE slopes
+// (tangents of the half-angles; engine defaults left/right = +/-1.333,
+// top/bottom = +/-1.0). Every read below is sanity-gated so a layout or
+// convention surprise degrades to the converted-ini fallback instead of a
+// broken image.
+// ---------------------------------------------------------------------------
+constexpr uintptr_t kNiCameraFrustumOffset = 0x160;
+
+NiAVObject* FindNiCameraChild(NiNode* node) {
+    if (!node || !node->m_children.m_data) {
+        return nullptr;
+    }
+    const UInt16 count = node->m_children.m_emptyRunStart;
+    for (UInt16 i = 0; i < count && i < 8; ++i) {
+        NiAVObject* child = node->m_children.m_data[i];
+        if (!child) {
+            continue;
+        }
+        char leaf[64] = "";
+        SemanticCapture::GetLeafClassName(child, leaf, sizeof(leaf));
+        if (std::strcmp(leaf, "NiCamera") == 0) {
+            return child;
+        }
+    }
+    return nullptr;
+}
+
+// Returns true and fills fovY/aspect/nearP/farP from the camera's live view
+// frustum; false when no NiCamera child exists or the values fail sanity.
+bool ReadFrustumFov(NiNode* cameraNode,
+                    float& fovYDeg, float& aspect,
+                    float& nearP, float& farP) {
+    NiAVObject* cam = FindNiCameraChild(cameraNode);
+    if (!cam) {
+        return false;
+    }
+
+    const NiFrustum* fr = reinterpret_cast<const NiFrustum*>(
+        reinterpret_cast<uintptr_t>(cam) + kNiCameraFrustumOffset);
+    if (fr->m_bOrtho || !(fr->m_fNear > 0.0f) || !(fr->m_fFar > fr->m_fNear)) {
+        return false;
+    }
+
+    // Unit-distance slopes first (the Gamebryo convention). If a runtime
+    // surprise stores extents at the near plane instead, the unit read
+    // produces an absurd FOV and the near-scaled read is tried before
+    // giving up.
+    float tanHalfY = (fr->m_fTop - fr->m_fBottom) * 0.5f;
+    float tanHalfX = (fr->m_fRight - fr->m_fLeft) * 0.5f;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (attempt == 1) {
+            tanHalfY /= fr->m_fNear;
+            tanHalfX /= fr->m_fNear;
+        }
+        if (tanHalfY > 0.001f && tanHalfX > 0.001f) {
+            const float vDeg = 2.0f * std::atan(tanHalfY) * (180.0f / kPi);
+            const float asp  = tanHalfX / tanHalfY;
+            if (vDeg >= 10.0f && vDeg <= 160.0f && asp >= 0.5f && asp <= 4.0f) {
+                fovYDeg = vDeg;
+                aspect  = asp;
+                // Clamp near/far into a range the path tracer is happy with;
+                // the game's fNear (~15) is fine, but never let a transient
+                // 0-ish or astronomically large frustum through.
+                nearP = fr->m_fNear < 0.1f ? 0.1f : (fr->m_fNear > 50.0f ? 50.0f : fr->m_fNear);
+                farP  = fr->m_fFar  < 1000.0f ? 1000.0f
+                      : (fr->m_fFar > 10000000.0f ? 10000000.0f : fr->m_fFar);
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Fallback: convert the game's horizontal-convention FOV setting to the
+// vertical FOV Remix expects, assuming the 16:9 reference aspect.
+float HorizontalToVerticalFov(float hFovDeg, float aspect) {
+    const float halfH = hFovDeg * 0.5f * (kPi / 180.0f);
+    return 2.0f * std::atan(std::tan(halfH) / aspect) * (180.0f / kPi);
+}
+
+} // namespace
 
 static CameraState MakeFallback() {
     CameraState state = {};
@@ -64,14 +176,29 @@ CameraState Camera::Get() {
     state.up[1]      = xform.rot.data[2][0];
     state.up[2]      = xform.rot.data[2][2];
 
-    state.fovY = playerCam->fDefaultWorldFov;
-    if (state.fovY <= 0.0f || state.fovY > 170.0f) {
-        state.fovY = 70.0f;
+    // FOV source ladder (see the NiCamera comment block above):
+    //   1. Live NiCamera view frustum -- exact vertical FOV + aspect + near/
+    //      far, tracks ADS zoom and FOV mods per frame.
+    //   2. fDefaultWorldFov converted horizontal->vertical at 16:9.
+    //   3. Legacy raw value ([Camera] FovFromFrustum=0 preserves the old
+    //      behavior of passing the setting through unconverted).
+    bool fromFrustum = false;
+    if (g_config.cameraFovFromFrustum) {
+        fromFrustum = ReadFrustumFov(cameraNode, state.fovY, state.aspectRatio,
+                                     state.nearPlane, state.farPlane);
     }
-
-    state.aspectRatio = 16.0f / 9.0f;
-    state.nearPlane = 5.0f;
-    state.farPlane = 100000.0f;
+    if (!fromFrustum) {
+        float hFov = playerCam->fDefaultWorldFov;
+        if (hFov <= 0.0f || hFov > 170.0f) {
+            hFov = 70.0f;
+        }
+        state.aspectRatio = 16.0f / 9.0f;
+        state.fovY = g_config.cameraFovFromFrustum
+            ? HorizontalToVerticalFov(hFov, state.aspectRatio)
+            : hFov;  // legacy passthrough
+        state.nearPlane = 5.0f;
+        state.farPlane = 100000.0f;
+    }
 
     // Snapshot player world position (Beth coords, not swapped) for the
     // worldspace LOD chunk spatial filter in OnFrame. Cheap; reads
@@ -90,12 +217,15 @@ CameraState Camera::Get() {
     static int s_logCounter = 0;
     if (s_logCounter++ % 300 == 0) {
         _MESSAGE("FO4RemixPlugin: Camera pos=(%.1f, %.1f, %.1f) fwd=(%.3f, %.3f, %.3f) "
-                 "up=(%.3f, %.3f, %.3f) right=(%.3f, %.3f, %.3f) fov=%.1f",
+                 "up=(%.3f, %.3f, %.3f) right=(%.3f, %.3f, %.3f) fovY=%.1f aspect=%.3f "
+                 "near=%.1f far=%.0f src=%s",
                  state.position[0], state.position[1], state.position[2],
                  state.forward[0], state.forward[1], state.forward[2],
                  state.up[0], state.up[1], state.up[2],
                  state.right[0], state.right[1], state.right[2],
-                 state.fovY);
+                 state.fovY, state.aspectRatio, state.nearPlane, state.farPlane,
+                 fromFrustum ? "frustum"
+                             : (g_config.cameraFovFromFrustum ? "ini-converted" : "ini-raw"));
     }
 
     return state;

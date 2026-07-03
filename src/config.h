@@ -135,6 +135,16 @@ struct PluginConfig {
     float metalAlbedoLumFloor;      // 0..1 minimum diffuse luminance, hue-preserving lift below it (default 0.25)
     float metalMinRoughness;        // floor on (1 - fSmoothness) so metals aren't mirrors (default 0.15)
 
+    // [Camera]
+    // FOV source for the Remix camera (2026-07-03). Default true: read the
+    // live NiCamera view frustum (exact vertical FOV + aspect + near/far,
+    // tracks ADS zoom and FOV mods), falling back to fDefaultWorldFov
+    // converted horizontal->vertical at 16:9. False restores the legacy
+    // behavior of passing fDefaultWorldFov through raw -- which the runtime
+    // treats as VERTICAL FOV, rendering ~112 deg horizontal for an 80 deg
+    // setting (the "fov is different than the game" report).
+    bool cameraFovFromFrustum;
+
     // [Overlay]
     // HUD/Scaleform overlay submission via Remix's DrawScreenOverlay API.
     // Default OFF: the in-source dxvk-remix's dispatchScreenOverlay currently

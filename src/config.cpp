@@ -99,6 +99,10 @@ void LoadConfig() {
              g_config.metalRoughnessEnabled, g_config.metalMetallic,
              g_config.metalAlbedoLumFloor, g_config.metalMinRoughness);
 
+    // [Camera]
+    g_config.cameraFovFromFrustum = GetIniBool("Camera", "FovFromFrustum", true, dllPath);
+    _MESSAGE("FO4RemixPlugin: Camera - FovFromFrustum=%d", g_config.cameraFovFromFrustum);
+
     // [Overlay]
     g_config.hudOverlayEnabled  = GetIniBool("Overlay", "HudOverlayEnabled",  false, dllPath);
     g_config.restoreLegacyInput = GetIniBool("Overlay", "RestoreLegacyInput", true,  dllPath);
