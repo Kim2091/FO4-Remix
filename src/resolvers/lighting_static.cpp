@@ -528,6 +528,20 @@ static std::mutex g_bakedChunkLock;
 static std::vector<uintptr_t> g_bakedChunkSeen;
 
 static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
+    // Walk diagnostics (run 1 of take 11 found ZERO chunks with no trace
+    // of why): count every gate, log the ascend chain and per-stage
+    // rejections for the first shapes.
+    static std::atomic<int> sWalkLogs{0};
+    const int wl = sWalkLogs.fetch_add(1, std::memory_order_relaxed);
+    const bool wlog = wl < 6;
+    char chain[256];
+    size_t chainPos = 0;
+    chain[0] = 0;
+    int cTriShape = 0, cFlag35 = 0, cGeo = 0, cStride = 0, cCpu = 0, cBytes = 0,
+        cBound = 0;
+    char firstShapeCls[64] = "";
+    uint64_t firstShapeFlags = 0;
+
     // ascend to the BSMultiBoundNode ancestor
     uintptr_t node = reinterpret_cast<uintptr_t>(tri);
     uintptr_t mbNode = 0;
@@ -535,6 +549,11 @@ static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
         char cls[64] = "";
         SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(node), cls,
                                           sizeof(cls));
+        if (wlog && chainPos < sizeof(chain) - 40) {
+            const int wn = snprintf(chain + chainPos, sizeof(chain) - chainPos,
+                                    "%s%s", d ? "|" : "", cls);
+            if (wn > 0) chainPos += (size_t)wn;
+        }
         if (std::strcmp(cls, "BSMultiBoundNode") == 0) {
             mbNode = node;
             break;
@@ -546,7 +565,13 @@ static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
         }
         node = (uintptr_t)p;
     }
-    if (!mbNode) return;
+    if (!mbNode) {
+        if (wlog) {
+            _MESSAGE("FO4RemixPlugin: [MergeWalk] #%d NO BSMultiBoundNode ancestor; "
+                     "chain=[%s]", wl, chain);
+        }
+        return;
+    }
     const NiTransform& W = tri->m_worldTransform;
     const NiBound& B = tri->m_worldBound;
     // The merge shape's own shaderProperty: when the precombine system
@@ -569,12 +594,18 @@ static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
         if (std::strcmp(cls, "BSTriShape") == 0) {
             // candidate baked chunk (merge shapes have a different leaf
             // class, so they never enter here)
+            ++cTriShape;
             uint64_t flags = 0;
-            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(cur + 0x108),
-                                   &flags, 1) ||
-                !(flags & (1ULL << 35))) {  // kFlagInInstanceGroup
+            const bool haveFlags = PeekQwordsGuarded(
+                reinterpret_cast<const void*>(cur + 0x108), &flags, 1);
+            if (cTriShape == 1) {
+                std::memcpy(firstShapeCls, cls, sizeof(firstShapeCls));
+                firstShapeFlags = flags;
+            }
+            if (!haveFlags || !(flags & (1ULL << 35))) {  // kFlagInInstanceGroup
                 continue;
             }
+            ++cFlag35;
             uint64_t geo = 0;
             if (!PeekQwordsGuarded(reinterpret_cast<const void*>(cur + 0x148),
                                    &geo, 1) || !HeapLikePtr(geo)) {
@@ -584,15 +615,18 @@ static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
             if (!PeekQwordsGuarded(reinterpret_cast<const void*>(geo), g, 3)) {
                 continue;
             }
+            ++cGeo;
             const uint32_t desc0 = (uint32_t)g[0];
             if (((desc0 & 0xFu) * 4u) != 32u) continue;
             if (!HeapLikePtr(g[1]) || !HeapLikePtr(g[2])) continue;
+            ++cStride;
             uint64_t vbCpu = 0, ibCpu = 0, tmp = 0;
             uint32_t vbBytes = 0, ibBytes = 0;
             if (!PeekQwordsGuarded(reinterpret_cast<const void*>(g[1] + 0x8),
                                    &vbCpu, 1) || !HeapLikePtr(vbCpu)) continue;
             if (!PeekQwordsGuarded(reinterpret_cast<const void*>(g[2] + 0x8),
                                    &ibCpu, 1) || !HeapLikePtr(ibCpu)) continue;
+            ++cCpu;
             if (!PeekQwordsGuarded(reinterpret_cast<const void*>(g[1] + 0x38),
                                    &tmp, 1)) continue;
             vbBytes = (uint32_t)tmp;
@@ -601,6 +635,7 @@ static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
             ibBytes = (uint32_t)tmp;
             if (vbBytes < 32 || vbBytes > 0x800000 || (vbBytes % 32) != 0) continue;
             if (ibBytes < 6 || ibBytes > 0x400000 || (ibBytes % 2) != 0) continue;
+            ++cBytes;
             uint32_t tris = ibBytes / 6;
             if (PeekQwordsGuarded(reinterpret_cast<const void*>(cur + 0x160),
                                   &tmp, 1)) {
@@ -631,11 +666,20 @@ static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
             const float dz = bnd[2] - B.m_kCenter.z;
             const float rr = B.m_fRadius + bnd[3] + 64.0f;
             if (dx * dx + dy * dy + dz * dz > rr * rr) continue;
+            ++cBound;
             (void)W;
             out.push_back(bc);
             continue;
         }
-        if (std::strstr(cls, "Node") == nullptr) continue;
+        if (std::strstr(cls, "Node") == nullptr) {
+            // sample the classes we're NOT descending into / not matching
+            if (wlog && chainPos < sizeof(chain) - 40) {
+                const int wn = snprintf(chain + chainPos, sizeof(chain) - chainPos,
+                                        " x:%s", cls);
+                if (wn > 0) chainPos += (size_t)wn;
+            }
+            continue;
+        }
         // NiNode m_children: NiTArray at +0x120 -> data +0x128,
         // m_emptyRunStart (iterate bound) is the ushort at +0x132
         uint64_t kids = 0;
@@ -657,6 +701,14 @@ static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
             }
             if (child && HeapLikePtr(child)) stack[sp++] = (uintptr_t)child;
         }
+    }
+    if (wlog) {
+        _MESSAGE("FO4RemixPlugin: [MergeWalk] #%d mb=%p visited=%d triShapes=%d "
+                 "flag35=%d geo=%d stride32=%d cpu=%d bytes=%d bound=%d "
+                 "chain=[%s] firstShape cls=%s flags=0x%llX",
+                 wl, (void*)mbNode, visited, cTriShape, cFlag35, cGeo, cStride,
+                 cCpu, cBytes, cBound, chain, firstShapeCls,
+                 (unsigned long long)firstShapeFlags);
     }
     // Prefer exact property attribution when it exists: if any collected
     // chunk shares the merge shape's shaderProperty object, keep only
