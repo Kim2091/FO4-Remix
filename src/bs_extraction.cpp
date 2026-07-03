@@ -713,6 +713,73 @@ static void DiffuseAlphaFromLuminance_Apply(ExtractedTexture& tex, bool forceFor
     }
 }
 
+// Hue-preserving luminance floor (metal-conversion albedo treatment).
+// FO4 metal albedo is authored near-black (the vanilla look is built from
+// specular + envmap on top), and Remix's metal BRDF takes F0 from albedo --
+// black albedo means a black metal no matter what the metallic constant
+// says. Pixels below the luminance floor are scaled up multiplicatively so
+// their hue survives (rust stays rust-colored, just brighter); pixels
+// already above the floor are untouched, so bright/painted regions keep
+// their authored color. This is deliberately NOT a blend toward the
+// material's spec tint -- that variant (506e5e7, reverted) dragged every
+// classified surface toward the tint (white-washed weapons).
+//
+// Scale is capped at 6x to keep quantization noise in very dark texels from
+// blowing up into confetti; whatever the cap leaves below the floor is
+// topped up with a neutral (gray) fill. Alpha is untouched (cutouts
+// survive).
+static void AlbedoLumFloor_Apply(ExtractedTexture& tex, uint8_t lumFloor)
+{
+    // BC input: decompress to RGBA8 first (no channel transform).
+    switch (tex.dxgiFormat) {
+        case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB: case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB: case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM: case DXGI_FORMAT_BC5_TYPELESS:
+            if (!DecompressBC(tex, BCTransform::None)) return;
+            break;
+        default:
+            break;
+    }
+    const bool rgba = (tex.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                       tex.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    const bool bgra = (tex.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                       tex.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+    if (!rgba && !bgra) {
+        return;  // BC7/other: can't process without a decoder; leave as-is
+    }
+
+    // Rec.709 luma weights in /256 fixed point (54+183+19 = 256). Channel
+    // order only swaps the R/B weights.
+    const uint32_t wr = bgra ? 19u : 54u;
+    const uint32_t wb = bgra ? 54u : 19u;
+    constexpr uint32_t kMaxScaleFP = 6u * 256u;  // 6x cap, 8.8 fixed point
+
+    const uint32_t floorL = lumFloor;
+    for (uint32_t i = 0; i < tex.width * tex.height; i++) {
+        uint8_t* p = &tex.pixels[i * 4];
+        uint32_t lum = (wr * p[0] + 183u * p[1] + wb * p[2]) >> 8;
+        if (lum >= floorL) continue;
+
+        if (lum > 0) {
+            uint32_t scaleFP = (floorL << 8) / lum;
+            if (scaleFP > kMaxScaleFP) scaleFP = kMaxScaleFP;
+            for (int c = 0; c < 3; c++) {
+                uint32_t v = (p[c] * scaleFP) >> 8;
+                p[c] = v > 255u ? 255u : (uint8_t)v;
+            }
+            lum = (wr * p[0] + 183u * p[1] + wb * p[2]) >> 8;
+        }
+        if (lum < floorL) {
+            // Near-black tail (or capped scale still short): neutral fill.
+            const uint32_t add = floorL - lum;
+            for (int c = 0; c < 3; c++) {
+                uint32_t v = p[c] + add;
+                p[c] = v > 255u ? 255u : (uint8_t)v;
+            }
+        }
+    }
+}
+
 // Convert FO4 smoothness/spec mask → Remix roughness by inverting RGB
 static void SmoothnessToRoughness(ExtractedTexture& tex)
 {
@@ -805,7 +872,8 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                                        ID3D11Device* device,
                                        std::vector<ExtractedTexture>& newTextures,
                                        TexturePostProcess postProcess,
-                                       uint8_t minRoughness)
+                                       uint8_t minRoughness,
+                                       uint8_t albedoLumFloor)
 {
     // Early-bail diagnostic: log when diffuse texture extraction fails because
     // the D3D resource isn't available. Helps distinguish "decal not extracted
@@ -842,6 +910,10 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // hash differently. Otherwise the first-seen variant would poison the
     // cache for the other case.
     if (minRoughness > 0)                                             hash = FnvHashCombine(hash, 4 | (uint64_t)minRoughness << 8);
+    // Fold the metal albedo luminance floor into the cache key: metal and
+    // non-metal materials sharing a source texture need distinct lifted/
+    // unlifted variants (same poisoning argument as the roughness clamp).
+    if (albedoLumFloor > 0)                                           hash = FnvHashCombine(hash, 7 | (uint64_t)albedoLumFloor << 8);
 
     // Check cache first. A hit normally returns just the hash -- the pixels
     // were already handed to SubmitDrawable when the texture was first
@@ -1050,6 +1122,12 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
             DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/false);
         } else if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminanceForceBC3) {
             DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/true);
+        }
+        // Metal albedo luminance floor composes AFTER the alpha stage so
+        // synthesized / authored cutout alpha is preserved while dark RGB is
+        // lifted (hue-preserving; see AlbedoLumFloor_Apply).
+        if (albedoLumFloor > 0) {
+            AlbedoLumFloor_Apply(mip, albedoLumFloor);
         }
     }
 

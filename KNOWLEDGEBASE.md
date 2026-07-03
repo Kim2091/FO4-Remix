@@ -443,8 +443,10 @@ Object creation is wrapped by `RemixRenderer::SubmitDrawable`:
   else maps to 0 and the texture is skipped).
 - `api->CreateMaterial(remixapi_MaterialInfo*)` — opaque branch sets
   `albedoConstant = (1,1,1)`, `opacityConstant = 1`, `roughnessConstant =
-  0.5` if a roughness texture is present else `0.8`, `metallicConstant = 0`,
-  and copies alpha-test fields directly. `useDrawCallAlphaState = 0` so the
+  mesh.roughnessConstantOverride` when >= 0 (metal conversion) else `0.5`
+  if a roughness texture is present else `0.8`, `metallicConstant =
+  mesh.metallicConstant` (0 for non-metals), and copies alpha-test fields
+  directly. `useDrawCallAlphaState = 0` so the
   material-level alpha-test fields win. Translucent branch sets
   `refractiveIndex = 1.33`, `transmittanceMeasurementDistance = 500.0` cm,
   `useDiffuseLayer = 0`, and forwards `transmittanceColor` from the water
@@ -601,10 +603,33 @@ from FO4 is outstanding.
   (`lighting_static.cpp:101-124`).
 - **Smoothness/spec-mask (`_s.dds`) extraction removed (2026-07-02).** FO4's
   packed spec maps translated too inconsistently to naive roughness
-  (mirror decals, black-void metal fences/racks). All opaque materials now
+  (mirror decals, black-void metal fences/racks). Non-metal opaque materials
   use `roughnessConstant = 0.8`; the `InvertRGB` post-process machinery
-  remains in `bs_extraction.cpp` but has no caller. Revisit only as part of
-  a real spec-gloss -> metal-rough conversion.
+  remains in `bs_extraction.cpp` but has no caller. The real spec-gloss ->
+  metal-rough conversion now exists for the envmap class (next entry).
+- **Metal conversion take 2: kType_Envmap -> metal-rough (2026-07-02).**
+  The pure-black objects (power-armor stands, picket-fence LODs, street
+  lamps, workstations) were all `GetType() == kType_Envmap` with the
+  `SLSF1_Environment_Mapping` propFlags bit (log-verified: every reported
+  class matType=1/bit7=1, every fine-rendering control 0/0). FO4 authors
+  their diffuse near-black and builds the look from `kSpecularColor *
+  fSpecularColorScale` + cubemap; untreated they path-trace as black
+  dielectric voids. NOT caused by async readback (content verified via BC3
+  alpha stats), texture lifecycle (0 orphans/evictions logged), or vertex
+  colors (gate engaged, still black). The resolver
+  (`lighting_static.cpp`) classifies on `GetType()` ONLY — take 1 (506e5e7,
+  reverted bb2a02f) also gated on `fEnvmapScale > 0.01`, which skipped the
+  PA stand (reads ~0); bb2a02f's claim it "was not kType_Envmap" is wrong.
+  Derivations: `metallic = MetalMetallic * (0.2 + 0.8*fSmoothness)`
+  (smoothness modulation keeps bark/wood wetness-envmaps mostly dielectric;
+  take 1's `* fEnvmapScale` under-metallized authored-low scales),
+  `roughness = clamp(1-fSmoothness, MetalMinRoughness, 0.95)`, and a
+  hue-preserving luminance floor on the diffuse (`AlbedoLumFloor_Apply`,
+  multiplicative to 6x + neutral fill, alpha untouched) instead of take 1's
+  blend-toward-spec-tint that white-washed weapons. Floor folds into the
+  texture cache hash (discriminant 7), metallic/roughness fold into the
+  material cache key. `[Materials]` ini section; first 40 classifications
+  log as `[Metal]` lines.
 - **`maxExtent` config is plumbed but unused.** `lighting_static.cpp` and
   `water.cpp` use a hard-coded `1.0e6f` extent guard instead of
   `g_config.maxExtent`.

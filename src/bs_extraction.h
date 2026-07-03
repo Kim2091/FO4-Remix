@@ -86,6 +86,22 @@ struct ExtractedMesh {
     float waterTransmittanceR  = 0.0f;
     float waterTransmittanceG  = 0.0f;
     float waterTransmittanceB  = 0.0f;
+
+    // Metal conversion (2026-07-02, take 2). FO4 authors metal albedo near-
+    // black and builds the metallic look from kSpecularColor/
+    // fSpecularColorScale + an environment map -- a pipeline the path tracer
+    // doesn't replicate, so untreated kType_Envmap materials (power-armor
+    // stands, picket-fence LODs, street lamps) render as black dielectric
+    // voids. The lighting resolver classifies kType_Envmap materials and
+    // sets:
+    //   metallicConstant          > 0 -> SubmitDrawable writes it into the
+    //                                    opaque material (else default 0)
+    //   roughnessConstantOverride >= 0 -> derived from the material's scalar
+    //                                    fSmoothness (else default 0.8)
+    // The diffuse itself gets a hue-preserving luminance floor at texture-
+    // extraction time; see ExtractMaterialTexture's albedoLumFloor param.
+    float metallicConstant          = 0.0f;
+    float roughnessConstantOverride = -1.0f;
 };
 
 struct CellInfo {
@@ -195,11 +211,24 @@ namespace BsExtraction {
     // tracer treats it as a literal mirror. Clamping to ~30% roughness
     // keeps glossy variation while preventing decals from being more
     // reflective than a polished surface should be.
+    // albedoLumFloor: when > 0, every pixel whose Rec.709 luminance is below
+    // this 8-bit floor is lifted AFTER the postProcess stage -- dark pixels
+    // are scaled up multiplicatively (hue preserved, capped at 6x, with a
+    // neutral fill for the near-black tail), bright pixels are untouched.
+    // Alpha is untouched (cutouts survive). Used by the metal conversion:
+    // FO4 metal diffuse is authored near-black and Remix's metal BRDF takes
+    // F0 from albedo, so black albedo means a black metal regardless of the
+    // metallic constant. Unlike the reverted lift-toward-spec-tint, this
+    // never drags hue toward white spec (the weapon-washing failure of
+    // 506e5e7). BC inputs are decompressed to RGBA8 first; BC7/other pass
+    // through unchanged. The floor is folded into the texture cache hash so
+    // metal and non-metal users of one source texture get distinct variants.
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,
                                     std::vector<ExtractedTexture>& newTextures,
                                     TexturePostProcess postProcess = TexturePostProcess::None,
-                                    uint8_t minRoughness = 0);
+                                    uint8_t minRoughness = 0,
+                                    uint8_t albedoLumFloor = 0);
 
     // Extract emissive data from a shape's shader property and material
     void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,

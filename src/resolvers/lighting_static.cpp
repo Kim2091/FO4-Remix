@@ -250,6 +250,64 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     ResolverTrace::g_lastStep.store(Trace::kMaterialFetched, std::memory_order_relaxed);
 
+    // ---- Metal conversion, take 2 (spec-gloss -> metal-rough, 2026-07-02) ----
+    // FO4's "shiny metal" pathway is BSLightingShaderMaterialEnvmap: near-
+    // black diffuse + kSpecularColor*fSpecularColorScale + cubemap*
+    // fEnvmapScale. The path tracer replicates none of that, so untreated
+    // envmap materials render as black dielectric voids. Session 2026-07-02
+    // log: every user-reported black class (PArig02 power-armor stands,
+    // PicketFenceB LODs, street lamps, workstations) is matType==kType_Envmap
+    // with the SLSF1_Environment_Mapping propFlags bit set, while fine-
+    // rendering controls (picture frames, TVs, vans) are kType_Default.
+    //
+    // Take 1 (506e5e7, reverted in bb2a02f) targeted this class but failed
+    // three ways, each fixed here:
+    //   - Gated on fEnvmapScale > 0.01, which skipped the very objects it
+    //     was built for (the PA stand reads envScale ~0). Classify on
+    //     GetType() alone; log envScale for diagnostics only.
+    //   - metallic = 0.9 * envScale: authored-low scales (ShotgunReceiver
+    //     0.20) came out nearly dielectric. envScale is a reflection-
+    //     intensity knob, not a metalness signal. Modulate by fSmoothness
+    //     instead -- wetness-style envmaps (tree bark is kType_Envmap!)
+    //     author low smoothness, real metals author high -- with a 0.2
+    //     participation floor so nothing classified is fully dielectric.
+    //   - Albedo lift BLENDED toward the spec tint, washing white-spec
+    //     weapons toward white/sepia. Replaced by a hue-preserving
+    //     luminance floor on the diffuse (dark pixels scaled up keeping
+    //     their hue, bright pixels untouched) -- see AlbedoLumFloor_Apply.
+    uint8_t albedoLumFloor = 0;
+    if (g_config.metalConversionEnabled &&
+        mat->GetType() == BSLightingShaderMaterialBase::kType_Envmap) {
+        float smooth = mat->fSmoothness;
+        if (smooth < 0.0f) smooth = 0.0f;
+        if (smooth > 1.0f) smooth = 1.0f;
+        mesh.metallicConstant = g_config.metalMetallic * (0.2f + 0.8f * smooth);
+
+        float rough = 1.0f - smooth;
+        if (rough < g_config.metalMinRoughness) rough = g_config.metalMinRoughness;
+        if (rough > 0.95f) rough = 0.95f;
+        mesh.roughnessConstantOverride = rough;
+
+        float floorF = g_config.metalAlbedoLumFloor;
+        if (floorF < 0.0f) floorF = 0.0f;
+        if (floorF > 1.0f) floorF = 1.0f;
+        albedoLumFloor = (uint8_t)(floorF * 255.0f + 0.5f);
+
+        static std::atomic<int> sMetalLogs{0};
+        const int mn = sMetalLogs.fetch_add(1, std::memory_order_relaxed);
+        if (mn < 40) {
+            const float envScale =
+                static_cast<BSLightingShaderMaterialEnvmap*>(mat)->fEnvmapScale;
+            _MESSAGE("FO4RemixPlugin: [Metal] #%d shape=\"%s\" envScale=%.2f smooth=%.2f "
+                     "spec=(%.2f,%.2f,%.2f)x%.2f -> metallic=%.2f rough=%.2f lumFloor=%u",
+                     mn, tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                     envScale, mat->fSmoothness,
+                     mat->kSpecularColor.r, mat->kSpecularColor.g, mat->kSpecularColor.b,
+                     mat->fSpecularColorScale, mesh.metallicConstant, rough,
+                     (unsigned)albedoLumFloor);
+        }
+    }
+
     std::vector<ExtractedTexture> newTextures;
     // For alpha-tested or alpha-blended geometry: synthesize alpha from RGB
     // luminance if the diffuse is BC1 (no alpha channel). BGS LOD foliage
@@ -276,7 +334,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             ? TexturePostProcess::DiffuseAlphaFromLuminance
             : TexturePostProcess::None;
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess);
+        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
+        /*minRoughness=*/0, albedoLumFloor);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
     // Smoothness/spec-mask (_s.dds) extraction REMOVED (2026-07-02). FO4's
