@@ -1079,80 +1079,69 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             }
             const uint32_t meshTris = (uint32_t)(mesh.indices.size() / 3);
             if (nonZero >= 2) {
-                // Preferred: the engine's own draw parameters, captured off
-                // DrawIndexedInstanced by matching this shape's instance-
-                // record SRV/buffer (draw_capture.h). The vanilla renderer
-                // knows the per-sub-model index ranges, the record
-                // partition (9+4 on the road cluster), and the active LOD
-                // slice -- ground truth the +0x1D0 descriptor inference
-                // never had (2026-07-03 probe: invalid pointer on the road
-                // cluster, polymorphic objects elsewhere). Any capture
-                // that doesn't validate falls through to the take-5 path.
+                // Preferred: the engine's own draw parameters for this
+                // shape, captured off the D3D11 draw stream by matching
+                // the instance-record SRV at VS t7/t8 (draw_capture.h).
+                // The engine CPU-instances merged shapes -- one plain
+                // DrawIndexed per instance, record index via constant
+                // buffer -- so a captured frame is a multiset of index
+                // ranges: each unique range is a sub-model (offset into a
+                // SHARED index buffer; normalize by the smallest start),
+                // its repeat count = that sub-model's instance count times
+                // the number of render passes k (depth/main/shadow), which
+                // divides out. Record blocks are contiguous per sub-model
+                // in first-seen draw order. Anything that doesn't validate
+                // re-arms the watch for another frame (up to 5) and then
+                // falls back to the take-5 path.
                 if (g_config.mergeInstanceDrawCapture && instBufPtr) {
                     std::vector<DrawCapture::SegDraw> cap;
                     if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
                                            (uint32_t)instRecords.size(), cap) ==
                             DrawCapture::kReady &&
                         !cap.empty()) {
-                        // Same record range drawn with different index
-                        // ranges = the same sub-model in different passes
-                        // (main view vs shadow LOD): keep the most
-                        // detailed. Distinct record ranges = distinct
-                        // sub-models.
+                        const uint32_t rc = (uint32_t)instRecords.size();
+                        // Only the DrawIndexed capture is trusted; kind-0
+                        // (DrawIndexedInstanced) entries were only ever
+                        // stray leftover-binding draws.
                         std::vector<DrawCapture::SegDraw> uniq;
                         for (const auto& d : cap) {
-                            bool mergedIn = false;
-                            for (auto& u : uniq) {
-                                if (u.startInstance == d.startInstance &&
-                                    u.instanceCount == d.instanceCount) {
-                                    if (d.indexCount > u.indexCount) u = d;
-                                    mergedIn = true;
-                                    break;
-                                }
-                            }
-                            if (!mergedIn) uniq.push_back(d);
+                            if (d.kind == 1) uniq.push_back(d);
                         }
-                        const uint32_t rc = (uint32_t)instRecords.size();
                         bool ok = !uniq.empty() && uniq.size() <= 8;
-                        bool allZeroStart = true;
+                        uint32_t base = UINT32_MAX;
+                        uint64_t total = 0;
                         for (const auto& d : uniq) {
-                            if (d.startInstance != 0) allZeroStart = false;
-                            if (d.baseVertex != 0 || d.startIndex % 3 != 0 ||
-                                d.indexCount == 0 || d.indexCount % 3 != 0 ||
-                                (uint64_t)d.startIndex + d.indexCount >
-                                    mesh.indices.size() ||
-                                d.instanceCount == 0 || d.instanceCount > rc) {
-                                ok = false;
-                                break;
-                            }
+                            if (d.startIndex < base) base = d.startIndex;
+                            total += d.instanceCount;
                         }
-                        if (ok && uniq.size() > 1 && allZeroStart) {
-                            // Record offsets delivered via constant buffer,
-                            // not StartInstanceLocation: partition
-                            // cumulatively in draw order.
+                        const uint32_t k =
+                            (ok && rc && total % rc == 0) ? (uint32_t)(total / rc) : 0;
+                        ok = ok && k >= 1;
+                        SegDraw capSegs[8];
+                        int nCapSegs = 0;
+                        if (ok) {
                             std::sort(uniq.begin(), uniq.end(),
                                       [](const DrawCapture::SegDraw& a,
                                          const DrawCapture::SegDraw& b) {
                                           return a.order < b.order;
                                       });
-                            uint32_t cursor = 0;
-                            for (auto& d : uniq) {
-                                d.startInstance = cursor;
-                                cursor += d.instanceCount;
-                            }
-                            ok = (cursor == rc);
-                        } else if (ok) {
-                            std::sort(uniq.begin(), uniq.end(),
-                                      [](const DrawCapture::SegDraw& a,
-                                         const DrawCapture::SegDraw& b) {
-                                          return a.startInstance < b.startInstance;
-                                      });
-                            uint32_t cursor = 0;
+                            uint32_t recCursor = 0;
                             for (const auto& d : uniq) {
-                                if (d.startInstance != cursor) { ok = false; break; }
-                                cursor += d.instanceCount;
+                                const uint32_t rel = d.startIndex - base;
+                                if (d.instanceCount % k != 0 ||
+                                    rel % 3 != 0 || d.indexCount == 0 ||
+                                    d.indexCount % 3 != 0 ||
+                                    (uint64_t)rel + d.indexCount >
+                                        mesh.indices.size()) {
+                                    ok = false;
+                                    break;
+                                }
+                                const uint32_t recCount = d.instanceCount / k;
+                                capSegs[nCapSegs++] = { rel / 3, d.indexCount / 3,
+                                                        recCursor, recCount };
+                                recCursor += recCount;
                             }
-                            ok = ok && cursor == rc;
+                            ok = ok && recCursor == rc;
                         }
                         static std::atomic<int> sDrawLogs{0};
                         const int dn = sDrawLogs.fetch_add(1, std::memory_order_relaxed);
@@ -1163,23 +1152,27 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             for (size_t i = 0; i < cap.size() && i < 10; ++i) {
                                 const auto& d = cap[i];
                                 const int wln = snprintf(list + pos, sizeof(list) - pos,
-                                    "%s[idx %u+%u rec %u+%u bv%d]", i ? " " : "",
-                                    d.startIndex, d.indexCount, d.startInstance,
+                                    "%s[k%u idx %u+%u n%u bv%d]", i ? " " : "",
+                                    d.kind, d.startIndex, d.indexCount,
                                     d.instanceCount, d.baseVertex);
                                 if (wln <= 0 || (size_t)wln >= sizeof(list) - pos) break;
                                 pos += (size_t)wln;
                             }
                             _MESSAGE("FO4RemixPlugin: [MergeDraw] #%d hash=0x%llX "
-                                     "raw=%zu uniq=%zu rc=%u meshTris=%u ok=%d %s",
+                                     "raw=%zu uniq=%zu rc=%u meshTris=%u base=%u "
+                                     "passes=%u ok=%d %s",
                                      dn, (unsigned long long)hash, cap.size(),
-                                     uniq.size(), rc, meshTris, ok ? 1 : 0, list);
+                                     uniq.size(), rc, meshTris, base, k,
+                                     ok ? 1 : 0, list);
                         }
                         if (ok) {
-                            for (const auto& d : uniq) {
-                                segs[nSegs++] = { d.startIndex / 3, d.indexCount / 3,
-                                                  (size_t)d.startInstance,
-                                                  (size_t)d.instanceCount };
+                            for (int c = 0; c < nCapSegs; ++c) {
+                                segs[nSegs++] = capSegs[c];
                             }
+                        } else if (DrawCapture::Rearm(hash)) {
+                            // Bad frame (partial shadow set, LOD mix):
+                            // capture another one before giving up.
+                            return false;
                         }
                     }
                 }

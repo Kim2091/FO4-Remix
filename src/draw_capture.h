@@ -20,9 +20,14 @@ struct SegDraw {
     uint32_t indexCount;      // IndexCountPerInstance
     uint32_t startIndex;      // StartIndexLocation
     int32_t  baseVertex;      // BaseVertexLocation
-    uint32_t instanceCount;   // InstanceCount
-    uint32_t startInstance;   // StartInstanceLocation
-    uint32_t order;           // arrival order within the captured frame
+    uint32_t instanceCount;   // kind 0: InstanceCount of the draw
+                              // kind 1: times this exact DrawIndexed tuple
+                              //         was seen within the frame (the
+                              //         engine CPU-instances merged shapes:
+                              //         one DrawIndexed per instance)
+    uint32_t startInstance;   // kind 0 only: StartInstanceLocation
+    uint32_t order;           // first-seen order within the captured frame
+    uint32_t kind;            // 0 = DrawIndexedInstanced, 1 = DrawIndexed
 };
 
 // Hook ID3D11DeviceContext::DrawIndexedInstanced (vtable slot 20) on the
@@ -47,5 +52,11 @@ enum QueryResult {
 // `key` identifies the shape across calls (mesh hash).
 QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
                   std::vector<SegDraw>& out);
+
+// The captured frame didn't validate (e.g. a shadow-only frame that drew a
+// partial sub-model set): put the watch back to capturing so the next
+// frame gets a chance. Returns false when the re-arm budget is exhausted
+// -- the caller should fall back instead of deferring again.
+bool Rearm(uint64_t key);
 
 }  // namespace DrawCapture

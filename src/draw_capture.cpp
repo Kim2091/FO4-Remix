@@ -12,6 +12,8 @@ namespace DrawCapture {
 
 typedef void (STDMETHODCALLTYPE* PFN_DrawIndexedInstanced)(
     ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
+typedef void (STDMETHODCALLTYPE* PFN_DrawIndexed)(
+    ID3D11DeviceContext*, UINT, UINT, INT);
 typedef void (STDMETHODCALLTYPE* PFN_DrawInstanced)(
     ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
 typedef void (STDMETHODCALLTYPE* PFN_DrawIndexedInstancedIndirect)(
@@ -19,6 +21,7 @@ typedef void (STDMETHODCALLTYPE* PFN_DrawIndexedInstancedIndirect)(
 typedef void (STDMETHODCALLTYPE* PFN_SetShaderResources)(
     ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
 static PFN_DrawIndexedInstanced g_original = nullptr;
+static PFN_DrawIndexed g_originalDX = nullptr;
 static PFN_DrawInstanced g_originalDI = nullptr;
 static PFN_DrawIndexedInstancedIndirect g_originalDIII = nullptr;
 static PFN_SetShaderResources g_originalVSSet = nullptr;
@@ -31,23 +34,24 @@ constexpr int      kMaxDrawsPerFrame = 24;
 constexpr int      kVsSrvSlots       = 16;     // scan t0..t15 for the record SRV
 constexpr uint64_t kDeadlineMs       = 15000;  // then the caller falls back
 
-// 2026-07-03 run-2 findings driving this revision: 161k DrawIndexedInstanced
-// calls flowed through the hooked vtable (immediate ctx, no Indirect, no
-// DrawInstanced), a REAL stride-80 record buffer was seen bound at VS t8
-// (bytes=320 = 4 records, lingering across unrelated particle draws), but
-// the 18 watched buffer/SRV pointers never matched once -- and the only two
-// "captures" were false matches on particle draws (instance counts 36..378
-// against 4..18-record shapes; validation rejected both). Conclusion so
-// far: t8 is the record slot, the engine probably binds a DIFFERENT object
-// than the shape wrapper's own buffer/SRV (per-frame dynamic copy?), and
-// stale watched pointers can get recycled into unrelated live objects.
-// This revision therefore:
-//  - desc-verifies every pointer match (stride 80 + exact expected
-//    ByteWidth) so recycled pointers can't produce junk captures
-//  - hooks VS/PS/CSSetShaderResources to log whether a watched SRV (or a
-//    view of a watched buffer) is EVER bound, on any slot of those stages
-//  - logs every stride-80 t-slot per diag draw with usage/cpu flags
-//    (a dynamic ring copy shows USAGE_DYNAMIC + CPU_WRITE)
+// How the engine actually renders BSMergeInstancedTriShape (established by
+// the 2026-07-03 diagnostic runs): the shape's own record SRV (wrapper q1
+// at shape+0x170) is bound at VS t8 -- t7 gets the same SRV too, most
+// likely as the previous-frame copy for motion vectors -- and the draws
+// are NOT hardware-instanced: 161k DrawIndexedInstanced calls never had a
+// watched SRV bound (only stray inst=1 draws with leftover bindings, e.g.
+// idx offset 91880 into a large SHARED index buffer, correctly rejected by
+// validation). The engine CPU-instances the merged shape: plain
+// DrawIndexed per instance with the record index fed via constant buffer.
+// So the capture is: while a desc-verified watched SRV sits at t7/t8,
+// count identical DrawIndexed tuples per frame -- each unique index range
+// is a sub-model (possibly at a shared-IB offset; the consumer normalizes
+// by the smallest captured start), and its per-frame repeat count is that
+// sub-model's instance count (times the number of render passes, which
+// the consumer divides out).
+// Safety: every pointer match desc-verifies (structured, stride 80,
+// ByteWidth == recordCount*80) -- recycled pointers produced false
+// captures in run 2 and cannot pass that check.
 static std::atomic<uint64_t> g_diiCalls{0};
 static std::atomic<uint64_t> g_diCalls{0};
 static std::atomic<uint64_t> g_diiiCalls{0};
@@ -67,6 +71,7 @@ struct Watch {
     uint64_t registeredTick = 0;
     uint32_t registeredFrame = 0;
     uint32_t bindCount = 0;      // times a Set*ShaderResources bound us
+    uint32_t rearms = 0;         // invalid-frame retries granted so far
     // Draws accumulate per frame in cur[]; the previous frame's complete
     // list rolls into done[] so Query never reads a half-recorded frame.
     uint32_t curFrame = 0;
@@ -179,14 +184,15 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
                 bool dup = false;
                 for (int k = 0; k < w.curCount && !dup; ++k) {
                     const SegDraw& d = w.cur[k];
-                    dup = d.indexCount == idxCount && d.startIndex == startIdx &&
+                    dup = d.kind == 0 &&
+                          d.indexCount == idxCount && d.startIndex == startIdx &&
                           d.baseVertex == baseVtx && d.instanceCount == instCount &&
                           d.startInstance == startInst;
                 }
                 if (!dup && w.curCount < kMaxDrawsPerFrame) {
                     w.cur[w.curCount] = { idxCount, startIdx, baseVtx,
                                           instCount, startInst,
-                                          (uint32_t)w.curCount };
+                                          (uint32_t)w.curCount, 0 };
                     ++w.curCount;
                 }
             }
@@ -197,6 +203,67 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
         }
     }
     g_original(ctx, idxCount, instCount, startIdx, baseVtx, startInst);
+}
+
+// The merge-shape draw path: one plain DrawIndexed per instance with the
+// record SRV at VS t7/t8. Hot -- DrawIndexed is the game's most frequent
+// draw call -- so the peek is exactly two slots and pointer-compares
+// against the watch table before anything heavier runs.
+static void STDMETHODCALLTYPE hkDrawIndexed(
+    ID3D11DeviceContext* ctx, UINT idxCount, UINT startIdx, INT baseVtx)
+{
+    if (g_activeCount.load(std::memory_order_relaxed) > 0) {
+        ID3D11ShaderResourceView* srvs[2] = {};
+        ctx->VSGetShaderResources(7, 2, srvs);  // t7..t8, the proven slots
+        for (int i = 0; i < 2; ++i) {
+            ID3D11ShaderResourceView* srv = srvs[i];
+            if (!srv) continue;
+            // Unlocked pointer pre-filter; races here only cost a
+            // GetResource on a stale candidate, never a wrong capture
+            // (the locked pass re-checks and desc-verifies).
+            bool candidate = false;
+            for (const Watch& w : g_watches) {
+                if (w.state == Watch::kActive && srv == w.srv) {
+                    candidate = true;
+                    break;
+                }
+            }
+            if (!candidate) continue;
+            ID3D11Resource* r = nullptr;
+            srv->GetResource(&r);
+            {
+                std::lock_guard<std::mutex> g(g_lock);
+                const uint32_t f = g_frame.load(std::memory_order_relaxed);
+                for (Watch& w : g_watches) {
+                    if (w.state != Watch::kActive || srv != w.srv) continue;
+                    if (!DescMatches(r, w.expectedBytes)) continue;
+                    if (w.curFrame != f) {
+                        RollFrame(w);
+                        w.curFrame = f;
+                    }
+                    bool counted = false;
+                    for (int k = 0; k < w.curCount && !counted; ++k) {
+                        SegDraw& d = w.cur[k];
+                        if (d.kind == 1 && d.indexCount == idxCount &&
+                            d.startIndex == startIdx && d.baseVertex == baseVtx) {
+                            ++d.instanceCount;  // repeat = another instance
+                            counted = true;
+                        }
+                    }
+                    if (!counted && w.curCount < kMaxDrawsPerFrame) {
+                        w.cur[w.curCount] = { idxCount, startIdx, baseVtx,
+                                              1, 0, (uint32_t)w.curCount, 1 };
+                        ++w.curCount;
+                    }
+                }
+            }
+            if (r) r->Release();
+        }
+        for (int i = 0; i < 2; ++i) {
+            if (srvs[i]) srvs[i]->Release();
+        }
+    }
+    g_originalDX(ctx, idxCount, startIdx, baseVtx);
 }
 
 static void STDMETHODCALLTYPE hkDrawInstanced(
@@ -290,6 +357,7 @@ void InstallHook(ID3D11DeviceContext* ctx) {
     if (sAttempted.exchange(true)) return;
     void** vtbl = *reinterpret_cast<void***>(ctx);
     void* target = vtbl[20];      // DrawIndexedInstanced
+    void* targetDX = vtbl[12];    // DrawIndexed (the actual merge draw path)
     void* targetDI = vtbl[21];    // DrawInstanced (counter only)
     void* targetDIII = vtbl[39];  // DrawIndexedInstancedIndirect (counter only)
     void* targetPSSet = vtbl[8];  // PSSetShaderResources (bind diag)
@@ -297,12 +365,16 @@ void InstallHook(ID3D11DeviceContext* ctx) {
     void* targetCSSet = vtbl[67]; // CSSetShaderResources (bind diag)
     if (MH_CreateHook(target, &hkDrawIndexedInstanced,
                       reinterpret_cast<void**>(&g_original)) == MH_OK &&
-        MH_EnableHook(target) == MH_OK) {
+        MH_EnableHook(target) == MH_OK &&
+        MH_CreateHook(targetDX, &hkDrawIndexed,
+                      reinterpret_cast<void**>(&g_originalDX)) == MH_OK &&
+        MH_EnableHook(targetDX) == MH_OK) {
         g_hooked.store(true, std::memory_order_release);
-        _MESSAGE("FO4RemixPlugin: [DrawCap] DrawIndexedInstanced hooked at %p "
-                 "(ctxType=%d)", target, (int)ctx->GetType());
+        _MESSAGE("FO4RemixPlugin: [DrawCap] DrawIndexedInstanced + DrawIndexed "
+                 "hooked at %p / %p (ctxType=%d)", target, targetDX,
+                 (int)ctx->GetType());
     } else {
-        _MESSAGE("FO4RemixPlugin: [DrawCap] ERROR - DrawIndexedInstanced hook failed");
+        _MESSAGE("FO4RemixPlugin: [DrawCap] ERROR - draw hooks failed");
     }
     if (MH_CreateHook(targetDI, &hkDrawInstanced,
                       reinterpret_cast<void**>(&g_originalDI)) == MH_OK) {
@@ -417,6 +489,24 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
         return kReady;
     }
     return kUnavailable;  // unreachable fallthrough
+}
+
+bool Rearm(uint64_t key) {
+    constexpr uint32_t kMaxRearms = 5;
+    std::lock_guard<std::mutex> g(g_lock);
+    for (Watch& c : g_watches) {
+        if (c.state != Watch::kDone || c.key != key) continue;
+        if (c.rearms >= kMaxRearms) return false;
+        ++c.rearms;
+        c.state = Watch::kActive;
+        c.registeredTick = GetTickCount64();
+        c.registeredFrame = g_frame.load(std::memory_order_relaxed);
+        c.curCount = 0;
+        c.doneCount = 0;
+        g_activeCount.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
 }
 
 }  // namespace DrawCapture
