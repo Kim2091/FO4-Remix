@@ -265,17 +265,26 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     ip = ip->m_parent;
                 }
 
-                // v2 raw-member probe: v1 established that m_extraData is
-                // NULL on every merge-instanced shape, so the per-instance
-                // placement must live in the subclass's OWN members past the
-                // BSTriShape header (numTriangles 0x160, numVertices 0x164,
-                // unk168/unk16C; sizeof(BSTriShape) == 0x170). Dump 16 qwords
-                // from +0x160, then chase up to 5 heap-pointer-looking qwords
-                // and print their first 12 floats -- a per-instance transform
-                // array is self-evident in float form (rotation rows in
-                // [-1,1], world-range translations, 1.0 scales). All reads go
-                // through the SEH peek so a non-pointer qword cannot crash
-                // the resolve.
+                // v3 two-level chase (2026-07-03). v2 established the
+                // BSMergeInstancedTriShape member picture:
+                //   +0x170 ptr A -> per-shape buffer wrapper (q0 per-shape)
+                //   +0x178 ptr B -> buffer wrapper whose q0 is the SAME heap
+                //          object across all merged shapes (shared D3D pool)
+                //   +0x190 hi-dword: power-of-two capacity that divides
+                //          numTriangles exactly (e.g. 2-tri quad x 128,
+                //          18 tris x 32) -> hardware instancing: small base
+                //          piece replicated N times, per-instance transforms
+                //          in a second stream the parser never reads.
+                //   +0x1B8 constant 2 (stream count?), +0x1D0/+0x1D8 per-
+                //          shape heap ptrs.
+                // The v2 one-level float dump of A/B printed garbage because
+                // the targets are WRAPPERS (first member = D3D buffer /
+                // shared object), like BSGraphics::VertexBuffer whose pData
+                // CPU copy the parser reads via pVB->pData. v3 dumps 8
+                // qwords of each wrapper, then prints 24 floats behind each
+                // heap-like member -- an instance-transform stream is
+                // unmistakable (rotation values in [-1,1] interleaved with
+                // world-range translations).
                 {
                     uint64_t raw[16] = {};
                     if (PeekQwordsGuarded(
@@ -297,28 +306,50 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                  (unsigned long long)raw[12], (unsigned long long)raw[13],
                                  (unsigned long long)raw[14], (unsigned long long)raw[15]);
 
-                        int chased = 0;
-                        for (int qi = 0; qi < 16 && chased < 5; ++qi) {
-                            const uint64_t q = raw[qi];
-                            const bool ptrLike = q >= 0x10000ULL &&
-                                                 q <  0x0000800000000000ULL &&
-                                                 (q & 7ULL) == 0ULL;
-                            if (!ptrLike) continue;
-                            ++chased;
-                            uint64_t body[6] = {};
-                            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(q), body, 6)) {
-                                _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   ptr@+%X=%016llX unreadable",
-                                         n, 0x160 + qi * 8, (unsigned long long)q);
+                        // Heap (not module/image) pointers only: this process
+                        // allocates around 0x1D6..., images at 0x7FF7...
+                        auto heapLike = [](uint64_t q) {
+                            return q >= 0x100000000ULL &&
+                                   q <  0x00007F0000000000ULL &&
+                                   (q & 7ULL) == 0ULL;
+                        };
+
+                        // Wrappers of interest: A(+0x170)=raw[2], B(+0x178)=
+                        // raw[3], and the per-shape unknowns +0x1D0/+0x1D8 =
+                        // raw[14]/raw[15].
+                        const int wrapperIdx[4] = { 2, 3, 14, 15 };
+                        for (int wi = 0; wi < 4; ++wi) {
+                            const uint64_t wq = raw[wrapperIdx[wi]];
+                            if (!heapLike(wq)) continue;
+                            uint64_t wbody[8] = {};
+                            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wq), wbody, 8)) {
                                 continue;
                             }
-                            const float* bf = reinterpret_cast<const float*>(body);
-                            _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   ptr@+%X=%016llX "
-                                     "f=[%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f] "
-                                     "q0=%016llX",
-                                     n, 0x160 + qi * 8, (unsigned long long)q,
-                                     bf[0], bf[1], bf[2], bf[3], bf[4], bf[5],
-                                     bf[6], bf[7], bf[8], bf[9], bf[10], bf[11],
-                                     (unsigned long long)body[0]);
+                            _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   wrap@+%X=%016llX "
+                                     "q=[%016llX %016llX %016llX %016llX %016llX %016llX %016llX %016llX]",
+                                     n, 0x160 + wrapperIdx[wi] * 8, (unsigned long long)wq,
+                                     (unsigned long long)wbody[0], (unsigned long long)wbody[1],
+                                     (unsigned long long)wbody[2], (unsigned long long)wbody[3],
+                                     (unsigned long long)wbody[4], (unsigned long long)wbody[5],
+                                     (unsigned long long)wbody[6], (unsigned long long)wbody[7]);
+                            int floatDumps = 0;
+                            for (int bi = 0; bi < 8 && floatDumps < 4; ++bi) {
+                                if (!heapLike(wbody[bi])) continue;
+                                uint64_t fq[12] = {};
+                                if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wbody[bi]), fq, 12)) {
+                                    continue;
+                                }
+                                ++floatDumps;
+                                const float* ff = reinterpret_cast<const float*>(fq);
+                                _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     wrap+%X.q%d->f=[%.2f %.2f %.2f %.2f %.2f %.2f "
+                                         "%.2f %.2f %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f %.2f %.2f "
+                                         "%.2f %.2f %.2f %.2f %.2f %.2f]",
+                                         n, 0x160 + wrapperIdx[wi] * 8, bi,
+                                         ff[0], ff[1], ff[2], ff[3], ff[4], ff[5],
+                                         ff[6], ff[7], ff[8], ff[9], ff[10], ff[11],
+                                         ff[12], ff[13], ff[14], ff[15], ff[16], ff[17],
+                                         ff[18], ff[19], ff[20], ff[21], ff[22], ff[23]);
+                            }
                         }
                     }
                 }
