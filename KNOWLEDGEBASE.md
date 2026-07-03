@@ -582,6 +582,25 @@ from FO4 is outstanding.
 - **Skinned meshes are skipped.** Both resolvers reject
   `tri->vertexDesc & BSGeometry::kFlag_Skinned`. Characters and creatures
   do not appear in the path-traced view yet.
+- **Precombined / merge-instanced transforms are wrong (open, 2026-07-03).**
+  The resolver's model is "local-space vertices x leaf `m_worldTransform`",
+  which holds for plain refs but not for precombined geometry
+  (`BSMergeInstancedTriShape` / `BSMultiStreamInstanceTriShape`): those carry
+  per-instance placement in structures F4SE does not declare
+  (`BSPackedCombinedGeomDataExtra` is RTTI-only, `GameRTTI.h:883`), their
+  leaf transform arrives identity-rotation, and the plugin renders one copy
+  at the leaf transform where the engine draws N placed instances -- the
+  "roads in Sanctuary / light poles / hedges misplaced, worse with
+  precombines" report. The dirty-pose path is NOT the cause (it memcmps the
+  full 3x4). The capped `[InstDiag]` diagnostic in `lighting_static.cpp`
+  logs, per merge-instanced shape: parsed vertex bbox (local vs
+  combined-space discrimination), leaf local+world transforms, two parents,
+  and the shape's `NiExtraData` entries (class/name/leading qwords) to
+  anchor the runtime layout of the instance-transform array for the real
+  fix. Next session: read a log with precombines enabled, identify the
+  instance data, then either expand instances plugin-side (one DrawInstance
+  per transform, mesh shared) or skip merged shapes when the originals also
+  render.
 - **Weather is time-of-day only.** Storms, fog, volumetric fog, and the
   interior/exterior signal are not pushed to Remix; the Sky-struct RE
   required for FO4 is outstanding (see `weather_bridge.h:9-13`).

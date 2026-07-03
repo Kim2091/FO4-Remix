@@ -6,6 +6,8 @@
 #include "../config.h"
 #include "../fo4_diagnostics.h"
 #include "f4se/NiObjects.h"
+#include "f4se/NiNodes.h"      // NiNode (parent-chain walk in InstDiag)
+#include "f4se/NiExtraData.h"  // NiExtraData (InstDiag extra-data peek)
 #include "f4se/BSGeometry.h"
 #include "f4se/NiMaterials.h"
 #include "f4se/PluginAPI.h"  // _MESSAGE
@@ -174,6 +176,104 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     mesh.indices  = std::move(parsed.indices);
     SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
     BsExtraction::ExtractAlphaState(tri, mesh);
+
+    // ---- Precombine / merge-instanced diagnostic (2026-07-03, capped) ----
+    // "Bethesda-placed objects have incorrect transforms, worse with
+    // precombines" (roads in Sanctuary, light poles, hedges). Precombined
+    // geometry (BSMergeInstancedTriShape / BSMultiStreamInstanceTriShape)
+    // carries per-instance placement in structures F4SE does not declare
+    // (BSPackedCombinedGeomDataExtra is RTTI-only), while this resolver
+    // renders every shape as "local verts x leaf world transform" -- correct
+    // for plain refs, wrong for merged instances. This diagnostic gathers
+    // the data needed to build the real fix:
+    //   - the parsed vertex bounding box: local-space meshes center near the
+    //     origin; combined-space baking shows up as a box offset/spanning
+    //     hundreds-thousands of units;
+    //   - leaf local vs world transform + two parents: shows what placement
+    //     information survives on the scene graph;
+    //   - the shape's NiExtraData entries (class + name + leading qwords):
+    //     the NIF format stores precombined instance transforms in
+    //     BSPackedCombinedGeomDataExtra, so if it is present at runtime its
+    //     leading fields give us the layout anchor for a follow-up.
+    {
+        static std::atomic<int> sInstDiagLogs{0};
+        char instLeaf[64] = "";
+        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
+                                          instLeaf, sizeof(instLeaf));
+        const bool instancedClass =
+            std::strstr(instLeaf, "MergeInstanced") != nullptr ||
+            std::strstr(instLeaf, "MultiStreamInstance") != nullptr;
+        if (instancedClass) {
+            const int n = sInstDiagLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 12) {
+                float mn[3] = { 3.4e38f, 3.4e38f, 3.4e38f };
+                float mx[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+                for (const auto& v : parsed.vertices) {
+                    for (int c = 0; c < 3; ++c) {
+                        if (v.position[c] < mn[c]) mn[c] = v.position[c];
+                        if (v.position[c] > mx[c]) mx[c] = v.position[c];
+                    }
+                }
+                const NiTransform& wx = tri->m_worldTransform;
+                const NiTransform& lx = *reinterpret_cast<const NiTransform*>(
+                    reinterpret_cast<uintptr_t>(tri) + 0x30);  // m_localTransform
+                _MESSAGE("FO4RemixPlugin: [InstDiag] #%d class=%s name=\"%s\" verts=%zu tris=%zu "
+                         "vdesc=0x%016llX worldPos=(%.1f,%.1f,%.1f) worldRot0=(%.3f,%.3f,%.3f) "
+                         "worldScale=%.3f localPos=(%.1f,%.1f,%.1f) localScale=%.3f "
+                         "bboxMin=(%.1f,%.1f,%.1f) bboxMax=(%.1f,%.1f,%.1f)",
+                         n, instLeaf, tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                         parsed.vertices.size(), parsed.indices.size() / 3,
+                         (unsigned long long)parsed.vertexDesc,
+                         wx.pos.x, wx.pos.y, wx.pos.z,
+                         wx.rot.data[0][0], wx.rot.data[0][1], wx.rot.data[0][2],
+                         wx.scale, lx.pos.x, lx.pos.y, lx.pos.z, lx.scale,
+                         mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]);
+
+                // Parent chain (two levels): placement info on the graph.
+                NiNode* ip = tri->m_parent;
+                for (int lvl = 0; lvl < 2 && ip; ++lvl) {
+                    char pLeaf[64] = "";
+                    SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(ip),
+                                                      pLeaf, sizeof(pLeaf));
+                    const NiTransform& pw = ip->m_worldTransform;
+                    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   parent%d class=%s name=\"%s\" "
+                             "worldPos=(%.1f,%.1f,%.1f) worldRot0=(%.3f,%.3f,%.3f) scale=%.3f",
+                             n, lvl + 1, pLeaf,
+                             ip->m_name.c_str() ? ip->m_name.c_str() : "",
+                             pw.pos.x, pw.pos.y, pw.pos.z,
+                             pw.rot.data[0][0], pw.rot.data[0][1], pw.rot.data[0][2],
+                             pw.scale);
+                    ip = ip->m_parent;
+                }
+
+                // NiExtraData entries. Leading qwords start at +0x18 (NiObject
+                // 0x10 + BSFixedString m_name 8); precombined instance data
+                // objects are large, so a 6-qword peek stays inside the
+                // allocation for the entries we care about.
+                tMutexArray<NiExtraData*>* xd = tri->m_extraData;
+                if (xd && xd->entries && xd->count > 0) {
+                    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   extraData count=%u", n, xd->count);
+                    const UInt32 xdMax = xd->count < 6u ? xd->count : 6u;
+                    for (UInt32 xi = 0; xi < xdMax; ++xi) {
+                        NiExtraData* ed = xd->entries[xi];
+                        if (!ed) continue;
+                        char edLeaf[64] = "";
+                        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(ed),
+                                                          edLeaf, sizeof(edLeaf));
+                        const uint64_t* q = reinterpret_cast<const uint64_t*>(
+                            reinterpret_cast<uintptr_t>(ed) + 0x18);
+                        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   xd[%u] class=%s name=\"%s\" "
+                                 "q=[%016llX %016llX %016llX %016llX %016llX %016llX]",
+                                 n, xi, edLeaf,
+                                 ed->m_name.c_str() ? ed->m_name.c_str() : "",
+                                 (unsigned long long)q[0], (unsigned long long)q[1],
+                                 (unsigned long long)q[2], (unsigned long long)q[3],
+                                 (unsigned long long)q[4], (unsigned long long)q[5]);
+                    }
+                }
+            }
+        }
+    }
 
     // Decal tag. The decal bit is in flags1: bit 26, mask 0x04000000.
     // Confirmed for FO4 1.10.980 by static analysis of the BGSM flag-applier
