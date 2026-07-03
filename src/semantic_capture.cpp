@@ -906,6 +906,14 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                                  "Remix-side handles may leak",
                                  (unsigned long long)it->second.meshHash, excCode);
                     }
+                    // Merge-instanced extras share the base drawable's lifecycle.
+                    for (uint64_t xh : it->second.extraMeshHashes) {
+                        if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                            _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
+                                     "(instance extra) hash=0x%llX exception=0x%08lX",
+                                     (unsigned long long)xh, excCode);
+                        }
+                    }
                 }
                 g_lodChunkKeys.erase(it->first);
                 it = g_drawableMap.erase(it);
@@ -996,6 +1004,14 @@ void SemanticCapture::ClearDrawableMap() {
                 _MESSAGE("FO4RemixPlugin: [Reload] CRASH CAUGHT in ReleaseDrawable "
                          "hash=0x%llX exception=0x%08lX -- continuing wipe",
                          (unsigned long long)state.meshHash, excCode);
+            }
+            // Merge-instanced extras share the base drawable's lifecycle.
+            for (uint64_t xh : state.extraMeshHashes) {
+                if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                    _MESSAGE("FO4RemixPlugin: [Reload] CRASH CAUGHT in ReleaseDrawable "
+                             "(instance extra) hash=0x%llX exception=0x%08lX",
+                             (unsigned long long)xh, excCode);
+                }
             }
             ++submittedCount;
         }

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 struct ID3D11Device;
 struct NiTransform;
@@ -59,6 +60,11 @@ namespace SemanticCapture {
         uint64_t meshHash            = 0;        // == PassKey, used as Remix submission key
         uint64_t materialHash        = 0;        // index into g_materialCache
         bool     submittedToRemix    = false;
+        // Merge-instanced expansion (2026-07-03): derived hashes of the extra
+        // per-hardware-instance drawables submitted beyond meshHash (instance
+        // 0 keeps meshHash). Same lifecycle: released wherever meshHash is
+        // released (sweep eviction, ClearDrawableMap). Empty for plain shapes.
+        std::vector<uint64_t> extraMeshHashes;
         // Set of texture hashes this drawable references. NOT the refcount owner —
         // the canonical refcount tracking lives in g_drawables[meshHash].textureHashes
         // inside remix_renderer.cpp. This field is populated by the resolver as a

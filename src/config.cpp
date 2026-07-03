@@ -117,6 +117,12 @@ void LoadConfig() {
              g_config.gpuInstancingEnabled, g_config.remixMaxFPS,
              g_config.maxPendingTextureReadbacks);
 
+    // [Precombines]
+    g_config.mergeInstanceExpansion = GetIniBool("Precombines", "MergeInstanceExpansion", true, dllPath);
+    g_config.mergeInstanceRowVector = GetIniBool("Precombines", "MergeInstanceRowVector", true, dllPath);
+    _MESSAGE("FO4RemixPlugin: Precombines - MergeInstanceExpansion=%d MergeInstanceRowVector=%d",
+             g_config.mergeInstanceExpansion, g_config.mergeInstanceRowVector);
+
     _MESSAGE("FO4RemixPlugin: Config loaded - LogShapeInfo=%d LogLargeShapes=%d LogRejections=%d "
              "LogTextures=%d LogLights=%d MaxExtent=%.0f",
              g_config.logShapeInfo, g_config.logLargeShapes, g_config.logRejections,

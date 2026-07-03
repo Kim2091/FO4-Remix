@@ -14,7 +14,7 @@
 
 #include <atomic>
 #include <vector>
-#include <unordered_set>
+#include <array>
 #include <cmath>
 #include <cstring>
 
@@ -37,46 +37,30 @@ static bool PeekQwordsGuarded(const void* src, uint64_t* dst, int count) {
 }
 
 // ---------------------------------------------------------------------------
-// InstDiag v5 (2026-07-03). v4 verdict: 64-byte [rot 3x4 | trans, 1.0]
-// records (plus a wider sphere-bearing variant) DO exist near several
-// wrapper members -- the format is confirmed -- but the 16KB heap sweep is
-// unbounded, so hits landed in neighboring allocations and could not be
-// attributed to the probed shape (#3 and #11 "found" the identical far-away
-// record; #5's index member hit far past its 0x480-byte payload). Also
-// shapes #1/#3 have NULL +0x1D0/+0x1D8, so the CPU-side aux object is not
-// universal. The per-shape D3D objects ARE universal: wrap+170.q0/.q1 and
-// wrap+178.q3 carry d3d11.dll vtables (two distinct ones -> buffer/SRV
-// pairs) and wrap+178.q0 is the shared pool. v5 interrogates those
-// directly:
-//   - QueryInterface for ID3D11Buffer / ID3D11ShaderResourceView (guarded;
-//     only attempted when the vtable lies inside d3d11.dll's image);
-//   - log descs: ByteWidth / StructureByteStride / BindFlags give record
-//     size and slice bounds; a buffer-dimension SRV's FirstElement /
-//     NumElements give the pool slice AND likely the instance count;
-//   - copy contents back through a STAGING buffer (bounded by ByteWidth,
-//     no neighbor ambiguity) and run a strict record-run detector.
-// Heap-side members (game vtables / raw data) get the same detector over a
-// SEH-snapshotted 16KB window so CPU-side candidates stay visible.
+// Merge-instanced transform stream reader (2026-07-03).
 //
-// The detector looks for consecutive fixed-stride records, each parsing as
-// three near-orthonormal rotation rows (uniform scale tolerated) plus a
-// finite translation, in either of two layouts:
-//   A: rows padded to 4 with EXACT 0.0f, translation row 4 = [t.xyz, s]
-//      (the 64-byte pattern v4 confirmed in the wild)
-//   B: HLSL float3x4 -- translation in column 3 (48-byte instance streams)
-// Translations are classified world-near-shape / cluster-local / zero so a
-// run can be attributed to the probed shape by content, and the run length
-// can be correlated against the +0x190 capacity dwords.
-
-// One detected run of fixed-stride transform records.
-struct XformRun {
-    int   stride = 0;    // bytes between record starts
-    int   phase  = 0;    // byte offset of the first record
-    int   count  = 0;    // consecutive valid records
-    char  layout = '-';  // 'A' or 'B' (see above)
-    int   nWorld = 0, nLocal = 0, nZero = 0;
-    float t0[3] = {}, t1[3] = {}, tN[3] = {};
-};
+// BSMergeInstancedTriShape is a small base mesh hardware-instanced N times;
+// rendering it once at the leaf transform (translation-only cluster origin)
+// put one unrotated copy at the cluster center -- the "precombined objects
+// have wrong transforms" bug (Sanctuary roads / light poles / hedges).
+//
+// The InstDiag probes (eb9fef8..deecffc, 2026-07-03) pinned the source on
+// every sampled shape: shape+0x170 -> buffer wrapper whose first qword is a
+// STRUCTURED ID3D11Buffer (bind=SHADER_RESOURCE, misc=BUFFER_STRUCTURED,
+// StructureByteStride=80) holding exactly one 80-byte record per hardware
+// instance; the wrapper's second member is the paired SRV whose NumElements
+// always equals ByteWidth/80 (2..15 on the Sanctuary samples). Record
+// layout, content-validated by the v5 run detector (rotation rows with
+// exact-0.0f pads, cluster-local translations, phase 0, stride 80):
+//   f[0..11]  rotation, three rows of [x y z 0]
+//   f[12..14] translation, cluster-local (relative to the leaf transform)
+//   f[15]     scale slot (1.0 on every observed record)
+//   f[16..19] extra (bounding sphere); unused here
+// The vanilla vertex shader fetches records by SV_InstanceID through the
+// SRV, so the rows are basis rows in Bethesda's row-vector GPU convention
+// (pos = mul(v, world)); the reader transposes them into the engine's
+// column-vector convention. [Precombines] MergeInstanceRowVector=0 flips
+// that interpretation if placements ever come out inverse-rotated.
 
 // Rows at f+a / f+b / f+c: near-equal squared lengths in (1e-4, 1e4)
 // (uniform scale folded into the rows is tolerated) and pairwise
@@ -112,77 +96,6 @@ static bool ValidRecordA(const float* f) {
     return f[15] == 0.0f || (f[15] > 1e-4f && f[15] < 1e5f);
 }
 
-// Layout B, 12 floats: rows (0..2)(4..6)(8..10), translation 3/7/11.
-static bool ValidRecordB(const float* f) {
-    if (!RotRowsPlausible(f, 0, 4, 8)) return false;
-    return TransPlausible(f[3], f[7], f[11]);
-}
-
-// 0=zero 1=cluster-local 2=world-near-shape 3=far (someone else's data)
-static int ClassifyTrans(const float t[3], const float wpos[3]) {
-    if (std::fabs(t[0]) < 0.01f && std::fabs(t[1]) < 0.01f && std::fabs(t[2]) < 0.01f) return 0;
-    if (std::fabs(t[0] - wpos[0]) < 8192.0f && std::fabs(t[1] - wpos[1]) < 8192.0f &&
-        std::fabs(t[2] - wpos[2]) < 8192.0f) return 2;
-    if (std::fabs(t[0]) < 8192.0f && std::fabs(t[1]) < 8192.0f && std::fabs(t[2]) < 8192.0f) return 1;
-    return 3;
-}
-
-// Longest fixed-stride run of valid records in [0, size), first record no
-// deeper than maxPhase. Layout A wins ties (stricter validation).
-static XformRun FindBestXformRun(const uint8_t* data, size_t size,
-                                 const float wpos[3], int maxPhase = 1 << 30) {
-    XformRun best;
-    if (size < 64) return best;
-    const size_t nOff = (size - 64) / 8 + 1;  // 8-byte-aligned record starts
-    std::vector<uint8_t> validA(nOff), validB(nOff);
-    for (size_t i = 0; i < nOff; ++i) {
-        const float* f = reinterpret_cast<const float*>(data + i * 8);
-        validA[i] = ValidRecordA(f) ? 1 : 0;
-        validB[i] = ValidRecordB(f) ? 1 : 0;
-    }
-    static const int kStrides[] = { 48, 64, 80, 96, 112, 128, 144, 160,
-                                    176, 184, 192, 208, 224, 240, 256 };
-    std::vector<int> run(nOff);
-    const char layouts[2] = { 'A', 'B' };
-    for (char layout : layouts) {
-        const std::vector<uint8_t>& valid = (layout == 'A') ? validA : validB;
-        for (int s : kStrides) {
-            if (layout == 'A' && s < 64) continue;
-            const size_t step = (size_t)s / 8;
-            for (size_t i = nOff; i-- > 0;) {
-                run[i] = valid[i] ? (i + step < nOff ? run[i + step] + 1 : 1) : 0;
-            }
-            for (size_t i = 0; i < nOff; ++i) {
-                if (!run[i] || i * 8 > (size_t)maxPhase) continue;
-                if (i >= step && run[i - step] > run[i]) continue;  // mid-run
-                if (run[i] > best.count) {
-                    best.stride = s;
-                    best.phase  = (int)(i * 8);
-                    best.count  = run[i];
-                    best.layout = layout;
-                }
-            }
-        }
-    }
-    if (best.count) {
-        for (int k = 0; k < best.count; ++k) {
-            const float* f = reinterpret_cast<const float*>(
-                data + best.phase + (size_t)k * best.stride);
-            float t[3];
-            if (best.layout == 'A') { t[0] = f[12]; t[1] = f[13]; t[2] = f[14]; }
-            else                    { t[0] = f[3];  t[1] = f[7];  t[2] = f[11]; }
-            const int c = ClassifyTrans(t, wpos);
-            if (c == 0) ++best.nZero;
-            else if (c == 1) ++best.nLocal;
-            else if (c == 2) ++best.nWorld;
-            if (k == 0)              std::memcpy(best.t0, t, sizeof(t));
-            if (k == 1)              std::memcpy(best.t1, t, sizeof(t));
-            if (k == best.count - 1) std::memcpy(best.tN, t, sizeof(t));
-        }
-    }
-    return best;
-}
-
 // True when p lies inside d3d11.dll's loaded image -- the only vtables we
 // dare QueryInterface. Game-exe vtables (0x7FF7A7...) must NOT get a
 // virtual slot-0 call (that's usually the scalar dtor).
@@ -214,26 +127,12 @@ static int QiGuarded(void* obj, const GUID* iid, void** out) {
     }
 }
 
-// SEH-snapshot up to `bytes` from a heap candidate into `out` (512-byte
-// chunks; stops at the first unmapped chunk). Returns bytes captured.
-static size_t SnapshotHeapGuarded(uint64_t src, std::vector<uint8_t>& out, size_t bytes) {
-    out.resize(bytes);
-    size_t got = 0;
-    while (got + 512 <= bytes) {
-        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(src + got),
-                               reinterpret_cast<uint64_t*>(out.data() + got), 64)) {
-            break;
-        }
-        got += 512;
-    }
-    out.resize(got);
-    return got;
-}
-
 // Copy `bytes` at `srcOff` of a buffer through a staging buffer created on
 // the buffer's OWN device (which may differ from the resolver's device).
-// Blocking Map -- acceptable for a capped one-shot diagnostic; the texture
-// readback in bs_extraction does the same on this thread.
+// Blocking Map -- acceptable because it runs at most once per merge-
+// instanced shape at resolve time (the result is baked into the submitted
+// drawables); the texture readback in bs_extraction does the same on this
+// thread.
 static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t bytes,
                                     std::vector<uint8_t>& out) {
     ID3D11Device* dev = nullptr;
@@ -266,130 +165,75 @@ static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t
     return got;
 }
 
-// Bytes per element for the typed-SRV formats BSGraphics plausibly uses for
-// an instance stream; 0 = unknown (skip content readback, desc still logs).
-static uint32_t DxgiElementSize(DXGI_FORMAT f) {
-    switch (f) {
-        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
-        case DXGI_FORMAT_R32G32B32A32_FLOAT:
-        case DXGI_FORMAT_R32G32B32A32_UINT:   return 16;
-        case DXGI_FORMAT_R32G32B32_FLOAT:     return 12;
-        case DXGI_FORMAT_R32G32_FLOAT:        return 8;
-        case DXGI_FORMAT_R16G16B16A16_FLOAT:  return 8;
-        case DXGI_FORMAT_R32_TYPELESS:
-        case DXGI_FORMAT_R32_FLOAT:
-        case DXGI_FORMAT_R32_UINT:            return 4;
-        default:                              return 0;
+// Read the per-instance transform stream of a BSMergeInstancedTriShape.
+// See the block comment at the top of this section for the reverse-
+// engineered source and record layout. Output: one Bethesda-space
+// column-vector 3x4 per instance (row-major, translation in column 3),
+// cluster-local -- the caller composes each with the leaf world transform.
+// Returns false (out untouched) on ANY validation miss, and the caller
+// falls back to the pre-existing single-draw path.
+static bool ReadMergeInstanceTransforms(BSTriShape* tri,
+                                        std::vector<std::array<float, 12>>& out) {
+    const auto heapLike = [](uint64_t q) {
+        return q >= 0x100000000ULL && q < 0x00007F0000000000ULL && (q & 7ULL) == 0ULL;
+    };
+    // shape+0x170 -> wrapper; wrapper qword 0 -> structured instance buffer.
+    uint64_t wrapPtr = 0;
+    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+            reinterpret_cast<uintptr_t>(tri) + 0x170), &wrapPtr, 1)) return false;
+    if (!heapLike(wrapPtr)) return false;
+    uint64_t bufObj = 0;
+    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wrapPtr), &bufObj, 1)) return false;
+    if (!heapLike(bufObj)) return false;
+    uint64_t vtbl = 0;
+    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(bufObj), &vtbl, 1)) return false;
+    if (!PtrInD3D11(vtbl)) return false;
+
+    void* raw = nullptr;
+    if (!QiGuarded(reinterpret_cast<void*>(bufObj), &__uuidof(ID3D11Buffer), &raw)) {
+        return false;
     }
-}
+    ID3D11Buffer* buf = static_cast<ID3D11Buffer*>(raw);
+    bool ok = false;
+    do {
+        constexpr uint32_t kStride = 80;  // observed on every sampled shape
+        D3D11_BUFFER_DESC bd = {};
+        buf->GetDesc(&bd);
+        if (!(bd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED)) break;
+        if (bd.StructureByteStride != kStride) break;
+        if (bd.ByteWidth == 0 || bd.ByteWidth % kStride != 0) break;
+        const uint32_t count = bd.ByteWidth / kStride;
+        if (count > 4096) break;  // sanity bound; samples were 2..15
 
-static void LogXformRun(int n, int wrapOff, int bi, const char* src, const XformRun& r) {
-    if (r.count < 3) {
-        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d       %s +%X.q%d no-run", n, src, wrapOff, bi);
-        return;
-    }
-    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d       %s +%X.q%d run%c s=%d p=0x%X c=%d "
-             "w=%d l=%d z=%d t0=(%.1f,%.1f,%.1f) t1=(%.1f,%.1f,%.1f) tN=(%.1f,%.1f,%.1f)",
-             n, src, wrapOff, bi, r.layout, r.stride, r.phase, r.count,
-             r.nWorld, r.nLocal, r.nZero,
-             r.t0[0], r.t0[1], r.t0[2], r.t1[0], r.t1[1], r.t1[2],
-             r.tN[0], r.tN[1], r.tN[2]);
-}
+        std::vector<uint8_t> bytes;
+        if (ReadbackBufferSlice(buf, 0, bd.ByteWidth, bytes) != bd.ByteWidth) break;
 
-// Probe one heap-like wrapper member: d3d11 COM objects get QI + desc +
-// bounded readback; everything else gets a 16KB SEH heap snapshot. Both
-// paths feed the record-run detector. wpos = probed shape's world position
-// (for run attribution by translation content).
-static void InstDiagProbeMember(int n, int wrapOff, int bi, uint64_t member,
-                                const uint64_t head[2], ID3D11Device* resolverDev,
-                                const float wpos[3]) {
-    constexpr uint32_t kGpuCap = 512 * 1024;
-    std::vector<uint8_t> bytes;
-
-    if (PtrInD3D11(head[0])) {
-        void* raw = nullptr;
-        if (QiGuarded(reinterpret_cast<void*>(member), &__uuidof(ID3D11Buffer), &raw)) {
-            ID3D11Buffer* buf = static_cast<ID3D11Buffer*>(raw);
-            D3D11_BUFFER_DESC bd = {};
-            buf->GetDesc(&bd);
-            ID3D11Device* bufDev = nullptr;
-            buf->GetDevice(&bufDev);
-            _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX BUF bw=%u usage=%u "
-                     "bind=0x%X cpu=0x%X misc=0x%X ss=%u dev=%s",
-                     n, wrapOff, bi, (unsigned long long)member,
-                     bd.ByteWidth, (unsigned)bd.Usage, bd.BindFlags,
-                     bd.CPUAccessFlags, bd.MiscFlags, bd.StructureByteStride,
-                     bufDev == resolverDev ? "same" : "OTHER");
-            if (bufDev) bufDev->Release();
-            const uint32_t want = bd.ByteWidth < kGpuCap ? bd.ByteWidth : kGpuCap;
-            if (want >= 64 && ReadbackBufferSlice(buf, 0, want, bytes)) {
-                LogXformRun(n, wrapOff, bi, "gpu",
-                            FindBestXformRun(bytes.data(), bytes.size(), wpos));
-                // Second look pinned to the buffer head: an instance stream
-                // in its own buffer starts at phase ~0 even if some longer
-                // accidental run exists deeper in a pooled buffer.
-                XformRun headRun = FindBestXformRun(bytes.data(), bytes.size(), wpos, 256);
-                if (headRun.count >= 3) LogXformRun(n, wrapOff, bi, "gpu-head", headRun);
-            }
-            buf->Release();
-            return;
-        }
-        if (QiGuarded(reinterpret_cast<void*>(member),
-                      &__uuidof(ID3D11ShaderResourceView), &raw)) {
-            ID3D11ShaderResourceView* srv = static_cast<ID3D11ShaderResourceView*>(raw);
-            D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
-            srv->GetDesc(&sv);
-            ID3D11Resource* res = nullptr;
-            srv->GetResource(&res);
-            ID3D11Buffer* buf = nullptr;
-            if (res) res->QueryInterface(__uuidof(ID3D11Buffer),
-                                         reinterpret_cast<void**>(&buf));
-            D3D11_BUFFER_DESC bd = {};
-            if (buf) buf->GetDesc(&bd);
-            const uint32_t first = (sv.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
-                                       ? sv.Buffer.FirstElement : 0;
-            const uint32_t num   = (sv.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
-                                       ? sv.Buffer.NumElements : 0;
-            _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX SRV fmt=%u dim=%u "
-                     "first=%u num=%u -> buf bw=%u ss=%u bind=0x%X misc=0x%X",
-                     n, wrapOff, bi, (unsigned long long)member,
-                     (unsigned)sv.Format, (unsigned)sv.ViewDimension, first, num,
-                     bd.ByteWidth, bd.StructureByteStride, bd.BindFlags, bd.MiscFlags);
-            if (buf && num > 0) {
-                const uint32_t es = bd.StructureByteStride ? bd.StructureByteStride
-                                                           : DxgiElementSize(sv.Format);
-                if (es > 0) {
-                    uint64_t off = (uint64_t)first * es;
-                    uint64_t len = (uint64_t)num * es;
-                    if (off < bd.ByteWidth && len >= 64) {
-                        if (off + len > bd.ByteWidth) len = bd.ByteWidth - off;
-                        if (len > kGpuCap) len = kGpuCap;
-                        if (ReadbackBufferSlice(buf, (uint32_t)off, (uint32_t)len, bytes)) {
-                            LogXformRun(n, wrapOff, bi, "srv",
-                                        FindBestXformRun(bytes.data(), bytes.size(), wpos));
-                        }
-                    }
+        std::vector<std::array<float, 12>> xf(count);
+        bool valid = true;
+        for (uint32_t k = 0; k < count; ++k) {
+            const float* f = reinterpret_cast<const float*>(bytes.data() + k * kStride);
+            if (!ValidRecordA(f)) { valid = false; break; }
+            // f[15] is 1.0 on every observed record; treat it as scale but
+            // range-guard so an unexpected semantic (a radius, say) can't
+            // explode geometry.
+            const float s = (f[15] > 0.01f && f[15] < 20.0f) ? f[15] : 1.0f;
+            auto& m = xf[k];
+            for (int i = 0; i < 3; ++i) {
+                for (int j = 0; j < 3; ++j) {
+                    const float rij = g_config.mergeInstanceRowVector
+                        ? f[j * 4 + i]   // stored rows are basis rows -> transpose
+                        : f[i * 4 + j];  // stored rows are column-vector rows
+                    m[i * 4 + j] = rij * s;
                 }
+                m[i * 4 + 3] = f[12 + i];
             }
-            if (buf) buf->Release();
-            if (res) res->Release();
-            srv->Release();
-            return;
         }
-        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX d3d11-other vtbl=%016llX",
-                 n, wrapOff, bi, (unsigned long long)member, (unsigned long long)head[0]);
-        return;
-    }
-
-    // Heap-side candidate (game vtable or raw data): bounded-ish snapshot.
-    const size_t got = SnapshotHeapGuarded(member, bytes, 16384);
-    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX heap head=[%016llX %016llX] got=%zu",
-             n, wrapOff, bi, (unsigned long long)member,
-             (unsigned long long)head[0], (unsigned long long)head[1], got);
-    if (got >= 64) {
-        LogXformRun(n, wrapOff, bi, "heap",
-                    FindBestXformRun(bytes.data(), bytes.size(), wpos));
-    }
+        if (!valid) break;
+        out = std::move(xf);
+        ok = true;
+    } while (false);
+    buf->Release();
+    return ok;
 }
 
 // In-flight resolver state. Updated at each gate inside TryResolveStatic
@@ -550,205 +394,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
     BsExtraction::ExtractAlphaState(tri, mesh);
 
-    // ---- Precombine / merge-instanced diagnostic (2026-07-03, capped) ----
-    // "Bethesda-placed objects have incorrect transforms, worse with
-    // precombines" (roads in Sanctuary, light poles, hedges). Precombined
-    // geometry (BSMergeInstancedTriShape / BSMultiStreamInstanceTriShape)
-    // carries per-instance placement in structures F4SE does not declare
-    // (BSPackedCombinedGeomDataExtra is RTTI-only), while this resolver
-    // renders every shape as "local verts x leaf world transform" -- correct
-    // for plain refs, wrong for merged instances. This diagnostic gathers
-    // the data needed to build the real fix:
-    //   - the parsed vertex bounding box: local-space meshes center near the
-    //     origin; combined-space baking shows up as a box offset/spanning
-    //     hundreds-thousands of units;
-    //   - leaf local vs world transform + two parents: shows what placement
-    //     information survives on the scene graph;
-    //   - the shape's NiExtraData entries (class + name + leading qwords):
-    //     the NIF format stores precombined instance transforms in
-    //     BSPackedCombinedGeomDataExtra, so if it is present at runtime its
-    //     leading fields give us the layout anchor for a follow-up.
-    {
-        static std::atomic<int> sInstDiagLogs{0};
-        char instLeaf[64] = "";
-        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
-                                          instLeaf, sizeof(instLeaf));
-        const bool instancedClass =
-            std::strstr(instLeaf, "MergeInstanced") != nullptr ||
-            std::strstr(instLeaf, "MultiStreamInstance") != nullptr;
-        if (instancedClass) {
-            const int n = sInstDiagLogs.fetch_add(1, std::memory_order_relaxed);
-            if (n < 12) {
-                // v2 (2026-07-03): read mesh.vertices, not parsed.* -- the
-                // build step above MOVES the parsed vectors into the mesh, so
-                // v1 logged verts=0 and a sentinel bbox for every shape.
-                float mn[3] = { 3.4e38f, 3.4e38f, 3.4e38f };
-                float mx[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
-                for (const auto& v : mesh.vertices) {
-                    for (int c = 0; c < 3; ++c) {
-                        if (v.position[c] < mn[c]) mn[c] = v.position[c];
-                        if (v.position[c] > mx[c]) mx[c] = v.position[c];
-                    }
-                }
-                const NiTransform& wx = tri->m_worldTransform;
-                const NiTransform& lx = *reinterpret_cast<const NiTransform*>(
-                    reinterpret_cast<uintptr_t>(tri) + 0x30);  // m_localTransform
-                _MESSAGE("FO4RemixPlugin: [InstDiag] #%d class=%s name=\"%s\" verts=%zu tris=%zu "
-                         "vdesc=0x%016llX worldPos=(%.1f,%.1f,%.1f) worldRot0=(%.3f,%.3f,%.3f) "
-                         "worldScale=%.3f localPos=(%.1f,%.1f,%.1f) localScale=%.3f "
-                         "bboxMin=(%.1f,%.1f,%.1f) bboxMax=(%.1f,%.1f,%.1f)",
-                         n, instLeaf, tri->m_name.c_str() ? tri->m_name.c_str() : "",
-                         mesh.vertices.size(), mesh.indices.size() / 3,
-                         (unsigned long long)parsed.vertexDesc,
-                         wx.pos.x, wx.pos.y, wx.pos.z,
-                         wx.rot.data[0][0], wx.rot.data[0][1], wx.rot.data[0][2],
-                         wx.scale, lx.pos.x, lx.pos.y, lx.pos.z, lx.scale,
-                         mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]);
-
-                // Parent-chain logging retired in v5: v2-v4 showed identity
-                // world transforms on both parents for every merged shape.
-
-                // v3 two-level chase (2026-07-03). v2 established the
-                // BSMergeInstancedTriShape member picture:
-                //   +0x170 ptr A -> per-shape buffer wrapper (q0 per-shape)
-                //   +0x178 ptr B -> buffer wrapper whose q0 is the SAME heap
-                //          object across all merged shapes (shared D3D pool)
-                //   +0x190 hi-dword: power-of-two capacity that divides
-                //          numTriangles exactly (e.g. 2-tri quad x 128,
-                //          18 tris x 32) -> hardware instancing: small base
-                //          piece replicated N times, per-instance transforms
-                //          in a second stream the parser never reads.
-                //   +0x1B8 constant 2 (stream count?), +0x1D0/+0x1D8 per-
-                //          shape heap ptrs.
-                // The v2 one-level float dump of A/B printed garbage because
-                // the targets are WRAPPERS (first member = D3D buffer /
-                // shared object), like BSGraphics::VertexBuffer whose pData
-                // CPU copy the parser reads via pVB->pData. v3 dumps 8
-                // qwords of each wrapper, then prints 24 floats behind each
-                // heap-like member -- an instance-transform stream is
-                // unmistakable (rotation values in [-1,1] interleaved with
-                // world-range translations).
-                {
-                    uint64_t raw[16] = {};
-                    if (PeekQwordsGuarded(
-                            reinterpret_cast<const void*>(
-                                reinterpret_cast<uintptr_t>(tri) + 0x160),
-                            raw, 16)) {
-                        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   raw+160=[%016llX %016llX %016llX %016llX "
-                                 "%016llX %016llX %016llX %016llX]",
-                                 n,
-                                 (unsigned long long)raw[0], (unsigned long long)raw[1],
-                                 (unsigned long long)raw[2], (unsigned long long)raw[3],
-                                 (unsigned long long)raw[4], (unsigned long long)raw[5],
-                                 (unsigned long long)raw[6], (unsigned long long)raw[7]);
-                        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   raw+1A0=[%016llX %016llX %016llX %016llX "
-                                 "%016llX %016llX %016llX %016llX]",
-                                 n,
-                                 (unsigned long long)raw[8],  (unsigned long long)raw[9],
-                                 (unsigned long long)raw[10], (unsigned long long)raw[11],
-                                 (unsigned long long)raw[12], (unsigned long long)raw[13],
-                                 (unsigned long long)raw[14], (unsigned long long)raw[15]);
-
-                        // Heap (not module/image) pointers only: this process
-                        // allocates around 0x1D6..., images at 0x7FF7...
-                        auto heapLike = [](uint64_t q) {
-                            return q >= 0x100000000ULL &&
-                                   q <  0x00007F0000000000ULL &&
-                                   (q & 7ULL) == 0ULL;
-                        };
-
-                        // Wrappers of interest: A(+0x170)=raw[2], B(+0x178)=
-                        // raw[3], and the per-shape unknowns +0x1D0/+0x1D8 =
-                        // raw[14]/raw[15].
-                        //
-                        // v5: every heap-like member of each wrapper goes
-                        // through InstDiagProbeMember -- d3d11 COM objects
-                        // get QI + desc + bounded staging readback, heap
-                        // objects get a 16KB SEH snapshot; both feed the
-                        // strict record-run detector (see helpers above).
-                        const float wpos[3] = { wx.pos.x, wx.pos.y, wx.pos.z };
-                        const int wrapperIdx[4] = { 2, 3, 14, 15 };
-                        for (int wi = 0; wi < 4; ++wi) {
-                            const uint64_t wq = raw[wrapperIdx[wi]];
-                            if (!heapLike(wq)) continue;
-                            const int wrapOff = 0x160 + wrapperIdx[wi] * 8;
-                            uint64_t wbody[8] = {};
-                            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wq), wbody, 8)) {
-                                continue;
-                            }
-                            _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   wrap@+%X=%016llX "
-                                     "q=[%016llX %016llX %016llX %016llX %016llX %016llX %016llX %016llX]",
-                                     n, wrapOff, (unsigned long long)wq,
-                                     (unsigned long long)wbody[0], (unsigned long long)wbody[1],
-                                     (unsigned long long)wbody[2], (unsigned long long)wbody[3],
-                                     (unsigned long long)wbody[4], (unsigned long long)wbody[5],
-                                     (unsigned long long)wbody[6], (unsigned long long)wbody[7]);
-                            for (int bi = 0; bi < 8; ++bi) {
-                                if (!heapLike(wbody[bi])) continue;
-                                uint64_t head[4] = {};
-                                if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wbody[bi]), head, 4)) {
-                                    continue;
-                                }
-                                // Shared objects (the D3D pool, per-cell CPU
-                                // structures) recur across shapes; probe each
-                                // pointer once per session.
-                                static std::unordered_set<uint64_t> sProbed;
-                                if (!sProbed.insert(wbody[bi]).second) {
-                                    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX seen",
-                                             n, wrapOff, bi, (unsigned long long)wbody[bi]);
-                                    continue;
-                                }
-                                InstDiagProbeMember(n, wrapOff, bi, wbody[bi], head, device, wpos);
-
-                                // +0x1D0.q0 points at an array of 0xB8-strided
-                                // descriptors (v4: *(q0)+0xB8 == q4 exactly,
-                                // q1 == 4 == the +0x1A0 segment count). Chase
-                                // one level into the element pool; logged as
-                                // q8 to mark the synthetic slot.
-                                if (wrapperIdx[wi] == 14 && bi == 0 && heapLike(head[0]) &&
-                                    sProbed.insert(head[0]).second) {
-                                    uint64_t ehead[2] = {};
-                                    if (PeekQwordsGuarded(reinterpret_cast<const void*>(head[0]),
-                                                          ehead, 2)) {
-                                        InstDiagProbeMember(n, wrapOff, 8, head[0], ehead,
-                                                            device, wpos);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // NiExtraData entries. Leading qwords start at +0x18 (NiObject
-                // 0x10 + BSFixedString m_name 8); precombined instance data
-                // objects are large, so a 6-qword peek stays inside the
-                // allocation for the entries we care about. (v1 result: NULL
-                // on every merge-instanced shape -- kept for the MultiStream
-                // variant, which has not been sampled yet.)
-                tMutexArray<NiExtraData*>* xd = tri->m_extraData;
-                if (xd && xd->entries && xd->count > 0) {
-                    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   extraData count=%u", n, xd->count);
-                    const UInt32 xdMax = xd->count < 6u ? xd->count : 6u;
-                    for (UInt32 xi = 0; xi < xdMax; ++xi) {
-                        NiExtraData* ed = xd->entries[xi];
-                        if (!ed) continue;
-                        char edLeaf[64] = "";
-                        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(ed),
-                                                          edLeaf, sizeof(edLeaf));
-                        const uint64_t* q = reinterpret_cast<const uint64_t*>(
-                            reinterpret_cast<uintptr_t>(ed) + 0x18);
-                        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   xd[%u] class=%s name=\"%s\" "
-                                 "q=[%016llX %016llX %016llX %016llX %016llX %016llX]",
-                                 n, xi, edLeaf,
-                                 ed->m_name.c_str() ? ed->m_name.c_str() : "",
-                                 (unsigned long long)q[0], (unsigned long long)q[1],
-                                 (unsigned long long)q[2], (unsigned long long)q[3],
-                                 (unsigned long long)q[4], (unsigned long long)q[5]);
-                    }
-                }
-            }
-        }
-    }
+    // (Merge-instanced transform read happens just before submit, after the
+    // material/texture gates -- a retrying shape shouldn't pay the staging-
+    // buffer readback stall on every backoff attempt.)
 
     // Decal tag. The decal bit is in flags1: bit 26, mask 0x04000000.
     // Confirmed for FO4 1.10.980 by static analysis of the BGSM flag-applier
@@ -945,12 +593,123 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     ResolverTrace::g_lastStep.store(Trace::kTexturesExtracted, std::memory_order_relaxed);
 
+    // ---- Merge-instanced transform read (2026-07-03) ----
+    // BSMergeInstancedTriShape carries per-instance placements in a
+    // structured D3D buffer the parser never sees (see the reader's block
+    // comment near the top of this file). Read them here; the submit section
+    // below expands the shape into one Remix drawable per instance. Empty
+    // instXforms = plain shape OR read fell through validation ->
+    // single-draw path, pre-fix behavior. Scoped to MergeInstanced only:
+    // BSMultiStreamInstanceTriShape (engine grass) has a different stream
+    // layout (v2 probe: 8000.0f fade distance at +0x190) and stays on the
+    // single-draw path until sampled properly.
+    std::vector<std::array<float, 12>> instXforms;
+    if (g_config.mergeInstanceExpansion && g_config.gpuInstancingEnabled) {
+        char instLeaf[64] = "";
+        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
+                                          instLeaf, sizeof(instLeaf));
+        if (std::strstr(instLeaf, "MergeInstanced") != nullptr) {
+            const bool got = ReadMergeInstanceTransforms(tri, instXforms);
+            static std::atomic<int> sInstLogs{0};
+            const int n = sInstLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 40) {
+                const NiTransform& wx = tri->m_worldTransform;
+                if (got && !instXforms.empty()) {
+                    const auto& m0 = instXforms[0];
+                    _MESSAGE("FO4RemixPlugin: [MergeInst] #%d hash=0x%llX count=%zu "
+                             "leafPos=(%.1f,%.1f,%.1f) t0=(%.1f,%.1f,%.1f) "
+                             "r0=[%.2f,%.2f,%.2f]",
+                             n, (unsigned long long)hash, instXforms.size(),
+                             wx.pos.x, wx.pos.y, wx.pos.z,
+                             m0[3], m0[7], m0[11], m0[0], m0[1], m0[2]);
+                } else {
+                    _MESSAGE("FO4RemixPlugin: [MergeInst] #%d hash=0x%llX stream read "
+                             "FAILED -> single-draw fallback leafPos=(%.1f,%.1f,%.1f)",
+                             n, (unsigned long long)hash,
+                             wx.pos.x, wx.pos.y, wx.pos.z);
+                }
+            }
+        }
+    }
+
     // ---- Submit to Remix ----
     ResolverTrace::g_lastStep.store(Trace::kSubmitStart, std::memory_order_relaxed);
-    auto status = RemixRenderer::SubmitDrawable(hash, mesh, newTextures);
-    if (status != RemixRenderer::SubmitStatus::kSubmitted) {
-        ResolverTrace::g_lastStep.store(Trace::kSubmitFailed, std::memory_order_relaxed);
-        return false;
+
+    if (!instXforms.empty()) {
+        // Merge-instanced expansion: one drawable per hardware instance, all
+        // sharing the parsed mesh -- the content-hash mesh cache collapses
+        // them onto one Remix mesh/BLAS and OnFrame batches the bucket via
+        // InstanceInfoGpuInstancingEXT. Instance 0 keeps the base hash so
+        // every existing bookkeeping path (state.meshHash, retry/backoff,
+        // sweeps) is untouched; extras get derived hashes recorded in
+        // state.extraMeshHashes for release alongside the base.
+        //
+        // Transform: records are cluster-local, so compose leaf-world (o)
+        // instance in Bethesda space and reuse BuildRemixTransform for the
+        // Beth->Remix axis swap. Column-vector compose W o M:
+        //   R_f = W.R * M.R (M.R carries any instance scale)
+        //   t_f = W.scale * (W.R * M.t) + W.pos,  scale_f = W.scale
+        // Every sampled leaf was translation-only identity/1.0, so this
+        // reduces to R_f = M.R, t_f = M.t + W.pos -- but compose generally
+        // in case a rotated/scaled cluster root exists somewhere.
+        //
+        // Extras that fail (VRAM/budget gates) log and are skipped: the
+        // cluster renders partially rather than blocking the base drawable.
+        // Base failure returns false BEFORE any extra is submitted, so the
+        // normal retry path re-runs the whole expansion.
+        const NiTransform& W = tri->m_worldTransform;
+        std::vector<uint64_t> extraHashes;
+        extraHashes.reserve(instXforms.size() - 1);
+        size_t extrasFailed = 0;
+        for (size_t i = 0; i < instXforms.size(); ++i) {
+            const auto& M = instXforms[i];
+            // Raw buffer instead of `NiTransform xf;`: f4se_minimal declares
+            // but does not define NiPoint3's default ctor, so constructing
+            // NiTransform directly fails to link.
+            alignas(16) unsigned char xfBuf[sizeof(NiTransform)] = {};
+            NiTransform& xf = *reinterpret_cast<NiTransform*>(xfBuf);
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    xf.rot.data[r][c] = W.rot.data[r][0] * M[0 * 4 + c] +
+                                        W.rot.data[r][1] * M[1 * 4 + c] +
+                                        W.rot.data[r][2] * M[2 * 4 + c];
+                }
+            }
+            xf.pos.x = W.scale * (W.rot.data[0][0] * M[3] + W.rot.data[0][1] * M[7] +
+                                  W.rot.data[0][2] * M[11]) + W.pos.x;
+            xf.pos.y = W.scale * (W.rot.data[1][0] * M[3] + W.rot.data[1][1] * M[7] +
+                                  W.rot.data[1][2] * M[11]) + W.pos.y;
+            xf.pos.z = W.scale * (W.rot.data[2][0] * M[3] + W.rot.data[2][1] * M[7] +
+                                  W.rot.data[2][2] * M[11]) + W.pos.z;
+            xf.scale = W.scale;
+            SemanticCapture::BuildRemixTransform(xf, mesh.worldTransform);
+
+            const uint64_t instHash = (i == 0)
+                ? hash
+                : hash ^ (0x9E3779B97F4A7C15ULL * (uint64_t)i);
+            auto instStatus = RemixRenderer::SubmitDrawable(instHash, mesh, newTextures);
+            if (instStatus == RemixRenderer::SubmitStatus::kSubmitted) {
+                if (i > 0) extraHashes.push_back(instHash);
+            } else if (i == 0) {
+                ResolverTrace::g_lastStep.store(Trace::kSubmitFailed,
+                                                std::memory_order_relaxed);
+                return false;
+            } else {
+                ++extrasFailed;
+            }
+        }
+        if (extrasFailed > 0) {
+            _MESSAGE("FO4RemixPlugin: [MergeInst] hash=0x%llX %zu/%zu extra instances "
+                     "failed to submit (cluster renders partially)",
+                     (unsigned long long)hash, extrasFailed, instXforms.size() - 1);
+        }
+        state.extraMeshHashes = std::move(extraHashes);
+    } else {
+        auto status = RemixRenderer::SubmitDrawable(hash, mesh, newTextures);
+        if (status != RemixRenderer::SubmitStatus::kSubmitted) {
+            ResolverTrace::g_lastStep.store(Trace::kSubmitFailed, std::memory_order_relaxed);
+            return false;
+        }
     }
     ResolverTrace::g_lastStep.store(Trace::kSubmitOK, std::memory_order_relaxed);
 

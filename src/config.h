@@ -176,6 +176,24 @@ struct PluginConfig {
     // unique-mesh-per-drawable rendering path if a regression appears.
     bool gpuInstancingEnabled;
 
+    // [Precombines]
+    // Expand each BSMergeInstancedTriShape into one Remix drawable per
+    // hardware instance, with transforms read from the shape's structured
+    // instance buffer (see lighting_static.cpp ReadMergeInstanceTransforms).
+    // Without this, merged precombined geometry (Sanctuary roads, light
+    // poles, hedges) renders once, unrotated, at the cluster origin.
+    // Requires gpuInstancingEnabled (extras would otherwise each build a
+    // full Remix mesh); silently inactive when that is off.
+    bool mergeInstanceExpansion;
+
+    // Rotation convention of the 80-byte instance records. Default (true)
+    // treats the stored rows as basis rows (Bethesda row-vector GPU style,
+    // pos = mul(v, world)) and transposes into column-vector form. If
+    // instanced placements come out inverse-rotated (hedge corners / bent
+    // road pieces turned the wrong way), set false to read the rows as
+    // column-vector rotation rows directly.
+    bool mergeInstanceRowVector;
+
     // Frame-rate target for the Remix render thread. The thread loop paces to
     // this by sleeping only the unused remainder of the frame budget after
     // OnFrame returns. 0 = uncapped (yield-only between frames).
