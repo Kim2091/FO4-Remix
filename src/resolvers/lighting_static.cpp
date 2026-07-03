@@ -483,6 +483,121 @@ static float HalfToFloat(uint16_t h) {
     return out;
 }
 
+// ---- Baked expanded-mesh rebuild (take 10, 2026-07-03) ----
+// The engine renders BSMergeInstancedTriShape from a PRE-BAKED expanded
+// mesh: every placed instance's geometry duplicated into large shared
+// IB/VB pools, positions already CLUSTER-LOCAL (take-9 readback proof:
+// float3 spanning hundreds of units matching record translations, unit
+// normals as biased ubytes, half2 UVs). So instead of partitioning the
+// record buffer (five failed takes), rebuild our Remix mesh FROM the
+// engine's own baked chunks and submit it with just the leaf transform:
+// placement, rotation, and sub-model pairing are the engine's own.
+//
+// Captured chunk lists contain stray draws (the record SRV lingers bound
+// across unrelated geometry -- a 4km quad in a 20-byte format showed up).
+// Filters: exact baked vertex format (stride 32, R16_UINT indices) and
+// every sampled position inside the shape's world bound (leaf rotations
+// are identity on every sampled merged shape, so the local-space bound is
+// just the world bound recentered on the leaf position).
+static bool BuildMeshFromChunks(BSTriShape* tri,
+                                const DrawCapture::ChunkDraw* chunks, int nChunks,
+                                uint64_t hash,
+                                std::vector<remixapi_HardcodedVertex>& outVerts,
+                                std::vector<uint32_t>& outIndices,
+                                int& keptChunks) {
+    keptChunks = 0;
+    const NiTransform& W = tri->m_worldTransform;
+    const NiBound& B = tri->m_worldBound;
+    const float cx = B.m_kCenter.x - W.pos.x;
+    const float cy = B.m_kCenter.y - W.pos.y;
+    const float cz = B.m_kCenter.z - W.pos.z;
+    const float rad = B.m_fRadius * 1.6f + 128.0f;
+    const float radSq = rad * rad;
+
+    for (int c = 0; c < nChunks; ++c) {
+        const DrawCapture::ChunkDraw& ch = chunks[c];
+        if (ch.ibFormat != 57 /*R16_UINT*/ || ch.vbStride != 32) continue;
+        if (ch.idxCount == 0 || ch.idxCount % 3 != 0 || ch.idxCount > 200000) continue;
+        ID3D11Buffer* ibb = SafeBufferFromIdentity(ch.ib);
+        if (!ibb) continue;
+        std::vector<uint8_t> ibBytes;
+        const bool ibOk = ReadbackBufferSlice(ibb, ch.ibOffset, ch.idxCount * 2,
+                                              ibBytes) == ch.idxCount * 2;
+        ibb->Release();
+        if (!ibOk) continue;
+        const uint16_t* idx = reinterpret_cast<const uint16_t*>(ibBytes.data());
+        uint16_t mn = 0xFFFF, mx = 0;
+        for (uint32_t i = 0; i < ch.idxCount; ++i) {
+            if (idx[i] < mn) mn = idx[i];
+            if (idx[i] > mx) mx = idx[i];
+        }
+        const uint32_t nVerts = (uint32_t)mx - mn + 1;
+        if (nVerts > 70000) continue;
+        ID3D11Buffer* vbb = SafeBufferFromIdentity(ch.vb);
+        if (!vbb) continue;
+        std::vector<uint8_t> vbytes;
+        const bool vbOk = ReadbackBufferSlice(vbb, ch.vbOffset + (uint32_t)mn * 32u,
+                                              nVerts * 32u, vbytes) == nVerts * 32u;
+        vbb->Release();
+        if (!vbOk) continue;
+        // bound filter: all spread samples must land inside the cluster
+        bool inside = true;
+        for (int s = 0; s < 8 && inside; ++s) {
+            const uint32_t v = (uint32_t)(((uint64_t)s * (nVerts - 1)) / 7);
+            float p[3];
+            std::memcpy(p, vbytes.data() + v * 32u, 12);
+            const float dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
+            inside = (dx * dx + dy * dy + dz * dz) <= radSq;
+        }
+        if (!inside) continue;
+        // append: positions float3@0, UV half2@16, normal biased-ubyte@20
+        const uint32_t vbase = (uint32_t)outVerts.size();
+        outVerts.resize(vbase + nVerts);
+        for (uint32_t v = 0; v < nVerts; ++v) {
+            const uint8_t* p = vbytes.data() + v * 32u;
+            remixapi_HardcodedVertex& hv = outVerts[vbase + v];
+            std::memset(&hv, 0, sizeof(hv));
+            std::memcpy(hv.position, p, 12);
+            uint16_t uvh[2];
+            std::memcpy(uvh, p + 16, 4);
+            hv.texcoord[0] = HalfToFloat(uvh[0]);
+            hv.texcoord[1] = HalfToFloat(uvh[1]);
+            float nx = (p[20] / 255.0f) * 2.0f - 1.0f;
+            float ny = (p[21] / 255.0f) * 2.0f - 1.0f;
+            float nz = (p[22] / 255.0f) * 2.0f - 1.0f;
+            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl > 0.25f) {
+                nx /= nl; ny /= nl; nz /= nl;
+            } else {
+                nx = 0.0f; ny = 0.0f; nz = 1.0f;
+            }
+            hv.normal[0] = nx;
+            hv.normal[1] = ny;
+            hv.normal[2] = nz;
+            hv.color = 0xFFFFFFFF;
+        }
+        // same per-triangle 1<->2 winding flip the parser applies
+        const size_t ibase = outIndices.size();
+        outIndices.resize(ibase + ch.idxCount);
+        for (uint32_t t = 0; t + 2 < ch.idxCount; t += 3) {
+            outIndices[ibase + t]     = vbase + (uint32_t)(idx[t] - mn);
+            outIndices[ibase + t + 1] = vbase + (uint32_t)(idx[t + 2] - mn);
+            outIndices[ibase + t + 2] = vbase + (uint32_t)(idx[t + 1] - mn);
+        }
+        ++keptChunks;
+    }
+    if (keptChunks == 0 || outIndices.size() < 48) return false;
+    static std::atomic<int> sBakeLogs{0};
+    const int bl = sBakeLogs.fetch_add(1, std::memory_order_relaxed);
+    if (bl < 24) {
+        _MESSAGE("FO4RemixPlugin: [MergeBake] hash=0x%llX chunks=%d/%d tris=%zu "
+                 "verts=%zu bound=(%.0f,%.0f,%.0f r=%.0f)",
+                 (unsigned long long)hash, keptChunks, nChunks,
+                 outIndices.size() / 3, outVerts.size(), cx, cy, cz, rad);
+    }
+    return true;
+}
+
 static inline int PermXY(int i) { return i == 0 ? 1 : (i == 1 ? 0 : 2); }
 
 // Decode one 80-byte instance record into a Bethesda ROW-VECTOR 3x4
@@ -1166,110 +1281,43 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                            instSegTris, cap) ==
                         DrawCapture::kReady) {
                         const uint32_t rc = (uint32_t)instRecords.size();
-                        // ---- Baked-chunk diagnostics (take 9) ----
-                        // Run 6 established the engine draws a PRE-BAKED
-                        // expanded mesh (per-instance geometry duplicated,
-                        // ~2k-tri chunks selected by IB offset, records
-                        // applied by the VS via a per-vertex record index).
-                        // Read the expanded buffers back: IB slice + a few
-                        // referenced vertices, hunting the record-index
-                        // field (bet: the .w of a half4 position). Once
-                        // found, a record->tri-count histogram maps every
-                        // record to its sub-model exactly.
-                        DrawCapture::ChunkDraw chunks[32];
-                        const int nChunks = DrawCapture::GetChunks(hash, chunks, 32);
-                        static std::atomic<int> sChunkLogs{0};
-                        if (nChunks > 0 &&
-                            sChunkLogs.fetch_add(1, std::memory_order_relaxed) < 6) {
-                            uint64_t totalIdx = 0;
-                            char clist[420];
-                            size_t cpos = 0;
-                            clist[0] = 0;
-                            for (int c = 0; c < nChunks; ++c) {
-                                totalIdx += chunks[c].idxCount;
-                                if (c < 10) {
-                                    const int wln = snprintf(clist + cpos,
-                                        sizeof(clist) - cpos, "%s[off=%u n=%u]",
-                                        c ? " " : "", chunks[c].ibOffset,
-                                        chunks[c].idxCount);
-                                    if (wln <= 0 ||
-                                        (size_t)wln >= sizeof(clist) - cpos) break;
-                                    cpos += (size_t)wln;
+                        // ---- Baked-mesh rebuild (take 10) ----
+                        // Preferred: replace our parsed source mesh with
+                        // the engine's own baked expanded geometry (see
+                        // BuildMeshFromChunks). One drawable, leaf
+                        // transform only -- the records are already baked
+                        // into the vertices by the engine.
+                        DrawCapture::ChunkDraw chunks[48];
+                        const int nChunks = DrawCapture::GetChunks(hash, chunks, 48);
+                        bool bakedMesh = false;
+                        if (nChunks > 0) {
+                            std::vector<remixapi_HardcodedVertex> bv;
+                            std::vector<uint32_t> bi;
+                            int keptChunks = 0;
+                            if (BuildMeshFromChunks(tri, chunks, nChunks, hash,
+                                                    bv, bi, keptChunks)) {
+                                mesh.vertices = std::move(bv);
+                                mesh.indices = std::move(bi);
+                                instRecords.clear();
+                                std::array<float, 20> ident = {};
+                                ident[0] = ident[5] = ident[10] = ident[15] = 1.0f;
+                                instRecords.push_back(ident);
+                                segs[0] = { 0, (uint32_t)(mesh.indices.size() / 3),
+                                            0, 1 };
+                                nSegs = 1;
+                                bakedMesh = true;
+                            } else {
+                                static std::atomic<int> sBakeFail{0};
+                                const int bf = sBakeFail.fetch_add(1,
+                                    std::memory_order_relaxed);
+                                if (bf < 20) {
+                                    _MESSAGE("FO4RemixPlugin: [MergeBake] hash=0x%llX "
+                                             "REJECTED all %d chunks -> fallback",
+                                             (unsigned long long)hash, nChunks);
                                 }
-                            }
-                            _MESSAGE("FO4RemixPlugin: [MergeChunk] hash=0x%llX n=%d "
-                                     "bakedTris=%llu rc=%u srcMeshTris=%u stride=%u %s",
-                                     (unsigned long long)hash, nChunks,
-                                     (unsigned long long)(totalIdx / 3), rc, meshTris,
-                                     chunks[0].vbStride, clist);
-                            for (int c = 0; c < nChunks && c < 2; ++c) {
-                                const DrawCapture::ChunkDraw& ch = chunks[c];
-                                if (ch.ibFormat != 57 /*R16_UINT*/) continue;
-                                ID3D11Buffer* ibb = SafeBufferFromIdentity(ch.ib);
-                                if (!ibb) continue;
-                                const uint32_t nRead =
-                                    ch.idxCount < 512 ? ch.idxCount : 512;
-                                std::vector<uint8_t> ibBytes;
-                                if (ReadbackBufferSlice(ibb, ch.ibOffset, nRead * 2,
-                                                        ibBytes) == nRead * 2) {
-                                    const uint16_t* idx =
-                                        (const uint16_t*)ibBytes.data();
-                                    uint16_t mn = 0xFFFF, mx = 0;
-                                    for (uint32_t i = 0; i < nRead; ++i) {
-                                        if (idx[i] < mn) mn = idx[i];
-                                        if (idx[i] > mx) mx = idx[i];
-                                    }
-                                    _MESSAGE("FO4RemixPlugin: [MergeChunk] hash=0x%llX "
-                                             "c=%d idx[min=%u max=%u] first=[%u %u %u "
-                                             "%u %u %u %u %u %u %u %u %u]",
-                                             (unsigned long long)hash, c, mn, mx,
-                                             idx[0], idx[1], idx[2], idx[3], idx[4],
-                                             idx[5], idx[6], idx[7], idx[8], idx[9],
-                                             idx[10], idx[11]);
-                                    ID3D11Buffer* vbb = SafeBufferFromIdentity(ch.vb);
-                                    if (vbb && ch.vbStride >= 8 && ch.vbStride <= 128) {
-                                        const uint16_t picks[4] = {
-                                            mn, (uint16_t)(mn + (mx - mn) / 3),
-                                            (uint16_t)(mn + 2 * (mx - mn) / 3), mx };
-                                        for (int v = 0; v < 4; ++v) {
-                                            std::vector<uint8_t> vbytes;
-                                            const uint32_t voff = ch.vbOffset +
-                                                (uint32_t)picks[v] * ch.vbStride;
-                                            if (ReadbackBufferSlice(vbb, voff,
-                                                    ch.vbStride, vbytes) != ch.vbStride) {
-                                                continue;
-                                            }
-                                            const uint16_t* hw =
-                                                (const uint16_t*)vbytes.data();
-                                            char hexs[300];
-                                            size_t hp = 0;
-                                            hexs[0] = 0;
-                                            const uint32_t nw = ch.vbStride / 2;
-                                            for (uint32_t x = 0; x < nw; ++x) {
-                                                const int wln = snprintf(hexs + hp,
-                                                    sizeof(hexs) - hp, "%s%04X",
-                                                    x ? " " : "", hw[x]);
-                                                if (wln <= 0 || (size_t)wln >=
-                                                        sizeof(hexs) - hp) break;
-                                                hp += (size_t)wln;
-                                            }
-                                            _MESSAGE("FO4RemixPlugin: [MergeVert] "
-                                                     "hash=0x%llX c=%d vid=%u "
-                                                     "pos=(%.2f,%.2f,%.2f) w=%.3f "
-                                                     "raw=[%s]",
-                                                     (unsigned long long)hash, c,
-                                                     picks[v],
-                                                     HalfToFloat(hw[0]),
-                                                     HalfToFloat(hw[1]),
-                                                     HalfToFloat(hw[2]),
-                                                     HalfToFloat(hw[3]), hexs);
-                                        }
-                                    }
-                                    if (vbb) vbb->Release();
-                                }
-                                ibb->Release();
                             }
                         }
+                        if (!bakedMesh) {
                         // Only the DrawIndexed capture is trusted; kind-0
                         // (DrawIndexedInstanced) entries were only ever
                         // stray leftover-binding draws.
@@ -1343,6 +1391,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             // Bad frame (partial shadow set, LOD mix):
                             // capture another one before giving up.
                             return false;
+                        }
                         }
                     }
                 }
