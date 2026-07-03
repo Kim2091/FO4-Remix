@@ -366,7 +366,14 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
    logging:
    - For each new texture: refcount-bump-on-hit, `api->CreateTexture` on
      miss with a deterministic hash-derived path
-     (`HashToPath(hash)` formats `L"0x%llX"`).
+     (`HashToPath(hash)` formats `L"0x%llX"`). After the upload loop, every
+     texture hash the material will reference (diffuse/normal/roughness/
+     emissive) that arrived via a cache hit with a live handle is ALSO
+     refcount-bumped and added to the drawable's texture set (2026-07-02) —
+     previously only the first submitter of a shared texture held a
+     reference/stamped `lastDrawnFrame`, so a zeroed lone refcount let the
+     sweep or ReleaseDrawable destroy textures still bound to visible
+     materials (objects turned black ~10s after load).
    - Validates that all referenced texture hashes loaded; if diffuse
      missing, decrements bumps and returns `kFailed`.
    - Builds a material cache key by hashing

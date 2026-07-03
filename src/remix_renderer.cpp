@@ -722,6 +722,30 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     const uint64_t roughnessH = loaded(mesh.roughnessTextureHash) ? mesh.roughnessTextureHash : 0;
     const uint64_t emissiveH  = loaded(mesh.emissiveTextureHash)  ? mesh.emissiveTextureHash  : 0;
 
+    // ---- True texture refcounts (2026-07-02) ----
+    // The upload loop above only tracks textures that arrived in newTextures
+    // (fresh extraction or handle-recreate). Textures referenced via an
+    // extraction-cache hit whose Remix handle already existed were invisible
+    // to this drawable's refcount set -- only the FIRST submitter of a shared
+    // texture held a reference and stamped lastDrawnFrame in OnFrame. Any
+    // path that zeroed that lone refcount while later submitters still used
+    // the texture (failed-submit backout followed by a successful hash-only
+    // retry; sole holder released at TTL / reload) let ReleaseDrawable or the
+    // LRU sweep destroy a texture still bound to visible materials: objects
+    // rendered correctly and then turned black ~TextureLRUGraceFrames (~10s)
+    // later. Reference every texture this drawable's material will actually
+    // use, so refcounts mean what they say.
+    for (uint64_t refH : { mesh.diffuseTextureHash, normalH, roughnessH, emissiveH }) {
+        if (refH == 0 || inst.textureHashes.count(refH)) {
+            continue;
+        }
+        auto refIt = g_textureHandles.find(refH);
+        if (refIt != g_textureHandles.end()) {
+            refIt->second.refCount++;
+            inst.textureHashes.insert(refH);
+        }
+    }
+
     // ---- Material cache ----
     // Hash the texture combination to get a stable per-material cache key.
     // On hit, bump refCount + lastDrawnFrame. On miss, create a new Remix
