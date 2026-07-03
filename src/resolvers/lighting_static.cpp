@@ -963,7 +963,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 }
                 if (nzEarly >= 2 && g_config.mergeInstanceDrawCapture && instBufPtr) {
                     std::vector<DrawCapture::SegDraw> capPeek;
-                    if (DrawCapture::Query(instBufPtr, instSrvPtr, hash, capPeek) ==
+                    if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
+                                           (uint32_t)instRecords.size(), capPeek) ==
                         DrawCapture::kCapturing) {
                         return false;
                     }
@@ -1089,7 +1090,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 // that doesn't validate falls through to the take-5 path.
                 if (g_config.mergeInstanceDrawCapture && instBufPtr) {
                     std::vector<DrawCapture::SegDraw> cap;
-                    if (DrawCapture::Query(instBufPtr, instSrvPtr, hash, cap) ==
+                    if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
+                                           (uint32_t)instRecords.size(), cap) ==
                             DrawCapture::kReady &&
                         !cap.empty()) {
                         // Same record range drawn with different index

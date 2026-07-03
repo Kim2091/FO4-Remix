@@ -16,33 +16,45 @@ typedef void (STDMETHODCALLTYPE* PFN_DrawInstanced)(
     ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
 typedef void (STDMETHODCALLTYPE* PFN_DrawIndexedInstancedIndirect)(
     ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+typedef void (STDMETHODCALLTYPE* PFN_SetShaderResources)(
+    ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
 static PFN_DrawIndexedInstanced g_original = nullptr;
 static PFN_DrawInstanced g_originalDI = nullptr;
 static PFN_DrawIndexedInstancedIndirect g_originalDIII = nullptr;
+static PFN_SetShaderResources g_originalVSSet = nullptr;
+static PFN_SetShaderResources g_originalPSSet = nullptr;
+static PFN_SetShaderResources g_originalCSSet = nullptr;
 static std::atomic<bool> g_hooked{false};
 
 constexpr int      kMaxWatches       = 16;
 constexpr int      kMaxDrawsPerFrame = 24;
 constexpr int      kVsSrvSlots       = 16;     // scan t0..t15 for the record SRV
 constexpr uint64_t kDeadlineMs       = 15000;  // then the caller falls back
-                                               // (generous: registration can
-                                               // happen during loading, before
-                                               // the world ever renders)
 
-// 2026-07-03 diagnostics: the first take-8 run captured NOTHING (all
-// watches expired; zero [MergeDraw] lines) while the hook itself installed
-// fine. These counters pin down where the merge draws actually are:
-//  - g_diiCalls / g_diCalls / g_diiiCalls: are instanced draws flowing
-//    through the hooked vtable at all (deferred-context miss if not)?
-//  - g_stride80Hits: do ANY instanced draws bind a stride-80 structured
-//    buffer on a VS t-slot (identity/slot mismatch if yes but no match)?
-//  - [DrawCapDiag] lines: the first draws that DO bind stride-80 buffers,
-//    with slot + buffer pointer to compare against the watched pointers.
+// 2026-07-03 run-2 findings driving this revision: 161k DrawIndexedInstanced
+// calls flowed through the hooked vtable (immediate ctx, no Indirect, no
+// DrawInstanced), a REAL stride-80 record buffer was seen bound at VS t8
+// (bytes=320 = 4 records, lingering across unrelated particle draws), but
+// the 18 watched buffer/SRV pointers never matched once -- and the only two
+// "captures" were false matches on particle draws (instance counts 36..378
+// against 4..18-record shapes; validation rejected both). Conclusion so
+// far: t8 is the record slot, the engine probably binds a DIFFERENT object
+// than the shape wrapper's own buffer/SRV (per-frame dynamic copy?), and
+// stale watched pointers can get recycled into unrelated live objects.
+// This revision therefore:
+//  - desc-verifies every pointer match (stride 80 + exact expected
+//    ByteWidth) so recycled pointers can't produce junk captures
+//  - hooks VS/PS/CSSetShaderResources to log whether a watched SRV (or a
+//    view of a watched buffer) is EVER bound, on any slot of those stages
+//  - logs every stride-80 t-slot per diag draw with usage/cpu flags
+//    (a dynamic ring copy shows USAGE_DYNAMIC + CPU_WRITE)
 static std::atomic<uint64_t> g_diiCalls{0};
 static std::atomic<uint64_t> g_diCalls{0};
 static std::atomic<uint64_t> g_diiiCalls{0};
 static std::atomic<uint64_t> g_stride80Hits{0};
+static std::atomic<uint64_t> g_bindHits{0};
 static std::atomic<int>      g_diagLogs{0};
+static std::atomic<int>      g_bindLogs{0};
 static std::atomic<bool>     g_typeLogged{false};
 
 struct Watch {
@@ -51,8 +63,10 @@ struct Watch {
     void*    buffer = nullptr;
     void*    srv = nullptr;
     uint64_t key = 0;
+    uint32_t expectedBytes = 0;  // recordCount * 80; desc-verified on match
     uint64_t registeredTick = 0;
     uint32_t registeredFrame = 0;
+    uint32_t bindCount = 0;      // times a Set*ShaderResources bound us
     // Draws accumulate per frame in cur[]; the previous frame's complete
     // list rolls into done[] so Query never reads a half-recorded frame.
     uint32_t curFrame = 0;
@@ -77,6 +91,21 @@ static void RollFrame(Watch& w) {
     w.curCount = 0;
 }
 
+// Pointer-equality is necessary but no longer sufficient: a destroyed
+// watched object's address can be recycled into an unrelated live one
+// (proven by run 2's particle-draw false matches). Confirm the resource
+// really is THIS shape's record buffer before trusting a match.
+static bool DescMatches(ID3D11Resource* r, uint32_t expectedBytes) {
+    if (!r) return false;
+    ID3D11Buffer* b = nullptr;
+    if (FAILED(r->QueryInterface(__uuidof(ID3D11Buffer), (void**)&b))) return false;
+    D3D11_BUFFER_DESC bd = {};
+    b->GetDesc(&bd);
+    b->Release();
+    return (bd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) &&
+           bd.StructureByteStride == 80 && bd.ByteWidth == expectedBytes;
+}
+
 static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
     ID3D11DeviceContext* ctx, UINT idxCount, UINT instCount,
     UINT startIdx, INT baseVtx, UINT startInst)
@@ -95,9 +124,10 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
         for (int i = 0; i < kVsSrvSlots; ++i) {
             if (srvs[i]) srvs[i]->GetResource(&res[i]);
         }
-        // Diagnostic: does this draw bind ANY stride-80 structured buffer
-        // on a VS t-slot? Capped GetDesc probing while watches are active.
-        if (instCount >= 2 && g_diagLogs.load(std::memory_order_relaxed) < 24) {
+        // Diagnostic: log EVERY stride-80 structured buffer on a VS t-slot
+        // for the first draws, with usage/cpu flags (dynamic copy theory).
+        if (instCount >= 2 && g_diagLogs.load(std::memory_order_relaxed) < 40) {
+            bool any = false;
             for (int i = 0; i < kVsSrvSlots; ++i) {
                 if (!res[i]) continue;
                 ID3D11Buffer* b = nullptr;
@@ -110,17 +140,23 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
                 b->Release();
                 if ((bd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) &&
                     bd.StructureByteStride == 80) {
-                    g_stride80Hits.fetch_add(1, std::memory_order_relaxed);
-                    const int dl = g_diagLogs.fetch_add(1, std::memory_order_relaxed);
-                    if (dl < 24) {
-                        _MESSAGE("FO4RemixPlugin: [DrawCapDiag] #%d t%d buf=%p "
-                                 "srv=%p bytes=%u idx=%u+%u inst=%u+%u bv=%d",
-                                 dl, i, (void*)res[i], (void*)srvs[i],
-                                 bd.ByteWidth, startIdx, idxCount,
-                                 startInst, instCount, baseVtx);
+                    any = true;
+                    const int dl = g_diagLogs.load(std::memory_order_relaxed);
+                    if (dl < 40) {
+                        _MESSAGE("FO4RemixPlugin: [DrawCapDiag] #%d f=%u t%d "
+                                 "buf=%p srv=%p bytes=%u usage=%u cpu=0x%X "
+                                 "idx=%u+%u inst=%u+%u bv=%d",
+                                 dl, g_frame.load(std::memory_order_relaxed), i,
+                                 (void*)res[i], (void*)srvs[i], bd.ByteWidth,
+                                 (unsigned)bd.Usage, bd.CPUAccessFlags,
+                                 startIdx, idxCount, startInst, instCount,
+                                 baseVtx);
                     }
-                    break;
                 }
+            }
+            if (any) {
+                g_stride80Hits.fetch_add(1, std::memory_order_relaxed);
+                g_diagLogs.fetch_add(1, std::memory_order_relaxed);
             }
         }
         {
@@ -131,7 +167,9 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
                 bool match = false;
                 for (int i = 0; i < kVsSrvSlots && !match; ++i) {
                     if (!srvs[i]) continue;
-                    match = (srvs[i] == w.srv) || (res[i] && res[i] == w.buffer);
+                    if (srvs[i] == w.srv || (res[i] && res[i] == w.buffer)) {
+                        match = DescMatches(res[i], w.expectedBytes);
+                    }
                 }
                 if (!match) continue;
                 if (w.curFrame != f) {
@@ -176,14 +214,87 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstancedIndirect(
     g_originalDIII(ctx, args, offset);
 }
 
+// Shared body for the Set*ShaderResources hooks: answer, cheaply and
+// decisively, whether the engine EVER binds a watched SRV -- or any view
+// of a watched buffer -- on this stage, and at which slot.
+static void CheckBind(const char* stage, UINT startSlot, UINT numViews,
+                      ID3D11ShaderResourceView* const* views) {
+    if (g_activeCount.load(std::memory_order_relaxed) == 0 || !views) return;
+    for (UINT v = 0; v < numViews; ++v) {
+        ID3D11ShaderResourceView* srv = views[v];
+        if (!srv) continue;
+        // Pointer pre-filter against the watch table without the lock;
+        // confirm under the lock only on candidate hits.
+        bool candidate = false;
+        for (const Watch& w : g_watches) {
+            if (w.state != Watch::kActive) continue;
+            if (srv == w.srv) { candidate = true; break; }
+        }
+        ID3D11Resource* r = nullptr;
+        if (!candidate) {
+            srv->GetResource(&r);
+            for (const Watch& w : g_watches) {
+                if (w.state != Watch::kActive) continue;
+                if (r && r == w.buffer) { candidate = true; break; }
+            }
+        }
+        if (candidate) {
+            g_bindHits.fetch_add(1, std::memory_order_relaxed);
+            std::lock_guard<std::mutex> g(g_lock);
+            for (Watch& w : g_watches) {
+                if (w.state != Watch::kActive) continue;
+                if (srv == w.srv || (r && r == w.buffer)) {
+                    ++w.bindCount;
+                    const int bl = g_bindLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (bl < 40) {
+                        _MESSAGE("FO4RemixPlugin: [DrawCap] BIND %s t%u f=%u "
+                                 "key=0x%llX srv=%p",
+                                 stage, startSlot + v,
+                                 g_frame.load(std::memory_order_relaxed),
+                                 (unsigned long long)w.key, (void*)srv);
+                    }
+                }
+            }
+        }
+        if (r) r->Release();
+    }
+}
+
+static void STDMETHODCALLTYPE hkVSSetShaderResources(
+    ID3D11DeviceContext* ctx, UINT startSlot, UINT numViews,
+    ID3D11ShaderResourceView* const* views)
+{
+    CheckBind("VS", startSlot, numViews, views);
+    g_originalVSSet(ctx, startSlot, numViews, views);
+}
+
+static void STDMETHODCALLTYPE hkPSSetShaderResources(
+    ID3D11DeviceContext* ctx, UINT startSlot, UINT numViews,
+    ID3D11ShaderResourceView* const* views)
+{
+    CheckBind("PS", startSlot, numViews, views);
+    g_originalPSSet(ctx, startSlot, numViews, views);
+}
+
+static void STDMETHODCALLTYPE hkCSSetShaderResources(
+    ID3D11DeviceContext* ctx, UINT startSlot, UINT numViews,
+    ID3D11ShaderResourceView* const* views)
+{
+    CheckBind("CS", startSlot, numViews, views);
+    g_originalCSSet(ctx, startSlot, numViews, views);
+}
+
 void InstallHook(ID3D11DeviceContext* ctx) {
     static std::atomic<bool> sAttempted{false};
     if (g_hooked.load(std::memory_order_acquire)) return;
     if (sAttempted.exchange(true)) return;
     void** vtbl = *reinterpret_cast<void***>(ctx);
-    void* target = vtbl[20];    // DrawIndexedInstanced
-    void* targetDI = vtbl[21];  // DrawInstanced (counter only)
+    void* target = vtbl[20];      // DrawIndexedInstanced
+    void* targetDI = vtbl[21];    // DrawInstanced (counter only)
     void* targetDIII = vtbl[39];  // DrawIndexedInstancedIndirect (counter only)
+    void* targetPSSet = vtbl[8];  // PSSetShaderResources (bind diag)
+    void* targetVSSet = vtbl[25]; // VSSetShaderResources (bind diag)
+    void* targetCSSet = vtbl[67]; // CSSetShaderResources (bind diag)
     if (MH_CreateHook(target, &hkDrawIndexedInstanced,
                       reinterpret_cast<void**>(&g_original)) == MH_OK &&
         MH_EnableHook(target) == MH_OK) {
@@ -201,6 +312,18 @@ void InstallHook(ID3D11DeviceContext* ctx) {
                       reinterpret_cast<void**>(&g_originalDIII)) == MH_OK) {
         MH_EnableHook(targetDIII);
     }
+    if (MH_CreateHook(targetVSSet, &hkVSSetShaderResources,
+                      reinterpret_cast<void**>(&g_originalVSSet)) == MH_OK) {
+        MH_EnableHook(targetVSSet);
+    }
+    if (MH_CreateHook(targetPSSet, &hkPSSetShaderResources,
+                      reinterpret_cast<void**>(&g_originalPSSet)) == MH_OK) {
+        MH_EnableHook(targetPSSet);
+    }
+    if (MH_CreateHook(targetCSSet, &hkCSSetShaderResources,
+                      reinterpret_cast<void**>(&g_originalCSSet)) == MH_OK) {
+        MH_EnableHook(targetCSSet);
+    }
 }
 
 bool Hooked() {
@@ -211,7 +334,7 @@ void OnPresent() {
     g_frame.fetch_add(1, std::memory_order_relaxed);
 }
 
-QueryResult Query(void* buffer, void* srv, uint64_t key,
+QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
                   std::vector<SegDraw>& out) {
     if (!Hooked()) return kUnavailable;
     const uint64_t now = GetTickCount64();
@@ -221,8 +344,7 @@ QueryResult Query(void* buffer, void* srv, uint64_t key,
         if (c.state != Watch::kFree && c.key == key) { w = &c; break; }
     }
     if (w && w->state == Watch::kExpired) {
-        // A NEW resolve cycle for a shape whose earlier watch timed out
-        // (e.g. registered during loading, before the world rendered).
+        // A NEW resolve cycle for a shape whose earlier watch timed out.
         // Give it a fresh window instead of failing forever.
         w->state = Watch::kActive;
         w->registeredTick = now;
@@ -246,14 +368,15 @@ QueryResult Query(void* buffer, void* srv, uint64_t key,
         victim->buffer = buffer;
         victim->srv = srv;
         victim->key = key;
+        victim->expectedBytes = recordCount * 80u;
         victim->registeredTick = now;
         victim->registeredFrame = g_frame.load(std::memory_order_relaxed);
         g_activeCount.fetch_add(1, std::memory_order_relaxed);
         static std::atomic<int> sWatchLogs{0};
         const int wl = sWatchLogs.fetch_add(1, std::memory_order_relaxed);
         if (wl < 24) {
-            _MESSAGE("FO4RemixPlugin: [DrawCap] watch #%d key=0x%llX buf=%p srv=%p",
-                     wl, (unsigned long long)key, buffer, srv);
+            _MESSAGE("FO4RemixPlugin: [DrawCap] watch #%d key=0x%llX buf=%p srv=%p rc=%u",
+                     wl, (unsigned long long)key, buffer, srv, recordCount);
         }
         return kCapturing;
     }
@@ -274,13 +397,15 @@ QueryResult Query(void* buffer, void* srv, uint64_t key,
             const int el = sExpireLogs.fetch_add(1, std::memory_order_relaxed);
             if (el < 24) {
                 _MESSAGE("FO4RemixPlugin: [DrawCap] expire #%d key=0x%llX "
-                         "framesWatched=%u dii=%llu di=%llu diii=%llu stride80=%llu",
+                         "framesWatched=%u binds=%u dii=%llu di=%llu diii=%llu "
+                         "stride80=%llu bindHits=%llu",
                          el, (unsigned long long)key,
-                         f - w->registeredFrame,
+                         f - w->registeredFrame, w->bindCount,
                          (unsigned long long)g_diiCalls.load(std::memory_order_relaxed),
                          (unsigned long long)g_diCalls.load(std::memory_order_relaxed),
                          (unsigned long long)g_diiiCalls.load(std::memory_order_relaxed),
-                         (unsigned long long)g_stride80Hits.load(std::memory_order_relaxed));
+                         (unsigned long long)g_stride80Hits.load(std::memory_order_relaxed),
+                         (unsigned long long)g_bindHits.load(std::memory_order_relaxed));
             }
             return kUnavailable;
         } else {

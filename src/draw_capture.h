@@ -41,9 +41,11 @@ enum QueryResult {
 
 // Register-or-poll the watch for one shape. `buffer`/`srv` are raw pointer
 // IDENTITIES of the shape's structured instance buffer and its paired SRV
-// (no references held -- compared against the bound pipeline state only).
+// (no references held -- compared against the bound pipeline state only,
+// and desc-verified against recordCount*80 bytes before a match counts:
+// recycled pointers produced false captures in run 2).
 // `key` identifies the shape across calls (mesh hash).
-QueryResult Query(void* buffer, void* srv, uint64_t key,
+QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
                   std::vector<SegDraw>& out);
 
 }  // namespace DrawCapture
