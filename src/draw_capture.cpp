@@ -99,6 +99,37 @@ static std::atomic<uint32_t> g_frame{1};
 // always dereferenceable and state is re-checked under the lock.
 static std::atomic<Watch*>   g_boundT8{nullptr};
 
+// Draw-window diagnostics (run 5): after a record-SRV bind, log the next
+// few draws with FULL IA state -- run 5 showed every draw at
+// StartIndexLocation=0, so Bethesda selects geometry via the
+// IASetIndexBuffer OFFSET, which the plain draw params never showed.
+static std::atomic<int>      g_winRemaining{0};
+static std::atomic<uint64_t> g_winKey{0};
+static std::atomic<uint64_t> g_lastWinKey{0};
+static std::atomic<int>      g_winCount{0};
+
+static void LogWindowDraw(ID3D11DeviceContext* ctx, const char* kind,
+                          UINT idxCount, UINT startIdx, INT baseVtx,
+                          UINT instCount) {
+    if (g_winRemaining.load(std::memory_order_relaxed) <= 0) return;
+    if (g_winRemaining.fetch_sub(1, std::memory_order_relaxed) <= 0) return;
+    ID3D11Buffer* ib = nullptr;
+    DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    UINT off = 0;
+    ctx->IAGetIndexBuffer(&ib, &fmt, &off);
+    ID3D11ShaderResourceView* s8 = nullptr;
+    ctx->VSGetShaderResources(8, 1, &s8);
+    Watch* owner = g_boundT8.load(std::memory_order_relaxed);
+    const int ours = (owner && s8 == owner->srv) ? 1 : 0;
+    _MESSAGE("FO4RemixPlugin: [DrawWin] %s key=0x%llX idx=%u+%u bv=%d inst=%u "
+             "ib=%p off=%u fmt=%d t8ours=%d",
+             kind, (unsigned long long)g_winKey.load(std::memory_order_relaxed),
+             startIdx, idxCount, baseVtx, instCount, (void*)ib, off, (int)fmt,
+             ours);
+    if (ib) ib->Release();
+    if (s8) s8->Release();
+}
+
 static void RollFrame(Watch& w) {
     if (w.curCount > 0) {
         std::memcpy(w.done, w.cur, sizeof(SegDraw) * (size_t)w.curCount);
@@ -128,6 +159,7 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
     UINT startIdx, INT baseVtx, UINT startInst)
 {
     g_diiCalls.fetch_add(1, std::memory_order_relaxed);
+    LogWindowDraw(ctx, "DII", idxCount, startIdx, baseVtx, instCount);
     // Fast path: one relaxed load per draw when nothing is being watched.
     if (g_activeCount.load(std::memory_order_relaxed) > 0) {
         if (!g_typeLogged.exchange(true)) {
@@ -228,6 +260,7 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
 static void STDMETHODCALLTYPE hkDrawIndexed(
     ID3D11DeviceContext* ctx, UINT idxCount, UINT startIdx, INT baseVtx)
 {
+    LogWindowDraw(ctx, "DX", idxCount, startIdx, baseVtx, 1);
     Watch* w = g_boundT8.load(std::memory_order_relaxed);
     if (w) {
         bool sized = false;
@@ -361,6 +394,21 @@ static void STDMETHODCALLTYPE hkVSSetShaderResources(
             }
         }
         g_boundT8.store(newBound, std::memory_order_relaxed);
+        // Open a draw window on a fresh ownership: log the next draws with
+        // full IA state. One window at a time, distinct keys preferred,
+        // capped per session.
+        if (newBound &&
+            g_winCount.load(std::memory_order_relaxed) < 12 &&
+            g_winRemaining.load(std::memory_order_relaxed) <= 0 &&
+            g_lastWinKey.load(std::memory_order_relaxed) != newBound->key) {
+            g_winKey.store(newBound->key, std::memory_order_relaxed);
+            g_lastWinKey.store(newBound->key, std::memory_order_relaxed);
+            g_winCount.fetch_add(1, std::memory_order_relaxed);
+            _MESSAGE("FO4RemixPlugin: [DrawWin] open key=0x%llX f=%u",
+                     (unsigned long long)newBound->key,
+                     g_frame.load(std::memory_order_relaxed));
+            g_winRemaining.store(12, std::memory_order_relaxed);
+        }
     } else if (views && startSlot <= 8 && 8 < startSlot + numViews) {
         g_boundT8.store(nullptr, std::memory_order_relaxed);
     }

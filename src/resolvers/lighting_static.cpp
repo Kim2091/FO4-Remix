@@ -281,6 +281,30 @@ static void Dump(BSTriShape* tri, uint64_t hash) {
                  (unsigned long long)hash);
     }
 
+    // low region +0x140..+0x187 (9 qwords): pointer-rich (the +0x170
+    // record-buffer wrapper lives here); chase heap-like qwords one level
+    // hunting per-sub-model tables the +0x1D0 route never was.
+    uint64_t lq[9];
+    if (PeekQwordsGuarded(reinterpret_cast<const void*>(
+            reinterpret_cast<uintptr_t>(tri) + 0x140), lq, 9)) {
+        FormatQwordsHex(lq, 9, buf, sizeof(buf));
+        _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX low(+0x140)=[%s]",
+                 (unsigned long long)hash, buf);
+        int chased = 0;
+        for (int i = 0; i < 9 && chased < 3; ++i) {
+            if (!HeapLikePtr(lq[i])) continue;
+            uint64_t tq[16];
+            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(lq[i]), tq, 16)) {
+                continue;
+            }
+            FormatQwordsHex(tq, 16, buf, sizeof(buf));
+            _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX chase +0x%X=%016llX "
+                     "q=[%s]", (unsigned long long)hash, 0x140 + i * 8,
+                     (unsigned long long)lq[i], buf);
+            ++chased;
+        }
+    }
+
     // descriptor chain + raw descriptor dumps
     uint64_t wrapPtr = 0;
     if (PeekQwordsGuarded(reinterpret_cast<const void*>(
@@ -1008,18 +1032,30 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                              detNeg, tilted, f0[15],
                              instSegTris[0], instSegTris[1], instSegTris[2], instSegTris[3]);
                     // Full record dumps for the first shapes: enough raw
-                    // data to test any decode hypothesis offline.
-                    if (n < 8) {
-                        const size_t kMax = instRecords.size() < 16 ? instRecords.size() : 16;
+                    // data to test any decode hypothesis offline. e[] is
+                    // f[16..19] -- per NIF BSPackedGeomDataCombined each
+                    // combined instance carries a bounding sphere; if
+                    // e[1..3] encode radius/center, records of the same
+                    // sub-model share a radius and the record partition
+                    // (9+4 on the road cluster) falls out of THIS dump
+                    // with no draw capture at all. Hex alongside floats:
+                    // ints/flags masquerade as denormals in %g.
+                    if (n < 10) {
+                        const size_t kMax = instRecords.size() < 48 ? instRecords.size() : 48;
                         for (size_t k = 0; k < kMax; ++k) {
                             const float* f = instRecords[k].data();
+                            uint32_t e[4];
+                            std::memcpy(e, f + 16, sizeof(e));
                             _MESSAGE("FO4RemixPlugin: [MergeInstRec] #%d k=%zu "
                                      "r=[%.4f,%.4f,%.4f|%.4f,%.4f,%.4f|%.4f,%.4f,%.4f] "
-                                     "t=(%.2f,%.2f,%.2f) s=%.3f",
+                                     "t=(%.2f,%.2f,%.2f) s=%.3f "
+                                     "e=[%.4g,%.4g,%.4g,%.4g|%08X,%08X,%08X,%08X]",
                                      n, k,
                                      f[0], f[1], f[2], f[4], f[5], f[6],
                                      f[8], f[9], f[10],
-                                     f[12], f[13], f[14], f[15]);
+                                     f[12], f[13], f[14], f[15],
+                                     f[16], f[17], f[18], f[19],
+                                     e[0], e[1], e[2], e[3]);
                         }
                     }
                 } else {
