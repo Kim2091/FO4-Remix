@@ -147,10 +147,16 @@ struct PluginConfig {
 
     // [Overlay]
     // HUD/Scaleform overlay submission via Remix's DrawScreenOverlay API.
-    // Default OFF: the in-source dxvk-remix's dispatchScreenOverlay currently
-    // asserts in dxvk_barrier.cpp on a Vulkan layout transition (dstLayout ==
-    // VK_IMAGE_LAYOUT_UNDEFINED). Gating this here keeps the plugin functional
-    // for everything else; flip to true once the runtime barrier path is fixed.
+    // Requires a runtime built with the rtx_fork_overlay.cpp layout fix
+    // (dxvk-remix 8990aed, 2026-07-02): older runtimes created the overlay
+    // image with VK_IMAGE_LAYOUT_UNDEFINED and tripped
+    // assert(dstLayout != VK_IMAGE_LAYOUT_UNDEFINED) in dxvk_barrier.cpp on
+    // the first HUD upload. The code default stays OFF (a missing ini key on
+    // an un-fixed runtime must not crash), but the shipped ini enables it as
+    // of 2026-07-03. Known costs when enabled: the capture is
+    // a CopyResource + blocking Map on the game's render thread each frame
+    // the UI draws, and interactive-menu input focus is not routed (pixels
+    // only -- fine for the passive HUD).
     bool hudOverlayEnabled;
 
     // After Remix's overlay window registers raw input with RIDEV_NOLEGACY on

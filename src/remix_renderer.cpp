@@ -1607,12 +1607,12 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         api->DrawInstance(&instance);
     }
 
-    // Submit screen overlay (game UI/HUD captured from DX11 backbuffer).
-    // Gated on g_config.hudOverlayEnabled (default false) because the in-source
-    // dxvk-remix's dispatchScreenOverlay currently asserts inside dxvk_barrier
-    // (dstLayout == VK_IMAGE_LAYOUT_UNDEFINED) the moment a HUD frame is staged.
-    // Flip the [Overlay] HudOverlayEnabled INI key to true once the runtime
-    // barrier path is fixed.
+    // Submit screen overlay (game UI/HUD captured from the DX11 UI render
+    // target). Gated on g_config.hudOverlayEnabled; requires a runtime with
+    // the rtx_fork_overlay.cpp layout fix (dxvk-remix 8990aed) -- older
+    // runtimes asserted inside dxvk_barrier (dstLayout ==
+    // VK_IMAGE_LAYOUT_UNDEFINED) the moment a HUD frame was staged. Enabled
+    // via the shipped ini as of 2026-07-03.
     if (g_config.hudOverlayEnabled
         && overlay.valid && !overlay.pixels.empty()
         && api->DrawScreenOverlay) {

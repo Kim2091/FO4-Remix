@@ -560,7 +560,7 @@ from FO4 is outstanding.
 | Culling | `TextureBudgetMiB` | uint32 | 0 (TTL only) | soft cap on `usedMaterialTextureBytes`; non-zero enables the budget pass | `remix_renderer.cpp:1305` |
 | Culling | `MaterialLRUGraceFrames` | uint32 | 600 | TTL for un-drawn materials before refcount-zero entries are destroyed | `remix_renderer.cpp:1310` |
 | Culling | `LodChunkStaleFrames` | uint32 | 30 | frames a worldspace LOD chunk can go un-fired before OnFrame stops drawing it (0 = disabled); engine hid the chunk when its cells attached | `remix_renderer.cpp` (OnFrame stale-chunk filter) |
-| Overlay | `HudOverlayEnabled` | bool | 0 | submit the captured DX11 UI render target via `api->DrawScreenOverlay`. Default OFF because the in-source dxvk-remix's `dispatchScreenOverlay` currently asserts on a Vulkan layout transition | `remix_renderer.cpp:1273` |
+| Overlay | `HudOverlayEnabled` | bool | 0 (code) / 1 (shipped ini) | submit the captured DX11 UI render target via `api->DrawScreenOverlay`. Requires a runtime with the rtx_fork_overlay.cpp layout fix (dxvk-remix 8990aed); the shipped ini enables it as of 2026-07-03 | `remix_renderer.cpp:1273` |
 | Overlay | `RestoreLegacyInput` | bool | 1 | issue `RIDEV_REMOVE` for keyboard so the game still receives `WM_KEYDOWN` after Remix's overlay-thread `RIDEV_NOLEGACY` registration | `remix_api.cpp:162` |
 | Performance | `GpuInstancing` | bool | 1 | share Remix mesh handles across drawables with byte-identical geometry+material and batch via `InstanceInfoGpuInstancingEXT` | `remix_renderer.cpp:820` |
 
@@ -585,10 +585,18 @@ from FO4 is outstanding.
 - **Weather is time-of-day only.** Storms, fog, volumetric fog, and the
   interior/exterior signal are not pushed to Remix; the Sky-struct RE
   required for FO4 is outstanding (see `weather_bridge.h:9-13`).
-- **HUD/Scaleform overlay defaults OFF.** The in-source dxvk-remix's
-  `dispatchScreenOverlay` currently asserts in `dxvk_barrier.cpp` on a
-  `dstLayout == VK_IMAGE_LAYOUT_UNDEFINED` transition. Flip
-  `[Overlay] HudOverlayEnabled=1` only when the runtime is patched.
+- **HUD/Scaleform overlay (UI passthrough) enabled as of 2026-07-03.** The
+  historical blocker -- `dispatchScreenOverlay` asserting in
+  `dxvk_barrier.cpp` on a `dstLayout == VK_IMAGE_LAYOUT_UNDEFINED`
+  transition -- was fixed runtime-side (dxvk-remix `8990aed`, image created
+  in `SHADER_READ_ONLY_OPTIMAL`), and the shipped ini now sets
+  `[Overlay] HudOverlayEnabled=1` (code default stays 0 so a missing key on
+  an un-fixed runtime cannot crash). Remaining known gaps: the capture is a
+  `CopyResource` + blocking `Map(READ)` on the game's render thread each
+  frame the UI draws (measurable cost); overlay opacity is hardcoded 1.0;
+  input for interactive menus is not routed (pixels only -- fine for the
+  passive HUD, but Pip-Boy/inventory focus stays with whichever window has
+  it).
 - **Worldspace LOD chunk hiding follows engine fire cadence (2026-07-02).**
   Chunks are identified by parent NiNode names (`"chunk"` +
   `"4"|"8"|"16"|"32"`, or `"obj"`). The primary filter is fire-age based:
