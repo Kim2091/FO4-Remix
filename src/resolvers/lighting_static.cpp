@@ -174,6 +174,134 @@ static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t
     return got;
 }
 
+static bool HeapLikePtr(uint64_t q);
+
+// Read the per-segment instance-record ranges from the descriptor array at
+// shape+0x1D0. Chain (probe-verified): *(shape+0x1D0) -> wrapper whose
+// qword 0 points at a block whose first qword is the base of a 4-element,
+// 0xB8-stride descriptor array (wrapper qword 1 == 4; wrapper qword 4 ==
+// base+0xB8 on every sample; the array is NULL on single-segment shapes,
+// which need no partition).
+//
+// The field layout inside the 184-byte descriptor is unknown, so INFER it
+// per shape instead of hardcoding: find a dword offset pair (count, start)
+// such that, mapping element i to segment slot i,
+//   - empty slots (segTris[i] == 0) have count == 0,
+//   - nonzero slots have 1 <= count <= recordCount and counts sum to
+//     recordCount,
+//   - the (start, count) ranges tile [0, recordCount) exactly (disjoint
+//     cover).
+// Those constraints are tight enough that coincidental matches are
+// essentially impossible on multi-segment shapes; if several offset pairs
+// match they must produce the SAME ranges or the result is rejected.
+// Returns true and fills outStart/outCount per slot (zeros for empty
+// slots); logs the inferred offsets (capped) so they can be hardcoded once
+// stable. On any failure the caller falls back to the equal-block split.
+static bool ReadSegmentRecordRanges(BSTriShape* tri, const uint32_t segTris[4],
+                                    size_t recordCount,
+                                    uint32_t outStart[4], uint32_t outCount[4]) {
+    if (recordCount == 0 || recordCount > 0xFFFFFFu) return false;
+    uint64_t wrapPtr = 0, q0 = 0, elemBase = 0;
+    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+            reinterpret_cast<uintptr_t>(tri) + 0x1D0), &wrapPtr, 1)) return false;
+    if (!HeapLikePtr(wrapPtr)) return false;
+    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wrapPtr), &q0, 1)) return false;
+    if (!HeapLikePtr(q0)) return false;
+    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(q0), &elemBase, 1)) return false;
+    if (!HeapLikePtr(elemBase)) return false;
+
+    constexpr int kDescQwords = 23;  // 0xB8 bytes
+    constexpr int kDescDwords = kDescQwords * 2;
+    uint32_t d[4][kDescDwords];
+    for (int s = 0; s < 4; ++s) {
+        uint64_t q[kDescQwords];
+        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(elemBase + (uint64_t)s * 0xB8),
+                               q, kDescQwords)) {
+            return false;
+        }
+        std::memcpy(d[s], q, sizeof(q));
+    }
+
+    const uint32_t rc = (uint32_t)recordCount;
+    bool found = false;
+    uint32_t bestStart[4] = {}, bestCount[4] = {};
+    int foundIc = -1, foundIs = -1;
+    for (int offIc = 0; offIc < kDescDwords; ++offIc) {
+        uint32_t sum = 0;
+        bool ok = true;
+        for (int s = 0; s < 4 && ok; ++s) {
+            const uint32_t v = d[s][offIc];
+            if (segTris[s] == 0) {
+                if (v != 0) ok = false;
+            } else {
+                if (v == 0 || v > rc) ok = false;
+                sum += v;
+            }
+        }
+        if (!ok || sum != rc) continue;
+        for (int offIs = 0; offIs < kDescDwords; ++offIs) {
+            if (offIs == offIc) continue;
+            // Ranges must tile [0, rc) exactly.
+            uint32_t starts[4], counts[4];
+            int n = 0;
+            bool ok2 = true;
+            for (int s = 0; s < 4 && ok2; ++s) {
+                if (segTris[s] == 0) continue;
+                starts[n] = d[s][offIs];
+                counts[n] = d[s][offIc];
+                if (starts[n] > rc || starts[n] + counts[n] > rc) ok2 = false;
+                ++n;
+            }
+            if (!ok2) continue;
+            // insertion-sort by start, then check exact tiling
+            for (int a = 1; a < n; ++a) {
+                for (int b = a; b > 0 && starts[b] < starts[b - 1]; --b) {
+                    std::swap(starts[b], starts[b - 1]);
+                    std::swap(counts[b], counts[b - 1]);
+                }
+            }
+            uint32_t cursor = 0;
+            for (int a = 0; a < n && ok2; ++a) {
+                if (starts[a] != cursor) ok2 = false;
+                cursor += counts[a];
+            }
+            if (!ok2 || cursor != rc) continue;
+            // Candidate. Build per-slot result (unsorted, slot order).
+            uint32_t candStart[4] = {}, candCount[4] = {};
+            for (int s = 0; s < 4; ++s) {
+                if (segTris[s] == 0) continue;
+                candStart[s] = d[s][offIs];
+                candCount[s] = d[s][offIc];
+            }
+            if (found) {
+                if (std::memcmp(candStart, bestStart, sizeof(candStart)) != 0 ||
+                    std::memcmp(candCount, bestCount, sizeof(candCount)) != 0) {
+                    return false;  // ambiguous encodings disagree -> reject
+                }
+            } else {
+                std::memcpy(bestStart, candStart, sizeof(candStart));
+                std::memcpy(bestCount, candCount, sizeof(candCount));
+                foundIc = offIc;
+                foundIs = offIs;
+                found = true;
+            }
+        }
+    }
+    if (!found) return false;
+    std::memcpy(outStart, bestStart, sizeof(bestStart));
+    std::memcpy(outCount, bestCount, sizeof(bestCount));
+    static std::atomic<int> sDescLogs{0};
+    const int n = sDescLogs.fetch_add(1, std::memory_order_relaxed);
+    if (n < 20) {
+        _MESSAGE("FO4RemixPlugin: [MergeSeg] #%d desc offsets count=+0x%X start=+0x%X "
+                 "ranges=[%u+%u,%u+%u,%u+%u,%u+%u] rc=%u",
+                 n, foundIc * 4, foundIs * 4,
+                 bestStart[0], bestCount[0], bestStart[1], bestCount[1],
+                 bestStart[2], bestCount[2], bestStart[3], bestCount[3], rc);
+    }
+    return true;
+}
+
 static inline int PermXY(int i) { return i == 0 ? 1 : (i == 1 ? 0 : 2); }
 
 // Decode one 80-byte instance record into a Bethesda ROW-VECTOR 3x4
@@ -221,6 +349,10 @@ static void ComposeLeafInstance(const NiTransform& W, const float m[12], float o
     }
 }
 
+static bool HeapLikePtr(uint64_t q) {
+    return q >= 0x100000000ULL && q < 0x00007F0000000000ULL && (q & 7ULL) == 0ULL;
+}
+
 // Read the per-instance record stream of a BSMergeInstancedTriShape. See
 // the block comment at the top of this section for the reverse-engineered
 // source. Output: the raw validated 20-float records (rotation reading is
@@ -229,9 +361,7 @@ static void ComposeLeafInstance(const NiTransform& W, const float m[12], float o
 // pre-existing single-draw path.
 static bool ReadMergeInstanceRecords(BSTriShape* tri,
                                      std::vector<std::array<float, 20>>& out) {
-    const auto heapLike = [](uint64_t q) {
-        return q >= 0x100000000ULL && q < 0x00007F0000000000ULL && (q & 7ULL) == 0ULL;
-    };
+    const auto heapLike = HeapLikePtr;
     // shape+0x170 -> wrapper; wrapper qword 0 -> structured instance buffer.
     uint64_t wrapPtr = 0;
     if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
@@ -781,18 +911,35 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 if (instSegTris[s]) ++nonZero;
             }
             const uint32_t meshTris = (uint32_t)(mesh.indices.size() / 3);
-            if (nonZero >= 2 && totalSegTris == meshTris &&
-                instRecords.size() % (size_t)nonZero == 0) {
-                const size_t block = instRecords.size() / (size_t)nonZero;
-                uint32_t triCursor = 0;
-                size_t   recCursor = 0;
-                for (int s = 0; s < 4; ++s) {
-                    if (!instSegTris[s]) continue;
-                    segs[nSegs++] = { triCursor, instSegTris[s], recCursor, block };
-                    triCursor += instSegTris[s];
-                    recCursor += block;
+            if (nonZero >= 2 && totalSegTris == meshTris) {
+                // Preferred: exact per-segment record ranges from the
+                // +0x1D0 descriptors (partitions are NOT generally equal --
+                // road clusters mix e.g. 10 straight pieces with 3 corner
+                // pieces; 13 records for 2 segments can't split evenly).
+                uint32_t rs[4] = {}, rn[4] = {};
+                if (ReadSegmentRecordRanges(tri, instSegTris, instRecords.size(), rs, rn)) {
+                    uint32_t triCursor = 0;
+                    for (int s = 0; s < 4; ++s) {
+                        if (!instSegTris[s]) continue;
+                        segs[nSegs++] = { triCursor, instSegTris[s], rs[s], rn[s] };
+                        triCursor += instSegTris[s];
+                    }
+                } else if (instRecords.size() % (size_t)nonZero == 0) {
+                    // Equal contiguous blocks -- correct for the symmetric
+                    // clusters (verified: hedges) and the best available
+                    // guess when the descriptors don't parse.
+                    const size_t block = instRecords.size() / (size_t)nonZero;
+                    uint32_t triCursor = 0;
+                    size_t   recCursor = 0;
+                    for (int s = 0; s < 4; ++s) {
+                        if (!instSegTris[s]) continue;
+                        segs[nSegs++] = { triCursor, instSegTris[s], recCursor, block };
+                        triCursor += instSegTris[s];
+                        recCursor += block;
+                    }
                 }
-            } else {
+            }
+            if (nSegs == 0) {
                 segs[0] = { 0, meshTris, 0, instRecords.size() };
                 nSegs = 1;
             }
