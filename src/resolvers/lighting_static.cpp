@@ -647,12 +647,32 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // and stays on the single-draw path until sampled properly.
     std::vector<std::array<float, 20>> instRecords;
     bool instRowVector = g_config.mergeInstanceRowVector;
+    // Per-segment triangle counts from shape+0x1A0 (4 dwords; zeros = empty
+    // slots; the nonzero ones sum to numTriangles on every probe sample).
+    // A merged shape is a concatenation of sub-models ("segments" -- tree
+    // variants, trunk/canopy parts) sharing one material, and the instance
+    // records are partitioned per segment: the [MergeInstRec] dumps show
+    // exact duplicate transform runs (count == placements x segments, e.g.
+    // 39 == 13 x 3 with record 13 duplicating record 0). Drawing the WHOLE
+    // mesh with EVERY record put segment geometry on other segments'
+    // placements: canopy-style geometry (verts authored high) landed on
+    // ground-piece records ("floating"), wrong variants on other variants'
+    // spots ("upside down"), while single-segment shapes (the fence lines
+    // that proved the decode) were perfect.
+    uint32_t instSegTris[4] = { 0, 0, 0, 0 };
     if (g_config.mergeInstanceExpansion && g_config.gpuInstancingEnabled) {
         char instLeaf[64] = "";
         SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
                                           instLeaf, sizeof(instLeaf));
         if (std::strstr(instLeaf, "MergeInstanced") != nullptr) {
             const bool got = ReadMergeInstanceRecords(tri, instRecords);
+            if (got) {
+                uint64_t segQ[2] = {};
+                if (PeekQwordsGuarded(reinterpret_cast<const void*>(
+                        reinterpret_cast<uintptr_t>(tri) + 0x1A0), segQ, 2)) {
+                    std::memcpy(instSegTris, segQ, sizeof(instSegTris));
+                }
+            }
             const NiTransform& W = tri->m_worldTransform;
             static std::atomic<int> sInstLogs{0};
             const int n = sInstLogs.fetch_add(1, std::memory_order_relaxed);
@@ -681,12 +701,14 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     const float* f0 = instRecords[0].data();
                     _MESSAGE("FO4RemixPlugin: [MergeInst] #%d hash=0x%llX count=%zu "
                              "leafPos=(%.1f,%.1f,%.1f) t0=(%.1f,%.1f,%.1f) "
-                             "conv=%s conj=%d detNeg=%d tilted=%d s0=%.2f",
+                             "conv=%s conj=%d detNeg=%d tilted=%d s0=%.2f "
+                             "segTris=[%u,%u,%u,%u]",
                              n, (unsigned long long)hash, instRecords.size(),
                              W.pos.x, W.pos.y, W.pos.z, f0[12], f0[13], f0[14],
                              instRowVector ? "row" : "col",
                              g_config.mergeInstanceConjugate ? 1 : 0,
-                             detNeg, tilted, f0[15]);
+                             detNeg, tilted, f0[15],
+                             instSegTris[0], instSegTris[1], instSegTris[2], instSegTris[3]);
                     // Full record dumps for the first shapes: enough raw
                     // data to test any decode hypothesis offline.
                     if (n < 8) {
@@ -716,63 +738,114 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     ResolverTrace::g_lastStep.store(Trace::kSubmitStart, std::memory_order_relaxed);
 
     if (!instRecords.empty()) {
-        // Merge-instanced expansion: one drawable per hardware instance, all
-        // sharing the parsed mesh -- the content-hash mesh cache collapses
-        // them onto one Remix mesh/BLAS and OnFrame batches the bucket via
-        // InstanceInfoGpuInstancingEXT. Instance 0 keeps the base hash so
-        // every existing bookkeeping path (state.meshHash, retry/backoff,
-        // sweeps) is untouched; extras get derived hashes recorded in
-        // state.extraMeshHashes for release alongside the base.
+        // Merge-instanced expansion: one drawable per hardware instance.
+        // Drawables of one segment share that segment's sub-mesh -- the
+        // content-hash mesh cache collapses them onto one Remix mesh/BLAS
+        // and OnFrame batches each bucket via InstanceInfoGpuInstancingEXT.
+        // Instance 0 keeps the base hash so every existing bookkeeping path
+        // (state.meshHash, retry/backoff, sweeps) is untouched; extras get
+        // derived hashes recorded in state.extraMeshHashes.
+        //
+        // Segments: the merged mesh concatenates up to 4 sub-models whose
+        // triangle counts sit at +0x1A0 (see instSegTris above), and the
+        // record buffer is partitioned into equal contiguous blocks, one
+        // per NONZERO segment, in dword order (record count == placements
+        // x segments per the duplicate-run evidence). Each segment's index
+        // subrange is submitted only with its own record block. When the
+        // segment picture doesn't validate (counts don't sum to the parsed
+        // triangle count, or records don't divide evenly), fall back to
+        // whole mesh x all records -- correct for single-segment shapes,
+        // which is the common case.
         //
         // Transform: records are cluster-local and share the engine's
-        // row-vector convention, so compose instance-then-leaf in Bethesda
-        // space and reuse BuildRemixTransform for the one Beth->Remix
-        // conversion. Every sampled leaf was translation-only identity/1.0,
-        // so the compose usually reduces to M_f = M_inst, t_f = t_inst +
-        // W.pos -- but compose generally in case a rotated/scaled cluster
-        // root exists somewhere.
+        // row-vector convention (decode proven by the fence-line check:
+        // record row0 tracks consecutive piece positions to <1 degree), so
+        // compose instance-then-leaf in Bethesda space and reuse
+        // BuildRemixTransform for the one Beth->Remix conversion.
         //
         // Extras that fail (VRAM/budget gates) log and are skipped: the
         // cluster renders partially rather than blocking the base drawable.
         // Base failure returns false BEFORE any extra is submitted, so the
         // normal retry path re-runs the whole expansion.
+        struct SegDraw {
+            uint32_t triStart, triCount;    // into mesh.indices/3
+            size_t   recStart, recCount;    // into instRecords
+        };
+        SegDraw segs[4];
+        int nSegs = 0;
+        {
+            uint32_t totalSegTris = 0;
+            int nonZero = 0;
+            for (int s = 0; s < 4; ++s) {
+                totalSegTris += instSegTris[s];
+                if (instSegTris[s]) ++nonZero;
+            }
+            const uint32_t meshTris = (uint32_t)(mesh.indices.size() / 3);
+            if (nonZero >= 2 && totalSegTris == meshTris &&
+                instRecords.size() % (size_t)nonZero == 0) {
+                const size_t block = instRecords.size() / (size_t)nonZero;
+                uint32_t triCursor = 0;
+                size_t   recCursor = 0;
+                for (int s = 0; s < 4; ++s) {
+                    if (!instSegTris[s]) continue;
+                    segs[nSegs++] = { triCursor, instSegTris[s], recCursor, block };
+                    triCursor += instSegTris[s];
+                    recCursor += block;
+                }
+            } else {
+                segs[0] = { 0, meshTris, 0, instRecords.size() };
+                nSegs = 1;
+            }
+        }
+
         const NiTransform& W = tri->m_worldTransform;
         std::vector<uint64_t> extraHashes;
         extraHashes.reserve(instRecords.size() - 1);
         size_t extrasFailed = 0;
-        for (size_t i = 0; i < instRecords.size(); ++i) {
-            float m[12], comp[12];
-            DecodeInstanceRecord(instRecords[i].data(), instRowVector,
-                                 g_config.mergeInstanceConjugate, m);
-            ComposeLeafInstance(W, m, comp);
-            // Raw buffer instead of `NiTransform xf;`: f4se_minimal declares
-            // but does not define NiPoint3's default ctor, so constructing
-            // NiTransform directly fails to link.
-            alignas(16) unsigned char xfBuf[sizeof(NiTransform)] = {};
-            NiTransform& xf = *reinterpret_cast<NiTransform*>(xfBuf);
-            for (int r = 0; r < 3; ++r) {
-                for (int c = 0; c < 3; ++c) {
-                    xf.rot.data[r][c] = comp[r * 4 + c];
+        size_t drawIndex = 0;  // 0 keeps the base hash
+        const std::vector<uint32_t> fullIndices = std::move(mesh.indices);
+        for (int s = 0; s < nSegs; ++s) {
+            const SegDraw& sd = segs[s];
+            // Segment sub-mesh: index subrange (triangle-aligned, winding
+            // flip from the parse preserved); vertices shared as-is --
+            // ContentHashOf covers (vertices, indices) so each segment gets
+            // its own Remix mesh/BLAS.
+            mesh.indices.assign(fullIndices.begin() + (size_t)sd.triStart * 3,
+                                fullIndices.begin() + ((size_t)sd.triStart + sd.triCount) * 3);
+            for (size_t k = 0; k < sd.recCount; ++k, ++drawIndex) {
+                float m[12], comp[12];
+                DecodeInstanceRecord(instRecords[sd.recStart + k].data(), instRowVector,
+                                     g_config.mergeInstanceConjugate, m);
+                ComposeLeafInstance(W, m, comp);
+                // Raw buffer instead of `NiTransform xf;`: f4se_minimal
+                // declares but does not define NiPoint3's default ctor, so
+                // constructing NiTransform directly fails to link.
+                alignas(16) unsigned char xfBuf[sizeof(NiTransform)] = {};
+                NiTransform& xf = *reinterpret_cast<NiTransform*>(xfBuf);
+                for (int r = 0; r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        xf.rot.data[r][c] = comp[r * 4 + c];
+                    }
                 }
-            }
-            xf.pos.x = comp[3];
-            xf.pos.y = comp[7];
-            xf.pos.z = comp[11];
-            xf.scale = 1.0f;  // leaf scale already folded by ComposeLeafInstance
-            SemanticCapture::BuildRemixTransform(xf, mesh.worldTransform);
+                xf.pos.x = comp[3];
+                xf.pos.y = comp[7];
+                xf.pos.z = comp[11];
+                xf.scale = 1.0f;  // leaf scale folded by ComposeLeafInstance
+                SemanticCapture::BuildRemixTransform(xf, mesh.worldTransform);
 
-            const uint64_t instHash = (i == 0)
-                ? hash
-                : hash ^ (0x9E3779B97F4A7C15ULL * (uint64_t)i);
-            auto instStatus = RemixRenderer::SubmitDrawable(instHash, mesh, newTextures);
-            if (instStatus == RemixRenderer::SubmitStatus::kSubmitted) {
-                if (i > 0) extraHashes.push_back(instHash);
-            } else if (i == 0) {
-                ResolverTrace::g_lastStep.store(Trace::kSubmitFailed,
-                                                std::memory_order_relaxed);
-                return false;
-            } else {
-                ++extrasFailed;
+                const uint64_t instHash = (drawIndex == 0)
+                    ? hash
+                    : hash ^ (0x9E3779B97F4A7C15ULL * (uint64_t)drawIndex);
+                auto instStatus = RemixRenderer::SubmitDrawable(instHash, mesh, newTextures);
+                if (instStatus == RemixRenderer::SubmitStatus::kSubmitted) {
+                    if (drawIndex > 0) extraHashes.push_back(instHash);
+                } else if (drawIndex == 0) {
+                    ResolverTrace::g_lastStep.store(Trace::kSubmitFailed,
+                                                    std::memory_order_relaxed);
+                    return false;
+                } else {
+                    ++extrasFailed;
+                }
             }
         }
         if (extrasFailed > 0) {
