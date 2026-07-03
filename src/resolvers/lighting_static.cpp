@@ -13,6 +13,7 @@
 #include "f4se/PluginAPI.h"  // _MESSAGE
 
 #include <atomic>
+#include <mutex>
 #include <vector>
 #include <array>
 #include <cmath>
@@ -255,8 +256,14 @@ static bool ReadSegmentRecordRanges(BSTriShape* tri, const uint32_t segTris[4],
                 if (starts[n] > rc || starts[n] + counts[n] > rc) ok2 = false;
                 ++n;
             }
-            if (n == 0) continue;
             if (!ok2) continue;
+            // The 2026-07-03 live run produced only degenerate single-range
+            // "matches" (all records on one slot, e.g. [0+0,0+0,0+4,0+0],
+            // with DIFFERENT offsets per shape) -- coincidences, not layout.
+            // A single range is also the only shape of spurious match that
+            // LOSES geometry (the other active slots draw nothing), so
+            // require at least two nonzero ranges before trusting one.
+            if (n < 2) continue;
             // insertion-sort by start, then check exact tiling
             for (int a = 1; a < n; ++a) {
                 for (int b = a; b > 0 && starts[b] < starts[b - 1]; --b) {
@@ -306,6 +313,255 @@ static bool ReadSegmentRecordRanges(BSTriShape* tri, const uint32_t segTris[4],
     }
     return true;
 }
+
+// ---- Merge-segment layout probe (2026-07-03) ----
+// The offset inference above came back UNRESOLVED on all 20 multi-segment
+// shapes in the first live run, so the (count,start) pair either isn't in
+// the +0x1D0 descriptors as plain dwords or doesn't satisfy the tiling
+// constraints as modeled. Dump enough raw layout to pin the true encoding
+// offline:
+//   hdr      shape+0x188..+0x1CF as 18 dwords. +0x190 is the candidate
+//            per-slot record-count table (expect 9-and-4 dwords on the
+//            13-record road cluster), +0x1A0..0x1AC is the proven segTris
+//            table, the rest is unknown.
+//   wrap     the +0x1D0 chain pointers plus the wrapper's first 5 qwords.
+//   desc     all four 0xB8-byte descriptors, raw dwords.
+//   xdata    extra-data walk up the parent chain: the NIF-side ground truth
+//            (BSPackedCombinedGeomDataExtra) carries NumCombined per
+//            BSPackedGeomData, and its runtime object should hang off the
+//            shape or a cluster ancestor. "Packed" entries get raw dumps
+//            plus one level of pointer-chasing.
+//   resample hdr re-read ~2s later, pumped from TryResolveStatic: a live
+//            LOD-selector dword changes with camera distance while static
+//            count tables stay put.
+namespace MergeProbe {
+
+constexpr int kMaxEntries = 8;
+struct Entry {
+    void*    tri;
+    uint64_t hash;
+    uint64_t tick;
+    uint32_t hdr[18];
+    bool     pending;
+};
+static Entry            sEntries[kMaxEntries];
+static int              sCount = 0;         // guarded by sLock
+static std::atomic<int> sPending{0};        // fast-path gate for the pump
+static std::mutex       sLock;
+
+static void FormatDwordsHex(const uint32_t* d, int n, char* out, size_t cap) {
+    size_t pos = 0;
+    out[0] = 0;
+    for (int i = 0; i < n; ++i) {
+        const int w = snprintf(out + pos, cap - pos, i ? " %08X" : "%08X", d[i]);
+        if (w <= 0 || (size_t)w >= cap - pos) break;
+        pos += (size_t)w;
+    }
+}
+
+static void FormatQwordsHex(const uint64_t* q, int n, char* out, size_t cap) {
+    size_t pos = 0;
+    out[0] = 0;
+    for (int i = 0; i < n; ++i) {
+        const int w = snprintf(out + pos, cap - pos, i ? " %016llX" : "%016llX",
+                               (unsigned long long)q[i]);
+        if (w <= 0 || (size_t)w >= cap - pos) break;
+        pos += (size_t)w;
+    }
+}
+
+// BSFixedString data pointer -> printable copy (guarded; empty on any doubt).
+static void ReadCStrGuarded(uint64_t strPtr, char* out, size_t cap) {
+    out[0] = 0;
+    if (!HeapLikePtr(strPtr)) return;
+    uint64_t q[6] = {};
+    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(strPtr), q, 6)) return;
+    char tmp[49];
+    std::memcpy(tmp, q, 48);
+    tmp[48] = 0;
+    size_t i = 0;
+    for (; i + 1 < cap && tmp[i]; ++i) {
+        const unsigned char c = (unsigned char)tmp[i];
+        out[i] = (c >= 0x20 && c < 0x7F) ? tmp[i] : '?';
+    }
+    out[i] = 0;
+}
+
+static void Dump(BSTriShape* tri, uint64_t hash) {
+    char buf[560];
+
+    // hdr + resample registration
+    uint64_t hq[9];
+    if (PeekQwordsGuarded(reinterpret_cast<const void*>(
+            reinterpret_cast<uintptr_t>(tri) + 0x188), hq, 9)) {
+        uint32_t hd[18];
+        std::memcpy(hd, hq, sizeof(hd));
+        FormatDwordsHex(hd, 18, buf, sizeof(buf));
+        _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX hdr(+0x188)=[%s]",
+                 (unsigned long long)hash, buf);
+        std::lock_guard<std::mutex> g(sLock);
+        if (sCount < kMaxEntries) {
+            Entry& e = sEntries[sCount++];
+            e.tri = tri;
+            e.hash = hash;
+            e.tick = GetTickCount64();
+            std::memcpy(e.hdr, hd, sizeof(hd));
+            e.pending = true;
+            sPending.fetch_add(1, std::memory_order_relaxed);
+        }
+    } else {
+        _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX hdr UNREADABLE",
+                 (unsigned long long)hash);
+    }
+
+    // descriptor chain + raw descriptor dumps
+    uint64_t wrapPtr = 0;
+    if (PeekQwordsGuarded(reinterpret_cast<const void*>(
+            reinterpret_cast<uintptr_t>(tri) + 0x1D0), &wrapPtr, 1) &&
+        HeapLikePtr(wrapPtr)) {
+        uint64_t wq[5] = {};
+        if (PeekQwordsGuarded(reinterpret_cast<const void*>(wrapPtr), wq, 5)) {
+            FormatQwordsHex(wq, 5, buf, sizeof(buf));
+            _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX wrap=%016llX q=[%s]",
+                     (unsigned long long)hash, (unsigned long long)wrapPtr, buf);
+            uint64_t elemBase = 0;
+            if (HeapLikePtr(wq[0]) &&
+                PeekQwordsGuarded(reinterpret_cast<const void*>(wq[0]), &elemBase, 1) &&
+                HeapLikePtr(elemBase)) {
+                for (int s = 0; s < 4; ++s) {
+                    uint64_t q[23];
+                    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                            elemBase + (uint64_t)s * 0xB8), q, 23)) {
+                        break;
+                    }
+                    uint32_t dd[46];
+                    std::memcpy(dd, q, sizeof(dd));
+                    FormatDwordsHex(dd, 46, buf, sizeof(buf));
+                    _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX desc[%d]=[%s]",
+                             (unsigned long long)hash, s, buf);
+                }
+            }
+        }
+    } else {
+        _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX desc chain unreadable "
+                 "(+0x1D0=%016llX)", (unsigned long long)hash,
+                 (unsigned long long)wrapPtr);
+    }
+
+    // extra-data walk up the parent chain (NiObjectNET::m_extraData at +0x20
+    // is tMutexArray<NiExtraData*>*: entries qword at +0, count dword at
+    // +0x10; NiAVObject::m_parent at +0x28; NiExtraData::m_name at +0x10).
+    uintptr_t obj = reinterpret_cast<uintptr_t>(tri);
+    for (int depth = 0; depth < 8 && obj; ++depth) {
+        uint64_t xarr = 0;
+        if (PeekQwordsGuarded(reinterpret_cast<const void*>(obj + 0x20), &xarr, 1) &&
+            HeapLikePtr(xarr)) {
+            uint64_t entq[3] = {};
+            if (PeekQwordsGuarded(reinterpret_cast<const void*>(xarr), entq, 3)) {
+                const uint64_t entries = entq[0];
+                const uint32_t count = (uint32_t)entq[2];
+                if (HeapLikePtr(entries) && count > 0 && count <= 64) {
+                    char cls[64] = "";
+                    SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(obj),
+                                                      cls, sizeof(cls));
+                    for (uint32_t i = 0; i < count && i < 16; ++i) {
+                        uint64_t xp = 0;
+                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                entries + 8ull * i), &xp, 1) || !HeapLikePtr(xp)) {
+                            continue;
+                        }
+                        char xcls[64] = "";
+                        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(xp),
+                                                          xcls, sizeof(xcls));
+                        uint64_t namePtr = 0;
+                        char xname[48] = "";
+                        if (PeekQwordsGuarded(reinterpret_cast<const void*>(xp + 0x10),
+                                              &namePtr, 1)) {
+                            ReadCStrGuarded(namePtr, xname, sizeof(xname));
+                        }
+                        _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX xdata d=%d "
+                                 "owner=%s i=%u/%u cls=%s name=\"%s\"",
+                                 (unsigned long long)hash, depth, cls, i, count,
+                                 xcls, xname);
+                        if (std::strstr(xcls, "Packed") == nullptr &&
+                            std::strstr(xname, "Packed") == nullptr) {
+                            continue;
+                        }
+                        // ground-truth candidate: raw object dump plus one
+                        // level of pointer-chasing (skip vtbl/refcount/name)
+                        uint64_t oq[16] = {};
+                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(xp),
+                                               oq, 16)) {
+                            continue;
+                        }
+                        FormatQwordsHex(oq, 16, buf, sizeof(buf));
+                        _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX xdump "
+                                 "obj=%016llX q=[%s]", (unsigned long long)hash,
+                                 (unsigned long long)xp, buf);
+                        int followed = 0;
+                        for (int k = 3; k < 16 && followed < 3; ++k) {
+                            if (!HeapLikePtr(oq[k])) continue;
+                            uint64_t tq[16] = {};
+                            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(oq[k]),
+                                                   tq, 16)) {
+                                continue;
+                            }
+                            FormatQwordsHex(tq, 16, buf, sizeof(buf));
+                            _MESSAGE("FO4RemixPlugin: [MergeProbe] hash=0x%llX "
+                                     "xfollow q%d=%016llX q=[%s]",
+                                     (unsigned long long)hash, k,
+                                     (unsigned long long)oq[k], buf);
+                            ++followed;
+                        }
+                    }
+                }
+            }
+        }
+        uint64_t parent = 0;
+        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(obj + 0x28),
+                               &parent, 1) || !HeapLikePtr(parent)) {
+            break;
+        }
+        obj = (uintptr_t)parent;
+    }
+}
+
+// Called from TryResolveStatic on every drawable: re-read registered hdr
+// regions once ~2s old so distance-driven dwords show up as changed bits.
+// The shape pointer can go stale (cell unload) -- the guarded peek turns
+// that into an UNREADABLE line instead of a crash.
+static void Pump() {
+    if (sPending.load(std::memory_order_relaxed) == 0) return;
+    const uint64_t now = GetTickCount64();
+    std::lock_guard<std::mutex> g(sLock);
+    for (int i = 0; i < sCount; ++i) {
+        Entry& e = sEntries[i];
+        if (!e.pending || now - e.tick < 2000) continue;
+        e.pending = false;
+        sPending.fetch_sub(1, std::memory_order_relaxed);
+        uint64_t hq[9];
+        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                reinterpret_cast<uintptr_t>(e.tri) + 0x188), hq, 9)) {
+            _MESSAGE("FO4RemixPlugin: [MergeProbe] resample hash=0x%llX UNREADABLE "
+                     "(dt=%llums)", (unsigned long long)e.hash,
+                     (unsigned long long)(now - e.tick));
+            continue;
+        }
+        uint32_t hd[18];
+        std::memcpy(hd, hq, sizeof(hd));
+        uint32_t mask = 0;
+        for (int k = 0; k < 18; ++k) {
+            if (hd[k] != e.hdr[k]) mask |= 1u << k;
+        }
+        char buf[200];
+        FormatDwordsHex(hd, 18, buf, sizeof(buf));
+        _MESSAGE("FO4RemixPlugin: [MergeProbe] resample hash=0x%llX dt=%llums "
+                 "changed=0x%05X hdr=[%s]", (unsigned long long)e.hash,
+                 (unsigned long long)(now - e.tick), mask, buf);
+    }
+}
+
+}  // namespace MergeProbe
 
 static inline int PermXY(int i) { return i == 0 ? 1 : (i == 1 ? 0 : 2); }
 
@@ -463,6 +719,8 @@ namespace Lighting {
 bool TryResolveStatic(SemanticCapture::DrawableState& state,
                       uint64_t hash,
                       ID3D11Device* device) {
+    Resolvers::MergeProbe::Pump();  // delayed hdr re-reads; no-op when none pending
+
     if (state.submittedToRemix) return true;
 
     // Mark in-flight immediately so an SEH catch on an early-step crash
@@ -978,6 +1236,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                  fn, (unsigned long long)hash, instRecords.size(),
                                  instSegTris[0], instSegTris[1], instSegTris[2],
                                  instSegTris[3], meshTris);
+                    }
+                    if (fn < 6) {
+                        MergeProbe::Dump(tri, hash);
                     }
                 }
             }
