@@ -68,12 +68,36 @@ PassKey ComputePassKey(const void* geo, const void* prop, const void* mat) {
 } // namespace (close anonymous so we define in SemanticCapture:: scope)
 
 void SemanticCapture::BuildRemixTransform(const NiTransform& xf, float out[3][4]) {
+    // Conventions (2026-07-03, anchored by the empirically-correct camera
+    // path in camera.cpp, which feeds Remix right/forward/up = P * (rot
+    // row i) where P is the Beth->Remix X/Y swap):
+    //   - Engine matrices are ROW-VECTOR: world = v * M + t; the rows of M
+    //     are the world-space images of the local axes.
+    //   - remixapi transforms are COLUMN-VECTOR row-major 3x4.
+    //   - The plugin's Remix world is the Beth world mirrored through P.
+    // A drawable must therefore render as P*(v*M + t):
+    //   out_linear = P * M^T  ->  out[r][c] = M[c][perm(r)], perm = (1,0,2)
+    //   out_t      = P * t
+    // Until 2026-07-03 this computed M[r][perm(c)] -- the TRANSPOSE of the
+    // correct linear part. Identical for identity rotations (the bulk of
+    // world geometry, P*I == I*P, which kept it invisible), but any
+    // Z-rotated object rendered at -theta instead of theta: user-visible as
+    // "Bethesda-placed objects have incorrect transforms" (rotated refs --
+    // light poles, cars, furniture), and, once the merge-instance expansion
+    // landed, as road/hedge pieces "rotated 90 degrees" (diagonal +-45 deg
+    // pieces negated = 90 apart). Both variants are reflections (det -1),
+    // so the triangle-winding flip in ParseShapeGeometry stays required and
+    // unchanged.
     const float scale = xf.scale;
-    for (int r = 0; r < 3; ++r) {
-        out[r][0] = xf.rot.data[r][1] * scale;
-        out[r][1] = xf.rot.data[r][0] * scale;
-        out[r][2] = xf.rot.data[r][2] * scale;
-    }
+    out[0][0] = xf.rot.data[0][1] * scale;
+    out[0][1] = xf.rot.data[1][1] * scale;
+    out[0][2] = xf.rot.data[2][1] * scale;
+    out[1][0] = xf.rot.data[0][0] * scale;
+    out[1][1] = xf.rot.data[1][0] * scale;
+    out[1][2] = xf.rot.data[2][0] * scale;
+    out[2][0] = xf.rot.data[0][2] * scale;
+    out[2][1] = xf.rot.data[1][2] * scale;
+    out[2][2] = xf.rot.data[2][2] * scale;
     out[0][3] = xf.pos.y;
     out[1][3] = xf.pos.x;
     out[2][3] = xf.pos.z;

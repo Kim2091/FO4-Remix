@@ -118,9 +118,11 @@ namespace SemanticCapture {
         bool  isLODChunk               = false;
     };
 
-    // Convert a Bethesda NiTransform (right-handed, X/Y in Bethesda order)
-    // into a Remix-friendly row-major 3x4 matrix: rotation columns 0/1
-    // swapped, translation x/y swapped, scale applied. Output is
+    // Convert a Bethesda NiTransform (engine row-vector convention: world =
+    // v * M + t) into a Remix-friendly column-vector row-major 3x4:
+    // linear = P * M^T where P is the Beth->Remix X/Y mirror, translation
+    // x/y swapped, scale applied. See the definition's comment block for
+    // the derivation (anchored by the camera path). Output is
     // mesh.worldTransform[3][4].
     void BuildRemixTransform(const NiTransform& niXf, float out[3][4]);
 
