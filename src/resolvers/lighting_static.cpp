@@ -210,6 +210,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             mesh.chunkOriginX = tri->m_worldTransform.pos.x;
             mesh.chunkOriginY = tri->m_worldTransform.pos.y;
             mesh.chunkExtent  = lodLevel * 4096.0f;
+            // Mirror onto the DrawableState so Tick can maintain the
+            // chunk-key index that feeds OnFrame's stale-chunk filter.
+            state.isLODChunk  = true;
         }
     }
 
@@ -256,17 +259,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
-    // For decals, clamp the lower bound of the resulting roughness texture
-    // so the surface can't be more reflective than ~30% rough (76/255).
-    // Bethesda's smoothness map is often "very smooth" on decals; after our
-    // InvertRGB conversion that becomes roughness near 0 (mirror), which the
-    // path tracer renders literally. Vanilla DX11 hides this with specular
-    // highlights. The clamp preserves authoring intent (relative variation)
-    // while preventing literal-mirror decals.
-    const uint8_t roughnessFloor = mesh.isDecal ? 76 : 0;
-    mesh.roughnessTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures,
-        TexturePostProcess::InvertRGB, roughnessFloor);
+    // Smoothness/spec-mask (_s.dds) extraction REMOVED (2026-07-02). FO4's
+    // packed spec maps translate too inconsistently to naive roughness:
+    // "very smooth" authoring became roughness~0 mirrors (decals needed a
+    // clamp band-aid; metal fences/racks read as black voids reflecting a
+    // dark environment), and per-asset channel packing varies. Dropping the
+    // slot leaves mesh.roughnessTextureHash == 0, so SubmitDrawable builds
+    // materials with roughnessConstant=0.8 -- and saves a GPU readback +
+    // BC decompress + invert per material. Revisit only as part of a real
+    // spec-gloss -> metal-rough conversion (spec color/envmap -> metallic).
     BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
                                       mesh.emissiveTextureHash,
                                       mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,

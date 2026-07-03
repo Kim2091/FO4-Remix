@@ -102,6 +102,18 @@ struct PluginConfig {
     uint32_t cullingTextureBudgetMiB;        // Soft cap on materialTex VRAM (default 0 = disabled, TTL-only)
     uint32_t cullingMaterialLRUGraceFrames;  // Frames a material can go un-drawn before cascade-eviction (default 600)
 
+    // Frames a worldspace LOD chunk can go un-fired before OnFrame stops
+    // drawing it (0 = disabled). The engine calls GetRenderPasses every frame
+    // for geometry that survives its culling, and it HIDES a LOD chunk when
+    // the chunk's cells attach at full detail -- so a chunk that stopped
+    // firing is one the engine stopped rendering. Drawing it anyway overlays
+    // the low-poly shell on the streamed-in buildings ("LODs stay lowest
+    // quality" report, 2026-07-02). When the engine shows the chunk again
+    // (cells detach / camera turns back), it fires and reappears within a
+    // frame or two. Only applies while the 3D scene is actively firing, so
+    // pause menus don't age chunks out of the Remix view.
+    uint32_t cullingLodChunkStaleFrames;     // default 30
+
     // [Overlay]
     // HUD/Scaleform overlay submission via Remix's DrawScreenOverlay API.
     // Default OFF: the in-source dxvk-remix's dispatchScreenOverlay currently

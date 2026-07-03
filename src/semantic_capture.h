@@ -104,6 +104,12 @@ namespace SemanticCapture {
         // sets this, so per-frame pose propagation is O(animating objects)
         // instead of O(entire map).
         bool  poseDirty                = false;
+
+        // Set by the lighting resolver when this drawable was identified as
+        // a worldspace LOD chunk (parent chain "chunk"/level or "obj").
+        // Tick maintains g_lodChunkKeys from it so SnapshotLodChunkAges can
+        // walk only the ~dozens of chunk entries instead of the whole map.
+        bool  isLODChunk               = false;
     };
 
     // Convert a Bethesda NiTransform (right-handed, X/Y in Bethesda order)
@@ -192,6 +198,18 @@ namespace SemanticCapture {
     // 4-5ms/frame in dense scenes); SnapshotActiveDrawables remains for
     // periodic diagnostics.
     void DrainDirtyPoses(std::unordered_map<uint64_t, std::array<float, 12>>& out);
+
+    // Fill `out` with key -> (currentFrame - lastSeenFrame) for every tracked
+    // worldspace LOD chunk drawable. O(chunks), called once per Remix frame
+    // by OnFrame's stale-chunk filter: the engine fires GetRenderPasses every
+    // frame for geometry that survives its culling, so a chunk whose age
+    // grows is one the engine hid (its cells attached at full detail) and
+    // must not be drawn over the streamed-in buildings. Also returns the
+    // cumulative fire count so the caller can detect "scene not rendering"
+    // states (pause menu / main menu) where every drawable stops firing and
+    // staleness is meaningless.
+    uint64_t SnapshotLodChunkAges(uint64_t currentFrame,
+                                  std::unordered_map<uint64_t, uint64_t>& out);
 
     // Cumulative game-thread perf counters; consumers diff across reporting
     // windows. fires/fireNs cover the GetRenderPasses detour body (our

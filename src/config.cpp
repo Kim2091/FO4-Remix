@@ -79,11 +79,13 @@ void LoadConfig() {
     g_config.cullingTextureLRUSweepPeriod  = (uint32_t)GetIniInt("Culling", "TextureLRUSweepPeriod",  60,  dllPath);
     g_config.cullingTextureBudgetMiB       = (uint32_t)GetIniInt("Culling", "TextureBudgetMiB",       0,   dllPath);
     g_config.cullingMaterialLRUGraceFrames = (uint32_t)GetIniInt("Culling", "MaterialLRUGraceFrames", 600, dllPath);
-    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u",
+    g_config.cullingLodChunkStaleFrames    = (uint32_t)GetIniInt("Culling", "LodChunkStaleFrames",    30,  dllPath);
+    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u",
              g_config.cullingTextureLRUGraceFrames,
              g_config.cullingTextureLRUSweepPeriod,
              g_config.cullingTextureBudgetMiB,
-             g_config.cullingMaterialLRUGraceFrames);
+             g_config.cullingMaterialLRUGraceFrames,
+             g_config.cullingLodChunkStaleFrames);
 
     // [Overlay]
     g_config.hudOverlayEnabled  = GetIniBool("Overlay", "HudOverlayEnabled",  false, dllPath);

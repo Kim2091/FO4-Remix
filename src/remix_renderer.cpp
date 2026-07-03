@@ -1202,6 +1202,24 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     livePoses.clear();
     const PerfClock::time_point tSnap0 = PerfClock::now();
     SemanticCapture::DrainDirtyPoses(livePoses);
+
+    // Stale-chunk filter inputs. The engine fires GetRenderPasses every frame
+    // for geometry that survives its culling and HIDES worldspace LOD chunks
+    // when their cells attach at full detail -- so a chunk whose fire age
+    // exceeds the threshold is one the engine stopped rendering, and drawing
+    // it overlays the low-poly shell on the streamed-in buildings. Guard on
+    // "fires advanced since last OnFrame": in pause/main menus the 3D scene
+    // stops firing entirely and staleness is meaningless (without the guard,
+    // unpausing would blink all distant LOD out of the Remix view).
+    static std::unordered_map<uint64_t, uint64_t> lodChunkAges;
+    lodChunkAges.clear();
+    static uint64_t s_lastTotalFires = 0;
+    const uint64_t totalFires =
+        SemanticCapture::SnapshotLodChunkAges(Diagnostics::CurrentFrameIndex(), lodChunkAges);
+    const bool sceneFiring = totalFires != s_lastTotalFires;
+    s_lastTotalFires = totalFires;
+    const bool staleChunkFilterActive = sceneFiring && g_config.cullingLodChunkStaleFrames > 0;
+
     const PerfClock::time_point tSnap1 = PerfClock::now();
     PerfClock::duration dBucket{}, dDraw{};
 
@@ -1216,6 +1234,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t batchedBucketCount = 0;
     size_t skippedInactive = 0;
     size_t skippedChunkPlayerInside = 0;
+    size_t skippedChunkStale = 0;
     {
         std::lock_guard<std::mutex> lock(g_renderStateMutex);
         const PerfClock::time_point tBucket0 = PerfClock::now();
@@ -1257,16 +1276,31 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     }
                 }
             }
-            // Spatial filter for worldspace LOD chunks: skip if player is
-            // inside the chunk's coverage box. (Beth coords; chunk pivot is
-            // the chunk's origin corner, extent is its side length.)
-            if (inst.isLODChunk && inst.chunkExtent > 0.0f) {
-                const float chunkMaxX = inst.chunkOriginX + inst.chunkExtent;
-                const float chunkMaxY = inst.chunkOriginY + inst.chunkExtent;
-                if (playerX >= inst.chunkOriginX && playerX <= chunkMaxX &&
-                    playerY >= inst.chunkOriginY && playerY <= chunkMaxY) {
-                    ++skippedChunkPlayerInside;
-                    continue;
+            if (inst.isLODChunk) {
+                // Stale-fire filter: the engine hid this chunk (its cells
+                // attached at full detail) if it stopped firing -- see the
+                // lodChunkAges block above. Re-appears within a frame or two
+                // of the engine rendering it again.
+                if (staleChunkFilterActive) {
+                    auto ageIt = lodChunkAges.find(drawHash);
+                    if (ageIt != lodChunkAges.end() &&
+                        ageIt->second > g_config.cullingLodChunkStaleFrames) {
+                        ++skippedChunkStale;
+                        continue;
+                    }
+                }
+                // Spatial filter: skip if player is inside the chunk's
+                // coverage box. (Beth coords; chunk pivot is the chunk's
+                // origin corner, extent is its side length.) Backstop for
+                // the fire-age filter's first N frames after a swap.
+                if (inst.chunkExtent > 0.0f) {
+                    const float chunkMaxX = inst.chunkOriginX + inst.chunkExtent;
+                    const float chunkMaxY = inst.chunkOriginY + inst.chunkExtent;
+                    if (playerX >= inst.chunkOriginX && playerX <= chunkMaxX &&
+                        playerY >= inst.chunkOriginY && playerY <= chunkMaxY) {
+                        ++skippedChunkPlayerInside;
+                        continue;
+                    }
                 }
             }
             buckets[inst.meshHandle].members.push_back(&inst);
@@ -1475,11 +1509,11 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                                                  kActiveAgeFrames, statsScratch,
                                                  &activeStats, nullptr);
         _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu "
-                 "skippedChunkPlayerInside=%zu "
+                 "skippedChunkPlayerInside=%zu skippedChunkStale=%zu chunks=%zu "
                  "active=%u isLod=%u fadedIn=%u notVisible=%u lodFadingOut=%u forcedFadeOut=%u "
                  "player=(%.0f,%.0f,%.0f)",
                  drawableCount, bucketCount, batchedBucketCount, skippedInactive,
-                 skippedChunkPlayerInside,
+                 skippedChunkPlayerInside, skippedChunkStale, lodChunkAges.size(),
                  activeStats.total, activeStats.isLod, activeStats.fadedIn,
                  activeStats.notVisible, activeStats.lodFadingOut, activeStats.forcedFadeOut,
                  cam.playerWorldPos[0], cam.playerWorldPos[1], cam.playerWorldPos[2]);

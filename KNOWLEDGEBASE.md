@@ -320,10 +320,11 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
    - `BsExtraction::GetLightingMaterial` returns the
      `BSLightingShaderMaterialBase`. Skip if the material type is `kType_Landscape`.
    - For each texture slot — `spDiffuseTexture`, `spNormalTexture`
-     (Octahedral post-process), `spSmoothnessSpecMaskTexture` (InvertRGB
-     post-process), and (via `ExtractEmissiveData`) the glow map from
-     `BSLightingShaderMaterialGlowmap::spGlowMapTexture` — call
-     `BsExtraction::ExtractMaterialTexture`. That function:
+     (Octahedral post-process), and (via `ExtractEmissiveData`) the glow
+     map from `BSLightingShaderMaterialGlowmap::spGlowMapTexture` — call
+     `BsExtraction::ExtractMaterialTexture`. (The
+     `spSmoothnessSpecMaskTexture` roughness slot was removed 2026-07-02;
+     see Known limitations.) That function:
      1. Computes a stable hash from the texture *name* (FNV1a) plus the
         post-process mode.
      2. Hits the per-plugin `g_textureCache` to skip already-extracted
@@ -549,6 +550,7 @@ from FO4 is outstanding.
 | Culling | `TextureLRUSweepPeriod` | uint32 | 60 | frames between LRU sweeps in `OnFrame` | `remix_renderer.cpp:1294` |
 | Culling | `TextureBudgetMiB` | uint32 | 0 (TTL only) | soft cap on `usedMaterialTextureBytes`; non-zero enables the budget pass | `remix_renderer.cpp:1305` |
 | Culling | `MaterialLRUGraceFrames` | uint32 | 600 | TTL for un-drawn materials before refcount-zero entries are destroyed | `remix_renderer.cpp:1310` |
+| Culling | `LodChunkStaleFrames` | uint32 | 30 | frames a worldspace LOD chunk can go un-fired before OnFrame stops drawing it (0 = disabled); engine hid the chunk when its cells attached | `remix_renderer.cpp` (OnFrame stale-chunk filter) |
 | Overlay | `HudOverlayEnabled` | bool | 0 | submit the captured DX11 UI render target via `api->DrawScreenOverlay`. Default OFF because the in-source dxvk-remix's `dispatchScreenOverlay` currently asserts on a Vulkan layout transition | `remix_renderer.cpp:1273` |
 | Overlay | `RestoreLegacyInput` | bool | 1 | issue `RIDEV_REMOVE` for keyboard so the game still receives `WM_KEYDOWN` after Remix's overlay-thread `RIDEV_NOLEGACY` registration | `remix_api.cpp:162` |
 | Performance | `GpuInstancing` | bool | 1 | share Remix mesh handles across drawables with byte-identical geometry+material and batch via `InstanceInfoGpuInstancingEXT` | `remix_renderer.cpp:820` |
@@ -578,14 +580,24 @@ from FO4 is outstanding.
   `dispatchScreenOverlay` currently asserts in `dxvk_barrier.cpp` on a
   `dstLayout == VK_IMAGE_LAYOUT_UNDEFINED` transition. Flip
   `[Overlay] HudOverlayEnabled=1` only when the runtime is patched.
-- **Worldspace LOD chunk filter is heuristic.** The "skip if player inside
-  chunk coverage" filter relies on parent NiNode names (`"chunk"` +
-  `"4"|"8"|"16"|"32"`, or `"obj"`). Two earlier filters
-  (`kFlagTopFadeNode`, `kFlagIsMeshLOD` blanket-reject) were tried and
-  reverted because they over-rejected HQ structural meshes
-  (`lighting_static.cpp:101-124`). The up-close low-quality / low-quality
-  texture overlap symptom users have reported is documented as not yet
-  fully resolved.
+- **Worldspace LOD chunk hiding follows engine fire cadence (2026-07-02).**
+  Chunks are identified by parent NiNode names (`"chunk"` +
+  `"4"|"8"|"16"|"32"`, or `"obj"`). The primary filter is fire-age based:
+  the engine calls `GetRenderPasses` every frame for geometry that survives
+  its culling and hides LOD chunks when their cells attach at full detail,
+  so OnFrame skips any chunk whose fire age exceeds `[Culling]
+  LodChunkStaleFrames` (default 30) while the scene is actively firing
+  (pause/main menus freeze the filter). The older "skip if player inside
+  chunk coverage box" spatial test remains as a backstop. Two earlier
+  filters (`kFlagTopFadeNode`, `kFlagIsMeshLOD` blanket-reject) were tried
+  and reverted because they over-rejected HQ structural meshes
+  (`lighting_static.cpp:101-124`).
+- **Smoothness/spec-mask (`_s.dds`) extraction removed (2026-07-02).** FO4's
+  packed spec maps translated too inconsistently to naive roughness
+  (mirror decals, black-void metal fences/racks). All opaque materials now
+  use `roughnessConstant = 0.8`; the `InvertRGB` post-process machinery
+  remains in `bs_extraction.cpp` but has no caller. Revisit only as part of
+  a real spec-gloss -> metal-rough conversion.
 - **`maxExtent` config is plumbed but unused.** `lighting_static.cpp` and
   `water.cpp` use a hard-coded `1.0e6f` extent guard instead of
   `g_config.maxExtent`.

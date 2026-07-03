@@ -135,6 +135,12 @@ std::unordered_map<PassKey, SemanticCapture::DrawableState> g_drawableMap;
 // Guarded by g_drawableMutex; deduped via DrawableState::poseDirty.
 std::vector<PassKey> g_dirtyPoses;
 
+// Keys of drawables the lighting resolver tagged as worldspace LOD chunks
+// (DrawableState::isLODChunk). Guarded by g_drawableMutex. Maintained by the
+// Tick resolve loop (insert), the TTL sweep and ClearDrawableMap (erase), so
+// SnapshotLodChunkAges walks ~dozens of entries per frame, not the whole map.
+std::unordered_set<PassKey> g_lodChunkKeys;
+
 // -------- Sweep cadence counter (Tick() rate-limits via this) --------
 std::atomic<uint32_t> g_sweepCounter{0};
 
@@ -849,6 +855,11 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                     state.nextRetryFrame =
                         currentFrame + RetryDelayFrames(state.resolveAttempts);
                 }
+            } else if (state.isLODChunk) {
+                // Chunk-key side index for SnapshotLodChunkAges. Insert only
+                // on submitted entries -- unsubmitted chunks never reach
+                // OnFrame's draw set. Idempotent across retries.
+                g_lodChunkKeys.insert(key);
             }
         }
     }
@@ -896,6 +907,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                                  (unsigned long long)it->second.meshHash, excCode);
                     }
                 }
+                g_lodChunkKeys.erase(it->first);
                 it = g_drawableMap.erase(it);
                 ++evicted;
             } else {
@@ -994,6 +1006,7 @@ void SemanticCapture::ClearDrawableMap() {
     // the engine destructor runs inline here and frees the BSGeometry.
     g_drawableMap.clear();
     g_dirtyPoses.clear();
+    g_lodChunkKeys.clear();
 
     _MESSAGE("FO4RemixPlugin: [Reload] cleared %zu drawables (%zu submitted) on PreLoadGame",
              totalCount, submittedCount);
@@ -1032,6 +1045,20 @@ void SemanticCapture::SnapshotActiveDrawables(uint64_t currentFrame,
             if (f & (1ULL << 38)) ++stats->forcedFadeOut;
         }
     }
+}
+
+uint64_t SemanticCapture::SnapshotLodChunkAges(uint64_t currentFrame,
+                                               std::unordered_map<uint64_t, uint64_t>& out) {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    out.reserve(g_lodChunkKeys.size());
+    for (const PassKey key : g_lodChunkKeys) {
+        auto it = g_drawableMap.find(key);
+        if (it == g_drawableMap.end()) continue;
+        const uint64_t age = (currentFrame > it->second.lastSeenFrame)
+            ? (currentFrame - it->second.lastSeenFrame) : 0;
+        out.emplace(key, age);
+    }
+    return g_totalFires.load(std::memory_order_relaxed);
 }
 
 void SemanticCapture::DrainDirtyPoses(std::unordered_map<uint64_t, std::array<float, 12>>& out) {
