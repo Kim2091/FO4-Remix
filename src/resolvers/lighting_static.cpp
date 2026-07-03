@@ -943,6 +943,35 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 segs[0] = { 0, meshTris, 0, instRecords.size() };
                 nSegs = 1;
             }
+
+            // LOD-replication collapse (subagent-verified 2026-07-03: a
+            // full-detail twin shape carries the SAME 13 placements once
+            // that its isLOD sibling carries three times -- bit-identical
+            // record blocks are alternative LOD levels of the same
+            // placements, not co-placed sub-models). Drawing every slot
+            // stacks 2-3 z-fighting shells; keep only the most detailed
+            // slot (largest triangle count).
+            if (nSegs >= 2) {
+                bool allEqual = true;
+                for (int s = 1; s < nSegs && allEqual; ++s) {
+                    if (segs[s].recCount != segs[0].recCount) { allEqual = false; break; }
+                    for (size_t k = 0; k < segs[s].recCount && allEqual; ++k) {
+                        if (std::memcmp(instRecords[segs[0].recStart + k].data(),
+                                        instRecords[segs[s].recStart + k].data(),
+                                        sizeof(float) * 20) != 0) {
+                            allEqual = false;
+                        }
+                    }
+                }
+                if (allEqual) {
+                    int best = 0;
+                    for (int s = 1; s < nSegs; ++s) {
+                        if (segs[s].triCount > segs[best].triCount) best = s;
+                    }
+                    segs[0] = segs[best];
+                    nSegs = 1;
+                }
+            }
         }
 
         const NiTransform& W = tri->m_worldTransform;
@@ -960,6 +989,17 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             mesh.indices.assign(fullIndices.begin() + (size_t)sd.triStart * 3,
                                 fullIndices.begin() + ((size_t)sd.triStart + sd.triCount) * 3);
             for (size_t k = 0; k < sd.recCount; ++k, ++drawIndex) {
+                // Skip exact duplicates within this segment's block: two
+                // coincident path-traced instances self-Z-fight; vanilla's
+                // rasterizer hid them. (Also collapses the fallback path's
+                // repeated LOD sets when the segment picture didn't parse.)
+                bool dup = false;
+                for (size_t p = 0; p < k && !dup; ++p) {
+                    dup = std::memcmp(instRecords[sd.recStart + k].data(),
+                                      instRecords[sd.recStart + p].data(),
+                                      sizeof(float) * 20) == 0;
+                }
+                if (dup) continue;
                 float m[12], comp[12];
                 DecodeInstanceRecord(instRecords[sd.recStart + k].data(), instRowVector,
                                      g_config.mergeInstanceConjugate, m);
