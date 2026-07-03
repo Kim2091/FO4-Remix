@@ -234,24 +234,28 @@ static bool ReadSegmentRecordRanges(BSTriShape* tri, const uint32_t segTris[4],
             if (segTris[s] == 0) {
                 if (v != 0) ok = false;
             } else {
-                if (v == 0 || v > rc) ok = false;
+                // v == 0 is allowed: a sub-model can have triangles but no
+                // live instances (subagent: [9,9,9,0]-style tables exist).
+                if (v > rc) ok = false;
                 sum += v;
             }
         }
         if (!ok || sum != rc) continue;
         for (int offIs = 0; offIs < kDescDwords; ++offIs) {
             if (offIs == offIc) continue;
-            // Ranges must tile [0, rc) exactly.
+            // Nonempty ranges must tile [0, rc) exactly; zero-count slots
+            // are unconstrained (their start dword may be stale).
             uint32_t starts[4], counts[4];
             int n = 0;
             bool ok2 = true;
             for (int s = 0; s < 4 && ok2; ++s) {
-                if (segTris[s] == 0) continue;
+                if (segTris[s] == 0 || d[s][offIc] == 0) continue;
                 starts[n] = d[s][offIs];
                 counts[n] = d[s][offIc];
                 if (starts[n] > rc || starts[n] + counts[n] > rc) ok2 = false;
                 ++n;
             }
+            if (n == 0) continue;
             if (!ok2) continue;
             // insertion-sort by start, then check exact tiling
             for (int a = 1; a < n; ++a) {
@@ -266,10 +270,11 @@ static bool ReadSegmentRecordRanges(BSTriShape* tri, const uint32_t segTris[4],
                 cursor += counts[a];
             }
             if (!ok2 || cursor != rc) continue;
-            // Candidate. Build per-slot result (unsorted, slot order).
+            // Candidate. Build per-slot result (unsorted, slot order);
+            // zero-count slots stay 0/0 regardless of their start dword.
             uint32_t candStart[4] = {}, candCount[4] = {};
             for (int s = 0; s < 4; ++s) {
-                if (segTris[s] == 0) continue;
+                if (segTris[s] == 0 || d[s][offIc] == 0) continue;
                 candStart[s] = d[s][offIs];
                 candCount[s] = d[s][offIc];
             }
@@ -911,31 +916,68 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 if (instSegTris[s]) ++nonZero;
             }
             const uint32_t meshTris = (uint32_t)(mesh.indices.size() / 3);
-            if (nonZero >= 2 && totalSegTris == meshTris) {
+            if (nonZero >= 2) {
                 // Preferred: exact per-segment record ranges from the
-                // +0x1D0 descriptors (partitions are NOT generally equal --
-                // road clusters mix e.g. 10 straight pieces with 3 corner
-                // pieces; 13 records for 2 segments can't split evenly).
+                // +0x1D0 descriptors. Partitions are NOT generally equal:
+                // per-sub-model counts are independent (NumCombined per
+                // BSPackedGeomData -- 13 records = 9+4 on the Sanctuary
+                // road cluster; the subagent also proved a 15-record shape
+                // where the divisible 5/5/5 split is WRONG, true structure
+                // 8+7). No tri-sum gate here: the 4th +0x1A0 dword is not
+                // always a live segment (e.g. [352,320,320,1654] with only
+                // 3 record runs), so bounds-check each slot instead.
                 uint32_t rs[4] = {}, rn[4] = {};
                 if (ReadSegmentRecordRanges(tri, instSegTris, instRecords.size(), rs, rn)) {
                     uint32_t triCursor = 0;
                     for (int s = 0; s < 4; ++s) {
                         if (!instSegTris[s]) continue;
-                        segs[nSegs++] = { triCursor, instSegTris[s], rs[s], rn[s] };
+                        if (rn[s] > 0 && triCursor + instSegTris[s] <= meshTris) {
+                            segs[nSegs++] = { triCursor, instSegTris[s], rs[s], rn[s] };
+                        }
                         triCursor += instSegTris[s];
                     }
-                } else if (instRecords.size() % (size_t)nonZero == 0) {
-                    // Equal contiguous blocks -- correct for the symmetric
-                    // clusters (verified: hedges) and the best available
-                    // guess when the descriptors don't parse.
+                } else if (totalSegTris == meshTris &&
+                           instRecords.size() % (size_t)nonZero == 0) {
+                    // Equal contiguous blocks -- ONLY when the blocks are
+                    // bit-identical (LOD replication of the same
+                    // placements, the verified hedge case; the collapse
+                    // below then reduces them to one draw). A divisible
+                    // count with DIFFERING blocks is the proven silent-
+                    // wrong case (15 = "5/5/5" over a true 8+7) -> fall
+                    // through to whole-mesh instead.
                     const size_t block = instRecords.size() / (size_t)nonZero;
-                    uint32_t triCursor = 0;
-                    size_t   recCursor = 0;
-                    for (int s = 0; s < 4; ++s) {
-                        if (!instSegTris[s]) continue;
-                        segs[nSegs++] = { triCursor, instSegTris[s], recCursor, block };
-                        triCursor += instSegTris[s];
-                        recCursor += block;
+                    bool identical = true;
+                    for (size_t b = 1; b < (size_t)nonZero && identical; ++b) {
+                        identical = std::memcmp(instRecords[0].data(),
+                                                instRecords[b * block].data(),
+                                                sizeof(float) * 20) == 0;
+                        for (size_t k = 1; k < block && identical; ++k) {
+                            identical = std::memcmp(instRecords[k].data(),
+                                                    instRecords[b * block + k].data(),
+                                                    sizeof(float) * 20) == 0;
+                        }
+                    }
+                    if (identical) {
+                        uint32_t triCursor = 0;
+                        size_t   recCursor = 0;
+                        for (int s = 0; s < 4; ++s) {
+                            if (!instSegTris[s]) continue;
+                            segs[nSegs++] = { triCursor, instSegTris[s], recCursor, block };
+                            triCursor += instSegTris[s];
+                            recCursor += block;
+                        }
+                    }
+                }
+                if (nSegs == 0) {
+                    static std::atomic<int> sSegFailLogs{0};
+                    const int fn = sSegFailLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (fn < 20) {
+                        _MESSAGE("FO4RemixPlugin: [MergeSeg] #%d hash=0x%llX partition "
+                                 "UNRESOLVED (multi-seg, count=%zu segTris=[%u,%u,%u,%u] "
+                                 "meshTris=%u) -> whole-mesh fallback",
+                                 fn, (unsigned long long)hash, instRecords.size(),
+                                 instSegTris[0], instSegTris[1], instSegTris[2],
+                                 instSegTris[3], meshTris);
                     }
                 }
             }
