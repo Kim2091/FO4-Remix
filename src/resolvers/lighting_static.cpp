@@ -19,6 +19,22 @@
 
 namespace Resolvers {
 
+// SEH-guarded memory peek for the InstDiag raw-member probe: candidate
+// pointers come from raw qword dumps of undeclared engine classes and may
+// not be pointers at all. POD-only locals (SEH cannot coexist with C++
+// unwinding in one function). __except(1) == EXCEPTION_EXECUTE_HANDLER.
+static bool PeekQwordsGuarded(const void* src, uint64_t* dst, int count) {
+    __try {
+        const uint64_t* s = static_cast<const uint64_t*>(src);
+        for (int i = 0; i < count; ++i) {
+            dst[i] = s[i];
+        }
+        return true;
+    } __except (1) {
+        return false;
+    }
+}
+
 // In-flight resolver state. Updated at each gate inside TryResolveStatic
 // AND inside RemixRenderer::SubmitDrawable (via Trace::SetStep). Read by
 // the SEH handler in semantic_capture.cpp's Tick when an access violation
@@ -206,9 +222,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         if (instancedClass) {
             const int n = sInstDiagLogs.fetch_add(1, std::memory_order_relaxed);
             if (n < 12) {
+                // v2 (2026-07-03): read mesh.vertices, not parsed.* -- the
+                // build step above MOVES the parsed vectors into the mesh, so
+                // v1 logged verts=0 and a sentinel bbox for every shape.
                 float mn[3] = { 3.4e38f, 3.4e38f, 3.4e38f };
                 float mx[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
-                for (const auto& v : parsed.vertices) {
+                for (const auto& v : mesh.vertices) {
                     for (int c = 0; c < 3; ++c) {
                         if (v.position[c] < mn[c]) mn[c] = v.position[c];
                         if (v.position[c] > mx[c]) mx[c] = v.position[c];
@@ -222,7 +241,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                          "worldScale=%.3f localPos=(%.1f,%.1f,%.1f) localScale=%.3f "
                          "bboxMin=(%.1f,%.1f,%.1f) bboxMax=(%.1f,%.1f,%.1f)",
                          n, instLeaf, tri->m_name.c_str() ? tri->m_name.c_str() : "",
-                         parsed.vertices.size(), parsed.indices.size() / 3,
+                         mesh.vertices.size(), mesh.indices.size() / 3,
                          (unsigned long long)parsed.vertexDesc,
                          wx.pos.x, wx.pos.y, wx.pos.z,
                          wx.rot.data[0][0], wx.rot.data[0][1], wx.rot.data[0][2],
@@ -246,10 +265,70 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     ip = ip->m_parent;
                 }
 
+                // v2 raw-member probe: v1 established that m_extraData is
+                // NULL on every merge-instanced shape, so the per-instance
+                // placement must live in the subclass's OWN members past the
+                // BSTriShape header (numTriangles 0x160, numVertices 0x164,
+                // unk168/unk16C; sizeof(BSTriShape) == 0x170). Dump 16 qwords
+                // from +0x160, then chase up to 5 heap-pointer-looking qwords
+                // and print their first 12 floats -- a per-instance transform
+                // array is self-evident in float form (rotation rows in
+                // [-1,1], world-range translations, 1.0 scales). All reads go
+                // through the SEH peek so a non-pointer qword cannot crash
+                // the resolve.
+                {
+                    uint64_t raw[16] = {};
+                    if (PeekQwordsGuarded(
+                            reinterpret_cast<const void*>(
+                                reinterpret_cast<uintptr_t>(tri) + 0x160),
+                            raw, 16)) {
+                        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   raw+160=[%016llX %016llX %016llX %016llX "
+                                 "%016llX %016llX %016llX %016llX]",
+                                 n,
+                                 (unsigned long long)raw[0], (unsigned long long)raw[1],
+                                 (unsigned long long)raw[2], (unsigned long long)raw[3],
+                                 (unsigned long long)raw[4], (unsigned long long)raw[5],
+                                 (unsigned long long)raw[6], (unsigned long long)raw[7]);
+                        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   raw+1A0=[%016llX %016llX %016llX %016llX "
+                                 "%016llX %016llX %016llX %016llX]",
+                                 n,
+                                 (unsigned long long)raw[8],  (unsigned long long)raw[9],
+                                 (unsigned long long)raw[10], (unsigned long long)raw[11],
+                                 (unsigned long long)raw[12], (unsigned long long)raw[13],
+                                 (unsigned long long)raw[14], (unsigned long long)raw[15]);
+
+                        int chased = 0;
+                        for (int qi = 0; qi < 16 && chased < 5; ++qi) {
+                            const uint64_t q = raw[qi];
+                            const bool ptrLike = q >= 0x10000ULL &&
+                                                 q <  0x0000800000000000ULL &&
+                                                 (q & 7ULL) == 0ULL;
+                            if (!ptrLike) continue;
+                            ++chased;
+                            uint64_t body[6] = {};
+                            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(q), body, 6)) {
+                                _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   ptr@+%X=%016llX unreadable",
+                                         n, 0x160 + qi * 8, (unsigned long long)q);
+                                continue;
+                            }
+                            const float* bf = reinterpret_cast<const float*>(body);
+                            _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   ptr@+%X=%016llX "
+                                     "f=[%.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f | %.3f %.3f %.3f %.3f] "
+                                     "q0=%016llX",
+                                     n, 0x160 + qi * 8, (unsigned long long)q,
+                                     bf[0], bf[1], bf[2], bf[3], bf[4], bf[5],
+                                     bf[6], bf[7], bf[8], bf[9], bf[10], bf[11],
+                                     (unsigned long long)body[0]);
+                        }
+                    }
+                }
+
                 // NiExtraData entries. Leading qwords start at +0x18 (NiObject
                 // 0x10 + BSFixedString m_name 8); precombined instance data
                 // objects are large, so a 6-qword peek stays inside the
-                // allocation for the entries we care about.
+                // allocation for the entries we care about. (v1 result: NULL
+                // on every merge-instanced shape -- kept for the MultiStream
+                // variant, which has not been sampled yet.)
                 tMutexArray<NiExtraData*>* xd = tri->m_extraData;
                 if (xd && xd->entries && xd->count > 0) {
                     _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   extraData count=%u", n, xd->count);
