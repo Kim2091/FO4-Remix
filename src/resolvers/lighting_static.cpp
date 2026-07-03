@@ -1196,34 +1196,23 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     }
                 } else if (totalSegTris == meshTris &&
                            instRecords.size() % (size_t)nonZero == 0) {
-                    // Equal contiguous blocks -- ONLY when the blocks are
-                    // bit-identical (LOD replication of the same
-                    // placements, the verified hedge case; the collapse
-                    // below then reduces them to one draw). A divisible
-                    // count with DIFFERING blocks is the proven silent-
-                    // wrong case (15 = "5/5/5" over a true 8+7) -> fall
-                    // through to whole-mesh instead.
+                    // Equal contiguous blocks on divisibility alone -- the
+                    // take-5 semantics, restored 2026-07-03 after the live
+                    // run: requiring bit-identical blocks here (plus the
+                    // LOD collapse that followed) REGRESSED hedges, the
+                    // one user-verified-correct multi-segment case. The
+                    // known cost is the proven silent-wrong shape (15 =
+                    // "5/5/5" over a true 8+7) rendering with misassigned
+                    // records -- accepted until the [MergeProbe] dumps pin
+                    // the real per-segment count table.
                     const size_t block = instRecords.size() / (size_t)nonZero;
-                    bool identical = true;
-                    for (size_t b = 1; b < (size_t)nonZero && identical; ++b) {
-                        identical = std::memcmp(instRecords[0].data(),
-                                                instRecords[b * block].data(),
-                                                sizeof(float) * 20) == 0;
-                        for (size_t k = 1; k < block && identical; ++k) {
-                            identical = std::memcmp(instRecords[k].data(),
-                                                    instRecords[b * block + k].data(),
-                                                    sizeof(float) * 20) == 0;
-                        }
-                    }
-                    if (identical) {
-                        uint32_t triCursor = 0;
-                        size_t   recCursor = 0;
-                        for (int s = 0; s < 4; ++s) {
-                            if (!instSegTris[s]) continue;
-                            segs[nSegs++] = { triCursor, instSegTris[s], recCursor, block };
-                            triCursor += instSegTris[s];
-                            recCursor += block;
-                        }
+                    uint32_t triCursor = 0;
+                    size_t   recCursor = 0;
+                    for (int s = 0; s < 4; ++s) {
+                        if (!instSegTris[s]) continue;
+                        segs[nSegs++] = { triCursor, instSegTris[s], recCursor, block };
+                        triCursor += instSegTris[s];
+                        recCursor += block;
                     }
                 }
                 if (nSegs == 0) {
@@ -1247,34 +1236,16 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 nSegs = 1;
             }
 
-            // LOD-replication collapse (subagent-verified 2026-07-03: a
-            // full-detail twin shape carries the SAME 13 placements once
-            // that its isLOD sibling carries three times -- bit-identical
-            // record blocks are alternative LOD levels of the same
-            // placements, not co-placed sub-models). Drawing every slot
-            // stacks 2-3 z-fighting shells; keep only the most detailed
-            // slot (largest triangle count).
-            if (nSegs >= 2) {
-                bool allEqual = true;
-                for (int s = 1; s < nSegs && allEqual; ++s) {
-                    if (segs[s].recCount != segs[0].recCount) { allEqual = false; break; }
-                    for (size_t k = 0; k < segs[s].recCount && allEqual; ++k) {
-                        if (std::memcmp(instRecords[segs[0].recStart + k].data(),
-                                        instRecords[segs[s].recStart + k].data(),
-                                        sizeof(float) * 20) != 0) {
-                            allEqual = false;
-                        }
-                    }
-                }
-                if (allEqual) {
-                    int best = 0;
-                    for (int s = 1; s < nSegs; ++s) {
-                        if (segs[s].triCount > segs[best].triCount) best = s;
-                    }
-                    segs[0] = segs[best];
-                    nSegs = 1;
-                }
-            }
+            // NOTE(2026-07-03): the LOD-replication collapse that lived here
+            // (bit-identical record blocks -> draw only the largest-tri
+            // segment) is REMOVED: the live run broke hedges, take 5's one
+            // user-verified-correct multi-segment case. The twin-shape LOD
+            // evidence it rested on was cross-shape (full-detail twin vs
+            // isLOD sibling); within ONE shape, identical blocks evidently
+            // include co-placed sub-models sharing placements, where
+            // dropping segments loses geometry. Exact-coincident duplicate
+            // DRAWS are still skipped per-record in the submit loop below,
+            // which is the visually-safe half of that idea.
         }
 
         const NiTransform& W = tri->m_worldTransform;
