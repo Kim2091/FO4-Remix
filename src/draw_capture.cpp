@@ -79,6 +79,13 @@ struct Watch {
     uint32_t rearms = 0;         // invalid-frame retries granted so far
     uint32_t expectedIdx[4] = {};  // segTris[s]*3 for nonzero, sane slots
     int      nExpected = 0;
+    // Baked-chunk capture (run-6 model), same cur/done frame-roll pattern.
+    static constexpr int kMaxChunks = 32;
+    uint32_t  ccurFrame = 0;
+    int       ccurCount = 0;
+    ChunkDraw ccur[kMaxChunks];
+    int       cdoneCount = 0;
+    ChunkDraw cdone[kMaxChunks];
     // Draws accumulate per frame in cur[]; the previous frame's complete
     // list rolls into done[] so Query never reads a half-recorded frame.
     uint32_t curFrame = 0;
@@ -171,6 +178,14 @@ static void RollFrame(Watch& w) {
         w.doneFrame = w.curFrame;
     }
     w.curCount = 0;
+}
+
+static void RollChunks(Watch& w) {
+    if (w.ccurCount > 0) {
+        std::memcpy(w.cdone, w.ccur, sizeof(ChunkDraw) * (size_t)w.ccurCount);
+        w.cdoneCount = w.ccurCount;
+    }
+    w.ccurCount = 0;
 }
 
 // Pointer-equality is necessary but no longer sufficient: a destroyed
@@ -297,46 +312,45 @@ static void STDMETHODCALLTYPE hkDrawIndexed(
     LogWindowDraw(ctx, "DX", idxCount, startIdx, baseVtx, 1);
     Watch* w = g_boundT8.load(std::memory_order_relaxed);
     if (w) {
-        bool sized = false;
-        for (int i = 0; i < w->nExpected && !sized; ++i) {
-            sized = (w->expectedIdx[i] == idxCount);
-        }
-        if (!sized) {
-            // Mixed bag by design: sticky-bound unrelated draws AND -- if
-            // the engine subdivides finer than the +0x1A0 table -- the
-            // real sub-model draws we'd be wrongly filtering out. If a
-            // run yields no ok=1 captures, read these for the true sizes.
-            static std::atomic<int> sMissLogs{0};
-            const int u = sMissLogs.fetch_add(1, std::memory_order_relaxed);
-            if (u < 40) {
-                _MESSAGE("FO4RemixPlugin: [DrawCapMiss] key=0x%llX idx=%u+%u bv=%d",
-                         (unsigned long long)w->key, startIdx, idxCount, baseVtx);
-            }
-        }
-        if (sized) {
-            std::lock_guard<std::mutex> g(g_lock);
-            if (w->state == Watch::kActive &&
-                g_boundT8.load(std::memory_order_relaxed) == w) {
-                const uint32_t f = g_frame.load(std::memory_order_relaxed);
-                if (w->curFrame != f) {
-                    RollFrame(*w);
-                    w->curFrame = f;
-                }
-                bool counted = false;
-                for (int k = 0; k < w->curCount && !counted; ++k) {
-                    SegDraw& d = w->cur[k];
-                    if (d.kind == 1 && d.indexCount == idxCount &&
-                        d.startIndex == startIdx && d.baseVertex == baseVtx) {
-                        ++d.instanceCount;  // repeat = another instance
-                        counted = true;
+        // Exact state check kills ownership staleness: is OUR SRV
+        // literally at t8 for THIS draw? (Run 4/5 lesson: bindings and
+        // even bind-tracked ownership go stale across unrelated draws.)
+        ID3D11ShaderResourceView* s8 = nullptr;
+        ctx->VSGetShaderResources(8, 1, &s8);
+        const bool ours = (s8 == w->srv);
+        if (s8) s8->Release();
+        if (ours) {
+            // Baked-chunk capture: this draw is one ~2k-tri slice of the
+            // shape's expanded mesh, selected by the IB offset.
+            ID3D11Buffer* ib = nullptr;
+            DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+            UINT ibOff = 0;
+            ctx->IAGetIndexBuffer(&ib, &fmt, &ibOff);
+            ID3D11Buffer* vb = nullptr;
+            UINT stride = 0, vbOff = 0;
+            ctx->IAGetVertexBuffers(0, 1, &vb, &stride, &vbOff);
+            {
+                std::lock_guard<std::mutex> g(g_lock);
+                if (w->state == Watch::kActive) {
+                    const uint32_t f = g_frame.load(std::memory_order_relaxed);
+                    if (w->ccurFrame != f) {
+                        RollChunks(*w);
+                        w->ccurFrame = f;
+                    }
+                    bool dup = false;
+                    for (int k = 0; k < w->ccurCount && !dup; ++k) {
+                        dup = w->ccur[k].ibOffset == ibOff &&
+                              w->ccur[k].idxCount == idxCount;
+                    }
+                    if (!dup && w->ccurCount < Watch::kMaxChunks) {
+                        w->ccur[w->ccurCount++] = { (void*)ib, ibOff, idxCount,
+                                                    (uint32_t)fmt, (void*)vb,
+                                                    vbOff, stride };
                     }
                 }
-                if (!counted && w->curCount < kMaxDrawsPerFrame) {
-                    w->cur[w->curCount] = { idxCount, startIdx, baseVtx,
-                                            1, 0, (uint32_t)w->curCount, 1 };
-                    ++w->curCount;
-                }
             }
+            if (ib) ib->Release();
+            if (vb) vb->Release();
         }
     }
     g_originalDX(ctx, idxCount, startIdx, baseVtx);
@@ -586,7 +600,10 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
         if (w->curCount > 0 && w->curFrame < f) {
             RollFrame(*w);
         }
-        if (w->doneCount > 0) {
+        if (w->ccurCount > 0 && w->ccurFrame < f) {
+            RollChunks(*w);
+        }
+        if (w->doneCount > 0 || w->cdoneCount > 0) {
             w->state = Watch::kDone;
             g_activeCount.fetch_sub(1, std::memory_order_relaxed);
         } else if (now - w->registeredTick > kDeadlineMs) {
@@ -630,10 +647,23 @@ bool Rearm(uint64_t key) {
         c.registeredFrame = g_frame.load(std::memory_order_relaxed);
         c.curCount = 0;
         c.doneCount = 0;
+        c.ccurCount = 0;
+        c.cdoneCount = 0;
         g_activeCount.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
     return false;
+}
+
+int GetChunks(uint64_t key, ChunkDraw* out, int maxOut) {
+    std::lock_guard<std::mutex> g(g_lock);
+    for (Watch& c : g_watches) {
+        if (c.state == Watch::kFree || c.key != key) continue;
+        const int n = c.cdoneCount < maxOut ? c.cdoneCount : maxOut;
+        std::memcpy(out, c.cdone, sizeof(ChunkDraw) * (size_t)n);
+        return n;
+    }
+    return 0;
 }
 
 }  // namespace DrawCapture

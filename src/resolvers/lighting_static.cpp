@@ -454,6 +454,35 @@ static void Pump() {
 
 }  // namespace MergeProbe
 
+// Take-9 chunk diagnostics: captured baked-chunk IA identities are raw
+// pointers with no reference held; validate the vtable lives in d3d11 and
+// QI before touching (the deferral keeps resolve within a frame or two of
+// capture, but the engine could still have freed them).
+static ID3D11Buffer* SafeBufferFromIdentity(void* p) {
+    if (!HeapLikePtr((uint64_t)(uintptr_t)p)) return nullptr;
+    uint64_t vtbl = 0;
+    if (!PeekQwordsGuarded(p, &vtbl, 1) || !PtrInD3D11(vtbl)) return nullptr;
+    void* raw = nullptr;
+    if (!QiGuarded(p, &__uuidof(ID3D11Buffer), &raw)) return nullptr;
+    return static_cast<ID3D11Buffer*>(raw);
+}
+
+// Enough of IEEE half for diagnostics (denorms flushed to zero).
+static float HalfToFloat(uint16_t h) {
+    const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
+    uint32_t f;
+    if (e == 0) {
+        f = s << 31;
+    } else if (e == 31) {
+        f = (s << 31) | 0x7F800000u;
+    } else {
+        f = (s << 31) | ((e + 112u) << 23) | (m << 13);
+    }
+    float out;
+    std::memcpy(&out, &f, 4);
+    return out;
+}
+
 static inline int PermXY(int i) { return i == 0 ? 1 : (i == 1 ? 0 : 2); }
 
 // Decode one 80-byte instance record into a Bethesda ROW-VECTOR 3x4
@@ -1135,9 +1164,112 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
                                            (uint32_t)instRecords.size(),
                                            instSegTris, cap) ==
-                            DrawCapture::kReady &&
-                        !cap.empty()) {
+                        DrawCapture::kReady) {
                         const uint32_t rc = (uint32_t)instRecords.size();
+                        // ---- Baked-chunk diagnostics (take 9) ----
+                        // Run 6 established the engine draws a PRE-BAKED
+                        // expanded mesh (per-instance geometry duplicated,
+                        // ~2k-tri chunks selected by IB offset, records
+                        // applied by the VS via a per-vertex record index).
+                        // Read the expanded buffers back: IB slice + a few
+                        // referenced vertices, hunting the record-index
+                        // field (bet: the .w of a half4 position). Once
+                        // found, a record->tri-count histogram maps every
+                        // record to its sub-model exactly.
+                        DrawCapture::ChunkDraw chunks[32];
+                        const int nChunks = DrawCapture::GetChunks(hash, chunks, 32);
+                        static std::atomic<int> sChunkLogs{0};
+                        if (nChunks > 0 &&
+                            sChunkLogs.fetch_add(1, std::memory_order_relaxed) < 6) {
+                            uint64_t totalIdx = 0;
+                            char clist[420];
+                            size_t cpos = 0;
+                            clist[0] = 0;
+                            for (int c = 0; c < nChunks; ++c) {
+                                totalIdx += chunks[c].idxCount;
+                                if (c < 10) {
+                                    const int wln = snprintf(clist + cpos,
+                                        sizeof(clist) - cpos, "%s[off=%u n=%u]",
+                                        c ? " " : "", chunks[c].ibOffset,
+                                        chunks[c].idxCount);
+                                    if (wln <= 0 ||
+                                        (size_t)wln >= sizeof(clist) - cpos) break;
+                                    cpos += (size_t)wln;
+                                }
+                            }
+                            _MESSAGE("FO4RemixPlugin: [MergeChunk] hash=0x%llX n=%d "
+                                     "bakedTris=%llu rc=%u srcMeshTris=%u stride=%u %s",
+                                     (unsigned long long)hash, nChunks,
+                                     (unsigned long long)(totalIdx / 3), rc, meshTris,
+                                     chunks[0].vbStride, clist);
+                            for (int c = 0; c < nChunks && c < 2; ++c) {
+                                const DrawCapture::ChunkDraw& ch = chunks[c];
+                                if (ch.ibFormat != 57 /*R16_UINT*/) continue;
+                                ID3D11Buffer* ibb = SafeBufferFromIdentity(ch.ib);
+                                if (!ibb) continue;
+                                const uint32_t nRead =
+                                    ch.idxCount < 512 ? ch.idxCount : 512;
+                                std::vector<uint8_t> ibBytes;
+                                if (ReadbackBufferSlice(ibb, ch.ibOffset, nRead * 2,
+                                                        ibBytes) == nRead * 2) {
+                                    const uint16_t* idx =
+                                        (const uint16_t*)ibBytes.data();
+                                    uint16_t mn = 0xFFFF, mx = 0;
+                                    for (uint32_t i = 0; i < nRead; ++i) {
+                                        if (idx[i] < mn) mn = idx[i];
+                                        if (idx[i] > mx) mx = idx[i];
+                                    }
+                                    _MESSAGE("FO4RemixPlugin: [MergeChunk] hash=0x%llX "
+                                             "c=%d idx[min=%u max=%u] first=[%u %u %u "
+                                             "%u %u %u %u %u %u %u %u %u]",
+                                             (unsigned long long)hash, c, mn, mx,
+                                             idx[0], idx[1], idx[2], idx[3], idx[4],
+                                             idx[5], idx[6], idx[7], idx[8], idx[9],
+                                             idx[10], idx[11]);
+                                    ID3D11Buffer* vbb = SafeBufferFromIdentity(ch.vb);
+                                    if (vbb && ch.vbStride >= 8 && ch.vbStride <= 128) {
+                                        const uint16_t picks[4] = {
+                                            mn, (uint16_t)(mn + (mx - mn) / 3),
+                                            (uint16_t)(mn + 2 * (mx - mn) / 3), mx };
+                                        for (int v = 0; v < 4; ++v) {
+                                            std::vector<uint8_t> vbytes;
+                                            const uint32_t voff = ch.vbOffset +
+                                                (uint32_t)picks[v] * ch.vbStride;
+                                            if (ReadbackBufferSlice(vbb, voff,
+                                                    ch.vbStride, vbytes) != ch.vbStride) {
+                                                continue;
+                                            }
+                                            const uint16_t* hw =
+                                                (const uint16_t*)vbytes.data();
+                                            char hexs[300];
+                                            size_t hp = 0;
+                                            hexs[0] = 0;
+                                            const uint32_t nw = ch.vbStride / 2;
+                                            for (uint32_t x = 0; x < nw; ++x) {
+                                                const int wln = snprintf(hexs + hp,
+                                                    sizeof(hexs) - hp, "%s%04X",
+                                                    x ? " " : "", hw[x]);
+                                                if (wln <= 0 || (size_t)wln >=
+                                                        sizeof(hexs) - hp) break;
+                                                hp += (size_t)wln;
+                                            }
+                                            _MESSAGE("FO4RemixPlugin: [MergeVert] "
+                                                     "hash=0x%llX c=%d vid=%u "
+                                                     "pos=(%.2f,%.2f,%.2f) w=%.3f "
+                                                     "raw=[%s]",
+                                                     (unsigned long long)hash, c,
+                                                     picks[v],
+                                                     HalfToFloat(hw[0]),
+                                                     HalfToFloat(hw[1]),
+                                                     HalfToFloat(hw[2]),
+                                                     HalfToFloat(hw[3]), hexs);
+                                        }
+                                    }
+                                    if (vbb) vbb->Release();
+                                }
+                                ibb->Release();
+                            }
+                        }
                         // Only the DrawIndexed capture is trusted; kind-0
                         // (DrawIndexedInstanced) entries were only ever
                         // stray leftover-binding draws.

@@ -64,4 +64,27 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
 // -- the caller should fall back instead of deferring again.
 bool Rearm(uint64_t key);
 
+// Run-6 discovery: the engine draws merged shapes from a PRE-BAKED
+// expanded mesh -- every instance's geometry duplicated into a large
+// shared IB/VB, sliced into ~2k-tri chunks at 16-bit-index vertex-window
+// boundaries, drawn as plain DrawIndexed with a per-chunk IB OFFSET while
+// the record SRV sits at t8 (vertices are piece-local; the VS applies the
+// record transform fetched by a per-vertex record index). Chunk draws are
+// captured with full IA state so the resolver can read the expanded
+// buffers back and recover the exact record->sub-model mapping.
+struct ChunkDraw {
+    void*    ib;        // ID3D11Buffer* identity (no reference held)
+    uint32_t ibOffset;  // bytes into the shared index buffer
+    uint32_t idxCount;
+    uint32_t ibFormat;  // DXGI_FORMAT (57 = R16_UINT on every sample)
+    void*    vb;        // slot-0 vertex buffer identity
+    uint32_t vbOffset;  // bytes
+    uint32_t vbStride;
+};
+
+// Chunk draws of the most recent complete frame for this key (captured
+// while the watch's SRV was verified live at t8). Returns the count
+// copied into out (0 = none captured).
+int GetChunks(uint64_t key, ChunkDraw* out, int maxOut);
+
 }  // namespace DrawCapture
