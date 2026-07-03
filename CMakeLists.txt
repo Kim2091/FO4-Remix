@@ -73,6 +73,8 @@ add_library(FO4RemixPlugin SHARED
     src/camera.cpp
     src/bs_extraction.h
     src/bs_extraction.cpp
+    src/draw_capture.h
+    src/draw_capture.cpp
     src/fo4_diagnostics.h
     src/fo4_diagnostics.cpp
     src/startup_diag.h

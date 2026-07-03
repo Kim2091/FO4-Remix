@@ -1,5 +1,6 @@
 #include "present_hook.h"
 #include "config.h"
+#include "draw_capture.h"
 #include "fo4_diagnostics.h"
 #include "remix_api.h"
 #include "remix_renderer.h"
@@ -366,6 +367,27 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
             }
             hookDevice->Release();
         }
+    }
+
+    // Merge-instanced draw capture: hook DrawIndexedInstanced so the static
+    // resolver can reuse the engine's own per-sub-model draw parameters for
+    // BSMergeInstancedTriShape partitioning (see draw_capture.h). Idle cost
+    // once hooked is one relaxed atomic load per draw call.
+    if (g_config.mergeInstanceExpansion && g_config.mergeInstanceDrawCapture) {
+        if (!DrawCapture::Hooked()) {
+            ID3D11Device* dcDev = nullptr;
+            swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&dcDev);
+            if (dcDev) {
+                ID3D11DeviceContext* dcCtx = nullptr;
+                dcDev->GetImmediateContext(&dcCtx);
+                if (dcCtx) {
+                    DrawCapture::InstallHook(dcCtx);
+                    dcCtx->Release();
+                }
+                dcDev->Release();
+            }
+        }
+        DrawCapture::OnPresent();
     }
 
     // Capture UI render target for screen overlay (isolated UI without 3D scene).

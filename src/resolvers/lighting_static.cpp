@@ -4,6 +4,7 @@
 #include "../semantic_capture.h"
 #include "../remix_renderer.h"
 #include "../config.h"
+#include "../draw_capture.h"
 #include "../fo4_diagnostics.h"
 #include "f4se/NiObjects.h"
 #include "f4se/NiNodes.h"      // NiNode (parent-chain walk in InstDiag)
@@ -12,6 +13,7 @@
 #include "f4se/NiMaterials.h"
 #include "f4se/PluginAPI.h"  // _MESSAGE
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <vector>
@@ -177,149 +179,14 @@ static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t
 
 static bool HeapLikePtr(uint64_t q);
 
-// Read the per-segment instance-record ranges from the descriptor array at
-// shape+0x1D0. Chain (probe-verified): *(shape+0x1D0) -> wrapper whose
-// qword 0 points at a block whose first qword is the base of a 4-element,
-// 0xB8-stride descriptor array (wrapper qword 1 == 4; wrapper qword 4 ==
-// base+0xB8 on every sample; the array is NULL on single-segment shapes,
-// which need no partition).
-//
-// The field layout inside the 184-byte descriptor is unknown, so INFER it
-// per shape instead of hardcoding: find a dword offset pair (count, start)
-// such that, mapping element i to segment slot i,
-//   - empty slots (segTris[i] == 0) have count == 0,
-//   - nonzero slots have 1 <= count <= recordCount and counts sum to
-//     recordCount,
-//   - the (start, count) ranges tile [0, recordCount) exactly (disjoint
-//     cover).
-// Those constraints are tight enough that coincidental matches are
-// essentially impossible on multi-segment shapes; if several offset pairs
-// match they must produce the SAME ranges or the result is rejected.
-// Returns true and fills outStart/outCount per slot (zeros for empty
-// slots); logs the inferred offsets (capped) so they can be hardcoded once
-// stable. On any failure the caller falls back to the equal-block split.
-static bool ReadSegmentRecordRanges(BSTriShape* tri, const uint32_t segTris[4],
-                                    size_t recordCount,
-                                    uint32_t outStart[4], uint32_t outCount[4]) {
-    if (recordCount == 0 || recordCount > 0xFFFFFFu) return false;
-    uint64_t wrapPtr = 0, q0 = 0, elemBase = 0;
-    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
-            reinterpret_cast<uintptr_t>(tri) + 0x1D0), &wrapPtr, 1)) return false;
-    if (!HeapLikePtr(wrapPtr)) return false;
-    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wrapPtr), &q0, 1)) return false;
-    if (!HeapLikePtr(q0)) return false;
-    if (!PeekQwordsGuarded(reinterpret_cast<const void*>(q0), &elemBase, 1)) return false;
-    if (!HeapLikePtr(elemBase)) return false;
-
-    constexpr int kDescQwords = 23;  // 0xB8 bytes
-    constexpr int kDescDwords = kDescQwords * 2;
-    uint32_t d[4][kDescDwords];
-    for (int s = 0; s < 4; ++s) {
-        uint64_t q[kDescQwords];
-        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(elemBase + (uint64_t)s * 0xB8),
-                               q, kDescQwords)) {
-            return false;
-        }
-        std::memcpy(d[s], q, sizeof(q));
-    }
-
-    const uint32_t rc = (uint32_t)recordCount;
-    bool found = false;
-    uint32_t bestStart[4] = {}, bestCount[4] = {};
-    int foundIc = -1, foundIs = -1;
-    for (int offIc = 0; offIc < kDescDwords; ++offIc) {
-        uint32_t sum = 0;
-        bool ok = true;
-        for (int s = 0; s < 4 && ok; ++s) {
-            const uint32_t v = d[s][offIc];
-            if (segTris[s] == 0) {
-                if (v != 0) ok = false;
-            } else {
-                // v == 0 is allowed: a sub-model can have triangles but no
-                // live instances (subagent: [9,9,9,0]-style tables exist).
-                if (v > rc) ok = false;
-                sum += v;
-            }
-        }
-        if (!ok || sum != rc) continue;
-        for (int offIs = 0; offIs < kDescDwords; ++offIs) {
-            if (offIs == offIc) continue;
-            // Nonempty ranges must tile [0, rc) exactly; zero-count slots
-            // are unconstrained (their start dword may be stale).
-            uint32_t starts[4], counts[4];
-            int n = 0;
-            bool ok2 = true;
-            for (int s = 0; s < 4 && ok2; ++s) {
-                if (segTris[s] == 0 || d[s][offIc] == 0) continue;
-                starts[n] = d[s][offIs];
-                counts[n] = d[s][offIc];
-                if (starts[n] > rc || starts[n] + counts[n] > rc) ok2 = false;
-                ++n;
-            }
-            if (!ok2) continue;
-            // The 2026-07-03 live run produced only degenerate single-range
-            // "matches" (all records on one slot, e.g. [0+0,0+0,0+4,0+0],
-            // with DIFFERENT offsets per shape) -- coincidences, not layout.
-            // A single range is also the only shape of spurious match that
-            // LOSES geometry (the other active slots draw nothing), so
-            // require at least two nonzero ranges before trusting one.
-            if (n < 2) continue;
-            // insertion-sort by start, then check exact tiling
-            for (int a = 1; a < n; ++a) {
-                for (int b = a; b > 0 && starts[b] < starts[b - 1]; --b) {
-                    std::swap(starts[b], starts[b - 1]);
-                    std::swap(counts[b], counts[b - 1]);
-                }
-            }
-            uint32_t cursor = 0;
-            for (int a = 0; a < n && ok2; ++a) {
-                if (starts[a] != cursor) ok2 = false;
-                cursor += counts[a];
-            }
-            if (!ok2 || cursor != rc) continue;
-            // Candidate. Build per-slot result (unsorted, slot order);
-            // zero-count slots stay 0/0 regardless of their start dword.
-            uint32_t candStart[4] = {}, candCount[4] = {};
-            for (int s = 0; s < 4; ++s) {
-                if (segTris[s] == 0 || d[s][offIc] == 0) continue;
-                candStart[s] = d[s][offIs];
-                candCount[s] = d[s][offIc];
-            }
-            if (found) {
-                if (std::memcmp(candStart, bestStart, sizeof(candStart)) != 0 ||
-                    std::memcmp(candCount, bestCount, sizeof(candCount)) != 0) {
-                    return false;  // ambiguous encodings disagree -> reject
-                }
-            } else {
-                std::memcpy(bestStart, candStart, sizeof(candStart));
-                std::memcpy(bestCount, candCount, sizeof(candCount));
-                foundIc = offIc;
-                foundIs = offIs;
-                found = true;
-            }
-        }
-    }
-    if (!found) return false;
-    std::memcpy(outStart, bestStart, sizeof(bestStart));
-    std::memcpy(outCount, bestCount, sizeof(bestCount));
-    static std::atomic<int> sDescLogs{0};
-    const int n = sDescLogs.fetch_add(1, std::memory_order_relaxed);
-    if (n < 20) {
-        _MESSAGE("FO4RemixPlugin: [MergeSeg] #%d desc offsets count=+0x%X start=+0x%X "
-                 "ranges=[%u+%u,%u+%u,%u+%u,%u+%u] rc=%u",
-                 n, foundIc * 4, foundIs * 4,
-                 bestStart[0], bestCount[0], bestStart[1], bestCount[1],
-                 bestStart[2], bestCount[2], bestStart[3], bestCount[3], rc);
-    }
-    return true;
-}
-
 // ---- Merge-segment layout probe (2026-07-03) ----
-// The offset inference above came back UNRESOLVED on all 20 multi-segment
-// shapes in the first live run, so the (count,start) pair either isn't in
-// the +0x1D0 descriptors as plain dwords or doesn't satisfy the tiling
-// constraints as modeled. Dump enough raw layout to pin the true encoding
-// offline:
+// A descriptor-offset inference over the +0x1D0 chain used to live here; it
+// came back UNRESOLVED on all 20 multi-segment shapes in its one live run
+// and this probe's dumps showed why: +0x1D0 is not a per-segment descriptor
+// array at all (invalid 0xFF..FF pointer on the road cluster, polymorphic
+// vtabled objects and even raw index-buffer bytes at the "element" strides
+// elsewhere). The inference was deleted; DrawCapture (draw_capture.h)
+// provides the partition instead. The probe stays for layout questions:
 //   hdr      shape+0x188..+0x1CF as 18 dwords. +0x190 is the candidate
 //            per-slot record-count table (expect 9-and-4 dwords on the
 //            13-record road cluster), +0x1A0..0x1AC is the proven segTris
@@ -617,11 +484,14 @@ static bool HeapLikePtr(uint64_t q) {
 // Read the per-instance record stream of a BSMergeInstancedTriShape. See
 // the block comment at the top of this section for the reverse-engineered
 // source. Output: the raw validated 20-float records (rotation reading is
-// decided later against the records' own bounding spheres). Returns false
-// (out untouched) on ANY validation miss, and the caller falls back to the
-// pre-existing single-draw path.
+// decided later against the records' own bounding spheres), plus the raw
+// pointer IDENTITIES of the instance buffer and its paired SRV (wrapper
+// qwords 0 and 1) for DrawCapture matching -- no references are held.
+// Returns false (out untouched) on ANY validation miss, and the caller
+// falls back to the pre-existing single-draw path.
 static bool ReadMergeInstanceRecords(BSTriShape* tri,
-                                     std::vector<std::array<float, 20>>& out) {
+                                     std::vector<std::array<float, 20>>& out,
+                                     void** outBufPtr, void** outSrvPtr) {
     const auto heapLike = HeapLikePtr;
     // shape+0x170 -> wrapper; wrapper qword 0 -> structured instance buffer.
     uint64_t wrapPtr = 0;
@@ -634,6 +504,17 @@ static bool ReadMergeInstanceRecords(BSTriShape* tri,
     uint64_t vtbl = 0;
     if (!PeekQwordsGuarded(reinterpret_cast<const void*>(bufObj), &vtbl, 1)) return false;
     if (!PtrInD3D11(vtbl)) return false;
+    *outBufPtr = reinterpret_cast<void*>(bufObj);
+    // Wrapper qword 1 = the paired SRV on every v5 probe sample; validate
+    // the same way and pass null if it doesn't look like a D3D11 object.
+    *outSrvPtr = nullptr;
+    uint64_t srvObj = 0, srvVtbl = 0;
+    if (PeekQwordsGuarded(reinterpret_cast<const void*>(wrapPtr + 8), &srvObj, 1) &&
+        heapLike(srvObj) &&
+        PeekQwordsGuarded(reinterpret_cast<const void*>(srvObj), &srvVtbl, 1) &&
+        PtrInD3D11(srvVtbl)) {
+        *outSrvPtr = reinterpret_cast<void*>(srvObj);
+    }
 
     void* raw = nullptr;
     if (!QiGuarded(reinterpret_cast<void*>(bufObj), &__uuidof(ID3D11Buffer), &raw)) {
@@ -1053,17 +934,39 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // spots ("upside down"), while single-segment shapes (the fence lines
     // that proved the decode) were perfect.
     uint32_t instSegTris[4] = { 0, 0, 0, 0 };
+    void* instBufPtr = nullptr;   // identity only, for DrawCapture matching
+    void* instSrvPtr = nullptr;
     if (g_config.mergeInstanceExpansion && g_config.gpuInstancingEnabled) {
         char instLeaf[64] = "";
         SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
                                           instLeaf, sizeof(instLeaf));
         if (std::strstr(instLeaf, "MergeInstanced") != nullptr) {
-            const bool got = ReadMergeInstanceRecords(tri, instRecords);
+            const bool got = ReadMergeInstanceRecords(tri, instRecords,
+                                                      &instBufPtr, &instSrvPtr);
             if (got) {
                 uint64_t segQ[2] = {};
                 if (PeekQwordsGuarded(reinterpret_cast<const void*>(
                         reinterpret_cast<uintptr_t>(tri) + 0x1A0), segQ, 2)) {
                     std::memcpy(instSegTris, segQ, sizeof(instSegTris));
+                }
+                // Multi-segment shapes: ask DrawCapture for the engine's own
+                // draw parameters (per-sub-model index ranges + record
+                // partition). The engine draws the shape within a frame or
+                // two of the drawable appearing, so while the capture is
+                // pending, defer the whole resolve exactly like a
+                // not-yet-ready texture -- the retry path re-enters here.
+                // Deliberately placed BEFORE the [MergeInst] logging so
+                // deferrals don't burn the capped log counters.
+                int nzEarly = 0;
+                for (int s = 0; s < 4; ++s) {
+                    if (instSegTris[s]) ++nzEarly;
+                }
+                if (nzEarly >= 2 && g_config.mergeInstanceDrawCapture && instBufPtr) {
+                    std::vector<DrawCapture::SegDraw> capPeek;
+                    if (DrawCapture::Query(instBufPtr, instSrvPtr, hash, capPeek) ==
+                        DrawCapture::kCapturing) {
+                        return false;
+                    }
                 }
             }
             const NiTransform& W = tri->m_worldTransform;
@@ -1164,7 +1067,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             uint32_t triStart, triCount;    // into mesh.indices/3
             size_t   recStart, recCount;    // into instRecords
         };
-        SegDraw segs[4];
+        SegDraw segs[8];
         int nSegs = 0;
         {
             uint32_t totalSegTris = 0;
@@ -1175,27 +1078,111 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             }
             const uint32_t meshTris = (uint32_t)(mesh.indices.size() / 3);
             if (nonZero >= 2) {
-                // Preferred: exact per-segment record ranges from the
-                // +0x1D0 descriptors. Partitions are NOT generally equal:
-                // per-sub-model counts are independent (NumCombined per
-                // BSPackedGeomData -- 13 records = 9+4 on the Sanctuary
-                // road cluster; the subagent also proved a 15-record shape
-                // where the divisible 5/5/5 split is WRONG, true structure
-                // 8+7). No tri-sum gate here: the 4th +0x1A0 dword is not
-                // always a live segment (e.g. [352,320,320,1654] with only
-                // 3 record runs), so bounds-check each slot instead.
-                uint32_t rs[4] = {}, rn[4] = {};
-                if (ReadSegmentRecordRanges(tri, instSegTris, instRecords.size(), rs, rn)) {
-                    uint32_t triCursor = 0;
-                    for (int s = 0; s < 4; ++s) {
-                        if (!instSegTris[s]) continue;
-                        if (rn[s] > 0 && triCursor + instSegTris[s] <= meshTris) {
-                            segs[nSegs++] = { triCursor, instSegTris[s], rs[s], rn[s] };
+                // Preferred: the engine's own draw parameters, captured off
+                // DrawIndexedInstanced by matching this shape's instance-
+                // record SRV/buffer (draw_capture.h). The vanilla renderer
+                // knows the per-sub-model index ranges, the record
+                // partition (9+4 on the road cluster), and the active LOD
+                // slice -- ground truth the +0x1D0 descriptor inference
+                // never had (2026-07-03 probe: invalid pointer on the road
+                // cluster, polymorphic objects elsewhere). Any capture
+                // that doesn't validate falls through to the take-5 path.
+                if (g_config.mergeInstanceDrawCapture && instBufPtr) {
+                    std::vector<DrawCapture::SegDraw> cap;
+                    if (DrawCapture::Query(instBufPtr, instSrvPtr, hash, cap) ==
+                            DrawCapture::kReady &&
+                        !cap.empty()) {
+                        // Same record range drawn with different index
+                        // ranges = the same sub-model in different passes
+                        // (main view vs shadow LOD): keep the most
+                        // detailed. Distinct record ranges = distinct
+                        // sub-models.
+                        std::vector<DrawCapture::SegDraw> uniq;
+                        for (const auto& d : cap) {
+                            bool mergedIn = false;
+                            for (auto& u : uniq) {
+                                if (u.startInstance == d.startInstance &&
+                                    u.instanceCount == d.instanceCount) {
+                                    if (d.indexCount > u.indexCount) u = d;
+                                    mergedIn = true;
+                                    break;
+                                }
+                            }
+                            if (!mergedIn) uniq.push_back(d);
                         }
-                        triCursor += instSegTris[s];
+                        const uint32_t rc = (uint32_t)instRecords.size();
+                        bool ok = !uniq.empty() && uniq.size() <= 8;
+                        bool allZeroStart = true;
+                        for (const auto& d : uniq) {
+                            if (d.startInstance != 0) allZeroStart = false;
+                            if (d.baseVertex != 0 || d.startIndex % 3 != 0 ||
+                                d.indexCount == 0 || d.indexCount % 3 != 0 ||
+                                (uint64_t)d.startIndex + d.indexCount >
+                                    mesh.indices.size() ||
+                                d.instanceCount == 0 || d.instanceCount > rc) {
+                                ok = false;
+                                break;
+                            }
+                        }
+                        if (ok && uniq.size() > 1 && allZeroStart) {
+                            // Record offsets delivered via constant buffer,
+                            // not StartInstanceLocation: partition
+                            // cumulatively in draw order.
+                            std::sort(uniq.begin(), uniq.end(),
+                                      [](const DrawCapture::SegDraw& a,
+                                         const DrawCapture::SegDraw& b) {
+                                          return a.order < b.order;
+                                      });
+                            uint32_t cursor = 0;
+                            for (auto& d : uniq) {
+                                d.startInstance = cursor;
+                                cursor += d.instanceCount;
+                            }
+                            ok = (cursor == rc);
+                        } else if (ok) {
+                            std::sort(uniq.begin(), uniq.end(),
+                                      [](const DrawCapture::SegDraw& a,
+                                         const DrawCapture::SegDraw& b) {
+                                          return a.startInstance < b.startInstance;
+                                      });
+                            uint32_t cursor = 0;
+                            for (const auto& d : uniq) {
+                                if (d.startInstance != cursor) { ok = false; break; }
+                                cursor += d.instanceCount;
+                            }
+                            ok = ok && cursor == rc;
+                        }
+                        static std::atomic<int> sDrawLogs{0};
+                        const int dn = sDrawLogs.fetch_add(1, std::memory_order_relaxed);
+                        if (dn < 24) {
+                            char list[512];
+                            size_t pos = 0;
+                            list[0] = 0;
+                            for (size_t i = 0; i < cap.size() && i < 10; ++i) {
+                                const auto& d = cap[i];
+                                const int wln = snprintf(list + pos, sizeof(list) - pos,
+                                    "%s[idx %u+%u rec %u+%u bv%d]", i ? " " : "",
+                                    d.startIndex, d.indexCount, d.startInstance,
+                                    d.instanceCount, d.baseVertex);
+                                if (wln <= 0 || (size_t)wln >= sizeof(list) - pos) break;
+                                pos += (size_t)wln;
+                            }
+                            _MESSAGE("FO4RemixPlugin: [MergeDraw] #%d hash=0x%llX "
+                                     "raw=%zu uniq=%zu rc=%u meshTris=%u ok=%d %s",
+                                     dn, (unsigned long long)hash, cap.size(),
+                                     uniq.size(), rc, meshTris, ok ? 1 : 0, list);
+                        }
+                        if (ok) {
+                            for (const auto& d : uniq) {
+                                segs[nSegs++] = { d.startIndex / 3, d.indexCount / 3,
+                                                  (size_t)d.startInstance,
+                                                  (size_t)d.instanceCount };
+                            }
+                        }
                     }
-                } else if (totalSegTris == meshTris &&
-                           instRecords.size() % (size_t)nonZero == 0) {
+                }
+                if (nSegs == 0 && totalSegTris == meshTris &&
+                    instRecords.size() % (size_t)nonZero == 0) {
                     // Equal contiguous blocks on divisibility alone -- the
                     // take-5 semantics, restored 2026-07-03 after the live
                     // run: requiring bit-identical blocks here (plus the

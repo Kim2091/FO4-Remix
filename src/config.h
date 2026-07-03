@@ -201,6 +201,14 @@ struct PluginConfig {
     // (1,1) S^T*P; (0,1) S*P.
     bool mergeInstanceConjugate;
 
+    // Partition multi-segment merged shapes by capturing the engine's own
+    // DrawIndexedInstanced parameters for the shape's instance buffer
+    // (draw_capture.h): per-sub-model index ranges + record counts, exactly
+    // as vanilla renders them. Adds a DrawIndexedInstanced vtable hook
+    // (one atomic load per draw once idle). Off = take-5 heuristics only
+    // (equal-block split, else whole mesh x all records).
+    bool mergeInstanceDrawCapture;
+
     // Frame-rate target for the Remix render thread. The thread loop paces to
     // this by sleeping only the unused remainder of the frame budget after
     // OnFrame returns. 0 = uncapped (yield-only between frames).
