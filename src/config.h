@@ -186,12 +186,13 @@ struct PluginConfig {
     // full Remix mesh); silently inactive when that is off.
     bool mergeInstanceExpansion;
 
-    // Rotation convention of the 80-byte instance records. Default (true)
-    // treats the stored rows as basis rows (Bethesda row-vector GPU style,
-    // pos = mul(v, world)) and transposes into column-vector form. If
-    // instanced placements come out inverse-rotated (hedge corners / bent
-    // road pieces turned the wrong way), set false to read the rows as
-    // column-vector rotation rows directly.
+    // Fallback rotation convention of the 80-byte instance records, used
+    // only when the per-shape sphere election can't discriminate (the
+    // resolver checks each record's bounding sphere f[16..19] against the
+    // piece's transformed bound center and picks the reading that fits;
+    // see lighting_static.cpp). true = stored rows are basis rows
+    // (row-vector GPU style) transposed into column-vector form; false =
+    // rows read as column-vector rotation rows directly.
     bool mergeInstanceRowVector;
 
     // Frame-rate target for the Remix render thread. The thread loop paces to

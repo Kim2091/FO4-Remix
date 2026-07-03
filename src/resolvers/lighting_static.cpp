@@ -57,10 +57,15 @@ static bool PeekQwordsGuarded(const void* src, uint64_t* dst, int count) {
 //   f[15]     scale slot (1.0 on every observed record)
 //   f[16..19] extra (bounding sphere); unused here
 // The vanilla vertex shader fetches records by SV_InstanceID through the
-// SRV, so the rows are basis rows in Bethesda's row-vector GPU convention
-// (pos = mul(v, world)); the reader transposes them into the engine's
-// column-vector convention. [Precombines] MergeInstanceRowVector=0 flips
-// that interpretation if placements ever come out inverse-rotated.
+// SRV. Whether the stored rows are basis rows (row-vector convention,
+// needing a transpose into the engine's column-vector form) or the column
+// matrix's rows directly cannot be told from structure alone -- the two
+// sphere-bearing CPU records sampled in the v4 log split between the
+// readings. The resolver therefore ELECTS the convention per shape: the
+// piece's local bound center mapped through the correct transform must
+// land on the record's stored bounding sphere center (f[16..19]);
+// [Precombines] MergeInstanceRowVector is only the fallback when a shape
+// can't discriminate (near-centered piece or no usable sphere data).
 
 // Rows at f+a / f+b / f+c: near-equal squared lengths in (1e-4, 1e4)
 // (uniform scale folded into the rows is tolerated) and pairwise
@@ -165,15 +170,52 @@ static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t
     return got;
 }
 
-// Read the per-instance transform stream of a BSMergeInstancedTriShape.
-// See the block comment at the top of this section for the reverse-
-// engineered source and record layout. Output: one Bethesda-space
-// column-vector 3x4 per instance (row-major, translation in column 3),
-// cluster-local -- the caller composes each with the leaf world transform.
-// Returns false (out untouched) on ANY validation miss, and the caller
-// falls back to the pre-existing single-draw path.
-static bool ReadMergeInstanceTransforms(BSTriShape* tri,
-                                        std::vector<std::array<float, 12>>& out) {
+// Decode one 80-byte instance record into a Bethesda-space column-vector
+// 3x4 (row-major, translation in column 3). rowVector selects the rotation
+// reading: true = stored rows are basis rows (row-vector GPU convention,
+// transpose into column form), false = stored rows are the column-vector
+// matrix's rows directly.
+static void DecodeInstanceRecord(const float* f, bool rowVector, float m[12]) {
+    // f[15] is 1.0 on every observed record; treat as scale but range-guard
+    // so an unexpected semantic (a radius, say) can't explode geometry.
+    const float s = (f[15] > 0.01f && f[15] < 20.0f) ? f[15] : 1.0f;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            const float rij = rowVector ? f[j * 4 + i] : f[i * 4 + j];
+            m[i * 4 + j] = rij * s;
+        }
+        m[i * 4 + 3] = f[12 + i];
+    }
+}
+
+// out(v) == W(m(v)): compose the leaf world transform (applied second) with
+// a Beth-space 3x4 (applied first). Leaf scale is folded into out.
+static void ComposeLeafInstance(const NiTransform& W, const float m[12], float out[12]) {
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out[r * 4 + c] = W.scale * (W.rot.data[r][0] * m[0 * 4 + c] +
+                                        W.rot.data[r][1] * m[1 * 4 + c] +
+                                        W.rot.data[r][2] * m[2 * 4 + c]);
+        }
+        out[r * 4 + 3] += (&W.pos.x)[r];
+    }
+}
+
+static void ApplyXform3x4(const float m[12], const float p[3], float out[3]) {
+    for (int r = 0; r < 3; ++r) {
+        out[r] = m[r * 4 + 0] * p[0] + m[r * 4 + 1] * p[1] +
+                 m[r * 4 + 2] * p[2] + m[r * 4 + 3];
+    }
+}
+
+// Read the per-instance record stream of a BSMergeInstancedTriShape. See
+// the block comment at the top of this section for the reverse-engineered
+// source. Output: the raw validated 20-float records (rotation reading is
+// decided later against the records' own bounding spheres). Returns false
+// (out untouched) on ANY validation miss, and the caller falls back to the
+// pre-existing single-draw path.
+static bool ReadMergeInstanceRecords(BSTriShape* tri,
+                                     std::vector<std::array<float, 20>>& out) {
     const auto heapLike = [](uint64_t q) {
         return q >= 0x100000000ULL && q < 0x00007F0000000000ULL && (q & 7ULL) == 0ULL;
     };
@@ -208,28 +250,15 @@ static bool ReadMergeInstanceTransforms(BSTriShape* tri,
         std::vector<uint8_t> bytes;
         if (ReadbackBufferSlice(buf, 0, bd.ByteWidth, bytes) != bd.ByteWidth) break;
 
-        std::vector<std::array<float, 12>> xf(count);
+        std::vector<std::array<float, 20>> recs(count);
         bool valid = true;
         for (uint32_t k = 0; k < count; ++k) {
             const float* f = reinterpret_cast<const float*>(bytes.data() + k * kStride);
             if (!ValidRecordA(f)) { valid = false; break; }
-            // f[15] is 1.0 on every observed record; treat it as scale but
-            // range-guard so an unexpected semantic (a radius, say) can't
-            // explode geometry.
-            const float s = (f[15] > 0.01f && f[15] < 20.0f) ? f[15] : 1.0f;
-            auto& m = xf[k];
-            for (int i = 0; i < 3; ++i) {
-                for (int j = 0; j < 3; ++j) {
-                    const float rij = g_config.mergeInstanceRowVector
-                        ? f[j * 4 + i]   // stored rows are basis rows -> transpose
-                        : f[i * 4 + j];  // stored rows are column-vector rows
-                    m[i * 4 + j] = rij * s;
-                }
-                m[i * 4 + 3] = f[12 + i];
-            }
+            std::memcpy(recs[k].data(), f, 20 * sizeof(float));
         }
         if (!valid) break;
-        out = std::move(xf);
+        out = std::move(recs);
         ok = true;
     } while (false);
     buf->Release();
@@ -596,37 +625,128 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // ---- Merge-instanced transform read (2026-07-03) ----
     // BSMergeInstancedTriShape carries per-instance placements in a
     // structured D3D buffer the parser never sees (see the reader's block
-    // comment near the top of this file). Read them here; the submit section
-    // below expands the shape into one Remix drawable per instance. Empty
-    // instXforms = plain shape OR read fell through validation ->
-    // single-draw path, pre-fix behavior. Scoped to MergeInstanced only:
-    // BSMultiStreamInstanceTriShape (engine grass) has a different stream
-    // layout (v2 probe: 8000.0f fade distance at +0x190) and stays on the
-    // single-draw path until sampled properly.
-    std::vector<std::array<float, 12>> instXforms;
+    // comment near the top of this file). Read the raw records here and
+    // elect the rotation convention against the records' own bounding
+    // spheres; the submit section below expands the shape into one Remix
+    // drawable per instance. Empty instRecords = plain shape OR read fell
+    // through validation -> single-draw path, pre-fix behavior. Scoped to
+    // MergeInstanced only: BSMultiStreamInstanceTriShape (engine grass) has
+    // a different stream layout (v2 probe: 8000.0f fade distance at +0x190)
+    // and stays on the single-draw path until sampled properly.
+    std::vector<std::array<float, 20>> instRecords;
+    bool instRowVector = g_config.mergeInstanceRowVector;
     if (g_config.mergeInstanceExpansion && g_config.gpuInstancingEnabled) {
         char instLeaf[64] = "";
         SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
                                           instLeaf, sizeof(instLeaf));
         if (std::strstr(instLeaf, "MergeInstanced") != nullptr) {
-            const bool got = ReadMergeInstanceTransforms(tri, instXforms);
+            const bool got = ReadMergeInstanceRecords(tri, instRecords);
+            const NiTransform& W = tri->m_worldTransform;
+
+            // ---- Rotation-convention election (2026-07-03, take 2) ----
+            // First deployment used the row-vector reading unconditionally;
+            // the user report says placements still look wrong, and the two
+            // sphere-bearing CPU-side records sampled in the v4 log split
+            // between the conventions -- so measure instead of assume.
+            // f[16..19] of each record is the instance's bounding sphere.
+            // The piece's local bound center b (mesh bbox center) mapped
+            // through the CORRECT transform must land on the stored sphere
+            // center. Compute the summed error under both readings, in both
+            // candidate sphere spaces (world = after leaf compose, local =
+            // cluster space before it), and pick the winner when the piece
+            // is off-center enough (|b| >= 4) to discriminate. Shapes that
+            // can't discriminate use the session majority of decided shapes,
+            // then the [Precombines] MergeInstanceRowVector ini default.
+            static std::atomic<int> sRowVotes{0}, sColVotes{0};
+            float b[3] = {0, 0, 0};
+            float meshRadius = 0.0f;
+            float errW[2] = {0, 0}, errL[2] = {0, 0};  // [0]=row, [1]=col
+            int   nSph = 0;
+            if (got && !instRecords.empty() && !mesh.vertices.empty()) {
+                float mn[3] = { 3.4e38f, 3.4e38f, 3.4e38f };
+                float mx[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+                for (const auto& v : mesh.vertices) {
+                    for (int c = 0; c < 3; ++c) {
+                        if (v.position[c] < mn[c]) mn[c] = v.position[c];
+                        if (v.position[c] > mx[c]) mx[c] = v.position[c];
+                    }
+                }
+                float halfDiag = 0.0f;
+                for (int c = 0; c < 3; ++c) {
+                    b[c] = 0.5f * (mn[c] + mx[c]);
+                    const float h = 0.5f * (mx[c] - mn[c]);
+                    halfDiag += h * h;
+                }
+                meshRadius = std::sqrt(halfDiag);
+
+                for (const auto& rec : instRecords) {
+                    const float* sph = rec.data() + 16;
+                    if (!(std::isfinite(sph[0]) && std::isfinite(sph[1]) &&
+                          std::isfinite(sph[2]) && sph[3] > 0.1f && sph[3] < 1e5f)) {
+                        continue;
+                    }
+                    for (int conv = 0; conv < 2; ++conv) {
+                        float m[12], comp[12], pW[3], pL[3];
+                        DecodeInstanceRecord(rec.data(), conv == 0, m);
+                        ComposeLeafInstance(W, m, comp);
+                        ApplyXform3x4(comp, b, pW);
+                        ApplyXform3x4(m, b, pL);
+                        for (int c = 0; c < 3; ++c) {
+                            const float dW = pW[c] - sph[c];
+                            const float dL = pL[c] - sph[c];
+                            errW[conv] += dW * dW;
+                            errL[conv] += dL * dL;
+                        }
+                    }
+                    ++nSph;
+                }
+            }
+            const float bLen = std::sqrt(b[0]*b[0] + b[1]*b[1] + b[2]*b[2]);
+            const float minW = errW[0] < errW[1] ? errW[0] : errW[1];
+            const float minL = errL[0] < errL[1] ? errL[0] : errL[1];
+            const bool sphereIsWorld = minW <= minL;
+            const float errRow = sphereIsWorld ? errW[0] : errL[0];
+            const float errCol = sphereIsWorld ? errW[1] : errL[1];
+            const char* convSrc = "ini";
+            if (nSph > 0 && bLen >= 4.0f &&
+                (errRow < 0.64f * errCol || errCol < 0.64f * errRow)) {
+                instRowVector = errRow < errCol;
+                convSrc = "sphere";
+                (instRowVector ? sRowVotes : sColVotes)
+                    .fetch_add(1, std::memory_order_relaxed);
+            } else {
+                const int rv = sRowVotes.load(std::memory_order_relaxed);
+                const int cv = sColVotes.load(std::memory_order_relaxed);
+                if (rv + cv >= 5 && (rv >= 4 * cv || cv >= 4 * rv)) {
+                    instRowVector = rv > cv;
+                    convSrc = "vote";
+                }
+            }
+
             static std::atomic<int> sInstLogs{0};
             const int n = sInstLogs.fetch_add(1, std::memory_order_relaxed);
-            if (n < 40) {
-                const NiTransform& wx = tri->m_worldTransform;
-                if (got && !instXforms.empty()) {
-                    const auto& m0 = instXforms[0];
+            if (n < 60) {
+                if (got && !instRecords.empty()) {
+                    const float* f0 = instRecords[0].data();
+                    const float scl = (float)(nSph > 0 ? nSph : 1) * 3.0f;
                     _MESSAGE("FO4RemixPlugin: [MergeInst] #%d hash=0x%llX count=%zu "
                              "leafPos=(%.1f,%.1f,%.1f) t0=(%.1f,%.1f,%.1f) "
-                             "r0=[%.2f,%.2f,%.2f]",
-                             n, (unsigned long long)hash, instXforms.size(),
-                             wx.pos.x, wx.pos.y, wx.pos.z,
-                             m0[3], m0[7], m0[11], m0[0], m0[1], m0[2]);
+                             "b=(%.1f,%.1f,%.1f) meshR=%.1f nSph=%d "
+                             "rmsW=(%.1f,%.1f) rmsL=(%.1f,%.1f) space=%s conv=%s(%s) "
+                             "sph0=(%.1f,%.1f,%.1f r=%.1f)",
+                             n, (unsigned long long)hash, instRecords.size(),
+                             W.pos.x, W.pos.y, W.pos.z, f0[12], f0[13], f0[14],
+                             b[0], b[1], b[2], meshRadius, nSph,
+                             std::sqrt(errW[0] / scl), std::sqrt(errW[1] / scl),
+                             std::sqrt(errL[0] / scl), std::sqrt(errL[1] / scl),
+                             sphereIsWorld ? "world" : "local",
+                             instRowVector ? "row" : "col", convSrc,
+                             f0[16], f0[17], f0[18], f0[19]);
                 } else {
                     _MESSAGE("FO4RemixPlugin: [MergeInst] #%d hash=0x%llX stream read "
                              "FAILED -> single-draw fallback leafPos=(%.1f,%.1f,%.1f)",
                              n, (unsigned long long)hash,
-                             wx.pos.x, wx.pos.y, wx.pos.z);
+                             W.pos.x, W.pos.y, W.pos.z);
                 }
             }
         }
@@ -635,7 +755,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // ---- Submit to Remix ----
     ResolverTrace::g_lastStep.store(Trace::kSubmitStart, std::memory_order_relaxed);
 
-    if (!instXforms.empty()) {
+    if (!instRecords.empty()) {
         // Merge-instanced expansion: one drawable per hardware instance, all
         // sharing the parsed mesh -- the content-hash mesh cache collapses
         // them onto one Remix mesh/BLAS and OnFrame batches the bucket via
@@ -645,13 +765,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // state.extraMeshHashes for release alongside the base.
         //
         // Transform: records are cluster-local, so compose leaf-world (o)
-        // instance in Bethesda space and reuse BuildRemixTransform for the
-        // Beth->Remix axis swap. Column-vector compose W o M:
-        //   R_f = W.R * M.R (M.R carries any instance scale)
-        //   t_f = W.scale * (W.R * M.t) + W.pos,  scale_f = W.scale
-        // Every sampled leaf was translation-only identity/1.0, so this
-        // reduces to R_f = M.R, t_f = M.t + W.pos -- but compose generally
-        // in case a rotated/scaled cluster root exists somewhere.
+        // instance in Bethesda space (rotation reading per the sphere
+        // election above) and reuse BuildRemixTransform for the Beth->Remix
+        // axis swap. Every sampled leaf was translation-only identity/1.0,
+        // so the compose usually reduces to R_f = M.R, t_f = M.t + W.pos --
+        // but compose generally in case a rotated/scaled cluster root
+        // exists somewhere.
         //
         // Extras that fail (VRAM/budget gates) log and are skipped: the
         // cluster renders partially rather than blocking the base drawable.
@@ -659,10 +778,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // normal retry path re-runs the whole expansion.
         const NiTransform& W = tri->m_worldTransform;
         std::vector<uint64_t> extraHashes;
-        extraHashes.reserve(instXforms.size() - 1);
+        extraHashes.reserve(instRecords.size() - 1);
         size_t extrasFailed = 0;
-        for (size_t i = 0; i < instXforms.size(); ++i) {
-            const auto& M = instXforms[i];
+        for (size_t i = 0; i < instRecords.size(); ++i) {
+            float m[12], comp[12];
+            DecodeInstanceRecord(instRecords[i].data(), instRowVector, m);
+            ComposeLeafInstance(W, m, comp);
             // Raw buffer instead of `NiTransform xf;`: f4se_minimal declares
             // but does not define NiPoint3's default ctor, so constructing
             // NiTransform directly fails to link.
@@ -670,18 +791,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             NiTransform& xf = *reinterpret_cast<NiTransform*>(xfBuf);
             for (int r = 0; r < 3; ++r) {
                 for (int c = 0; c < 3; ++c) {
-                    xf.rot.data[r][c] = W.rot.data[r][0] * M[0 * 4 + c] +
-                                        W.rot.data[r][1] * M[1 * 4 + c] +
-                                        W.rot.data[r][2] * M[2 * 4 + c];
+                    xf.rot.data[r][c] = comp[r * 4 + c];
                 }
             }
-            xf.pos.x = W.scale * (W.rot.data[0][0] * M[3] + W.rot.data[0][1] * M[7] +
-                                  W.rot.data[0][2] * M[11]) + W.pos.x;
-            xf.pos.y = W.scale * (W.rot.data[1][0] * M[3] + W.rot.data[1][1] * M[7] +
-                                  W.rot.data[1][2] * M[11]) + W.pos.y;
-            xf.pos.z = W.scale * (W.rot.data[2][0] * M[3] + W.rot.data[2][1] * M[7] +
-                                  W.rot.data[2][2] * M[11]) + W.pos.z;
-            xf.scale = W.scale;
+            xf.pos.x = comp[3];
+            xf.pos.y = comp[7];
+            xf.pos.z = comp[11];
+            xf.scale = 1.0f;  // leaf scale already folded by ComposeLeafInstance
             SemanticCapture::BuildRemixTransform(xf, mesh.worldTransform);
 
             const uint64_t instHash = (i == 0)
@@ -701,7 +817,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         if (extrasFailed > 0) {
             _MESSAGE("FO4RemixPlugin: [MergeInst] hash=0x%llX %zu/%zu extra instances "
                      "failed to submit (cluster renders partially)",
-                     (unsigned long long)hash, extrasFailed, instXforms.size() - 1);
+                     (unsigned long long)hash, extrasFailed, instRecords.size() - 1);
         }
         state.extraMeshHashes = std::move(extraHashes);
     } else {
