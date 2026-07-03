@@ -1182,7 +1182,8 @@ void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMateri
 // Parse vertices and indices from a BSTriShape. Returns false if the shape
 // should be skipped (effect shader, missing data, NaN positions, bad indices).
 // When logRejections is false, NaN/Inf and bad-index rejections are silent.
-bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections)
+bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections,
+                                      bool applyVertexColors)
 {
     if (!shape || shape->numVertices == 0 || shape->numTriangles == 0)
         return false;
@@ -1282,8 +1283,10 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
             out_v.normal[2] = 1.0f;
         }
 
-        // Color
-        if (hasColors && oColor + 4 <= vertexSize) {
+        // Color. Gated on the shader property's SLSF2_Vertex_Colors flag
+        // (threaded in by the caller): FO4 meshes often carry a painted
+        // color stream the vanilla shader ignores unless the flag is set.
+        if (applyVertexColors && hasColors && oColor + 4 <= vertexSize) {
             memcpy(&out_v.color, v + oColor, 4);
         } else {
             out_v.color = 0xFFFFFFFF;

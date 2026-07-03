@@ -172,7 +172,15 @@ namespace BsExtraction {
 
     // Parse vertices and indices from a BSTriShape. Returns false if the shape
     // should be skipped (effect shader, missing data, NaN positions, bad indices).
-    bool ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections = true);
+    // applyVertexColors: whether the mesh's vertex-color stream (if present)
+    // is baked into the output vertices. Callers should pass the shader
+    // property's SLSF2_Vertex_Colors bit (merged flag bit 37) -- FO4 meshes
+    // often carry painted vertex colors (AO/blend masks, frequently
+    // near-black) that the vanilla shader IGNORES unless that flag is set;
+    // baking them unconditionally rendered whole objects black. When false
+    // (or when the mesh has no color stream), vertices get 0xFFFFFFFF.
+    bool ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections = true,
+                            bool applyVertexColors = true);
 
     // Get the BSLightingShaderMaterialBase from a shape, or nullptr
     BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape);

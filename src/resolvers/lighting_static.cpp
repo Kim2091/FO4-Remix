@@ -125,10 +125,32 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     ResolverTrace::g_lastStep.store(Trace::kCastOK, std::memory_order_relaxed);
 
+    // Shader-property flag word, read BEFORE the parse because the vertex-
+    // color gate below needs it. BSLightingShaderProperty::flags (UInt64 at
+    // +0x30) packs shader-flags-1 in the low 32 bits, shader-flags-2 high.
+    uint64_t propFlagsEarly = 0;
+    if (state.property) {
+        propFlagsEarly = *reinterpret_cast<uint64_t*>(
+            reinterpret_cast<uintptr_t>(state.property) + 0x30);
+    }
+
+    // Vertex-color gate. FO4 meshes routinely CARRY a vertex-color stream
+    // that the vanilla shader only multiplies in when SLSF2_Vertex_Colors
+    // (flags2 bit 5 -> merged bit 37; layout anchored by kTwoSided = bit 36
+    // and kDecal = bit 26, both independently confirmed) is set -- the data
+    // is otherwise a shader-specific mask (AO paint, blend weights), often
+    // near-black. Baking it unconditionally rendered whole objects black
+    // (power-armor stands, chain-link fences, workstations) while their
+    // textures loaded fine: the log's WorkstationChemistry propFlags
+    // 0x8180400281 has bit 37 CLEAR, yet its painted colors were applied.
+    constexpr uint64_t kFlag_VertexColors = 1ULL << 37;
+    const bool applyVertexColors = (propFlagsEarly & kFlag_VertexColors) != 0;
+
     // ---- Parse vertex / index data ----
     ResolverTrace::g_lastStep.store(Trace::kParseStart, std::memory_order_relaxed);
     ParsedGeometry parsed;
-    if (!BsExtraction::ParseShapeGeometry(tri, parsed, /*logRejections=*/g_config.logRejections)) {
+    if (!BsExtraction::ParseShapeGeometry(tri, parsed, /*logRejections=*/g_config.logRejections,
+                                          applyVertexColors)) {
         return false;
     }
 
@@ -153,18 +175,16 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
     BsExtraction::ExtractAlphaState(tri, mesh);
 
-    // Decal tag. BSLightingShaderProperty::flags (UInt64 at +0x30) packs
-    // shader-flags-1 in the lower 32 bits and shader-flags-2 in the upper.
-    // The decal bit is in flags1: bit 26, mask 0x04000000. Confirmed for FO4
-    // 1.10.980 by static analysis of the BGSM flag-applier at VA 0x142163480
-    // (called from BSLightingShaderProperty::SetMaterial at 0x142162D7C):
-    // it passes bit index 0x1A to SetFlag (RVA 0x02161950) for the decal
-    // path, gated on the same source byte that drives bit 27 (Dynamic_Decal,
-    // 0x08000000). Matches Skyrim's SLSF1_Decal layout. F4SE's published
-    // kShaderFlags_* enum at NiProperties.h:125-129 omits this flag.
-    if (state.property) {
-        const uint64_t propFlagsEarly = *reinterpret_cast<uint64_t*>(
-            reinterpret_cast<uintptr_t>(state.property) + 0x30);
+    // Decal tag. The decal bit is in flags1: bit 26, mask 0x04000000.
+    // Confirmed for FO4 1.10.980 by static analysis of the BGSM flag-applier
+    // at VA 0x142163480 (called from BSLightingShaderProperty::SetMaterial at
+    // 0x142162D7C): it passes bit index 0x1A to SetFlag (RVA 0x02161950) for
+    // the decal path, gated on the same source byte that drives bit 27
+    // (Dynamic_Decal, 0x08000000). Matches Skyrim's SLSF1_Decal layout.
+    // F4SE's published kShaderFlags_* enum at NiProperties.h:125-129 omits
+    // this flag. (propFlagsEarly is read above the parse, before the
+    // vertex-color gate.)
+    {
         constexpr uint64_t kSLSF1_Decal = 0x0000000004000000ULL;
         // Two-sided: bit 36 of the merged 64-bit flag word (flags2 bit 4).
         // CommonLibF4 BSShaderProperty::EShaderPropertyFlag kTwoSided = 1<<36;
