@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <vector>
+#include <unordered_set>
 #include <cmath>
 #include <cstring>
 
@@ -35,38 +36,360 @@ static bool PeekQwordsGuarded(const void* src, uint64_t* dst, int count) {
     }
 }
 
-// InstDiag v4 transform-stream scanner. Sweeps up to scanBytes behind a
-// candidate buffer pointer looking for windows that LOOK like per-instance
-// transform data: several rotation-range values (|v| <= 1.01) interleaved
-// with cluster-offset/world-range values (5 < |v| < 300000), plus an exact
-// 1.0f somewhere in the window (matrix diagonal / scale). Reports up to
-// maxHits hit offsets into outOffsets. Chunked SEH peeks so an unmapped
-// tail aborts the scan instead of crashing the resolve.
-static int ScanForTransformsGuarded(uint64_t base, int scanBytes,
-                                    int* outOffsets, int maxHits) {
-    int hits = 0;
-    float chunk[128];  // 512 bytes
-    for (int off = 0; off + 512 <= scanBytes && hits < maxHits; off += 512) {
-        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(base + off),
-                               reinterpret_cast<uint64_t*>(chunk), 64)) {
-            break;
-        }
-        for (int w = 0; w + 16 <= 128 && hits < maxHits; w += 4) {
-            int rotRange = 0, posRange = 0, exactOne = 0;
-            for (int i = 0; i < 16; ++i) {
-                const float v = chunk[w + i];
-                const float a = v < 0.0f ? -v : v;
-                if (a <= 1.01f) ++rotRange;
-                if (a > 5.0f && a < 300000.0f) ++posRange;
-                if (v == 1.0f) ++exactOne;
+// ---------------------------------------------------------------------------
+// InstDiag v5 (2026-07-03). v4 verdict: 64-byte [rot 3x4 | trans, 1.0]
+// records (plus a wider sphere-bearing variant) DO exist near several
+// wrapper members -- the format is confirmed -- but the 16KB heap sweep is
+// unbounded, so hits landed in neighboring allocations and could not be
+// attributed to the probed shape (#3 and #11 "found" the identical far-away
+// record; #5's index member hit far past its 0x480-byte payload). Also
+// shapes #1/#3 have NULL +0x1D0/+0x1D8, so the CPU-side aux object is not
+// universal. The per-shape D3D objects ARE universal: wrap+170.q0/.q1 and
+// wrap+178.q3 carry d3d11.dll vtables (two distinct ones -> buffer/SRV
+// pairs) and wrap+178.q0 is the shared pool. v5 interrogates those
+// directly:
+//   - QueryInterface for ID3D11Buffer / ID3D11ShaderResourceView (guarded;
+//     only attempted when the vtable lies inside d3d11.dll's image);
+//   - log descs: ByteWidth / StructureByteStride / BindFlags give record
+//     size and slice bounds; a buffer-dimension SRV's FirstElement /
+//     NumElements give the pool slice AND likely the instance count;
+//   - copy contents back through a STAGING buffer (bounded by ByteWidth,
+//     no neighbor ambiguity) and run a strict record-run detector.
+// Heap-side members (game vtables / raw data) get the same detector over a
+// SEH-snapshotted 16KB window so CPU-side candidates stay visible.
+//
+// The detector looks for consecutive fixed-stride records, each parsing as
+// three near-orthonormal rotation rows (uniform scale tolerated) plus a
+// finite translation, in either of two layouts:
+//   A: rows padded to 4 with EXACT 0.0f, translation row 4 = [t.xyz, s]
+//      (the 64-byte pattern v4 confirmed in the wild)
+//   B: HLSL float3x4 -- translation in column 3 (48-byte instance streams)
+// Translations are classified world-near-shape / cluster-local / zero so a
+// run can be attributed to the probed shape by content, and the run length
+// can be correlated against the +0x190 capacity dwords.
+
+// One detected run of fixed-stride transform records.
+struct XformRun {
+    int   stride = 0;    // bytes between record starts
+    int   phase  = 0;    // byte offset of the first record
+    int   count  = 0;    // consecutive valid records
+    char  layout = '-';  // 'A' or 'B' (see above)
+    int   nWorld = 0, nLocal = 0, nZero = 0;
+    float t0[3] = {}, t1[3] = {}, tN[3] = {};
+};
+
+// Rows at f+a / f+b / f+c: near-equal squared lengths in (1e-4, 1e4)
+// (uniform scale folded into the rows is tolerated) and pairwise
+// near-orthogonal. NaNs fail the range compares.
+static bool RotRowsPlausible(const float* f, int a, int b, int c) {
+    const float* r0 = f + a;
+    const float* r1 = f + b;
+    const float* r2 = f + c;
+    const float l0 = r0[0] * r0[0] + r0[1] * r0[1] + r0[2] * r0[2];
+    const float l1 = r1[0] * r1[0] + r1[1] * r1[1] + r1[2] * r1[2];
+    const float l2 = r2[0] * r2[0] + r2[1] * r2[1] + r2[2] * r2[2];
+    if (!(l0 > 1e-4f && l0 < 1e4f)) return false;
+    if (!(l1 > l0 * 0.72f && l1 < l0 * 1.38f)) return false;
+    if (!(l2 > l0 * 0.72f && l2 < l0 * 1.38f)) return false;
+    const float d01 = r0[0] * r1[0] + r0[1] * r1[1] + r0[2] * r1[2];
+    const float d02 = r0[0] * r2[0] + r0[1] * r2[1] + r0[2] * r2[2];
+    const float d12 = r1[0] * r2[0] + r1[1] * r2[1] + r1[2] * r2[2];
+    const float tol = 0.12f * l0;
+    return std::fabs(d01) < tol && std::fabs(d02) < tol && std::fabs(d12) < tol;
+}
+
+static bool TransPlausible(float x, float y, float z) {
+    return std::isfinite(x) && std::isfinite(y) && std::isfinite(z) &&
+           std::fabs(x) < 1e6f && std::fabs(y) < 1e6f && std::fabs(z) < 1e6f;
+}
+
+// Layout A, 16 floats: rows (0..2)(4..6)(8..10), pads 3/7/11 exactly 0,
+// translation 12..14, slot 15 = scale/1.0/radius in [0, 1e5).
+static bool ValidRecordA(const float* f) {
+    if (f[3] != 0.0f || f[7] != 0.0f || f[11] != 0.0f) return false;
+    if (!RotRowsPlausible(f, 0, 4, 8)) return false;
+    if (!TransPlausible(f[12], f[13], f[14])) return false;
+    return f[15] == 0.0f || (f[15] > 1e-4f && f[15] < 1e5f);
+}
+
+// Layout B, 12 floats: rows (0..2)(4..6)(8..10), translation 3/7/11.
+static bool ValidRecordB(const float* f) {
+    if (!RotRowsPlausible(f, 0, 4, 8)) return false;
+    return TransPlausible(f[3], f[7], f[11]);
+}
+
+// 0=zero 1=cluster-local 2=world-near-shape 3=far (someone else's data)
+static int ClassifyTrans(const float t[3], const float wpos[3]) {
+    if (std::fabs(t[0]) < 0.01f && std::fabs(t[1]) < 0.01f && std::fabs(t[2]) < 0.01f) return 0;
+    if (std::fabs(t[0] - wpos[0]) < 8192.0f && std::fabs(t[1] - wpos[1]) < 8192.0f &&
+        std::fabs(t[2] - wpos[2]) < 8192.0f) return 2;
+    if (std::fabs(t[0]) < 8192.0f && std::fabs(t[1]) < 8192.0f && std::fabs(t[2]) < 8192.0f) return 1;
+    return 3;
+}
+
+// Longest fixed-stride run of valid records in [0, size), first record no
+// deeper than maxPhase. Layout A wins ties (stricter validation).
+static XformRun FindBestXformRun(const uint8_t* data, size_t size,
+                                 const float wpos[3], int maxPhase = 1 << 30) {
+    XformRun best;
+    if (size < 64) return best;
+    const size_t nOff = (size - 64) / 8 + 1;  // 8-byte-aligned record starts
+    std::vector<uint8_t> validA(nOff), validB(nOff);
+    for (size_t i = 0; i < nOff; ++i) {
+        const float* f = reinterpret_cast<const float*>(data + i * 8);
+        validA[i] = ValidRecordA(f) ? 1 : 0;
+        validB[i] = ValidRecordB(f) ? 1 : 0;
+    }
+    static const int kStrides[] = { 48, 64, 80, 96, 112, 128, 144, 160,
+                                    176, 184, 192, 208, 224, 240, 256 };
+    std::vector<int> run(nOff);
+    const char layouts[2] = { 'A', 'B' };
+    for (char layout : layouts) {
+        const std::vector<uint8_t>& valid = (layout == 'A') ? validA : validB;
+        for (int s : kStrides) {
+            if (layout == 'A' && s < 64) continue;
+            const size_t step = (size_t)s / 8;
+            for (size_t i = nOff; i-- > 0;) {
+                run[i] = valid[i] ? (i + step < nOff ? run[i + step] + 1 : 1) : 0;
             }
-            if (posRange >= 2 && rotRange >= 6 && exactOne >= 1) {
-                outOffsets[hits++] = off + w * 4;
-                w += 60;  // skip past this window before rescanning
+            for (size_t i = 0; i < nOff; ++i) {
+                if (!run[i] || i * 8 > (size_t)maxPhase) continue;
+                if (i >= step && run[i - step] > run[i]) continue;  // mid-run
+                if (run[i] > best.count) {
+                    best.stride = s;
+                    best.phase  = (int)(i * 8);
+                    best.count  = run[i];
+                    best.layout = layout;
+                }
             }
         }
     }
-    return hits;
+    if (best.count) {
+        for (int k = 0; k < best.count; ++k) {
+            const float* f = reinterpret_cast<const float*>(
+                data + best.phase + (size_t)k * best.stride);
+            float t[3];
+            if (best.layout == 'A') { t[0] = f[12]; t[1] = f[13]; t[2] = f[14]; }
+            else                    { t[0] = f[3];  t[1] = f[7];  t[2] = f[11]; }
+            const int c = ClassifyTrans(t, wpos);
+            if (c == 0) ++best.nZero;
+            else if (c == 1) ++best.nLocal;
+            else if (c == 2) ++best.nWorld;
+            if (k == 0)              std::memcpy(best.t0, t, sizeof(t));
+            if (k == 1)              std::memcpy(best.t1, t, sizeof(t));
+            if (k == best.count - 1) std::memcpy(best.tN, t, sizeof(t));
+        }
+    }
+    return best;
+}
+
+// True when p lies inside d3d11.dll's loaded image -- the only vtables we
+// dare QueryInterface. Game-exe vtables (0x7FF7A7...) must NOT get a
+// virtual slot-0 call (that's usually the scalar dtor).
+static bool PtrInD3D11(uint64_t p) {
+    static uint64_t base = 0, end = 0;
+    if (!base) {
+        HMODULE m = GetModuleHandleA("d3d11.dll");
+        if (m) {
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(m);
+            const IMAGE_DOS_HEADER* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(b);
+            const IMAGE_NT_HEADERS64* nt =
+                reinterpret_cast<const IMAGE_NT_HEADERS64*>(b + dos->e_lfanew);
+            base = reinterpret_cast<uint64_t>(b);
+            end  = base + nt->OptionalHeader.SizeOfImage;
+        } else {
+            base = 1;  // sentinel: looked once, d3d11.dll not loaded
+        }
+    }
+    return p >= base && p < end;
+}
+
+// POD-only SEH QueryInterface: the object was only vtable-sniffed, so the
+// call itself is guarded. Returns 1 and writes *out on S_OK.
+static int QiGuarded(void* obj, const GUID* iid, void** out) {
+    __try {
+        return static_cast<IUnknown*>(obj)->QueryInterface(*iid, out) == S_OK ? 1 : 0;
+    } __except (1) {
+        return 0;
+    }
+}
+
+// SEH-snapshot up to `bytes` from a heap candidate into `out` (512-byte
+// chunks; stops at the first unmapped chunk). Returns bytes captured.
+static size_t SnapshotHeapGuarded(uint64_t src, std::vector<uint8_t>& out, size_t bytes) {
+    out.resize(bytes);
+    size_t got = 0;
+    while (got + 512 <= bytes) {
+        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(src + got),
+                               reinterpret_cast<uint64_t*>(out.data() + got), 64)) {
+            break;
+        }
+        got += 512;
+    }
+    out.resize(got);
+    return got;
+}
+
+// Copy `bytes` at `srcOff` of a buffer through a staging buffer created on
+// the buffer's OWN device (which may differ from the resolver's device).
+// Blocking Map -- acceptable for a capped one-shot diagnostic; the texture
+// readback in bs_extraction does the same on this thread.
+static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t bytes,
+                                    std::vector<uint8_t>& out) {
+    ID3D11Device* dev = nullptr;
+    buf->GetDevice(&dev);
+    if (!dev) return 0;
+    uint32_t got = 0;
+    D3D11_BUFFER_DESC sd = {};
+    sd.ByteWidth      = bytes;
+    sd.Usage          = D3D11_USAGE_STAGING;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Buffer* staging = nullptr;
+    if (SUCCEEDED(dev->CreateBuffer(&sd, nullptr, &staging)) && staging) {
+        ID3D11DeviceContext* ctx = nullptr;
+        dev->GetImmediateContext(&ctx);
+        if (ctx) {
+            D3D11_BOX box = { srcOff, 0, 0, srcOff + bytes, 1, 1 };
+            ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, buf, 0, &box);
+            D3D11_MAPPED_SUBRESOURCE ms = {};
+            if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &ms))) {
+                out.resize(bytes);
+                std::memcpy(out.data(), ms.pData, bytes);
+                ctx->Unmap(staging, 0);
+                got = bytes;
+            }
+            ctx->Release();
+        }
+        staging->Release();
+    }
+    dev->Release();
+    return got;
+}
+
+// Bytes per element for the typed-SRV formats BSGraphics plausibly uses for
+// an instance stream; 0 = unknown (skip content readback, desc still logs).
+static uint32_t DxgiElementSize(DXGI_FORMAT f) {
+    switch (f) {
+        case DXGI_FORMAT_R32G32B32A32_TYPELESS:
+        case DXGI_FORMAT_R32G32B32A32_FLOAT:
+        case DXGI_FORMAT_R32G32B32A32_UINT:   return 16;
+        case DXGI_FORMAT_R32G32B32_FLOAT:     return 12;
+        case DXGI_FORMAT_R32G32_FLOAT:        return 8;
+        case DXGI_FORMAT_R16G16B16A16_FLOAT:  return 8;
+        case DXGI_FORMAT_R32_TYPELESS:
+        case DXGI_FORMAT_R32_FLOAT:
+        case DXGI_FORMAT_R32_UINT:            return 4;
+        default:                              return 0;
+    }
+}
+
+static void LogXformRun(int n, int wrapOff, int bi, const char* src, const XformRun& r) {
+    if (r.count < 3) {
+        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d       %s +%X.q%d no-run", n, src, wrapOff, bi);
+        return;
+    }
+    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d       %s +%X.q%d run%c s=%d p=0x%X c=%d "
+             "w=%d l=%d z=%d t0=(%.1f,%.1f,%.1f) t1=(%.1f,%.1f,%.1f) tN=(%.1f,%.1f,%.1f)",
+             n, src, wrapOff, bi, r.layout, r.stride, r.phase, r.count,
+             r.nWorld, r.nLocal, r.nZero,
+             r.t0[0], r.t0[1], r.t0[2], r.t1[0], r.t1[1], r.t1[2],
+             r.tN[0], r.tN[1], r.tN[2]);
+}
+
+// Probe one heap-like wrapper member: d3d11 COM objects get QI + desc +
+// bounded readback; everything else gets a 16KB SEH heap snapshot. Both
+// paths feed the record-run detector. wpos = probed shape's world position
+// (for run attribution by translation content).
+static void InstDiagProbeMember(int n, int wrapOff, int bi, uint64_t member,
+                                const uint64_t head[2], ID3D11Device* resolverDev,
+                                const float wpos[3]) {
+    constexpr uint32_t kGpuCap = 512 * 1024;
+    std::vector<uint8_t> bytes;
+
+    if (PtrInD3D11(head[0])) {
+        void* raw = nullptr;
+        if (QiGuarded(reinterpret_cast<void*>(member), &__uuidof(ID3D11Buffer), &raw)) {
+            ID3D11Buffer* buf = static_cast<ID3D11Buffer*>(raw);
+            D3D11_BUFFER_DESC bd = {};
+            buf->GetDesc(&bd);
+            ID3D11Device* bufDev = nullptr;
+            buf->GetDevice(&bufDev);
+            _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX BUF bw=%u usage=%u "
+                     "bind=0x%X cpu=0x%X misc=0x%X ss=%u dev=%s",
+                     n, wrapOff, bi, (unsigned long long)member,
+                     bd.ByteWidth, (unsigned)bd.Usage, bd.BindFlags,
+                     bd.CPUAccessFlags, bd.MiscFlags, bd.StructureByteStride,
+                     bufDev == resolverDev ? "same" : "OTHER");
+            if (bufDev) bufDev->Release();
+            const uint32_t want = bd.ByteWidth < kGpuCap ? bd.ByteWidth : kGpuCap;
+            if (want >= 64 && ReadbackBufferSlice(buf, 0, want, bytes)) {
+                LogXformRun(n, wrapOff, bi, "gpu",
+                            FindBestXformRun(bytes.data(), bytes.size(), wpos));
+                // Second look pinned to the buffer head: an instance stream
+                // in its own buffer starts at phase ~0 even if some longer
+                // accidental run exists deeper in a pooled buffer.
+                XformRun headRun = FindBestXformRun(bytes.data(), bytes.size(), wpos, 256);
+                if (headRun.count >= 3) LogXformRun(n, wrapOff, bi, "gpu-head", headRun);
+            }
+            buf->Release();
+            return;
+        }
+        if (QiGuarded(reinterpret_cast<void*>(member),
+                      &__uuidof(ID3D11ShaderResourceView), &raw)) {
+            ID3D11ShaderResourceView* srv = static_cast<ID3D11ShaderResourceView*>(raw);
+            D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+            srv->GetDesc(&sv);
+            ID3D11Resource* res = nullptr;
+            srv->GetResource(&res);
+            ID3D11Buffer* buf = nullptr;
+            if (res) res->QueryInterface(__uuidof(ID3D11Buffer),
+                                         reinterpret_cast<void**>(&buf));
+            D3D11_BUFFER_DESC bd = {};
+            if (buf) buf->GetDesc(&bd);
+            const uint32_t first = (sv.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
+                                       ? sv.Buffer.FirstElement : 0;
+            const uint32_t num   = (sv.ViewDimension == D3D11_SRV_DIMENSION_BUFFER)
+                                       ? sv.Buffer.NumElements : 0;
+            _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX SRV fmt=%u dim=%u "
+                     "first=%u num=%u -> buf bw=%u ss=%u bind=0x%X misc=0x%X",
+                     n, wrapOff, bi, (unsigned long long)member,
+                     (unsigned)sv.Format, (unsigned)sv.ViewDimension, first, num,
+                     bd.ByteWidth, bd.StructureByteStride, bd.BindFlags, bd.MiscFlags);
+            if (buf && num > 0) {
+                const uint32_t es = bd.StructureByteStride ? bd.StructureByteStride
+                                                           : DxgiElementSize(sv.Format);
+                if (es > 0) {
+                    uint64_t off = (uint64_t)first * es;
+                    uint64_t len = (uint64_t)num * es;
+                    if (off < bd.ByteWidth && len >= 64) {
+                        if (off + len > bd.ByteWidth) len = bd.ByteWidth - off;
+                        if (len > kGpuCap) len = kGpuCap;
+                        if (ReadbackBufferSlice(buf, (uint32_t)off, (uint32_t)len, bytes)) {
+                            LogXformRun(n, wrapOff, bi, "srv",
+                                        FindBestXformRun(bytes.data(), bytes.size(), wpos));
+                        }
+                    }
+                }
+            }
+            if (buf) buf->Release();
+            if (res) res->Release();
+            srv->Release();
+            return;
+        }
+        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX d3d11-other vtbl=%016llX",
+                 n, wrapOff, bi, (unsigned long long)member, (unsigned long long)head[0]);
+        return;
+    }
+
+    // Heap-side candidate (game vtable or raw data): bounded-ish snapshot.
+    const size_t got = SnapshotHeapGuarded(member, bytes, 16384);
+    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX heap head=[%016llX %016llX] got=%zu",
+             n, wrapOff, bi, (unsigned long long)member,
+             (unsigned long long)head[0], (unsigned long long)head[1], got);
+    if (got >= 64) {
+        LogXformRun(n, wrapOff, bi, "heap",
+                    FindBestXformRun(bytes.data(), bytes.size(), wpos));
+    }
 }
 
 // In-flight resolver state. Updated at each gate inside TryResolveStatic
@@ -282,22 +605,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                          wx.scale, lx.pos.x, lx.pos.y, lx.pos.z, lx.scale,
                          mn[0], mn[1], mn[2], mx[0], mx[1], mx[2]);
 
-                // Parent chain (two levels): placement info on the graph.
-                NiNode* ip = tri->m_parent;
-                for (int lvl = 0; lvl < 2 && ip; ++lvl) {
-                    char pLeaf[64] = "";
-                    SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(ip),
-                                                      pLeaf, sizeof(pLeaf));
-                    const NiTransform& pw = ip->m_worldTransform;
-                    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   parent%d class=%s name=\"%s\" "
-                             "worldPos=(%.1f,%.1f,%.1f) worldRot0=(%.3f,%.3f,%.3f) scale=%.3f",
-                             n, lvl + 1, pLeaf,
-                             ip->m_name.c_str() ? ip->m_name.c_str() : "",
-                             pw.pos.x, pw.pos.y, pw.pos.z,
-                             pw.rot.data[0][0], pw.rot.data[0][1], pw.rot.data[0][2],
-                             pw.scale);
-                    ip = ip->m_parent;
-                }
+                // Parent-chain logging retired in v5: v2-v4 showed identity
+                // world transforms on both parents for every merged shape.
 
                 // v3 two-level chase (2026-07-03). v2 established the
                 // BSMergeInstancedTriShape member picture:
@@ -352,25 +661,24 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         // raw[3], and the per-shape unknowns +0x1D0/+0x1D8 =
                         // raw[14]/raw[15].
                         //
-                        // v4: for every heap-like member of each wrapper,
-                        // (a) type it by its first qword (module-space q0 =
-                        // C++ object vtable, e.g. a d3d11.dll COM buffer --
-                        // meaning the instance data is GPU-only), and
-                        // (b) run the transform-stream scanner over 16KB
-                        // behind it. v3's fixed 24-float windows found an
-                        // identity-matrix pattern behind wrap+1D8.q5 but
-                        // were too small to prove an array follows.
+                        // v5: every heap-like member of each wrapper goes
+                        // through InstDiagProbeMember -- d3d11 COM objects
+                        // get QI + desc + bounded staging readback, heap
+                        // objects get a 16KB SEH snapshot; both feed the
+                        // strict record-run detector (see helpers above).
+                        const float wpos[3] = { wx.pos.x, wx.pos.y, wx.pos.z };
                         const int wrapperIdx[4] = { 2, 3, 14, 15 };
                         for (int wi = 0; wi < 4; ++wi) {
                             const uint64_t wq = raw[wrapperIdx[wi]];
                             if (!heapLike(wq)) continue;
+                            const int wrapOff = 0x160 + wrapperIdx[wi] * 8;
                             uint64_t wbody[8] = {};
                             if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wq), wbody, 8)) {
                                 continue;
                             }
                             _MESSAGE("FO4RemixPlugin: [InstDiag] #%d   wrap@+%X=%016llX "
                                      "q=[%016llX %016llX %016llX %016llX %016llX %016llX %016llX %016llX]",
-                                     n, 0x160 + wrapperIdx[wi] * 8, (unsigned long long)wq,
+                                     n, wrapOff, (unsigned long long)wq,
                                      (unsigned long long)wbody[0], (unsigned long long)wbody[1],
                                      (unsigned long long)wbody[2], (unsigned long long)wbody[3],
                                      (unsigned long long)wbody[4], (unsigned long long)wbody[5],
@@ -381,34 +689,29 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                 if (!PeekQwordsGuarded(reinterpret_cast<const void*>(wbody[bi]), head, 4)) {
                                     continue;
                                 }
-                                const bool vtObj = head[0] >= 0x00007FF000000000ULL;
-                                int hitOff[4] = {};
-                                const int nHits = ScanForTransformsGuarded(wbody[bi], 16384, hitOff, 4);
-                                _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     wrap+%X.q%d=%016llX head=[%016llX %016llX] "
-                                         "%s scanHits=%d at[%X %X %X %X]",
-                                         n, 0x160 + wrapperIdx[wi] * 8, bi,
-                                         (unsigned long long)wbody[bi],
-                                         (unsigned long long)head[0], (unsigned long long)head[1],
-                                         vtObj ? "VTOBJ" : "data", nHits,
-                                         nHits > 0 ? hitOff[0] : 0, nHits > 1 ? hitOff[1] : 0,
-                                         nHits > 2 ? hitOff[2] : 0, nHits > 3 ? hitOff[3] : 0);
-                                // Print the first hit's 24 floats so the
-                                // stride/layout is readable straight from
-                                // the log.
-                                if (nHits > 0) {
-                                    uint64_t fq[12] = {};
-                                    if (PeekQwordsGuarded(
-                                            reinterpret_cast<const void*>(wbody[bi] + (uint64_t)hitOff[0]),
-                                            fq, 12)) {
-                                        const float* ff = reinterpret_cast<const float*>(fq);
-                                        _MESSAGE("FO4RemixPlugin: [InstDiag] #%d       hit+%X f=[%.2f %.2f %.2f %.2f %.2f %.2f "
-                                                 "%.2f %.2f %.2f %.2f %.2f %.2f | %.2f %.2f %.2f %.2f %.2f %.2f "
-                                                 "%.2f %.2f %.2f %.2f %.2f %.2f]",
-                                                 n, hitOff[0],
-                                                 ff[0], ff[1], ff[2], ff[3], ff[4], ff[5],
-                                                 ff[6], ff[7], ff[8], ff[9], ff[10], ff[11],
-                                                 ff[12], ff[13], ff[14], ff[15], ff[16], ff[17],
-                                                 ff[18], ff[19], ff[20], ff[21], ff[22], ff[23]);
+                                // Shared objects (the D3D pool, per-cell CPU
+                                // structures) recur across shapes; probe each
+                                // pointer once per session.
+                                static std::unordered_set<uint64_t> sProbed;
+                                if (!sProbed.insert(wbody[bi]).second) {
+                                    _MESSAGE("FO4RemixPlugin: [InstDiag] #%d     +%X.q%d=%016llX seen",
+                                             n, wrapOff, bi, (unsigned long long)wbody[bi]);
+                                    continue;
+                                }
+                                InstDiagProbeMember(n, wrapOff, bi, wbody[bi], head, device, wpos);
+
+                                // +0x1D0.q0 points at an array of 0xB8-strided
+                                // descriptors (v4: *(q0)+0xB8 == q4 exactly,
+                                // q1 == 4 == the +0x1A0 segment count). Chase
+                                // one level into the element pool; logged as
+                                // q8 to mark the synthetic slot.
+                                if (wrapperIdx[wi] == 14 && bi == 0 && heapLike(head[0]) &&
+                                    sProbed.insert(head[0]).second) {
+                                    uint64_t ehead[2] = {};
+                                    if (PeekQwordsGuarded(reinterpret_cast<const void*>(head[0]),
+                                                          ehead, 2)) {
+                                        InstDiagProbeMember(n, wrapOff, 8, head[0], ehead,
+                                                            device, wpos);
                                     }
                                 }
                             }
