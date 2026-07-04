@@ -85,8 +85,16 @@ struct Watch {
                                    // drawable: exempt from kDeadlineMs
     uint32_t expectedIdx[4] = {};  // segTris[s]*3 for nonzero, sane slots
     int      nExpected = 0;
-    // Baked-chunk capture (run-6 model), same cur/done frame-roll pattern.
-    static constexpr int kMaxChunks = 32;
+    // Upgrade bookkeeping: cdone[] ACCUMULATES across frames (the engine
+    // draws only the pieces visible in a given frame, so any one frame is
+    // a subset of the cluster); consumedChunks = cdoneCount at the last
+    // upgrade so set GROWTH is detectable; upgradesServed caps re-resolve
+    // churn per shape.
+    int      consumedChunks = 0;
+    uint32_t upgradesServed = 0;
+    // Baked-chunk capture (run-6 model): ccur[] collects within a frame,
+    // RollChunks MERGES it into the accumulated cdone[] union.
+    static constexpr int kMaxChunks = 64;
     uint32_t  ccurFrame = 0;
     int       ccurCount = 0;
     ChunkDraw ccur[kMaxChunks];
@@ -187,9 +195,20 @@ static void RollFrame(Watch& w) {
 }
 
 static void RollChunks(Watch& w) {
-    if (w.ccurCount > 0) {
-        std::memcpy(w.cdone, w.ccur, sizeof(ChunkDraw) * (size_t)w.ccurCount);
-        w.cdoneCount = w.ccurCount;
+    // MERGE the frame's chunk draws into the accumulated union instead of
+    // replacing it: one frame only contains the pieces the engine deemed
+    // visible, so replacement made every capture a view-dependent subset
+    // (run 5: half-empty bakes -> holes). Dedup key = (ib, offset, count).
+    for (int i = 0; i < w.ccurCount; ++i) {
+        const ChunkDraw& c = w.ccur[i];
+        bool dup = false;
+        for (int k = 0; k < w.cdoneCount && !dup; ++k) {
+            dup = w.cdone[k].ib == c.ib && w.cdone[k].ibOffset == c.ibOffset &&
+                  w.cdone[k].idxCount == c.idxCount;
+        }
+        if (!dup && w.cdoneCount < Watch::kMaxChunks) {
+            w.cdone[w.cdoneCount++] = c;
+        }
     }
     w.ccurCount = 0;
 }
@@ -595,12 +614,25 @@ bool Rearm(uint64_t key) {
 bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
                  const uint32_t segTris[4]) {
     if (!Hooked()) return false;
+    constexpr uint32_t kMaxUpgradesPerShape = 6;
     const uint64_t now = GetTickCount64();
     std::lock_guard<std::mutex> g(g_lock);
     for (Watch& c : g_watches) {
         if (c.state == Watch::kFree || c.key != key) continue;
+        if (c.upgradesServed >= kMaxUpgradesPerShape) {
+            // Enough resubmissions for this shape; stop hunting and free
+            // the slot for others (entry lingers as evictable).
+            if (c.state == Watch::kActive) {
+                c.state = Watch::kExpired;
+                g_activeCount.fetch_sub(1, std::memory_order_relaxed);
+            }
+            return false;
+        }
         if (c.state == Watch::kDone) {
-            return c.doneCount > 0 || c.cdoneCount > 0;
+            // Only report when the accumulated union GREW past what the
+            // last upgrade consumed -- otherwise every poll would re-serve
+            // the same set and churn resubmissions.
+            return c.cdoneCount > c.consumedChunks;
         }
         if (c.state == Watch::kExpired) {
             c.state = Watch::kActive;
@@ -610,16 +642,17 @@ bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
             c.curCount = 0;
             c.doneCount = 0;
             c.ccurCount = 0;
-            c.cdoneCount = 0;
+            // cdone[] union intentionally KEPT: it's the accumulated
+            // coverage; stale entries are cheap to re-drop at bake time.
             g_activeCount.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-        // kActive: roll completed frames so a finished capture is visible
-        // on this poll instead of waiting for the next draw/Query.
+        // kActive: roll completed frames so fresh chunk draws land in the
+        // union on this poll instead of waiting for the next draw/Query.
         const uint32_t f = g_frame.load(std::memory_order_relaxed);
         if (c.curCount > 0 && c.curFrame < f) RollFrame(c);
         if (c.ccurCount > 0 && c.ccurFrame < f) RollChunks(c);
-        if (c.doneCount > 0 || c.cdoneCount > 0) {
+        if (c.cdoneCount > c.consumedChunks) {
             c.state = Watch::kDone;
             g_activeCount.fetch_sub(1, std::memory_order_relaxed);
             return true;
@@ -653,6 +686,25 @@ bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
     victim->registeredFrame = g_frame.load(std::memory_order_relaxed);
     g_activeCount.fetch_add(1, std::memory_order_relaxed);
     return false;
+}
+
+void MarkConsumed(uint64_t key) {
+    std::lock_guard<std::mutex> g(g_lock);
+    for (Watch& c : g_watches) {
+        if (c.state == Watch::kFree || c.key != key) continue;
+        // Budget only burns on GROWTH: post-cull re-resolves re-consume the
+        // same union and shouldn't count against the shape.
+        if (c.cdoneCount > c.consumedChunks) ++c.upgradesServed;
+        c.consumedChunks = c.cdoneCount;
+        if (c.state != Watch::kActive) {
+            c.state = Watch::kActive;
+            c.upgradeHunt = true;
+            c.registeredTick = GetTickCount64();
+            c.registeredFrame = g_frame.load(std::memory_order_relaxed);
+            g_activeCount.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
 }
 
 void ResetAll() {

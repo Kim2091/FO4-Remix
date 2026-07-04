@@ -78,6 +78,12 @@ bool Rearm(uint64_t key);
 bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
                  const uint32_t segTris[4]);
 
+// The resolver consumed the current accumulated chunk union for an upgrade
+// (or initial bake): snapshot the consumed count so EnsureWatch only fires
+// again on GROWTH, and put the watch back to hunting so the union keeps
+// merging new chunk draws as more of the cluster becomes visible.
+void MarkConsumed(uint64_t key);
+
 // Drop every watch (and the t8 ownership pointer). Called on PreLoadGame:
 // captured IB/VB offsets point into the engine's shared geometry pools,
 // which are repacked when a different world loads -- a stale capture

@@ -528,6 +528,8 @@ static float HalfToFloat(uint16_t h) {
 static bool BuildMeshFromChunks(BSTriShape* tri,
                                 const DrawCapture::ChunkDraw* chunks, int nChunks,
                                 uint64_t hash,
+                                const std::vector<std::array<float, 20>>& recs,
+                                const std::vector<remixapi_HardcodedVertex>& srcVerts,
                                 std::vector<remixapi_HardcodedVertex>& outVerts,
                                 std::vector<uint32_t>& outIndices,
                                 int& keptChunks) {
@@ -539,18 +541,49 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
     const float cz = B.m_kCenter.z - W.pos.z;
     const float rad = B.m_fRadius * 1.6f + 128.0f;
     const float radSq = rad * rad;
+    // Record-anchored gate (run-5 lesson): a 352-tri source cluster baked
+    // 12,223 tris because unrelated DrawIndexed geometry -- neighbor
+    // clusters' chunks in the same shared pools -- was drawn while our
+    // record SRV sat sticky at t8, and the cluster-radius filter (r up to
+    // ~1800) happily kept in-radius neighbors. The expanded mesh is OUR
+    // source pieces duplicated at OUR record translations, so every valid
+    // chunk vertex must lie within source-extent of at least one record
+    // translation. rSrc = parsed source mesh extent (pieces are authored
+    // around the leaf origin), scaled per record.
+    float rSrcSq = 0.0f;
+    for (const remixapi_HardcodedVertex& v : srcVerts) {
+        const float d = v.position[0] * v.position[0] +
+                        v.position[1] * v.position[1] +
+                        v.position[2] * v.position[2];
+        if (d > rSrcSq) rSrcSq = d;
+    }
+    float rSrc = std::sqrt(rSrcSq);
+    if (rSrc < 64.0f) rSrc = 64.0f;
+    struct RecAnchor { float x, y, z, reach2; };
+    std::vector<RecAnchor> anchors;
+    anchors.reserve(recs.size());
+    for (const auto& r : recs) {
+        const float* f = r.data();
+        const float s = (f[15] > 1.0f && f[15] < 20.0f) ? f[15] : 1.0f;
+        const float reach = rSrc * s + 96.0f;
+        anchors.push_back({ f[12], f[13], f[14], reach * reach });
+    }
+    int dFmt = 0, dIb = 0, dWin = 0, dVb = 0, dBound = 0, dRec = 0;
 
     for (int c = 0; c < nChunks; ++c) {
         const DrawCapture::ChunkDraw& ch = chunks[c];
-        if (ch.ibFormat != 57 /*R16_UINT*/ || ch.vbStride != 32) continue;
-        if (ch.idxCount == 0 || ch.idxCount % 3 != 0 || ch.idxCount > 200000) continue;
+        if (ch.ibFormat != 57 /*R16_UINT*/ || ch.vbStride != 32 ||
+            ch.idxCount == 0 || ch.idxCount % 3 != 0 || ch.idxCount > 200000) {
+            ++dFmt;
+            continue;
+        }
         ID3D11Buffer* ibb = SafeBufferFromIdentity(ch.ib);
-        if (!ibb) continue;
+        if (!ibb) { ++dIb; continue; }
         std::vector<uint8_t> ibBytes;
         const bool ibOk = ReadbackBufferSlice(ibb, ch.ibOffset, ch.idxCount * 2,
                                               ibBytes) == ch.idxCount * 2;
         ibb->Release();
-        if (!ibOk) continue;
+        if (!ibOk) { ++dIb; continue; }
         const uint16_t* idx = reinterpret_cast<const uint16_t*>(ibBytes.data());
         uint16_t mn = 0xFFFF, mx = 0;
         for (uint32_t i = 0; i < ch.idxCount; ++i) {
@@ -558,27 +591,36 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
             if (idx[i] > mx) mx = idx[i];
         }
         const uint32_t nVerts = (uint32_t)mx - mn + 1;
-        if (nVerts > 70000) continue;
+        if (nVerts > 70000) { ++dWin; continue; }
         ID3D11Buffer* vbb = SafeBufferFromIdentity(ch.vb);
-        if (!vbb) continue;
+        if (!vbb) { ++dVb; continue; }
         std::vector<uint8_t> vbytes;
         const bool vbOk = ReadbackBufferSlice(vbb, ch.vbOffset + (uint32_t)mn * 32u,
                                               nVerts * 32u, vbytes) == nVerts * 32u;
         vbb->Release();
-        if (!vbOk) continue;
-        // bound filter, EVERY vertex (was 8 spread samples): all positions
-        // must land inside the cluster. NaN/garbage from a repacked or
-        // reused pool slice fails the comparison and drops the chunk --
-        // one bad vertex disqualifies it (take-11.2's vertex-explosion
-        // lesson, kept for this path).
+        if (!vbOk) { ++dVb; continue; }
+        // Every vertex must (a) land inside the cluster bound and (b) lie
+        // within source-extent of SOME record translation. (a) kills
+        // NaN/garbage from repacked pool slices (comparisons with NaN are
+        // false); (b) kills in-radius NEIGHBOR geometry drawn under the
+        // sticky t8 binding. One bad vertex disqualifies the whole chunk.
         bool inside = true;
-        for (uint32_t v = 0; v < nVerts && inside; ++v) {
+        bool anchored = true;
+        for (uint32_t v = 0; v < nVerts && inside && anchored; ++v) {
             float p[3];
             std::memcpy(p, vbytes.data() + v * 32u, 12);
             const float dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
             inside = (dx * dx + dy * dy + dz * dz) <= radSq;
+            if (!inside) break;
+            bool nearRec = false;
+            for (const RecAnchor& a : anchors) {
+                const float ax = p[0] - a.x, ay = p[1] - a.y, az = p[2] - a.z;
+                if (ax * ax + ay * ay + az * az <= a.reach2) { nearRec = true; break; }
+            }
+            anchored = nearRec;
         }
-        if (!inside) continue;
+        if (!inside) { ++dBound; continue; }
+        if (!anchored) { ++dRec; continue; }
         // append: positions float3@0, UV half2@16, normal biased-ubyte@20
         const uint32_t vbase = (uint32_t)outVerts.size();
         outVerts.resize(vbase + nVerts);
@@ -615,16 +657,18 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
         }
         ++keptChunks;
     }
-    if (keptChunks == 0 || outIndices.size() < 48) return false;
+    const bool ok = keptChunks > 0 && outIndices.size() >= 48;
     static std::atomic<int> sBakeLogs{0};
     const int bl = sBakeLogs.fetch_add(1, std::memory_order_relaxed);
-    if (bl < 24) {
-        _MESSAGE("FO4RemixPlugin: [MergeBake] hash=0x%llX chunks=%d/%d tris=%zu "
-                 "verts=%zu bound=(%.0f,%.0f,%.0f r=%.0f)",
-                 (unsigned long long)hash, keptChunks, nChunks,
-                 outIndices.size() / 3, outVerts.size(), cx, cy, cz, rad);
+    if (bl < 48) {
+        _MESSAGE("FO4RemixPlugin: [MergeBake] hash=0x%llX %s chunks=%d/%d tris=%zu "
+                 "verts=%zu rSrc=%.0f recs=%zu drop=[fmt%d ib%d win%d vb%d bnd%d rec%d] "
+                 "bound=(%.0f,%.0f,%.0f r=%.0f)",
+                 (unsigned long long)hash, ok ? "OK" : "REJECT", keptChunks, nChunks,
+                 outIndices.size() / 3, outVerts.size(), rSrc, recs.size(),
+                 dFmt, dIb, dWin, dVb, dBound, dRec, cx, cy, cz, rad);
     }
-    return true;
+    return ok;
 }
 
 static inline int PermXY(int i) { return i == 0 ? 1 : (i == 1 ? 0 : 2); }
@@ -1146,6 +1190,14 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         reinterpret_cast<uintptr_t>(tri) + 0x1A0), segQ, 2)) {
                     std::memcpy(instSegTris, segQ, sizeof(instSegTris));
                 }
+                // The segment table is 3 dwords, NOT 4. Take-7 probing saw
+                // floats at +0x1AC, and run 5 confirmed live: dozens of
+                // TRUE single-segment shapes (slot sum == meshTris exactly)
+                // carried junk in slot 3 ([0,0,352,796], [0,160,0,4435968],
+                // [0,0,640,32759]...) which promoted them into the
+                // multi-segment capture path -- where a contaminated
+                // upgrade then REPLACED their correct whole-mesh rendering.
+                instSegTris[3] = 0;
                 // Multi-segment shapes: ask DrawCapture for the engine's own
                 // draw parameters (per-sub-model index ranges + record
                 // partition). The engine draws the shape within a frame or
@@ -1289,6 +1341,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 if (instSegTris[s]) ++nonZero;
             }
             const uint32_t meshTris = (uint32_t)(mesh.indices.size() / 3);
+            // Snapshot before the capture path replaces instRecords with a
+            // single identity record: the background watch needs the REAL
+            // record count for its desc-verified SRV matching.
+            const uint32_t realRecCount = (uint32_t)instRecords.size();
             if (nonZero >= 2) {
                 // Preferred: the engine's own draw parameters for this
                 // shape, captured off the D3D11 draw stream by matching
@@ -1317,14 +1373,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         // BuildMeshFromChunks). One drawable, leaf
                         // transform only -- the records are already baked
                         // into the vertices by the engine.
-                        DrawCapture::ChunkDraw chunks[48];
-                        const int nChunks = DrawCapture::GetChunks(hash, chunks, 48);
+                        DrawCapture::ChunkDraw chunks[64];
+                        const int nChunks = DrawCapture::GetChunks(hash, chunks, 64);
                         bool bakedMesh = false;
                         if (nChunks > 0) {
                             std::vector<remixapi_HardcodedVertex> bv;
                             std::vector<uint32_t> bi;
                             int keptChunks = 0;
                             if (BuildMeshFromChunks(tri, chunks, nChunks, hash,
+                                                    instRecords, mesh.vertices,
                                                     bv, bi, keptChunks)) {
                                 mesh.vertices = std::move(bv);
                                 mesh.indices = std::move(bi);
@@ -1336,15 +1393,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                             0, 1 };
                                 nSegs = 1;
                                 bakedMesh = true;
-                            } else {
-                                static std::atomic<int> sBakeFail{0};
-                                const int bf = sBakeFail.fetch_add(1,
-                                    std::memory_order_relaxed);
-                                if (bf < 20) {
-                                    _MESSAGE("FO4RemixPlugin: [MergeBake] hash=0x%llX "
-                                             "REJECTED all %d chunks -> fallback",
-                                             (unsigned long long)hash, nChunks);
-                                }
+                                // Mark the accumulated chunk set consumed:
+                                // the background hunt keeps merging new
+                                // chunk draws (the engine only draws
+                                // visible pieces per frame, so a single
+                                // capture is a view-dependent SUBSET), and
+                                // the upgrade poll re-resolves when the
+                                // set grows -- holes fill in as the player
+                                // looks around.
+                                DrawCapture::MarkConsumed(hash);
                             }
                         }
                         if (!bakedMesh) {
@@ -1425,27 +1482,23 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         }
                     }
                 }
-                // Capture starved or rejected: run-4 ground truth is that
-                // the engine issues a cluster's chunk draws only while it
-                // actually renders the cluster (record SRVs get BOUND every
-                // frame either way), so an off-screen cluster can never
-                // capture during the initial resolve. Submit the take-5 /
-                // whole-mesh fallback below, but record the watch
-                // identities: Tick's upgrade poll keeps a background watch
-                // alive and re-resolves this drawable the moment a capture
-                // lands (the player looked at it), hot-swapping in the
-                // engine-exact baked geometry.
+                // Keep the background hunt alive for every real multi-seg
+                // shape, whether the capture starved (engine only issues
+                // chunk draws for clusters it currently renders -- an
+                // off-screen cluster can never capture at initial resolve)
+                // or succeeded (a single-frame capture covers only the
+                // pieces visible THAT frame). Tick's upgrade poll
+                // re-resolves when the accumulated chunk set grows, so the
+                // engine-exact geometry appears/completes as the player
+                // looks around; DrawCapture's per-watch upgrade budget
+                // bounds the resubmission churn.
                 if (g_config.mergeInstanceDrawCapture && instBufPtr) {
-                    if (nSegs == 0) {
-                        state.mergeCaptureUpgradePending = true;
-                        state.mergeWatchBuf = instBufPtr;
-                        state.mergeWatchSrv = instSrvPtr;
-                        state.mergeWatchRecordCount = (uint32_t)instRecords.size();
-                        std::memcpy(state.mergeWatchSegTris, instSegTris,
-                                    sizeof(state.mergeWatchSegTris));
-                    } else {
-                        state.mergeCaptureUpgradePending = false;
-                    }
+                    state.mergeCaptureUpgradePending = true;
+                    state.mergeWatchBuf = instBufPtr;
+                    state.mergeWatchSrv = instSrvPtr;
+                    state.mergeWatchRecordCount = realRecCount;
+                    std::memcpy(state.mergeWatchSegTris, instSegTris,
+                                sizeof(state.mergeWatchSegTris));
                 }
                 if (nSegs == 0 && totalSegTris == meshTris &&
                     instRecords.size() % (size_t)nonZero == 0) {
