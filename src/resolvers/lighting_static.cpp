@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <array>
 #include <cmath>
@@ -525,7 +526,19 @@ struct BakedChunk {
 // Chunks already submitted (any merge shape). Prevents duplicates when
 // several merge shapes share one BSMultiBoundNode subtree.
 static std::mutex g_bakedChunkLock;
-static std::vector<uintptr_t> g_bakedChunkSeen;
+// chunk shape ptr -> owning mesh hash. Claims are RE-ENTRANT for the same
+// owner: culled drawables re-resolve, and run 1 of take 11 rendered
+// correctly on load then fell back to the broken whole-mesh path after a
+// camera cut, because consumed chunks could never be re-claimed.
+static std::unordered_map<uintptr_t, uint64_t> g_bakedChunkOwner;
+// mesh hash -> built chunk mesh. Re-resolves must NEVER re-read the engine
+// CPU buffers: they can be freed/reused after the GPU upload, which showed
+// up as vertex explosions on the post-cull rebuilds.
+struct BakedMeshData {
+    std::vector<remixapi_HardcodedVertex> verts;
+    std::vector<uint32_t> indices;
+};
+static std::unordered_map<uint64_t, BakedMeshData> g_bakedMeshCache;
 
 static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
     // Walk diagnostics (run 1 of take 11 found ZERO chunks with no trace
@@ -745,12 +758,11 @@ static bool BuildMeshFromBakedChunks(BSTriShape* tri, uint64_t hash,
     std::vector<uint8_t> vb, ib;
     for (const BakedChunk& bc : chunks) {
         {
+            // owner-keyed claim: another shape's chunk is off-limits, but
+            // OUR OWN chunks re-claim freely across re-resolves
             std::lock_guard<std::mutex> g(g_bakedChunkLock);
-            bool seen = false;
-            for (uintptr_t p : g_bakedChunkSeen) {
-                if (p == bc.shape) { seen = true; break; }
-            }
-            if (seen) continue;
+            auto it = g_bakedChunkOwner.find(bc.shape);
+            if (it != g_bakedChunkOwner.end() && it->second != hash) continue;
         }
         ib.resize(bc.tris * 6u);
         if (!PeekBytesGuarded(reinterpret_cast<const void*>(bc.ibCpu), ib.data(),
@@ -768,6 +780,30 @@ static bool BuildMeshFromBakedChunks(BSTriShape* tri, uint64_t hash,
         vb.resize(nVerts * 32u);
         if (!PeekBytesGuarded(reinterpret_cast<const void*>(bc.vbCpu), vb.data(),
                               vb.size())) {
+            continue;
+        }
+        // Freed/reused CPU buffer guard: every position must be finite and
+        // cluster-scale. Garbage here produced the post-cull "vertex
+        // explosions"; one bad vertex disqualifies the whole chunk.
+        bool sane = true;
+        for (uint32_t v = 0; v < nVerts && sane; ++v) {
+            float lp[3];
+            std::memcpy(lp, vb.data() + v * 32u, 12);
+            for (int j = 0; j < 3; ++j) {
+                if (!(lp[j] == lp[j]) || lp[j] > 65536.0f || lp[j] < -65536.0f) {
+                    sane = false;
+                    break;
+                }
+            }
+        }
+        if (!sane) {
+            static std::atomic<int> sInsaneLogs{0};
+            const int in = sInsaneLogs.fetch_add(1, std::memory_order_relaxed);
+            if (in < 12) {
+                _MESSAGE("FO4RemixPlugin: [MergeGraph] hash=0x%llX chunk %p CPU "
+                         "data invalid (freed?) -> dropped",
+                         (unsigned long long)hash, (void*)bc.shape);
+            }
             continue;
         }
         // leaf-local transform: row-vector rotate + scale + translate
@@ -818,7 +854,7 @@ static bool BuildMeshFromBakedChunks(BSTriShape* tri, uint64_t hash,
         }
         {
             std::lock_guard<std::mutex> g(g_bakedChunkLock);
-            if (g_bakedChunkSeen.size() < 8192) g_bakedChunkSeen.push_back(bc.shape);
+            if (g_bakedChunkOwner.size() < 65536) g_bakedChunkOwner[bc.shape] = hash;
         }
         ++keptChunks;
     }
@@ -1635,15 +1671,43 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 // falls back to the take-5 path.
                 // Take 11: build from the engine's own baked chunk shapes
                 // (scene-graph walk; exact geometry, placement, and -- via
-                // shaderProperty identity -- material attribution).
-                if (!bakedChunks.empty()) {
+                // shaderProperty identity -- material attribution). Cache
+                // first: a re-resolve after culling reuses the mesh built
+                // at load instead of touching engine CPU buffers that may
+                // be long freed.
+                bool bakedFromCache = false;
+                {
+                    std::lock_guard<std::mutex> g(g_bakedChunkLock);
+                    auto it = g_bakedMeshCache.find(hash);
+                    if (it != g_bakedMeshCache.end()) {
+                        mesh.vertices = it->second.verts;
+                        mesh.indices = it->second.indices;
+                        bakedFromCache = true;
+                    }
+                }
+                if (bakedFromCache) {
+                    instRecords.clear();
+                    std::array<float, 20> ident = {};
+                    ident[0] = ident[5] = ident[10] = ident[15] = 1.0f;
+                    instRecords.push_back(ident);
+                    segs[0] = { 0, (uint32_t)(mesh.indices.size() / 3), 0, 1 };
+                    nSegs = 1;
+                } else if (!bakedChunks.empty()) {
                     std::vector<remixapi_HardcodedVertex> bv;
                     std::vector<uint32_t> bi;
                     int keptChunks = 0;
                     if (BuildMeshFromBakedChunks(tri, hash, bakedChunks, bv, bi,
                                                  keptChunks)) {
-                        mesh.vertices = std::move(bv);
-                        mesh.indices = std::move(bi);
+                        mesh.vertices = bv;
+                        mesh.indices = bi;
+                        {
+                            std::lock_guard<std::mutex> g(g_bakedChunkLock);
+                            if (g_bakedMeshCache.size() < 4096) {
+                                BakedMeshData& d = g_bakedMeshCache[hash];
+                                d.verts = std::move(bv);
+                                d.indices = std::move(bi);
+                            }
+                        }
                         instRecords.clear();
                         std::array<float, 20> ident = {};
                         ident[0] = ident[5] = ident[10] = ident[15] = 1.0f;
