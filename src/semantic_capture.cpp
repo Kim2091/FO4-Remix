@@ -1,5 +1,6 @@
 #include "semantic_capture.h"
 #include "config.h"
+#include "draw_capture.h"
 #include "fo4_diagnostics.h"
 #include "resolvers/lighting_static.h"
 #include "resolvers/water.h"
@@ -786,7 +787,57 @@ void SemanticCapture::Tick(ID3D11Device* device) {
 
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         for (auto& [key, state] : g_drawableMap) {
-            if (state.submittedToRemix) continue;
+            if (state.submittedToRemix) {
+                // Capture upgrade poll (2026-07-04): this merge shape
+                // submitted with a fallback partition because the engine
+                // wasn't drawing its cluster while the watch was armed.
+                // Keep a background watch alive (~1 Hz per drawable) and,
+                // the moment a capture lands (the cluster became visible),
+                // release the fallback and re-resolve: Query finds the
+                // completed watch and the exact baked geometry replaces
+                // the fallback via the normal resolve path.
+                if (state.mergeCaptureUpgradePending &&
+                    ((currentFrame ^ key) & 63) == 0 &&
+                    DrawCapture::EnsureWatch(state.mergeWatchBuf,
+                                             state.mergeWatchSrv, key,
+                                             state.mergeWatchRecordCount,
+                                             state.mergeWatchSegTris)) {
+                    unsigned long excCode = 0;
+                    if (CallReleaseDrawableGuarded(state.meshHash, &excCode) != 0) {
+                        _MESSAGE("FO4RemixPlugin: [MergeUpgrade] CRASH CAUGHT in "
+                                 "ReleaseDrawable hash=0x%llX exception=0x%08lX",
+                                 (unsigned long long)state.meshHash, excCode);
+                    }
+                    for (uint64_t xh : state.extraMeshHashes) {
+                        if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                            _MESSAGE("FO4RemixPlugin: [MergeUpgrade] CRASH CAUGHT in "
+                                     "ReleaseDrawable extra=0x%llX exception=0x%08lX",
+                                     (unsigned long long)xh, excCode);
+                        }
+                    }
+                    state.extraMeshHashes.clear();
+                    state.submittedToRemix = false;
+                    state.resolveAttempts = 0;
+                    state.nextRetryFrame = 0;
+                    // The geometry is provably alive (the engine just drew
+                    // it, and this state holds a +1 NiPointer ref); touch
+                    // lastSeenFrame so the freshness gate below doesn't
+                    // retire the re-resolve of a long-ago-attached shape.
+                    state.lastSeenFrame = currentFrame;
+                    // The resolver re-sets this if it has to fall back again.
+                    state.mergeCaptureUpgradePending = false;
+                    static std::atomic<int> sUpgradeLogs{0};
+                    const int un = sUpgradeLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (un < 40) {
+                        _MESSAGE("FO4RemixPlugin: [MergeUpgrade] #%d hash=0x%llX capture "
+                                 "landed -> re-resolving with engine draws",
+                                 un, (unsigned long long)key);
+                    }
+                    // fall through: resolve this tick with the fresh capture
+                } else {
+                    continue;
+                }
+            }
             // Freshness gate (widened 2026-07-02, was age > 1). The engine
             // fires GetRenderPasses roughly once per cell ATTACH -- passes
             // are cached afterwards. Loading a save into a different area

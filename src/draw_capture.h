@@ -61,8 +61,29 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
 // The captured frame didn't validate (e.g. a shadow-only frame that drew a
 // partial sub-model set): put the watch back to capturing so the next
 // frame gets a chance. Returns false when the re-arm budget is exhausted
-// -- the caller should fall back instead of deferring again.
+// -- the caller should fall back instead of deferring again (the slot is
+// freed so a later EnsureWatch can start a fresh hunt).
 bool Rearm(uint64_t key);
+
+// Capture-upgrade support (2026-07-04, run-4 evidence): at load, watches
+// for clusters the engine isn't currently DRAWING starve -- their record
+// SRVs get bound every frame (bind-count proved it) but chunk draws only
+// happen for visible clusters -- so the resolver falls back and, before
+// this API, could never recover. EnsureWatch keeps a background watch
+// alive for such a shape: registers it if missing, re-arms it if expired
+// (upgrade-hunt watches never age out on their own), and returns true
+// exactly when a completed capture is waiting -- the caller then releases
+// its fallback submission and re-resolves, which consumes the capture via
+// Query/GetChunks. buffer/srv are pointer identities only.
+bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
+                 const uint32_t segTris[4]);
+
+// Drop every watch (and the t8 ownership pointer). Called on PreLoadGame:
+// captured IB/VB offsets point into the engine's shared geometry pools,
+// which are repacked when a different world loads -- a stale capture
+// served after reload slices the wrong pool region and renders garbage
+// (run-3's "progressively worse each save reload").
+void ResetAll();
 
 // Run-6 discovery: the engine draws merged shapes from a PRE-BAKED
 // expanded mesh -- every instance's geometry duplicated into a large

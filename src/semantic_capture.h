@@ -116,6 +116,23 @@ namespace SemanticCapture {
         // Tick maintains g_lodChunkKeys from it so SnapshotLodChunkAges can
         // walk only the ~dozens of chunk entries instead of the whole map.
         bool  isLODChunk               = false;
+
+        // ---- Merge-instanced capture upgrade (2026-07-04) ----
+        // Set by the lighting resolver when a multi-segment merge shape had
+        // to submit with a fallback partition because DrawCapture starved:
+        // run-4 ground truth is that the engine only issues the chunk draws
+        // for clusters it is actually rendering (visible), while the record
+        // SRV is bound every frame regardless -- so a cluster off-screen at
+        // resolve time can never capture then, but will capture the moment
+        // the player looks at it. Tick keeps a background watch alive from
+        // these fields (pointer IDENTITIES only, never dereferenced) and,
+        // when the capture completes, releases the fallback submission and
+        // re-resolves so the engine-exact baked geometry replaces it.
+        bool     mergeCaptureUpgradePending = false;
+        void*    mergeWatchBuf              = nullptr;
+        void*    mergeWatchSrv              = nullptr;
+        uint32_t mergeWatchRecordCount      = 0;
+        uint32_t mergeWatchSegTris[4]       = {};
     };
 
     // Convert a Bethesda NiTransform (engine row-vector convention: world =

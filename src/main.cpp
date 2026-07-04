@@ -2,6 +2,7 @@
 #include "f4se/PluginAPI.h"
 
 #include "config.h"
+#include "draw_capture.h"
 #include "present_hook.h"
 #include "remix_api.h"
 #include "remix_renderer.h"
@@ -61,6 +62,11 @@ void OnF4SEMessage(F4SEMessagingInterface::Message* msg) {
         // the old world fully tear down. Submission resumes naturally as
         // hooks fire for the new world.
         SemanticCapture::ClearDrawableMap();
+        // Captured merge-shape draws index into the engine's shared
+        // geometry pools, which the destination world repacks: a capture
+        // served across a reload slices the wrong pool region (run-3's
+        // progressive corruption per save reload). Drop every watch.
+        DrawCapture::ResetAll();
         break;
     case F4SEMessagingInterface::kMessage_PostLoadGame:
         // data is a bool: true = load succeeded, false = load failed/aborted.

@@ -29,10 +29,16 @@ static PFN_SetShaderResources g_originalPSSet = nullptr;
 static PFN_SetShaderResources g_originalCSSet = nullptr;
 static std::atomic<bool> g_hooked{false};
 
-constexpr int      kMaxWatches       = 16;
+constexpr int      kMaxWatches       = 32;
 constexpr int      kMaxDrawsPerFrame = 24;
 constexpr int      kVsSrvSlots       = 16;     // scan t0..t15 for the record SRV
-constexpr uint64_t kDeadlineMs       = 15000;  // then the caller falls back
+// Initial-resolve patience only. Run 4: a visible cluster's chunk draws
+// land within a frame or two of the watch arming, while a not-visible
+// cluster gets BINDS every frame but never a draw -- waiting 15s just
+// delayed the fallback without ever converting a starved watch. Expired
+// watches now continue hunting in the background via EnsureWatch
+// (upgradeHunt), so the foreground deadline can be short.
+constexpr uint64_t kDeadlineMs       = 4000;
 
 // How the engine actually renders BSMergeInstancedTriShape (established by
 // the 2026-07-03 diagnostic runs): the shape's own record SRV (wrapper q1
@@ -62,9 +68,7 @@ static std::atomic<uint64_t> g_diCalls{0};
 static std::atomic<uint64_t> g_diiiCalls{0};
 static std::atomic<uint64_t> g_stride80Hits{0};
 static std::atomic<uint64_t> g_bindHits{0};
-static std::atomic<int>      g_diagLogs{0};
 static std::atomic<int>      g_bindLogs{0};
-static std::atomic<bool>     g_typeLogged{false};
 
 struct Watch {
     enum State { kFree, kActive, kDone, kExpired };
@@ -77,6 +81,8 @@ struct Watch {
     uint32_t registeredFrame = 0;
     uint32_t bindCount = 0;      // times a Set*ShaderResources bound us
     uint32_t rearms = 0;         // invalid-frame retries granted so far
+    bool     upgradeHunt = false;  // background watch for a fallen-back
+                                   // drawable: exempt from kDeadlineMs
     uint32_t expectedIdx[4] = {};  // segTris[s]*3 for nonzero, sane slots
     int      nExpected = 0;
     // Baked-chunk capture (run-6 model), same cur/done frame-roll pattern.
@@ -209,92 +215,17 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
 {
     g_diiCalls.fetch_add(1, std::memory_order_relaxed);
     LogWindowDraw(ctx, "DII", idxCount, startIdx, baseVtx, instCount);
-    // Fast path: one relaxed load per draw when nothing is being watched.
-    if (g_activeCount.load(std::memory_order_relaxed) > 0) {
-        if (!g_typeLogged.exchange(true)) {
-            _MESSAGE("FO4RemixPlugin: [DrawCap] first watched-window draw: "
-                     "ctxType=%d tid=%lu inst=%u",
-                     (int)ctx->GetType(), GetCurrentThreadId(), instCount);
-        }
-        ID3D11ShaderResourceView* srvs[kVsSrvSlots] = {};
-        ID3D11Resource* res[kVsSrvSlots] = {};
-        ctx->VSGetShaderResources(0, kVsSrvSlots, srvs);
-        for (int i = 0; i < kVsSrvSlots; ++i) {
-            if (srvs[i]) srvs[i]->GetResource(&res[i]);
-        }
-        // Diagnostic: log EVERY stride-80 structured buffer on a VS t-slot
-        // for the first draws, with usage/cpu flags (dynamic copy theory).
-        if (instCount >= 2 && g_diagLogs.load(std::memory_order_relaxed) < 40) {
-            bool any = false;
-            for (int i = 0; i < kVsSrvSlots; ++i) {
-                if (!res[i]) continue;
-                ID3D11Buffer* b = nullptr;
-                if (FAILED(res[i]->QueryInterface(__uuidof(ID3D11Buffer),
-                                                  (void**)&b))) {
-                    continue;
-                }
-                D3D11_BUFFER_DESC bd = {};
-                b->GetDesc(&bd);
-                b->Release();
-                if ((bd.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) &&
-                    bd.StructureByteStride == 80) {
-                    any = true;
-                    const int dl = g_diagLogs.load(std::memory_order_relaxed);
-                    if (dl < 40) {
-                        _MESSAGE("FO4RemixPlugin: [DrawCapDiag] #%d f=%u t%d "
-                                 "buf=%p srv=%p bytes=%u usage=%u cpu=0x%X "
-                                 "idx=%u+%u inst=%u+%u bv=%d",
-                                 dl, g_frame.load(std::memory_order_relaxed), i,
-                                 (void*)res[i], (void*)srvs[i], bd.ByteWidth,
-                                 (unsigned)bd.Usage, bd.CPUAccessFlags,
-                                 startIdx, idxCount, startInst, instCount,
-                                 baseVtx);
-                    }
-                }
-            }
-            if (any) {
-                g_stride80Hits.fetch_add(1, std::memory_order_relaxed);
-                g_diagLogs.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-        {
-            std::lock_guard<std::mutex> g(g_lock);
-            const uint32_t f = g_frame.load(std::memory_order_relaxed);
-            for (Watch& w : g_watches) {
-                if (w.state != Watch::kActive) continue;
-                bool match = false;
-                for (int i = 0; i < kVsSrvSlots && !match; ++i) {
-                    if (!srvs[i]) continue;
-                    if (srvs[i] == w.srv || (res[i] && res[i] == w.buffer)) {
-                        match = DescMatches(res[i], w.expectedBytes);
-                    }
-                }
-                if (!match) continue;
-                if (w.curFrame != f) {
-                    RollFrame(w);
-                    w.curFrame = f;
-                }
-                bool dup = false;
-                for (int k = 0; k < w.curCount && !dup; ++k) {
-                    const SegDraw& d = w.cur[k];
-                    dup = d.kind == 0 &&
-                          d.indexCount == idxCount && d.startIndex == startIdx &&
-                          d.baseVertex == baseVtx && d.instanceCount == instCount &&
-                          d.startInstance == startInst;
-                }
-                if (!dup && w.curCount < kMaxDrawsPerFrame) {
-                    w.cur[w.curCount] = { idxCount, startIdx, baseVtx,
-                                          instCount, startInst,
-                                          (uint32_t)w.curCount, 0 };
-                    ++w.curCount;
-                }
-            }
-        }
-        for (int i = 0; i < kVsSrvSlots; ++i) {
-            if (res[i]) res[i]->Release();
-            if (srvs[i]) srvs[i]->Release();
-        }
-    }
+    // SegDraw sampling REMOVED (2026-07-04). Run-4 ground truth: with 15
+    // watches active for a full 17s window (9.3M DII calls, record SRVs
+    // bound 1-2x per frame per watch), the draw-time sampling never
+    // attributed a single DII draw to any watch -- the engine's merged-
+    // shape draws are plain DrawIndexed chunk draws (hkDrawIndexed), and
+    // the resolver already discards kind-0 entries as sticky-binding
+    // noise. The sampling cost (VSGetShaderResources(t0..t15) +
+    // GetResource x16 per draw while any watch is active) is now
+    // permanent overhead with background upgrade-hunt watches, so the
+    // dead path is gone: this hook is one atomic add + a capped
+    // diagnostic check per draw.
     g_original(ctx, idxCount, instCount, startIdx, baseVtx, startInst);
 }
 
@@ -606,7 +537,7 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
         if (w->doneCount > 0 || w->cdoneCount > 0) {
             w->state = Watch::kDone;
             g_activeCount.fetch_sub(1, std::memory_order_relaxed);
-        } else if (now - w->registeredTick > kDeadlineMs) {
+        } else if (!w->upgradeHunt && now - w->registeredTick > kDeadlineMs) {
             w->state = Watch::kExpired;
             g_activeCount.fetch_sub(1, std::memory_order_relaxed);
             static std::atomic<int> sExpireLogs{0};
@@ -640,7 +571,13 @@ bool Rearm(uint64_t key) {
     std::lock_guard<std::mutex> g(g_lock);
     for (Watch& c : g_watches) {
         if (c.state != Watch::kDone || c.key != key) continue;
-        if (c.rearms >= kMaxRearms) return false;
+        if (c.rearms >= kMaxRearms) {
+            // Budget spent on frames that never validated: free the slot so
+            // a later EnsureWatch can start a fresh hunt (with a fresh
+            // budget) instead of pinning stale done[] data forever.
+            c = Watch{};
+            return false;
+        }
         ++c.rearms;
         c.state = Watch::kActive;
         c.registeredTick = GetTickCount64();
@@ -653,6 +590,79 @@ bool Rearm(uint64_t key) {
         return true;
     }
     return false;
+}
+
+bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
+                 const uint32_t segTris[4]) {
+    if (!Hooked()) return false;
+    const uint64_t now = GetTickCount64();
+    std::lock_guard<std::mutex> g(g_lock);
+    for (Watch& c : g_watches) {
+        if (c.state == Watch::kFree || c.key != key) continue;
+        if (c.state == Watch::kDone) {
+            return c.doneCount > 0 || c.cdoneCount > 0;
+        }
+        if (c.state == Watch::kExpired) {
+            c.state = Watch::kActive;
+            c.upgradeHunt = true;
+            c.registeredTick = now;
+            c.registeredFrame = g_frame.load(std::memory_order_relaxed);
+            c.curCount = 0;
+            c.doneCount = 0;
+            c.ccurCount = 0;
+            c.cdoneCount = 0;
+            g_activeCount.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        // kActive: roll completed frames so a finished capture is visible
+        // on this poll instead of waiting for the next draw/Query.
+        const uint32_t f = g_frame.load(std::memory_order_relaxed);
+        if (c.curCount > 0 && c.curFrame < f) RollFrame(c);
+        if (c.ccurCount > 0 && c.ccurFrame < f) RollChunks(c);
+        if (c.doneCount > 0 || c.cdoneCount > 0) {
+            c.state = Watch::kDone;
+            g_activeCount.fetch_sub(1, std::memory_order_relaxed);
+            return true;
+        }
+        return false;
+    }
+    // No watch for this key: register a background hunt (same slot policy
+    // as Query's registration; never evicts an active watch).
+    Watch* victim = nullptr;
+    for (Watch& c : g_watches) {
+        if (c.state == Watch::kFree) { victim = &c; break; }
+        if (c.state != Watch::kActive &&
+            (!victim || c.registeredTick < victim->registeredTick)) {
+            victim = &c;
+        }
+    }
+    if (!victim) return false;
+    *victim = Watch{};
+    victim->state = Watch::kActive;
+    victim->upgradeHunt = true;
+    victim->buffer = buffer;
+    victim->srv = srv;
+    victim->key = key;
+    victim->expectedBytes = recordCount * 80u;
+    for (int s = 0; s < 4; ++s) {
+        if (segTris[s] && segTris[s] < 0x400000u) {
+            victim->expectedIdx[victim->nExpected++] = segTris[s] * 3u;
+        }
+    }
+    victim->registeredTick = now;
+    victim->registeredFrame = g_frame.load(std::memory_order_relaxed);
+    g_activeCount.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+void ResetAll() {
+    std::lock_guard<std::mutex> g(g_lock);
+    g_boundT8.store(nullptr, std::memory_order_relaxed);
+    for (Watch& c : g_watches) {
+        c = Watch{};
+    }
+    g_activeCount.store(0, std::memory_order_relaxed);
+    _MESSAGE("FO4RemixPlugin: [DrawCap] ResetAll (reload): watches purged");
 }
 
 int GetChunks(uint64_t key, ChunkDraw* out, int maxOut) {

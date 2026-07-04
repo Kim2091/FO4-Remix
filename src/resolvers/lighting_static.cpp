@@ -16,7 +16,6 @@
 #include <algorithm>
 #include <atomic>
 #include <mutex>
-#include <unordered_map>
 #include <vector>
 #include <array>
 #include <cmath>
@@ -495,380 +494,20 @@ static float HalfToFloat(uint16_t h) {
     return out;
 }
 
-// ---- Baked-chunk scene-graph walk (take 11, 2026-07-03) ----
-// Live in-process RE (frida session, RTTI-verified) settled the real
-// mechanism: the engine bakes each precombined cluster into plain
-// BSTriShape chunk nodes parented under the cell's BSMultiBoundNode --
-// an ancestor of the merge shapes themselves -- and draws them through
-// its batch renderer (which is why our GetRenderPasses hook never saw
-// them). Verified chunk layout:
-//   +0x70   NiTransform world (identity rotation observed, world pos)
-//   +0xB0   NiBound world bound
-//   +0x108  flags qword; bit 35 = kFlagInInstanceGroup marks baked chunks
-//   +0x148  rendererData -> {dword desc (stride=(desc&0xF)*4),
-//            +0x8 = VB wrapper, +0x10 = IB wrapper}
-//   wrapper: +0x8 CPU-side copy of the data, +0x38 byte size
-//            (+0x48 GPU pool byte offset -- unneeded, we read the CPU copy)
-//   +0x160  per-LOD triangle counts, PREFIX scheme (LOD0 = first N tris;
-//            live traces showed StartIndexLocation always 0)
-// Baked vertex format (GPU readback take 9 + live CPU dump agree):
-// float3 pos @0 (chunk-local), float @12, half2 uv @16, biased-ubyte
-// normal @20, color @28; R16_UINT indices, chunk-relative from 0.
-struct BakedChunk {
-    uintptr_t shape;
-    uint64_t  prop;     // BSGeometry::shaderProperty (+0x138) for attribution
-    uint64_t  vbCpu, ibCpu;
-    uint32_t  vbBytes, ibBytes;
-    uint32_t  tris;
-    float     xf[16];   // NiTransform: rot rows [x y z 0]x3, pos, scale
-};
-
-// Chunks already submitted (any merge shape). Prevents duplicates when
-// several merge shapes share one BSMultiBoundNode subtree.
-static std::mutex g_bakedChunkLock;
-// chunk shape ptr -> owning mesh hash. Claims are RE-ENTRANT for the same
-// owner: culled drawables re-resolve, and run 1 of take 11 rendered
-// correctly on load then fell back to the broken whole-mesh path after a
-// camera cut, because consumed chunks could never be re-claimed.
-static std::unordered_map<uintptr_t, uint64_t> g_bakedChunkOwner;
-// mesh hash -> built chunk mesh. Re-resolves must NEVER re-read the engine
-// CPU buffers: they can be freed/reused after the GPU upload, which showed
-// up as vertex explosions on the post-cull rebuilds.
-struct BakedMeshData {
-    std::vector<remixapi_HardcodedVertex> verts;
-    std::vector<uint32_t> indices;
-};
-static std::unordered_map<uint64_t, BakedMeshData> g_bakedMeshCache;
-
-static void CollectBakedChunks(BSTriShape* tri, std::vector<BakedChunk>& out) {
-    // Walk diagnostics (run 1 of take 11 found ZERO chunks with no trace
-    // of why): count every gate, log the ascend chain and per-stage
-    // rejections for the first shapes.
-    static std::atomic<int> sWalkLogs{0};
-    const int wl = sWalkLogs.fetch_add(1, std::memory_order_relaxed);
-    const bool wlog = wl < 6;
-    char chain[256];
-    size_t chainPos = 0;
-    chain[0] = 0;
-    int cTriShape = 0, cFlag35 = 0, cGeo = 0, cStride = 0, cCpu = 0, cBytes = 0,
-        cBound = 0;
-    char firstShapeCls[64] = "";
-    uint64_t firstShapeFlags = 0;
-
-    // ascend to the BSMultiBoundNode ancestor
-    uintptr_t node = reinterpret_cast<uintptr_t>(tri);
-    uintptr_t mbNode = 0;
-    for (int d = 0; d < 8 && node; ++d) {
-        char cls[64] = "";
-        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(node), cls,
-                                          sizeof(cls));
-        if (wlog && chainPos < sizeof(chain) - 40) {
-            const int wn = snprintf(chain + chainPos, sizeof(chain) - chainPos,
-                                    "%s%s", d ? "|" : "", cls);
-            if (wn > 0) chainPos += (size_t)wn;
-        }
-        if (std::strcmp(cls, "BSMultiBoundNode") == 0) {
-            mbNode = node;
-            break;
-        }
-        uint64_t p = 0;
-        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(node + 0x28), &p, 1) ||
-            !HeapLikePtr(p)) {
-            break;
-        }
-        node = (uintptr_t)p;
-    }
-    if (!mbNode) {
-        if (wlog) {
-            _MESSAGE("FO4RemixPlugin: [MergeWalk] #%d NO BSMultiBoundNode ancestor; "
-                     "chain=[%s]", wl, chain);
-        }
-        return;
-    }
-    const NiTransform& W = tri->m_worldTransform;
-    const NiBound& B = tri->m_worldBound;
-    // The merge shape's own shaderProperty: when the precombine system
-    // shares the property object with the chunks it baked from this
-    // shape, pointer equality gives exact per-material attribution.
-    uint64_t shapeProp = 0;
-    PeekQwordsGuarded(reinterpret_cast<const void*>(
-        reinterpret_cast<uintptr_t>(tri) + 0x138), &shapeProp, 1);
-
-    uintptr_t stack[512];
-    int sp = 0;
-    stack[sp++] = mbNode;
-    int visited = 0;
-    while (sp > 0 && visited < 2048 && out.size() < 64) {
-        const uintptr_t cur = stack[--sp];
-        ++visited;
-        char cls[64] = "";
-        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(cur), cls,
-                                          sizeof(cls));
-        if (std::strcmp(cls, "BSTriShape") == 0) {
-            // candidate baked chunk (merge shapes have a different leaf
-            // class, so they never enter here)
-            ++cTriShape;
-            uint64_t flags = 0;
-            const bool haveFlags = PeekQwordsGuarded(
-                reinterpret_cast<const void*>(cur + 0x108), &flags, 1);
-            if (cTriShape == 1) {
-                std::memcpy(firstShapeCls, cls, sizeof(firstShapeCls));
-                firstShapeFlags = flags;
-            }
-            if (!haveFlags || !(flags & (1ULL << 35))) {  // kFlagInInstanceGroup
-                continue;
-            }
-            ++cFlag35;
-            uint64_t geo = 0;
-            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(cur + 0x148),
-                                   &geo, 1) || !HeapLikePtr(geo)) {
-                continue;
-            }
-            uint64_t g[3] = {};
-            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(geo), g, 3)) {
-                continue;
-            }
-            ++cGeo;
-            const uint32_t desc0 = (uint32_t)g[0];
-            if (((desc0 & 0xFu) * 4u) != 32u) continue;
-            if (!HeapLikePtr(g[1]) || !HeapLikePtr(g[2])) continue;
-            ++cStride;
-            uint64_t vbCpu = 0, ibCpu = 0, tmp = 0;
-            uint32_t vbBytes = 0, ibBytes = 0;
-            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(g[1] + 0x8),
-                                   &vbCpu, 1) || !HeapLikePtr(vbCpu)) continue;
-            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(g[2] + 0x8),
-                                   &ibCpu, 1) || !HeapLikePtr(ibCpu)) continue;
-            ++cCpu;
-            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(g[1] + 0x38),
-                                   &tmp, 1)) continue;
-            vbBytes = (uint32_t)tmp;
-            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(g[2] + 0x38),
-                                   &tmp, 1)) continue;
-            ibBytes = (uint32_t)tmp;
-            if (vbBytes < 32 || vbBytes > 0x800000 || (vbBytes % 32) != 0) continue;
-            if (ibBytes < 6 || ibBytes > 0x400000 || (ibBytes % 2) != 0) continue;
-            ++cBytes;
-            uint32_t tris = ibBytes / 6;
-            if (PeekQwordsGuarded(reinterpret_cast<const void*>(cur + 0x160),
-                                  &tmp, 1)) {
-                const uint32_t lod0 = (uint32_t)tmp;
-                if (lod0 >= 1 && lod0 <= tris) tris = lod0;  // prefix scheme
-            }
-            BakedChunk bc = {};
-            bc.shape = cur;
-            PeekQwordsGuarded(reinterpret_cast<const void*>(cur + 0x138),
-                              &bc.prop, 1);
-            bc.vbCpu = vbCpu;
-            bc.ibCpu = ibCpu;
-            bc.vbBytes = vbBytes;
-            bc.ibBytes = ibBytes;
-            bc.tris = tris;
-            if (!PeekBytesGuarded(reinterpret_cast<const void*>(cur + 0x70),
-                                  bc.xf, sizeof(bc.xf))) {
-                continue;
-            }
-            float bnd[4] = {};
-            if (!PeekBytesGuarded(reinterpret_cast<const void*>(cur + 0xB0),
-                                  bnd, sizeof(bnd))) {
-                continue;
-            }
-            // attribution: chunk bound must intersect the merge shape's
-            const float dx = bnd[0] - B.m_kCenter.x;
-            const float dy = bnd[1] - B.m_kCenter.y;
-            const float dz = bnd[2] - B.m_kCenter.z;
-            const float rr = B.m_fRadius + bnd[3] + 64.0f;
-            if (dx * dx + dy * dy + dz * dz > rr * rr) continue;
-            ++cBound;
-            (void)W;
-            out.push_back(bc);
-            continue;
-        }
-        if (std::strstr(cls, "Node") == nullptr) {
-            // sample the classes we're NOT descending into / not matching
-            if (wlog && chainPos < sizeof(chain) - 40) {
-                const int wn = snprintf(chain + chainPos, sizeof(chain) - chainPos,
-                                        " x:%s", cls);
-                if (wn > 0) chainPos += (size_t)wn;
-            }
-            continue;
-        }
-        // NiNode m_children: NiTArray at +0x120 -> data +0x128,
-        // m_emptyRunStart (iterate bound) is the ushort at +0x132
-        uint64_t kids = 0;
-        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(cur + 0x128),
-                               &kids, 1) || !HeapLikePtr(kids)) {
-            continue;
-        }
-        uint64_t cnts = 0;
-        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(cur + 0x130),
-                               &cnts, 1)) {
-            continue;
-        }
-        const uint32_t n = (uint32_t)((cnts >> 16) & 0xFFFF);
-        for (uint32_t i = 0; i < n && i < 512 && sp < 512; ++i) {
-            uint64_t child = 0;
-            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(kids + 8ull * i),
-                                   &child, 1)) {
-                break;
-            }
-            if (child && HeapLikePtr(child)) stack[sp++] = (uintptr_t)child;
-        }
-    }
-    if (wlog) {
-        _MESSAGE("FO4RemixPlugin: [MergeWalk] #%d mb=%p visited=%d triShapes=%d "
-                 "flag35=%d geo=%d stride32=%d cpu=%d bytes=%d bound=%d "
-                 "chain=[%s] firstShape cls=%s flags=0x%llX",
-                 wl, (void*)mbNode, visited, cTriShape, cFlag35, cGeo, cStride,
-                 cCpu, cBytes, cBound, chain, firstShapeCls,
-                 (unsigned long long)firstShapeFlags);
-    }
-    // Prefer exact property attribution when it exists: if any collected
-    // chunk shares the merge shape's shaderProperty object, keep only
-    // those (the bound-intersection set otherwise claims the whole
-    // cluster including sibling materials' chunks).
-    if (shapeProp) {
-        bool anyMatch = false;
-        for (const BakedChunk& c : out) {
-            if (c.prop == shapeProp) { anyMatch = true; break; }
-        }
-        if (anyMatch) {
-            std::vector<BakedChunk> filtered;
-            for (const BakedChunk& c : out) {
-                if (c.prop == shapeProp) filtered.push_back(c);
-            }
-            out.swap(filtered);
-        }
-    }
-}
-
-// Build one leaf-local Remix mesh from the baked chunks: read the CPU
-// copies, convert vertices (winding flip matching the parser), transform
-// chunk-local -> leaf-local through each chunk's own world transform
-// (leaf rotation is identity on every sampled merged shape). Chunks
-// consumed here are registered so sibling merge shapes don't re-submit
-// them.
-static bool BuildMeshFromBakedChunks(BSTriShape* tri, uint64_t hash,
-                                     std::vector<BakedChunk>& chunks,
-                                     std::vector<remixapi_HardcodedVertex>& outVerts,
-                                     std::vector<uint32_t>& outIndices,
-                                     int& keptChunks) {
-    keptChunks = 0;
-    const NiTransform& W = tri->m_worldTransform;
-    std::vector<uint8_t> vb, ib;
-    for (const BakedChunk& bc : chunks) {
-        {
-            // owner-keyed claim: another shape's chunk is off-limits, but
-            // OUR OWN chunks re-claim freely across re-resolves
-            std::lock_guard<std::mutex> g(g_bakedChunkLock);
-            auto it = g_bakedChunkOwner.find(bc.shape);
-            if (it != g_bakedChunkOwner.end() && it->second != hash) continue;
-        }
-        ib.resize(bc.tris * 6u);
-        if (!PeekBytesGuarded(reinterpret_cast<const void*>(bc.ibCpu), ib.data(),
-                              ib.size())) {
-            continue;
-        }
-        const uint16_t* idx = reinterpret_cast<const uint16_t*>(ib.data());
-        const uint32_t nIdx = bc.tris * 3u;
-        uint16_t mx = 0;
-        for (uint32_t i = 0; i < nIdx; ++i) {
-            if (idx[i] > mx) mx = idx[i];
-        }
-        const uint32_t nVerts = (uint32_t)mx + 1;
-        if ((uint64_t)nVerts * 32u > bc.vbBytes) continue;
-        vb.resize(nVerts * 32u);
-        if (!PeekBytesGuarded(reinterpret_cast<const void*>(bc.vbCpu), vb.data(),
-                              vb.size())) {
-            continue;
-        }
-        // Freed/reused CPU buffer guard: every position must be finite and
-        // cluster-scale. Garbage here produced the post-cull "vertex
-        // explosions"; one bad vertex disqualifies the whole chunk.
-        bool sane = true;
-        for (uint32_t v = 0; v < nVerts && sane; ++v) {
-            float lp[3];
-            std::memcpy(lp, vb.data() + v * 32u, 12);
-            for (int j = 0; j < 3; ++j) {
-                if (!(lp[j] == lp[j]) || lp[j] > 65536.0f || lp[j] < -65536.0f) {
-                    sane = false;
-                    break;
-                }
-            }
-        }
-        if (!sane) {
-            static std::atomic<int> sInsaneLogs{0};
-            const int in = sInsaneLogs.fetch_add(1, std::memory_order_relaxed);
-            if (in < 12) {
-                _MESSAGE("FO4RemixPlugin: [MergeGraph] hash=0x%llX chunk %p CPU "
-                         "data invalid (freed?) -> dropped",
-                         (unsigned long long)hash, (void*)bc.shape);
-            }
-            continue;
-        }
-        // leaf-local transform: row-vector rotate + scale + translate
-        const float* m = bc.xf;
-        const float s = m[15];
-        const float tx = m[12] - W.pos.x;
-        const float ty = m[13] - W.pos.y;
-        const float tz = m[14] - W.pos.z;
-        const uint32_t vbase = (uint32_t)outVerts.size();
-        outVerts.resize(vbase + nVerts);
-        for (uint32_t v = 0; v < nVerts; ++v) {
-            const uint8_t* p = vb.data() + v * 32u;
-            float lp[3];
-            std::memcpy(lp, p, 12);
-            remixapi_HardcodedVertex& hv = outVerts[vbase + v];
-            std::memset(&hv, 0, sizeof(hv));
-            for (int j = 0; j < 3; ++j) {
-                hv.position[j] = s * (lp[0] * m[0 * 4 + j] + lp[1] * m[1 * 4 + j] +
-                                      lp[2] * m[2 * 4 + j]) +
-                                 (j == 0 ? tx : (j == 1 ? ty : tz));
-            }
-            uint16_t uvh[2];
-            std::memcpy(uvh, p + 16, 4);
-            hv.texcoord[0] = HalfToFloat(uvh[0]);
-            hv.texcoord[1] = HalfToFloat(uvh[1]);
-            float nx = (p[20] / 255.0f) * 2.0f - 1.0f;
-            float ny = (p[21] / 255.0f) * 2.0f - 1.0f;
-            float nz = (p[22] / 255.0f) * 2.0f - 1.0f;
-            float rn[3] = { 0.0f, 0.0f, 1.0f };
-            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
-            if (nl > 0.25f) {
-                nx /= nl; ny /= nl; nz /= nl;
-                for (int j = 0; j < 3; ++j) {
-                    rn[j] = nx * m[0 * 4 + j] + ny * m[1 * 4 + j] + nz * m[2 * 4 + j];
-                }
-            }
-            hv.normal[0] = rn[0];
-            hv.normal[1] = rn[1];
-            hv.normal[2] = rn[2];
-            hv.color = 0xFFFFFFFF;
-        }
-        const size_t ibase = outIndices.size();
-        outIndices.resize(ibase + nIdx);
-        for (uint32_t t = 0; t + 2 < nIdx; t += 3) {
-            outIndices[ibase + t]     = vbase + idx[t];
-            outIndices[ibase + t + 1] = vbase + idx[t + 2];
-            outIndices[ibase + t + 2] = vbase + idx[t + 1];
-        }
-        {
-            std::lock_guard<std::mutex> g(g_bakedChunkLock);
-            if (g_bakedChunkOwner.size() < 65536) g_bakedChunkOwner[bc.shape] = hash;
-        }
-        ++keptChunks;
-    }
-    if (keptChunks == 0 || outIndices.size() < 24) return false;
-    static std::atomic<int> sBakeLogs{0};
-    const int bl = sBakeLogs.fetch_add(1, std::memory_order_relaxed);
-    if (bl < 30) {
-        _MESSAGE("FO4RemixPlugin: [MergeGraph] hash=0x%llX chunks=%d/%zu tris=%zu "
-                 "verts=%zu",
-                 (unsigned long long)hash, keptChunks, chunks.size(),
-                 outIndices.size() / 3, outVerts.size());
-    }
-    return true;
-}
+// ---- Take 11 (scene-graph baked-chunk walk) REMOVED (2026-07-04) ----
+// Live re-verification (frida, same save/binary) disproved every premise:
+// no baked-chunk BSTriShapes exist under the cell's BSMultiBoundNode (the
+// MB-parented stride-32 shapes are cell terrain, 289-vert/512-tri LOD
+// quads), flags bits 35/43 are TRANSIENT batch-renderer state (verified
+// toggling between reads seconds apart; the engine's traversal SKIPS
+// bit-35 nodes), the wrapper +0x38 field is a refcount (a shared IB
+// wrapper read 101), and no scene-graph geometry shares the merge
+// shape's shaderProperty. Run 2's one-time success was a race on the
+// transient flag. The reproducible ground truth for baked cluster
+// geometry is the engine's own draw stream (take 10 below) plus the
+// capture-upgrade path that re-resolves once the engine draws the
+// cluster. Removed here: BakedChunk, CollectBakedChunks,
+// BuildMeshFromBakedChunks, g_bakedChunkOwner, g_bakedMeshCache.
 
 // ---- Baked expanded-mesh rebuild (take 10, 2026-07-03) ----
 // The engine renders BSMergeInstancedTriShape from a PRE-BAKED expanded
@@ -927,10 +566,13 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
                                               nVerts * 32u, vbytes) == nVerts * 32u;
         vbb->Release();
         if (!vbOk) continue;
-        // bound filter: all spread samples must land inside the cluster
+        // bound filter, EVERY vertex (was 8 spread samples): all positions
+        // must land inside the cluster. NaN/garbage from a repacked or
+        // reused pool slice fails the comparison and drops the chunk --
+        // one bad vertex disqualifies it (take-11.2's vertex-explosion
+        // lesson, kept for this path).
         bool inside = true;
-        for (int s = 0; s < 8 && inside; ++s) {
-            const uint32_t v = (uint32_t)(((uint64_t)s * (nVerts - 1)) / 7);
+        for (uint32_t v = 0; v < nVerts && inside; ++v) {
             float p[3];
             std::memcpy(p, vbytes.data() + v * 32u, 12);
             const float dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
@@ -1491,7 +1133,6 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     uint32_t instSegTris[4] = { 0, 0, 0, 0 };
     void* instBufPtr = nullptr;   // identity only, for DrawCapture matching
     void* instSrvPtr = nullptr;
-    std::vector<BakedChunk> bakedChunks;  // take-11 scene-graph chunk walk
     if (g_config.mergeInstanceExpansion && g_config.gpuInstancingEnabled) {
         char instLeaf[64] = "";
         SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
@@ -1517,20 +1158,14 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 for (int s = 0; s < 4; ++s) {
                     if (instSegTris[s]) ++nzEarly;
                 }
-                if (nzEarly >= 2 && g_config.mergeInstanceDrawCapture) {
-                    // Take 11: the baked chunk shapes are right there in
-                    // the scene graph -- collect them now. Only when the
-                    // walk finds nothing do we fall back to the deferred
-                    // draw-capture path.
-                    CollectBakedChunks(tri, bakedChunks);
-                    if (bakedChunks.empty() && instBufPtr) {
-                        std::vector<DrawCapture::SegDraw> capPeek;
-                        if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
-                                               (uint32_t)instRecords.size(),
-                                               instSegTris, capPeek) ==
-                            DrawCapture::kCapturing) {
-                            return false;
-                        }
+                if (nzEarly >= 2 && g_config.mergeInstanceDrawCapture &&
+                    instBufPtr) {
+                    std::vector<DrawCapture::SegDraw> capPeek;
+                    if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
+                                           (uint32_t)instRecords.size(),
+                                           instSegTris, capPeek) ==
+                        DrawCapture::kCapturing) {
+                        return false;
                     }
                 }
             }
@@ -1669,68 +1304,6 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 // in first-seen draw order. Anything that doesn't validate
                 // re-arms the watch for another frame (up to 5) and then
                 // falls back to the take-5 path.
-                // Take 11: build from the engine's own baked chunk shapes
-                // (scene-graph walk; exact geometry, placement, and -- via
-                // shaderProperty identity -- material attribution). Cache
-                // first: a re-resolve after culling reuses the mesh built
-                // at load instead of touching engine CPU buffers that may
-                // be long freed.
-                bool bakedFromCache = false;
-                {
-                    std::lock_guard<std::mutex> g(g_bakedChunkLock);
-                    auto it = g_bakedMeshCache.find(hash);
-                    if (it != g_bakedMeshCache.end()) {
-                        mesh.vertices = it->second.verts;
-                        mesh.indices = it->second.indices;
-                        bakedFromCache = true;
-                    }
-                }
-                if (bakedFromCache) {
-                    instRecords.clear();
-                    std::array<float, 20> ident = {};
-                    ident[0] = ident[5] = ident[10] = ident[15] = 1.0f;
-                    instRecords.push_back(ident);
-                    segs[0] = { 0, (uint32_t)(mesh.indices.size() / 3), 0, 1 };
-                    nSegs = 1;
-                } else if (!bakedChunks.empty()) {
-                    std::vector<remixapi_HardcodedVertex> bv;
-                    std::vector<uint32_t> bi;
-                    int keptChunks = 0;
-                    if (BuildMeshFromBakedChunks(tri, hash, bakedChunks, bv, bi,
-                                                 keptChunks)) {
-                        mesh.vertices = bv;
-                        mesh.indices = bi;
-                        {
-                            std::lock_guard<std::mutex> g(g_bakedChunkLock);
-                            if (g_bakedMeshCache.size() < 4096) {
-                                BakedMeshData& d = g_bakedMeshCache[hash];
-                                d.verts = std::move(bv);
-                                d.indices = std::move(bi);
-                            }
-                        }
-                        instRecords.clear();
-                        std::array<float, 20> ident = {};
-                        ident[0] = ident[5] = ident[10] = ident[15] = 1.0f;
-                        instRecords.push_back(ident);
-                        segs[0] = { 0, (uint32_t)(mesh.indices.size() / 3), 0, 1 };
-                        nSegs = 1;
-                    } else {
-                        // Chunks exist but a sibling merge shape already
-                        // submitted them all: this cluster's baked geometry
-                        // is fully covered. Submitting our source mesh on
-                        // top would double it -- resolve as intentionally
-                        // empty instead.
-                        static std::atomic<int> sEmptyLogs{0};
-                        const int en = sEmptyLogs.fetch_add(1, std::memory_order_relaxed);
-                        if (en < 20) {
-                            _MESSAGE("FO4RemixPlugin: [MergeGraph] hash=0x%llX all %zu "
-                                     "chunks already submitted -> empty resolve",
-                                     (unsigned long long)hash, bakedChunks.size());
-                        }
-                        state.submittedToRemix = true;
-                        return true;
-                    }
-                }
                 if (nSegs == 0 && g_config.mergeInstanceDrawCapture && instBufPtr) {
                     std::vector<DrawCapture::SegDraw> cap;
                     if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
@@ -1850,6 +1423,28 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             return false;
                         }
                         }
+                    }
+                }
+                // Capture starved or rejected: run-4 ground truth is that
+                // the engine issues a cluster's chunk draws only while it
+                // actually renders the cluster (record SRVs get BOUND every
+                // frame either way), so an off-screen cluster can never
+                // capture during the initial resolve. Submit the take-5 /
+                // whole-mesh fallback below, but record the watch
+                // identities: Tick's upgrade poll keeps a background watch
+                // alive and re-resolves this drawable the moment a capture
+                // lands (the player looked at it), hot-swapping in the
+                // engine-exact baked geometry.
+                if (g_config.mergeInstanceDrawCapture && instBufPtr) {
+                    if (nSegs == 0) {
+                        state.mergeCaptureUpgradePending = true;
+                        state.mergeWatchBuf = instBufPtr;
+                        state.mergeWatchSrv = instSrvPtr;
+                        state.mergeWatchRecordCount = (uint32_t)instRecords.size();
+                        std::memcpy(state.mergeWatchSegTris, instSegTris,
+                                    sizeof(state.mergeWatchSegTris));
+                    } else {
+                        state.mergeCaptureUpgradePending = false;
                     }
                 }
                 if (nSegs == 0 && totalSegTris == meshTris &&
