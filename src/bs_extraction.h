@@ -145,7 +145,11 @@ struct CellInfo {
 //   also overrides BC3.a on BC3 inputs. Used for decal-tagged surfaces
 //   specifically, where BGS sometimes packs non-cutout data in the BC3
 //   alpha channel so the authored alpha doesn't behave as a clean mask.
-enum class TexturePostProcess { None, InvertRGB, Octahedral, DiffuseAlphaFromLuminance, DiffuseAlphaFromLuminanceForceBC3 };
+// ForceRGBA8 (2026-07-06 black-merge experiment): decompress BC1/BC3 (incl.
+// SRGB) to RGBA8 with authored alpha preserved and no other change. Used to
+// discriminate "raw BC upload renders black on merge shapes" from
+// material/batching causes.
+enum class TexturePostProcess { None, InvertRGB, Octahedral, DiffuseAlphaFromLuminance, DiffuseAlphaFromLuminanceForceBC3, ForceRGBA8 };
 
 // ---------------------------------------------------------------------------
 // Common vertex/index extraction result -- shared between static and skinned paths
@@ -183,6 +187,13 @@ namespace BsExtraction {
 
     // Drop the internal texture cache (call on cell change if desired).
     void ClearTextureCache();
+
+    // Diagnostic (2026-07-06 black-merge investigation): content statistics
+    // of a cached extracted texture. Returns false on cache miss. meanRGBA is
+    // computed from a stride sample of mip 0 when the cached format is
+    // RGBA8 (post-decompression); left zeroed otherwise.
+    bool GetCachedTextureStats(uint64_t hash, uint32_t* outW, uint32_t* outH,
+                               uint32_t* outFmt, uint32_t outMeanRGBA[4]);
 
     // --- Shared helper functions (used by both bs_extraction.cpp and skinning.cpp) ---
 

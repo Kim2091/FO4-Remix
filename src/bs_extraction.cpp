@@ -905,6 +905,7 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     if (postProcess == TexturePostProcess::Octahedral)                        hash = FnvHashCombine(hash, 2);
     if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminance)         hash = FnvHashCombine(hash, 3);
     if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminanceForceBC3) hash = FnvHashCombine(hash, 5);
+    if (postProcess == TexturePostProcess::ForceRGBA8)                        hash = FnvHashCombine(hash, 6);
     // Fold roughness clamp into the cache key so a roughness texture extracted
     // for a decal (clamped) and the same texture for a non-decal (un-clamped)
     // hash differently. Otherwise the first-seen variant would poison the
@@ -1122,6 +1123,10 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
             DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/false);
         } else if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminanceForceBC3) {
             DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/true);
+        } else if (postProcess == TexturePostProcess::ForceRGBA8) {
+            // Decompress-only: BC1/BC3 (incl. SRGB) -> RGBA8, authored alpha
+            // kept. Non-BC inputs pass through untouched.
+            DecompressBC(mip, BCTransform::None);
         }
         // Metal albedo luminance floor composes AFTER the alpha stage so
         // synthesized / authored cutout alpha is preserved while dark RGB is
@@ -1699,4 +1704,78 @@ void BsExtraction::ClearTextureCache()
 {
     _MESSAGE("FO4RemixPlugin: ClearTextureCache - clearing %zu entries", g_textureCache.size());
     g_textureCache.clear();
+}
+
+bool BsExtraction::GetCachedTextureStats(uint64_t hash, uint32_t* outW, uint32_t* outH,
+                                         uint32_t* outFmt, uint32_t outMeanRGBA[4])
+{
+    auto it = g_textureCache.find(hash);
+    if (it == g_textureCache.end()) return false;
+    const ExtractedTexture& tex = it->second;
+    if (outW) *outW = tex.width;
+    if (outH) *outH = tex.height;
+    if (outFmt) *outFmt = (uint32_t)tex.dxgiFormat;
+    if (outMeanRGBA) {
+        outMeanRGBA[0] = outMeanRGBA[1] = outMeanRGBA[2] = outMeanRGBA[3] = 0;
+        if ((tex.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+             tex.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) &&
+            tex.pixels.size() >= (size_t)tex.width * tex.height * 4) {
+            uint64_t sum[4] = {};
+            const size_t px = (size_t)tex.width * tex.height;
+            const size_t step = px > 4096 ? px / 4096 : 1;
+            size_t n = 0;
+            for (size_t i = 0; i < px; i += step, ++n) {
+                const uint8_t* p = tex.pixels.data() + i * 4;
+                sum[0] += p[0]; sum[1] += p[1]; sum[2] += p[2]; sum[3] += p[3];
+            }
+            if (n) {
+                for (int c = 0; c < 4; ++c) outMeanRGBA[c] = (uint32_t)(sum[c] / n);
+            }
+        } else {
+            // BC1/BC2/BC3 (incl. SRGB variants): decode the 565 endpoint pair
+            // of each sampled color block into a mean RGB, and report the
+            // percentage of ALL-ZERO blocks in [3]. A zero-filled readback
+            // (streaming stub / failed copy) shows as mean=(0,0,0) with
+            // zeroPct=100; real content shows plausible endpoint means.
+            uint32_t blockBytes = 0, colorOff = 0;
+            switch (tex.dxgiFormat) {
+            case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM:
+            case DXGI_FORMAT_BC1_UNORM_SRGB: blockBytes = 8;  colorOff = 0; break;
+            case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM:
+            case DXGI_FORMAT_BC2_UNORM_SRGB:
+            case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM:
+            case DXGI_FORMAT_BC3_UNORM_SRGB: blockBytes = 16; colorOff = 8; break;
+            default: break;
+            }
+            if (blockBytes) {
+                const size_t bw = (tex.width + 3) / 4, bh = (tex.height + 3) / 4;
+                size_t nBlocks = bw * bh;
+                const size_t avail = tex.pixels.size() / blockBytes;
+                if (nBlocks > avail) nBlocks = avail;
+                const size_t step = nBlocks > 4096 ? nBlocks / 4096 : 1;
+                uint64_t rSum = 0, gSum = 0, bSum = 0;
+                size_t n = 0, zero = 0;
+                for (size_t i = 0; i < nBlocks; i += step, ++n) {
+                    const uint8_t* blk = tex.pixels.data() + i * blockBytes;
+                    bool allZero = true;
+                    for (uint32_t b = 0; b < blockBytes; ++b) {
+                        if (blk[b]) { allZero = false; break; }
+                    }
+                    if (allZero) ++zero;
+                    const uint16_t c0 = (uint16_t)(blk[colorOff] | (blk[colorOff + 1] << 8));
+                    const uint16_t c1 = (uint16_t)(blk[colorOff + 2] | (blk[colorOff + 3] << 8));
+                    rSum += (((c0 >> 11) & 0x1F) + ((c1 >> 11) & 0x1F)) * 255 / 62;
+                    gSum += (((c0 >>  5) & 0x3F) + ((c1 >>  5) & 0x3F)) * 255 / 126;
+                    bSum += (( c0        & 0x1F) + ( c1        & 0x1F)) * 255 / 62;
+                }
+                if (n) {
+                    outMeanRGBA[0] = (uint32_t)(rSum / n);
+                    outMeanRGBA[1] = (uint32_t)(gSum / n);
+                    outMeanRGBA[2] = (uint32_t)(bSum / n);
+                    outMeanRGBA[3] = (uint32_t)(zero * 100 / n);  // % all-zero blocks
+                }
+            }
+        }
+    }
+    return true;
 }

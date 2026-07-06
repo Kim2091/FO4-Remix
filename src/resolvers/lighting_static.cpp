@@ -1122,6 +1122,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // BC3 decals; synthesis would replace it with worse luminance-derived
     // values. Use the BC1-only synthesis: BC1 inputs (no alpha at all) get
     // the synthesized cutout, BC3/BC7 inputs preserve their authored alpha.
+    // (2026-07-06 black-merge investigation: raw BC1/BC3-SRGB merge uploads
+    // were briefly suspected and force-decompressed to RGBA8 -- the visual
+    // discriminator run showed black blobs SURVIVING the conversion, so BC
+    // upload is exonerated and the conversion is reverted. The real cause
+    // was the whole-mesh x all-records fallback; see the single-record
+    // fallback below.)
     const TexturePostProcess diffusePostProcess =
         (mesh.alphaTestEnabled || mesh.alphaBlendEnabled)
             ? TexturePostProcess::DiffuseAlphaFromLuminance
@@ -1289,6 +1295,63 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                              "FAILED -> single-draw fallback leafPos=(%.1f,%.1f,%.1f)",
                              n, (unsigned long long)hash,
                              W.pos.x, W.pos.y, W.pos.z);
+                }
+            }
+            // [MergeVtx] diagnostic (2026-07-06): the black-object repro shows
+            // merge fallbacks rendering pure black while textures resolve fine
+            // and zero [FORK-DIAG] events fire runtime-side. Two candidate
+            // data-side causes: (a) baked vertex COLORS -- bit 37 is set on
+            // the black trash-pile shapes and the pooled color stream of
+            // precombined geometry is a blend/AO mask, often near-black;
+            // (b) wrong UV decode against the pool layout. One capped stats
+            // line per shape discriminates: black colors -> (a); degenerate
+            // or wild UVs -> (b).
+            {
+                static std::atomic<int> sVtxLogs{0};
+                const int vn = sVtxLogs.fetch_add(1, std::memory_order_relaxed);
+                if (vn < 150 && !mesh.vertices.empty()) {
+                    uint32_t rMin = 255, rMax = 0;
+                    uint64_t rSum = 0, gSum = 0, bSum = 0, aSum = 0;
+                    float uMin = 1e9f, uMax = -1e9f, vMin = 1e9f, vMax = -1e9f;
+                    for (const auto& v : mesh.vertices) {
+                        const uint32_t c = v.color;
+                        const uint32_t r = c & 0xFF, g = (c >> 8) & 0xFF,
+                                       b = (c >> 16) & 0xFF, a = (c >> 24) & 0xFF;
+                        rSum += r; gSum += g; bSum += b; aSum += a;
+                        if (r < rMin) rMin = r;
+                        if (r > rMax) rMax = r;
+                        if (v.texcoord[0] < uMin) uMin = v.texcoord[0];
+                        if (v.texcoord[0] > uMax) uMax = v.texcoord[0];
+                        if (v.texcoord[1] < vMin) vMin = v.texcoord[1];
+                        if (v.texcoord[1] > vMax) vMax = v.texcoord[1];
+                    }
+                    const size_t nv = mesh.vertices.size();
+                    // Diffuse content stats: if the extracted albedo pixels
+                    // are themselves near-black, the object renders black
+                    // with every other stage working perfectly -- the one
+                    // mechanism left after FORK-DIAG and vertex stats came
+                    // back clean.
+                    uint32_t tw = 0, th = 0, tfmt = 0, tMean[4] = {};
+                    BsExtraction::GetCachedTextureStats(mesh.diffuseTextureHash,
+                                                        &tw, &th, &tfmt, tMean);
+                    const char* dTexName = "(none)";
+                    if (mat && mat->spDiffuseTexture) {
+                        const char* nm = mat->spDiffuseTexture->name.c_str();
+                        if (nm) dTexName = nm;
+                    }
+                    _MESSAGE("FO4RemixPlugin: [MergeVtx] #%d hash=0x%llX verts=%zu "
+                             "bit37=%d colorMeanRGBA=(%llu,%llu,%llu,%llu) rMin=%u rMax=%u "
+                             "uv=[%.3f..%.3f, %.3f..%.3f] desc=0x%llX vsize=%u "
+                             "difTex='%s' difHash=0x%llX %ux%u fmt=%u difMeanRGBA=(%u,%u,%u,%u)",
+                             vn, (unsigned long long)hash, nv,
+                             (int)((propFlagsEarly >> 37) & 1),
+                             (unsigned long long)(rSum / nv), (unsigned long long)(gSum / nv),
+                             (unsigned long long)(bSum / nv), (unsigned long long)(aSum / nv),
+                             rMin, rMax, uMin, uMax, vMin, vMax,
+                             (unsigned long long)parsed.vertexDesc,
+                             (unsigned)parsed.vertexSize,
+                             dTexName, (unsigned long long)mesh.diffuseTextureHash,
+                             tw, th, tfmt, tMean[0], tMean[1], tMean[2], tMean[3]);
                 }
             }
         }
@@ -1538,7 +1601,24 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 }
             }
             if (nSegs == 0) {
-                segs[0] = { 0, meshTris, 0, instRecords.size() };
+                // Unresolved-partition fallback: ONE record, not all of them
+                // (2026-07-06). Whole-mesh x ALL records stacked N copies of
+                // the entire cluster mesh onto near-coplanar placements
+                // (roads, trash blankets, debris ground), and self-
+                // intersecting opaque geometry shades PURE BLACK in the path
+                // tracer -- this was the "black texture bug": texture
+                // content, vertex colors, UVs, material creation, and the
+                // runtime texture table were all verified healthy
+                // ([MergeVtx] stats + zero [FORK-DIAG] events), and force-
+                // decompressing every merge diffuse to RGBA8 changed
+                // nothing, while single-record submission fixed ~99% of the
+                // black objects on the spot (user-verified at Red Rocket).
+                // For near-coplanar record sets one copy is visually ~the
+                // whole cluster; for genuinely spread clusters this renders
+                // one placement and loses the rest -- strictly better than
+                // a giant black blanket, and the capture/partition work
+                // (take 12.x) remains the path to exact geometry.
+                segs[0] = { 0, meshTris, 0, 1 };
                 nSegs = 1;
             }
 
