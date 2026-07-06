@@ -1196,14 +1196,32 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         reinterpret_cast<uintptr_t>(tri) + 0x1A0), segQ, 2)) {
                     std::memcpy(instSegTris, segQ, sizeof(instSegTris));
                 }
-                // The segment table is 3 dwords, NOT 4. Take-7 probing saw
-                // floats at +0x1AC, and run 5 confirmed live: dozens of
-                // TRUE single-segment shapes (slot sum == meshTris exactly)
-                // carried junk in slot 3 ([0,0,352,796], [0,160,0,4435968],
-                // [0,0,640,32759]...) which promoted them into the
-                // multi-segment capture path -- where a contaminated
-                // upgrade then REPLACED their correct whole-mesh rendering.
-                instSegTris[3] = 0;
+                // Segment-table width is PER SHAPE, validated by the triangle
+                // sum (2026-07-06, supersedes take 12.1's unconditional
+                // 3-dword truncation). Run 5's junk-slot-3 cases
+                // ([0,0,352,796] on a 352-tri mesh, [0,160,0,4435968] on 160,
+                // [0,0,640,32759] on 640...) all have sum(slots 0-2) ==
+                // meshTris with garbage in slot 3 -- but the unconditional
+                // `instSegTris[3] = 0` ALSO broke every genuine 4-segment
+                // shape: their sum no longer matched meshTris, the take-5
+                // partition failed, and they fell into the whole-mesh
+                // fallback (the black-blanket / missing-copy population).
+                // Rule: if all four slots sum to meshTris, the table is
+                // genuinely 4 dwords -- keep it. Otherwise, if the first
+                // three alone sum to meshTris, slot 3 is junk -- zero it.
+                // If neither matches, both partition attempts fail anyway
+                // and the overlap-culled fallback below takes over.
+                {
+                    const uint32_t segMeshTris =
+                        (uint32_t)(mesh.indices.size() / 3);
+                    const uint64_t sum4 = (uint64_t)instSegTris[0] + instSegTris[1] +
+                                          instSegTris[2] + instSegTris[3];
+                    const uint64_t sum3 = (uint64_t)instSegTris[0] + instSegTris[1] +
+                                          instSegTris[2];
+                    if (sum4 != segMeshTris && sum3 == segMeshTris) {
+                        instSegTris[3] = 0;
+                    }
+                }
                 // Multi-segment shapes: ask DrawCapture for the engine's own
                 // draw parameters (per-sub-model index ranges + record
                 // partition). The engine draws the shape within a frame or
@@ -1601,23 +1619,23 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 }
             }
             if (nSegs == 0) {
-                // Unresolved-partition fallback: ONE record, not all of them
-                // (2026-07-06). Whole-mesh x ALL records stacked N copies of
-                // the entire cluster mesh onto near-coplanar placements
-                // (roads, trash blankets, debris ground), and self-
-                // intersecting opaque geometry shades PURE BLACK in the path
-                // tracer -- this was the "black texture bug": texture
-                // content, vertex colors, UVs, material creation, and the
-                // runtime texture table were all verified healthy
-                // ([MergeVtx] stats + zero [FORK-DIAG] events), and force-
-                // decompressing every merge diffuse to RGBA8 changed
-                // nothing, while single-record submission fixed ~99% of the
-                // black objects on the spot (user-verified at Red Rocket).
-                // For near-coplanar record sets one copy is visually ~the
-                // whole cluster; for genuinely spread clusters this renders
-                // one placement and loses the rest -- strictly better than
-                // a giant black blanket, and the capture/partition work
-                // (take 12.x) remains the path to exact geometry.
+                // Unresolved-partition fallback: ONE record (2026-07-06).
+                // Whole-mesh x ALL records stacks N copies of the entire
+                // cluster mesh onto overlapping placements, and the flat
+                // segments in the concatenation z-fight to PURE BLACK in the
+                // path tracer -- this was the "black texture bug" (texture
+                // content, vertex data, material creation, and the runtime
+                // texture table were all verified healthy; single-record
+                // submission fixed ~99% of black objects, user-verified).
+                // A flatness gate ("3D shapes get all records") was tried
+                // and REVERTED same day: multi-segment concatenations mix
+                // flat blankets with tall pieces, so shapes classified 3D
+                // still contained flat segments that stacked black. Every
+                // record-multiplying variant of this fallback re-blackens
+                // something; missing copies are recovered by the segment-
+                // table sum-validation above (genuine 4-segment shapes
+                // partition again) and, longer-term, by the take-12.x
+                // capture path.
                 segs[0] = { 0, meshTris, 0, 1 };
                 nSegs = 1;
             }
