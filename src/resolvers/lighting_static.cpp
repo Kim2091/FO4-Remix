@@ -1183,6 +1183,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     uint32_t instSegTris[4] = { 0, 0, 0, 0 };
     void* instBufPtr = nullptr;   // identity only, for DrawCapture matching
     void* instSrvPtr = nullptr;
+    // Take-13 exact partition from the engine's CPU-resident u16 table
+    // (filled by the [MergeT7] block below when every invariant holds).
+    // t7Table[group] = record index for that GS-triangle group; the submit
+    // section expands it into one submesh per record.
+    std::vector<uint16_t> t7Table;
+    uint32_t t7GS = 0;
+    bool t7Valid = false;
     if (g_config.mergeInstanceExpansion && g_config.gpuInstancingEnabled) {
         char instLeaf[64] = "";
         SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
@@ -1196,30 +1203,139 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         reinterpret_cast<uintptr_t>(tri) + 0x1A0), segQ, 2)) {
                     std::memcpy(instSegTris, segQ, sizeof(instSegTris));
                 }
-                // Segment-table width is PER SHAPE, validated by the triangle
-                // sum (2026-07-06, supersedes take 12.1's unconditional
-                // 3-dword truncation). Run 5's junk-slot-3 cases
-                // ([0,0,352,796] on a 352-tri mesh, [0,160,0,4435968] on 160,
-                // [0,0,640,32759] on 640...) all have sum(slots 0-2) ==
-                // meshTris with garbage in slot 3 -- but the unconditional
-                // `instSegTris[3] = 0` ALSO broke every genuine 4-segment
-                // shape: their sum no longer matched meshTris, the take-5
-                // partition failed, and they fell into the whole-mesh
-                // fallback (the black-blanket / missing-copy population).
-                // Rule: if all four slots sum to meshTris, the table is
-                // genuinely 4 dwords -- keep it. Otherwise, if the first
-                // three alone sum to meshTris, slot 3 is junk -- zero it.
-                // If neither matches, both partition attempts fail anyway
-                // and the overlap-culled fallback below takes over.
+                // The segment table is EXACTLY 3 dwords -- decompiler-proven
+                // (2026-07-06 static-RE pass, scripts/merge_partition_
+                // research.md): the bake loop at 0x1421E27D0 is literally
+                // `while (seg < 3)` writing +0x1A0/+0x1A4/+0x1A8, and +0x1AC
+                // is never touched by ctor, bake, clone, or draw -- pure
+                // heap junk. (A brief "keep 4 slots when they sum" variant
+                // is reverted: any such sum is coincidence.) Segments are
+                // up to 3 DISTANCE-DETAIL BANDS of the cluster; near the
+                // player the engine draws all of them.
+                instSegTris[3] = 0;
+
+                // ---- Take 13: exact partition from the engine's own u16
+                // group->record table (2026-07-06, decompiler-proven).
+                // The engine never draws these instanced and keeps no
+                // {recordStart,recordCount} table; its vertex shader maps
+                // each triangle GROUP (GS consecutive triangles, GS at
+                // shape+0x194) to a record index via a u16 table bound at
+                // t7 -- and that table's CPU copy is RETAINED on the shape
+                // (+0x178 -> wrapper+0x8). Per band s:
+                //   recordStart(s) = T[prefix(s)/GS]
+                //   recordCount(s) = T[lastGroup(s)] - T[firstGroup(s)] + 1
+                // This needs no draw capture and works for off-screen
+                // clusters. All reads guarded; every invariant from the
+                // research doc gates acceptance -- any violation falls back
+                // to the existing capture -> take-5 -> single-record chain.
+                // (t7RecStart/t7RecCount/t7NSegs/t7Valid declared at
+                // function scope beside instSegTris.)
                 {
-                    const uint32_t segMeshTris =
-                        (uint32_t)(mesh.indices.size() / 3);
-                    const uint64_t sum4 = (uint64_t)instSegTris[0] + instSegTris[1] +
-                                          instSegTris[2] + instSegTris[3];
-                    const uint64_t sum3 = (uint64_t)instSegTris[0] + instSegTris[1] +
-                                          instSegTris[2];
-                    if (sum4 != segMeshTris && sum3 == segMeshTris) {
-                        instSegTris[3] = 0;
+                    const uint32_t mTris = (uint32_t)(mesh.indices.size() / 3);
+                    const char* rej = nullptr;
+                    uint64_t strideGs = 0;   // +0x190 stride | +0x194 GS
+                    uint64_t w178q = 0, w170q = 0;
+                    uint32_t GS = 0, nGroups = 0;
+                    std::vector<uint16_t> T;
+                    uint32_t recBufCount = 0;
+                    do {
+                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                reinterpret_cast<uintptr_t>(tri) + 0x190),
+                                &strideGs, 1)) { rej = "peek+0x190"; break; }
+                        GS = (uint32_t)(strideGs >> 32);
+                        if (GS < 16 || GS > 128 || (GS & (GS - 1)) != 0) {
+                            rej = "GS"; break;
+                        }
+                        uint64_t sumSeg = (uint64_t)instSegTris[0] +
+                                          instSegTris[1] + instSegTris[2];
+                        if (mTris == 0 || sumSeg != mTris ||
+                            (mTris % GS) != 0) { rej = "segSum"; break; }
+                        bool segMod = false;
+                        for (int s = 0; s < 3; ++s) {
+                            if (instSegTris[s] % GS) segMod = true;
+                        }
+                        if (segMod) { rej = "segMod"; break; }
+                        nGroups = mTris / GS;
+                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                reinterpret_cast<uintptr_t>(tri) + 0x178),
+                                &w178q, 1) || !w178q) { rej = "w178"; break; }
+                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                reinterpret_cast<uintptr_t>(tri) + 0x170),
+                                &w170q, 1) || !w170q) { rej = "w170"; break; }
+                        uint8_t owns = 0;
+                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)w178q + 0x4E), &owns, 1) ||
+                            owns != 1) { rej = "owns"; break; }
+                        uint32_t usedBytes = 0;
+                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)w178q + 0x34), &usedBytes, 4)) {
+                            rej = "used"; break;
+                        }
+                        const uint32_t expBytes = (2u * nGroups + 3u) & ~3u;
+                        if (usedBytes != expBytes) { rej = "usedBytes"; break; }
+                        uint64_t tPtr = 0;
+                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)w178q + 0x8), &tPtr, 1) || !tPtr) {
+                            rej = "tPtr"; break;
+                        }
+                        T.resize(nGroups);
+                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)tPtr), T.data(), nGroups * 2)) {
+                            rej = "tRead"; break;
+                        }
+                        if (T[0] != 0) { rej = "t0"; break; }
+                        bool mono = true;
+                        for (uint32_t g = 1; g < nGroups; ++g) {
+                            const int d = (int)T[g] - (int)T[g - 1];
+                            if (d != 0 && d != 1) { mono = false; break; }
+                        }
+                        if (!mono) { rej = "mono"; break; }
+                        uint32_t tag = 0;
+                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)w170q + 0x38), &tag, 4) ||
+                            tag != 2) { rej = "tag"; break; }
+                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)w170q + 0x34), &recBufCount, 4)) {
+                            rej = "recCount"; break;
+                        }
+                        if ((uint32_t)T[nGroups - 1] + 1 != recBufCount ||
+                            recBufCount != (uint32_t)instRecords.size()) {
+                            rej = "recMatch"; break;
+                        }
+                        // Per-band range validation: contiguity across
+                        // ascending active bands and full record coverage
+                        // (the per-record expansion happens at submit).
+                        uint32_t prefix = 0, expectStart = 0;
+                        bool ok = true;
+                        for (int s = 0; s < 3 && ok; ++s) {
+                            if (!instSegTris[s]) continue;
+                            const uint32_t fg = prefix / GS;
+                            const uint32_t ng = instSegTris[s] / GS;
+                            const uint32_t lg = fg + ng - 1;
+                            if (lg >= nGroups) { ok = false; break; }
+                            const uint32_t rs = T[fg];
+                            const uint32_t rc2 = (uint32_t)T[lg] - rs + 1;
+                            if (rs != expectStart) { ok = false; break; }
+                            expectStart = rs + rc2;
+                            prefix += instSegTris[s];
+                        }
+                        if (!ok || expectStart != recBufCount) {
+                            rej = "ranges"; break;
+                        }
+                        t7Table = std::move(T);
+                        t7GS = GS;
+                        t7Valid = true;
+                    } while (false);
+                    static std::atomic<int> sT7Logs{0};
+                    const int tn = sT7Logs.fetch_add(1, std::memory_order_relaxed);
+                    if (tn < 60) {
+                        _MESSAGE("FO4RemixPlugin: [MergeT7] #%d hash=0x%llX %s%s "
+                                 "GS=%u groups=%u recs=%u segTris=[%u,%u,%u]",
+                                 tn, (unsigned long long)hash,
+                                 t7Valid ? "OK" : "REJECT:",
+                                 t7Valid ? "" : (rej ? rej : "?"),
+                                 GS, nGroups, recBufCount,
+                                 instSegTris[0], instSegTris[1], instSegTris[2]);
                     }
                 }
                 // Multi-segment shapes: ask DrawCapture for the engine's own
@@ -1234,7 +1350,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 for (int s = 0; s < 4; ++s) {
                     if (instSegTris[s]) ++nzEarly;
                 }
-                if (nzEarly >= 2 && g_config.mergeInstanceDrawCapture &&
+                // Capture deferral only matters when the t7 table did NOT
+                // validate -- a t7-partitioned shape resolves immediately.
+                if (!t7Valid && nzEarly >= 2 && g_config.mergeInstanceDrawCapture &&
                     instBufPtr) {
                     std::vector<DrawCapture::SegDraw> capPeek;
                     if (DrawCapture::Query(instBufPtr, instSrvPtr, hash,
@@ -1414,6 +1532,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         };
         SegDraw segs[8];
         int nSegs = 0;
+        std::vector<SegDraw> t7Segs;
         {
             uint32_t totalSegTris = 0;
             int nonZero = 0;
@@ -1426,7 +1545,32 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             // single identity record: the background watch needs the REAL
             // record count for its desc-verified SRV matching.
             const uint32_t realRecCount = (uint32_t)instRecords.size();
-            if (nonZero >= 2) {
+            if (t7Valid) {
+                // Take 13 (2026-07-06): engine-exact per-RECORD expansion
+                // from the CPU-resident u16 group->record table. The
+                // engine's VS transforms each GS-triangle group by ITS OWN
+                // record (t8[t7[group]]) inside one plain DrawIndexed --
+                // the merged mesh already contains one padded triangle
+                // block per (band, model, placement). So the correct
+                // plugin expansion is one submesh per record: the
+                // contiguous group run mapped to that record, drawn once
+                // at that record's transform. Capture-free, off-screen-
+                // safe, and correct for BOTH multi-band and single-band
+                // multi-model shapes (the latter were silently duplicated
+                // by the old whole-mesh x all-records semantic).
+                t7Segs.reserve(instRecords.size());
+                const uint32_t nG = (uint32_t)t7Table.size();
+                uint32_t g = 0;
+                while (g < nG) {
+                    const uint16_t r = t7Table[g];
+                    uint32_t gEnd = g + 1;
+                    while (gEnd < nG && t7Table[gEnd] == r) ++gEnd;
+                    t7Segs.push_back({ g * t7GS, (gEnd - g) * t7GS,
+                                       (size_t)r, 1 });
+                    g = gEnd;
+                }
+            }
+            if (nonZero >= 2 && !t7Valid) {
                 // Preferred: the engine's own draw parameters for this
                 // shape, captured off the D3D11 draw stream by matching
                 // the instance-record SRV at VS t7/t8 (draw_capture.h).
@@ -1573,7 +1717,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 // engine-exact geometry appears/completes as the player
                 // looks around; DrawCapture's per-watch upgrade budget
                 // bounds the resubmission churn.
-                if (g_config.mergeInstanceDrawCapture && instBufPtr) {
+                // t7-partitioned shapes are already engine-exact -- no
+                // background watch or upgrade churn needed for them.
+                if (!t7Valid && g_config.mergeInstanceDrawCapture && instBufPtr) {
                     state.mergeCaptureUpgradePending = true;
                     state.mergeWatchBuf = instBufPtr;
                     state.mergeWatchSrv = instSrvPtr;
@@ -1618,7 +1764,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     }
                 }
             }
-            if (nSegs == 0) {
+            if (nSegs == 0 && t7Segs.empty()) {
                 // Unresolved-partition fallback: ONE record (2026-07-06).
                 // Whole-mesh x ALL records stacks N copies of the entire
                 // cluster mesh onto overlapping placements, and the flat
@@ -1632,10 +1778,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 // flat blankets with tall pieces, so shapes classified 3D
                 // still contained flat segments that stacked black. Every
                 // record-multiplying variant of this fallback re-blackens
-                // something; missing copies are recovered by the segment-
-                // table sum-validation above (genuine 4-segment shapes
-                // partition again) and, longer-term, by the take-12.x
-                // capture path.
+                // something. With take 13 (t7 table) most shapes never
+                // reach here; the leftovers are invariant-violating shapes
+                // where one visible copy remains the safe choice.
                 segs[0] = { 0, meshTris, 0, 1 };
                 nSegs = 1;
             }
@@ -1658,8 +1803,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         size_t extrasFailed = 0;
         size_t drawIndex = 0;  // 0 keeps the base hash
         const std::vector<uint32_t> fullIndices = std::move(mesh.indices);
-        for (int s = 0; s < nSegs; ++s) {
-            const SegDraw& sd = segs[s];
+        // Take 13: the t7 per-record expansion supersedes the fixed segs[]
+        // array when the table validated (one submesh per record; count can
+        // exceed 8).
+        const SegDraw* segArr = t7Segs.empty() ? segs : t7Segs.data();
+        const int segN = t7Segs.empty() ? nSegs : (int)t7Segs.size();
+        for (int s = 0; s < segN; ++s) {
+            const SegDraw& sd = segArr[s];
             // Segment sub-mesh: index subrange (triangle-aligned, winding
             // flip from the parse preserved); vertices shared as-is --
             // ContentHashOf covers (vertices, indices) so each segment gets
