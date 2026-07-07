@@ -1238,12 +1238,19 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     uint32_t GS = 0, nGroups = 0;
                     std::vector<uint16_t> T;
                     uint32_t recBufCount = 0;
+                    // SRV-slice diagnostics for the [MergeT7] line (zeros
+                    // when the CPU fast path was taken).
+                    uint32_t tFmt = 0, tFE = 0, tNE = 0, tUsed = 0;
+                    bool t7Defer = false;
                     do {
                         if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
                                 reinterpret_cast<uintptr_t>(tri) + 0x190),
                                 &strideGs, 1)) { rej = "peek+0x190"; break; }
                         GS = (uint32_t)(strideGs >> 32);
-                        if (GS < 16 || GS > 128 || (GS & (GS - 1)) != 0) {
+                        // Upper bound 1024, not 128: the 2026-07-07 live run
+                        // shows real GS=256 shapes (vault interiors); the
+                        // decompiled derivation only proves pow2 >= 16.
+                        if (GS < 16 || GS > 1024 || (GS & (GS - 1)) != 0) {
                             rej = "GS"; break;
                         }
                         uint64_t sumSeg = (uint64_t)instSegTris[0] +
@@ -1262,26 +1269,145 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
                                 reinterpret_cast<uintptr_t>(tri) + 0x170),
                                 &w170q, 1) || !w170q) { rej = "w170"; break; }
+                        // Table acquisition, two paths:
+                        // (a) CPU fast path -- valid when the wrapper OWNS a
+                        //     retained CPU copy (bake-time shapes; the owned
+                        //     flag at +0x4E was decompiler-proven for the
+                        //     CreateDataBuffer bake path).
+                        // (b) GPU staging readback of the shape's slice via
+                        //     the SRV at wrapper+0x18 -- live sessions show
+                        //     BA2-LOADED shapes never set the owned flag
+                        //     (60/60 REJECT:owns on 2026-07-07), so shipped
+                        //     precombines take this path. In-flight uploads
+                        //     DEFER via the pending counter at +0x44 (doc
+                        //     invariant 7) instead of rejecting.
+                        bool haveT = false;
                         uint8_t owns = 0;
-                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
-                                (uintptr_t)w178q + 0x4E), &owns, 1) ||
-                            owns != 1) { rej = "owns"; break; }
-                        uint32_t usedBytes = 0;
-                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
-                                (uintptr_t)w178q + 0x34), &usedBytes, 4)) {
-                            rej = "used"; break;
+                        if (PeekBytesGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)w178q + 0x4E), &owns, 1) &&
+                            owns == 1) {
+                            uint32_t usedBytes = 0;
+                            uint64_t tPtr = 0;
+                            const uint32_t expBytes = (2u * nGroups + 3u) & ~3u;
+                            if (PeekBytesGuarded(reinterpret_cast<const void*>(
+                                    (uintptr_t)w178q + 0x34), &usedBytes, 4) &&
+                                usedBytes == expBytes &&
+                                PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                    (uintptr_t)w178q + 0x8), &tPtr, 1) &&
+                                tPtr && HeapLikePtr(tPtr)) {
+                                tUsed = usedBytes;
+                                T.resize(nGroups);
+                                haveT = PeekBytesGuarded(
+                                    reinterpret_cast<const void*>((uintptr_t)tPtr),
+                                    T.data(), nGroups * 2);
+                            }
                         }
-                        const uint32_t expBytes = (2u * nGroups + 3u) & ~3u;
-                        if (usedBytes != expBytes) { rej = "usedBytes"; break; }
-                        uint64_t tPtr = 0;
-                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
-                                (uintptr_t)w178q + 0x8), &tPtr, 1) || !tPtr) {
-                            rej = "tPtr"; break;
-                        }
-                        T.resize(nGroups);
-                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
-                                (uintptr_t)tPtr), T.data(), nGroups * 2)) {
-                            rej = "tRead"; break;
+                        if (!haveT) {
+                            // The t7 table lives in a SHARED pool buffer --
+                            // reading the ID3D11Buffer from byte 0 returned
+                            // the identical pool head for every shape
+                            // (half-float vertex data). The shape's slice is
+                            // encoded in its SRV (wrapper+0x18): query the
+                            // view, take the resource FROM it, read exactly
+                            // that slice.
+                            //
+                            // 2026-07-07 run 1 pinned the slice layout: the
+                            // REJECT population split exactly at the 64-
+                            // element boundary (numElem is DWORD-granular
+                            // over a 256-byte-rounded pool slice, so an
+                            // element-vs-group compare rejects every table
+                            // over half the granule), and the u32 parse
+                            // tripped its range check precisely where a
+                            // packed u16 pair first gets a nonzero high
+                            // half. The view is dword-shaped; the DATA is
+                            // packed u16 -- capacity is checked in BYTES and
+                            // the slice is parsed as u16 for every format.
+                            uint32_t tPend = 0;
+                            if (PeekBytesGuarded(reinterpret_cast<const void*>(
+                                    (uintptr_t)w178q + 0x44), &tPend, 4) &&
+                                tPend != 0) {
+                                // Async upload in flight: the pool bytes are
+                                // not the table yet. Defer the resolve (same
+                                // contract as a not-yet-ready texture) -- a
+                                // reject here would park the shape on the
+                                // single-record fallback for the lifetime of
+                                // the cell.
+                                t7Defer = true; rej = "tPending"; break;
+                            }
+                            PeekBytesGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)w178q + 0x34), &tUsed, 4);
+                            uint64_t tSrvObj = 0, tVtbl = 0;
+                            if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                    (uintptr_t)w178q + 0x18), &tSrvObj, 1) ||
+                                !HeapLikePtr(tSrvObj) ||
+                                !PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                    (uintptr_t)tSrvObj), &tVtbl, 1) ||
+                                !PtrInD3D11(tVtbl)) { rej = "tSrv"; break; }
+                            void* rawV = nullptr;
+                            if (!QiGuarded(reinterpret_cast<void*>(tSrvObj),
+                                           &__uuidof(ID3D11ShaderResourceView),
+                                           &rawV)) { rej = "tSrvQi"; break; }
+                            ID3D11ShaderResourceView* tSrv =
+                                static_cast<ID3D11ShaderResourceView*>(rawV);
+                            D3D11_SHADER_RESOURCE_VIEW_DESC svd = {};
+                            tSrv->GetDesc(&svd);
+                            tFmt = (uint32_t)svd.Format;
+                            if (svd.ViewDimension == D3D11_SRV_DIMENSION_BUFFER) {
+                                tFE = svd.Buffer.FirstElement;
+                                tNE = svd.Buffer.NumElements;
+                            } else if (svd.ViewDimension == D3D11_SRV_DIMENSION_BUFFEREX) {
+                                tFE = svd.BufferEx.FirstElement;
+                                tNE = svd.BufferEx.NumElements;
+                            } else {
+                                tSrv->Release();
+                                rej = "tSrvDim"; break;
+                            }
+                            ID3D11Resource* tRes = nullptr;
+                            tSrv->GetResource(&tRes);
+                            tSrv->Release();
+                            if (!tRes) { rej = "tRes"; break; }
+                            void* rawB = nullptr;
+                            const bool qiOk = SUCCEEDED(tRes->QueryInterface(
+                                __uuidof(ID3D11Buffer), &rawB)) && rawB;
+                            tRes->Release();
+                            if (!qiOk) { rej = "tResQi"; break; }
+                            ID3D11Buffer* tBuf = static_cast<ID3D11Buffer*>(rawB);
+                            uint32_t elemSize = 0;
+                            switch (svd.Format) {
+                            case DXGI_FORMAT_R16_UINT:
+                            case DXGI_FORMAT_R16_TYPELESS: elemSize = 2; break;
+                            case DXGI_FORMAT_R32_UINT:
+                            case DXGI_FORMAT_R32_TYPELESS:
+                            case DXGI_FORMAT_R16G16_UINT:
+                            case DXGI_FORMAT_R16G16_TYPELESS: elemSize = 4; break;
+                            case DXGI_FORMAT_UNKNOWN: {
+                                // Structured view: element size lives on the
+                                // buffer desc, not the view format.
+                                D3D11_BUFFER_DESC bd = {};
+                                tBuf->GetDesc(&bd);
+                                elemSize = bd.StructureByteStride;
+                                break;
+                            }
+                            default: break;
+                            }
+                            if (elemSize != 2 && elemSize != 4) {
+                                tBuf->Release();
+                                rej = "tSrvFmt"; break;
+                            }
+                            if ((uint64_t)tNE * elemSize < 2ull * nGroups) {
+                                tBuf->Release();
+                                rej = "tSrvCap"; break;
+                            }
+                            std::vector<uint8_t> tBytes;
+                            const uint32_t want = nGroups * 2;
+                            const bool readOk =
+                                ReadbackBufferSlice(tBuf, tFE * elemSize,
+                                                    want, tBytes) == want;
+                            tBuf->Release();
+                            if (!readOk) { rej = "tReadback"; break; }
+                            T.resize(nGroups);
+                            std::memcpy(T.data(), tBytes.data(), want);
+                            haveT = true;
                         }
                         if (T[0] != 0) { rej = "t0"; break; }
                         bool mono = true;
@@ -1290,16 +1416,19 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             if (d != 0 && d != 1) { mono = false; break; }
                         }
                         if (!mono) { rej = "mono"; break; }
-                        uint32_t tag = 0;
-                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
-                                (uintptr_t)w170q + 0x38), &tag, 4) ||
-                            tag != 2) { rej = "tag"; break; }
-                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
-                                (uintptr_t)w170q + 0x34), &recBufCount, 4)) {
-                            rej = "recCount"; break;
-                        }
-                        if ((uint32_t)T[nGroups - 1] + 1 != recBufCount ||
-                            recBufCount != (uint32_t)instRecords.size()) {
+                        // No wrapper tag/count gate: the +0x38 typeTag==2 and
+                        // +0x34 elementCount fields are decompiler-proven only
+                        // for the bake-path CreateStructuredBuffer wrapper --
+                        // live 2026-07-07, EVERY shipped (BA2-loaded) shape
+                        // rejected at tag with a perfectly-formed T, and the
+                        // 2026-07-04 live pass had already shown +0x38 is a
+                        // REFCOUNT on live wrappers. The count that matters
+                        // for correctness is the one the submit loop indexes:
+                        // instRecords.size() from the t8 readback (fence-line
+                        // proven). T is monotone here, so its last element is
+                        // max(T).
+                        recBufCount = (uint32_t)instRecords.size();
+                        if ((uint32_t)T[nGroups - 1] + 1 != recBufCount) {
                             rej = "recMatch"; break;
                         }
                         // Per-band range validation: contiguity across
@@ -1326,16 +1455,46 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         t7GS = GS;
                         t7Valid = true;
                     } while (false);
+                    if (t7Defer && state.mergeT7Deferrals < 240) {
+                        // Transient by definition (pending-upload counter);
+                        // retry the whole resolve next tick. No log line:
+                        // deferrals would burn the capped counters and hide
+                        // the real OK/REJECT population. Bounded (~4s of
+                        // ticks) because +0x44 is only proven for the
+                        // bake-path wrapper -- junk that never clears must
+                        // fall through to the capture/fallback chain, not
+                        // hide the shape forever.
+                        ++state.mergeT7Deferrals;
+                        return false;
+                    }
                     static std::atomic<int> sT7Logs{0};
                     const int tn = sT7Logs.fetch_add(1, std::memory_order_relaxed);
                     if (tn < 60) {
+                        // Dump the head of whatever we read as T: content
+                        // evidence for the load-path wrapper/format question
+                        // (u16 vs u32 elements, headers, pending uploads).
+                        char tdump[96] = "";
+                        if (!T.empty()) {
+                            size_t p = 0;
+                            for (size_t d = 0; d < T.size() && d < 8; ++d) {
+                                const int wln = snprintf(tdump + p, sizeof(tdump) - p,
+                                                         "%s%u", d ? "," : " T=[",
+                                                         (unsigned)T[d]);
+                                if (wln <= 0 || (size_t)wln >= sizeof(tdump) - p) break;
+                                p += (size_t)wln;
+                            }
+                            snprintf(tdump + p, sizeof(tdump) - p, "]");
+                        }
                         _MESSAGE("FO4RemixPlugin: [MergeT7] #%d hash=0x%llX %s%s "
-                                 "GS=%u groups=%u recs=%u segTris=[%u,%u,%u]",
+                                 "GS=%u groups=%u recs=%u segTris=[%u,%u,%u] "
+                                 "ub=%u srv=[f%u fe=%u ne=%u]%s",
                                  tn, (unsigned long long)hash,
                                  t7Valid ? "OK" : "REJECT:",
                                  t7Valid ? "" : (rej ? rej : "?"),
                                  GS, nGroups, recBufCount,
-                                 instSegTris[0], instSegTris[1], instSegTris[2]);
+                                 instSegTris[0], instSegTris[1], instSegTris[2],
+                                 tUsed, tFmt, tFE, tNE,
+                                 tdump);
                     }
                 }
                 // Multi-segment shapes: ask DrawCapture for the engine's own
@@ -1568,6 +1727,117 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     t7Segs.push_back({ g * t7GS, (gEnd - g) * t7GS,
                                        (size_t)r, 1 });
                     g = gEnd;
+                }
+                // ---- [MergeSphere] rotation-convention self-check
+                // (2026-07-07). Vault-111 ground truth: pieces land at the
+                // right POSITIONS under either convention (vault leaf
+                // rotations are identity, so translation is convention-
+                // independent) but ORIENTATIONS come out mixed-wrong under
+                // both MergeInstanceRowVector settings -- fences/roads were
+                // too symmetric to ever catch it. The engine keeps an
+                // independent oracle: the parent BSFadeNode's per-record
+                // bounding-sphere array (research doc 1.5/evidence
+                // 0x1421E5250 -- same order as records, centers taken from
+                // source data WITHOUT the translation rebase). Predict each
+                // record's sphere center from its t7 vertex-block centroid
+                // under BOTH conventions and log which one the engine's own
+                // spheres agree with. Read-only diagnostic, capped.
+                static std::atomic<int> sSphereLogs{0};
+                if (sSphereLogs.load(std::memory_order_relaxed) < 40) {
+                    do {
+                        uint64_t prop = 0, fadeNode = 0, arr = 0;
+                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                reinterpret_cast<uintptr_t>(tri) + 0x138),
+                                &prop, 1) || !HeapLikePtr(prop)) break;
+                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)prop + 0x48), &fadeNode, 1) ||
+                            !HeapLikePtr(fadeNode)) break;
+                        if (!PeekQwordsGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)fadeNode + 0x180), &arr, 1) ||
+                            !HeapLikePtr(arr)) break;
+                        const size_t nRec = instRecords.size();
+                        std::vector<float> sph(nRec * 4);
+                        if (!PeekBytesGuarded(reinterpret_cast<const void*>(
+                                (uintptr_t)arr), sph.data(),
+                                (uint32_t)(nRec * 16))) break;
+                        bool sane = true;
+                        for (size_t k = 0; k < nRec && sane; ++k) {
+                            const float rad = sph[k * 4 + 3];
+                            sane = std::isfinite(rad) && rad > 0.01f &&
+                                   rad < 1.0e6f &&
+                                   std::isfinite(sph[k * 4]) &&
+                                   std::isfinite(sph[k * 4 + 1]) &&
+                                   std::isfinite(sph[k * 4 + 2]);
+                        }
+                        if (!sane) break;
+                        // Shape-local translate = the merged bound center the
+                        // bake subtracted from record translations (S+0x60).
+                        float C[3] = {};
+                        PeekBytesGuarded(reinterpret_cast<const void*>(
+                            reinterpret_cast<uintptr_t>(tri) + 0x60), C, 12);
+                        double eRow = 0, eCol = 0, eRowC = 0, eColC = 0;
+                        int used = 0;
+                        for (const auto& sd2 : t7Segs) {
+                            // Centroid of this record's vertex block,
+                            // cluster-local parsed positions.
+                            double cx = 0, cy = 0, cz = 0;
+                            size_t nv2 = 0;
+                            const size_t i0 = (size_t)sd2.triStart * 3;
+                            const size_t i1 = i0 + (size_t)sd2.triCount * 3;
+                            for (size_t ii = i0; ii < i1 && ii < mesh.indices.size(); ++ii) {
+                                const auto& v = mesh.vertices[mesh.indices[ii]];
+                                cx += v.position[0];
+                                cy += v.position[1];
+                                cz += v.position[2];
+                                ++nv2;
+                            }
+                            if (!nv2) continue;
+                            cx /= nv2; cy /= nv2; cz /= nv2;
+                            const float* f = instRecords[sd2.recStart].data();
+                            const float s2 = f[15];
+                            const float* sc = &sph[sd2.recStart * 4];
+                            double pr[3], pc[3];
+                            for (int i = 0; i < 3; ++i) {
+                                const double c3[3] = { cx, cy, cz };
+                                // row-vector: pred_j = sum_i c_i * R[i][j]
+                                pr[i] = (c3[0] * f[0 * 4 + i] +
+                                         c3[1] * f[1 * 4 + i] +
+                                         c3[2] * f[2 * 4 + i]) * s2 + f[12 + i];
+                                // col-vector: pred_i = sum_j R[i][j] * c_j
+                                pc[i] = (c3[0] * f[i * 4 + 0] +
+                                         c3[1] * f[i * 4 + 1] +
+                                         c3[2] * f[i * 4 + 2]) * s2 + f[12 + i];
+                            }
+                            auto d3 = [&](const double p[3], const float off[3]) {
+                                const double dx = p[0] + off[0] - sc[0];
+                                const double dy = p[1] + off[1] - sc[1];
+                                const double dz = p[2] + off[2] - sc[2];
+                                return std::sqrt(dx * dx + dy * dy + dz * dz);
+                            };
+                            static const float kZero3[3] = { 0, 0, 0 };
+                            eRow  += d3(pr, kZero3);
+                            eCol  += d3(pc, kZero3);
+                            eRowC += d3(pr, C);
+                            eColC += d3(pc, C);
+                            ++used;
+                        }
+                        if (!used) break;
+                        const int sn = sSphereLogs.fetch_add(1,
+                                           std::memory_order_relaxed);
+                        if (sn < 40) {
+                            _MESSAGE("FO4RemixPlugin: [MergeSphere] #%d hash=0x%llX "
+                                     "n=%d C=(%.1f,%.1f,%.1f) "
+                                     "errRow=%.1f errCol=%.1f errRowC=%.1f errColC=%.1f "
+                                     "sph0=(%.1f,%.1f,%.1f r=%.1f) rec0t=(%.1f,%.1f,%.1f)",
+                                     sn, (unsigned long long)hash, used,
+                                     C[0], C[1], C[2],
+                                     eRow / used, eCol / used,
+                                     eRowC / used, eColC / used,
+                                     sph[0], sph[1], sph[2], sph[3],
+                                     instRecords[0][12], instRecords[0][13],
+                                     instRecords[0][14]);
+                        }
+                    } while (false);
                 }
             }
             if (nonZero >= 2 && !t7Valid) {
@@ -1802,6 +2072,75 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         extraHashes.reserve(instRecords.size() - 1);
         size_t extrasFailed = 0;
         size_t drawIndex = 0;  // 0 keeps the base hash
+        // Merge geometry renders DOUBLE-SIDED (2026-07-07). The submitted
+        // transforms are engine-exact -- proven twice: the merge VS DXBC
+        // (research doc §7, row-vector v*R, stored rows) and the engine's
+        // own per-record bounding spheres ([MergeSphere], row-vector fits
+        // every rotation-bearing shape) -- yet Vault 111 still showed a
+        // stable per-shape mixed set of inside-out pieces under single-
+        // sided culling, through every transform-convention combination.
+        // With uniform code, per-shape variance can only be CONTENT: the
+        // baked kit models' authored winding is not consistently front-
+        // facing (vanilla tolerates it -- cull mode is a per-item material
+        // field, doc §6, and the shipped kit materials evidently don't rely
+        // on backface culling for these). Until the [MergeWind] stats below
+        // justify a per-triangle normal-matched re-flip, double-sided is
+        // the vanilla-faithful choice; scope is merge shapes only.
+        mesh.isTwoSided = true;
+        // [MergeWind] winding-vs-normals stats: fraction of sampled
+        // triangles whose geometric normal (current winding) OPPOSES the
+        // authored vertex normals. ~0 or ~1 per shape = consistent content
+        // (a deterministic re-flip could restore single-sided culling);
+        // mid-range = mixed within one mesh.
+        {
+            static std::atomic<int> sWindLogs{0};
+            if (sWindLogs.load(std::memory_order_relaxed) < 40 &&
+                !mesh.indices.empty()) {
+                const size_t nTri = mesh.indices.size() / 3;
+                const size_t step = nTri > 200 ? nTri / 200 : 1;
+                int nNeg = 0, nUsed = 0;
+                double dotSum = 0;
+                for (size_t t = 0; t < nTri; t += step) {
+                    const auto& a = mesh.vertices[mesh.indices[t * 3 + 0]];
+                    const auto& b = mesh.vertices[mesh.indices[t * 3 + 1]];
+                    const auto& c = mesh.vertices[mesh.indices[t * 3 + 2]];
+                    const double e1[3] = { b.position[0] - a.position[0],
+                                           b.position[1] - a.position[1],
+                                           b.position[2] - a.position[2] };
+                    const double e2[3] = { c.position[0] - a.position[0],
+                                           c.position[1] - a.position[1],
+                                           c.position[2] - a.position[2] };
+                    const double gn[3] = { e1[1] * e2[2] - e1[2] * e2[1],
+                                           e1[2] * e2[0] - e1[0] * e2[2],
+                                           e1[0] * e2[1] - e1[1] * e2[0] };
+                    const double gl = std::sqrt(gn[0] * gn[0] + gn[1] * gn[1] +
+                                                gn[2] * gn[2]);
+                    if (gl < 1e-9) continue;  // padding/degenerate tris
+                    const double vn[3] = {
+                        (double)a.normal[0] + b.normal[0] + c.normal[0],
+                        (double)a.normal[1] + b.normal[1] + c.normal[1],
+                        (double)a.normal[2] + b.normal[2] + c.normal[2] };
+                    const double vl = std::sqrt(vn[0] * vn[0] + vn[1] * vn[1] +
+                                                vn[2] * vn[2]);
+                    if (vl < 1e-9) continue;
+                    const double d = (gn[0] * vn[0] + gn[1] * vn[1] +
+                                      gn[2] * vn[2]) / (gl * vl);
+                    dotSum += d;
+                    if (d < 0) ++nNeg;
+                    ++nUsed;
+                }
+                if (nUsed > 0) {
+                    const int wn = sWindLogs.fetch_add(1,
+                                       std::memory_order_relaxed);
+                    if (wn < 40) {
+                        _MESSAGE("FO4RemixPlugin: [MergeWind] #%d hash=0x%llX "
+                                 "tris=%d meanDot=%.2f fracNeg=%.2f",
+                                 wn, (unsigned long long)hash, nUsed,
+                                 dotSum / nUsed, (double)nNeg / nUsed);
+                    }
+                }
+            }
+        }
         const std::vector<uint32_t> fullIndices = std::move(mesh.indices);
         // Take 13: the t7 per-record expansion supersedes the fixed segs[]
         // array when the table validated (one submesh per record; count can
@@ -1816,6 +2155,18 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             // its own Remix mesh/BLAS.
             mesh.indices.assign(fullIndices.begin() + (size_t)sd.triStart * 3,
                                 fullIndices.begin() + ((size_t)sd.triStart + sd.triCount) * 3);
+            // Winding parity is PER INSTANCE, not per shape -- the flip (if
+            // any) is applied inside the record loop below. Vault-111
+            // evidence (2026-07-07): record-0 fallback submissions of wall
+            // clusters rendered correct-side-in, the same triangles expanded
+            // to other records rendered inside-out (user tcl-verified), and
+            // a blanket whole-mesh flip inverted previously-correct
+            // geometry. Mirrored placements (negative-determinant record
+            // rotations, standard for interior kit walls) add a parity the
+            // constant parse-time flip can't see; the composed determinant
+            // below decides each instance. This is exactly the "reversed-
+            // winding mesh clone" follow-up the detNeg diagnostic predicted.
+            bool meshWindingFlipped = false;
             for (size_t k = 0; k < sd.recCount; ++k, ++drawIndex) {
                 // Skip exact duplicates within this segment's block: two
                 // coincident path-traced instances self-Z-fight; vanilla's
@@ -1832,6 +2183,24 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 DecodeInstanceRecord(instRecords[sd.recStart + k].data(), instRowVector,
                                      g_config.mergeInstanceConjugate, m);
                 ComposeLeafInstance(W, m, comp);
+                // Mirrored instance (composed 3x3 det < 0): the record adds
+                // a reflection on top of the Beth->Remix mirror the parse
+                // flip already compensates, so this instance needs its
+                // triangles re-flipped or its single-sided faces cull
+                // inward (Vault 111 walls). Toggle in place; the content
+                // hash covers indices, so flipped instances get their own
+                // mesh/BLAS bucket.
+                const float detC =
+                    comp[0] * (comp[5] * comp[10] - comp[6] * comp[9]) -
+                    comp[1] * (comp[4] * comp[10] - comp[6] * comp[8]) +
+                    comp[2] * (comp[4] * comp[9]  - comp[5] * comp[8]);
+                const bool needFlip = detC < 0.0f;
+                if (needFlip != meshWindingFlipped) {
+                    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+                        std::swap(mesh.indices[t + 1], mesh.indices[t + 2]);
+                    }
+                    meshWindingFlipped = needFlip;
+                }
                 // Raw buffer instead of `NiTransform xf;`: f4se_minimal
                 // declares but does not define NiPoint3's default ctor, so
                 // constructing NiTransform directly fails to link.

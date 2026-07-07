@@ -133,6 +133,15 @@ namespace SemanticCapture {
         void*    mergeWatchSrv              = nullptr;
         uint32_t mergeWatchRecordCount      = 0;
         uint32_t mergeWatchSegTris[4]       = {};
+
+        // Resolve deferrals spent waiting on the t7 table wrapper's
+        // pending-upload counter (lighting resolver, take 13.1). Bounded:
+        // the +0x44 counter was decompiler-proven only for the bake-path
+        // wrapper creator, so a BA2-variant wrapper reading junk there must
+        // not park the shape in defer-forever (invisible geometry). Past
+        // the cap the resolver treats it as a plain reject and the
+        // capture/fallback chain still renders something.
+        uint16_t mergeT7Deferrals           = 0;
     };
 
     // Convert a Bethesda NiTransform (engine row-vector convention: world =
