@@ -1310,18 +1310,25 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
 
     bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
 
-    // BSDynamicTriShape: morphed positions in dynamicVertices (offset 0x180)
+    // BSDynamicTriShape stores morphed positions outside the normal vertex
+    // buffer. Only take that path for the actual dynamic subclass
+    // (RTTI-checked): some plain BSTriShape vertex descriptors have the
+    // szVertex nibble set even though the object has no dynamicVertices
+    // field -- on those, reading +0x180 dereferences memory past the
+    // object (plain BSTriShape) or an unrelated field (subclass
+    // neighbors), and the resulting "positions" render as garbled or
+    // misplaced geometry. Cherry-picked from PR #1 (Kralich),
+    // user-verified 2026-07-07 as the PR's load-bearing fix.
     uint8_t* posData = vbData;
     uint32_t posStride = vertexSize;
-    bool isDynamic = (szVertex != 0);
-    if (isDynamic) {
-        uint8_t* dynVerts = *reinterpret_cast<uint8_t**>(
-            reinterpret_cast<uintptr_t>(shape) + 0x180);
-        if (dynVerts) {
+    bool isDynamic = false;
+    if (BSDynamicTriShape* dynShape = shape->GetAsBSDynamicTriShape()) {
+        uint8_t* dynVerts = dynShape->dynamicVertices;
+        const uint16_t dynVertexSize = dynShape->GetDynamicVertexSize();
+        if (dynVerts && dynVertexSize != 0) {
             posData = dynVerts;
-            posStride = szVertex * 4;
-        } else {
-            isDynamic = false;
+            posStride = dynVertexSize;
+            isDynamic = true;
         }
     }
 
