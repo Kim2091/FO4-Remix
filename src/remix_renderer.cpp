@@ -299,6 +299,17 @@ namespace {
     std::unordered_map<std::string, std::string> g_pendingConfigVars;
     // Per-key failure dedup for the drain site: first failure logs, then silent.
     std::unordered_set<std::string> g_configFailedKeys;
+
+    // Placed-light sync (revived 2026-07-07). The game thread queues a full
+    // snapshot of the loaded cells' placed lights (QueueLights, same
+    // never-touch-the-API-mutex contract as QueueConfigVariable); OnFrame
+    // drains it on the Remix thread, diffs by hash against the live handle
+    // map, and re-submits every live handle each frame (Remix lights are
+    // per-frame draws like instances).
+    std::mutex g_lightQueueMutex;
+    bool g_lightSnapshotPending = false;
+    std::vector<ExtractedLight> g_lightSnapshot;
+    std::unordered_map<uint64_t, remixapi_LightHandle> g_lights;  // Remix thread only
 }
 
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
@@ -1607,6 +1618,117 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         api->DrawInstance(&instance);
     }
 
+    // ------------------------------------------------------------------
+    // Placed lights (revived 2026-07-07). Drain the game thread's latest
+    // snapshot, diff by hash (REFR formID -- static params per form, so an
+    // existing hash keeps its handle), then draw every live handle: Remix
+    // analytical lights are per-frame submissions like instances.
+    // ------------------------------------------------------------------
+    {
+        bool haveSnapshot = false;
+        std::vector<ExtractedLight> snapshot;
+        {
+            std::lock_guard<std::mutex> qlock(g_lightQueueMutex);
+            if (g_lightSnapshotPending) {
+                snapshot = std::move(g_lightSnapshot);
+                g_lightSnapshot.clear();
+                g_lightSnapshotPending = false;
+                haveSnapshot = true;
+            }
+        }
+        if (haveSnapshot && g_config.lightsEnabled) {
+            std::unordered_map<uint64_t, const ExtractedLight*> desired;
+            desired.reserve(snapshot.size());
+            for (const auto& l : snapshot) desired.emplace(l.hash, &l);
+
+            for (auto it = g_lights.begin(); it != g_lights.end();) {
+                if (desired.find(it->first) == desired.end()) {
+                    if (it->second) api->DestroyLight(it->second);
+                    it = g_lights.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            static std::atomic<int> sLightLogs{0};
+            uint32_t created = 0, failed = 0;
+            for (const auto& [lhash, lp] : desired) {
+                if (g_lights.find(lhash) != g_lights.end()) continue;
+                const ExtractedLight& light = *lp;
+
+                remixapi_LightInfoSphereEXT sphere = {};
+                sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+                sphere.position = { light.position[0], light.position[1],
+                                    light.position[2] };
+                // Emitter size, not falloff: FO4's radius is the falloff
+                // range; a small emitter sphere scaled from it keeps shadows
+                // soft in proportion (0.025 = the retired pipeline's tuning).
+                sphere.radius = (std::max)(light.radius * 0.025f *
+                                           g_config.lightRadius, 0.5f);
+                sphere.volumetricRadianceScale = 1.0f;
+                if (light.isSpotLight && light.spotFOV > 0.0f) {
+                    sphere.shaping_hasvalue = true;
+                    sphere.shaping_value.direction = { light.spotDirection[0],
+                                                       light.spotDirection[1],
+                                                       light.spotDirection[2] };
+                    // FO4 FOV is the full cone angle.
+                    sphere.shaping_value.coneAngleDegrees = light.spotFOV * 0.5f;
+                    sphere.shaping_value.coneSoftness = light.spotSoftness;
+                    sphere.shaping_value.focusExponent = 0.0f;
+                }
+
+                float r = light.radiance[0], g = light.radiance[1],
+                      b = light.radiance[2];
+                const float cs = g_config.lightColorStrength;
+                if (cs < 1.0f) {
+                    const float avg = (r + g + b) / 3.0f;
+                    r = avg + (r - avg) * cs;
+                    g = avg + (g - avg) * cs;
+                    b = avg + (b - avg) * cs;
+                }
+
+                remixapi_LightInfo info = {};
+                info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
+                info.pNext = &sphere;
+                info.hash = lhash;
+                info.radiance = { r * g_config.lightIntensity,
+                                  g * g_config.lightIntensity,
+                                  b * g_config.lightIntensity };
+                info.isDynamic = false;
+                info.ignoreViewModel = false;
+
+                remixapi_LightHandle handle = nullptr;
+                if (api->CreateLight(&info, &handle) ==
+                        REMIXAPI_ERROR_CODE_SUCCESS && handle) {
+                    g_lights.emplace(lhash, handle);
+                    ++created;
+                    const int ln = sLightLogs.fetch_add(1,
+                                       std::memory_order_relaxed);
+                    if (ln < 12) {
+                        _MESSAGE("FO4RemixPlugin: [Lights] #%d hash=0x%llX "
+                                 "pos=(%.0f,%.0f,%.0f) radius=%.1f "
+                                 "radiance=(%.1f,%.1f,%.1f) spot=%d",
+                                 ln, (unsigned long long)lhash,
+                                 light.position[0], light.position[1],
+                                 light.position[2], sphere.radius,
+                                 info.radiance.x, info.radiance.y,
+                                 info.radiance.z,
+                                 light.isSpotLight ? 1 : 0);
+                    }
+                } else {
+                    ++failed;
+                }
+            }
+            if (created || failed) {
+                _MESSAGE("FO4RemixPlugin: [Lights] snapshot applied: %zu total, "
+                         "%u created, %u failed, %zu live",
+                         snapshot.size(), created, failed, g_lights.size());
+            }
+        }
+        for (const auto& [lhash, handle] : g_lights) {
+            if (handle) api->DrawLightInstance(handle);
+        }
+    }
+
     // Submit screen overlay (game UI/HUD captured from the DX11 UI render
     // target). Gated on g_config.hudOverlayEnabled; requires a runtime with
     // the rtx_fork_overlay.cpp layout fix (dxvk-remix 8990aed) -- older
@@ -1723,6 +1845,13 @@ void RemixRenderer::Shutdown() {
         g_textureHandles.clear();
     }
 
+    if (api) {
+        for (auto& [hash, handle] : g_lights) {
+            if (handle) api->DestroyLight(handle);
+        }
+        g_lights.clear();
+    }
+
     if (api && g_fallbackMesh) {
         api->DestroyMesh(g_fallbackMesh);
         g_fallbackMesh = nullptr;
@@ -1742,6 +1871,12 @@ void RemixRenderer::QueueConfigVariable(const char* key, const char* value) {
     if (!key || !value) return;
     std::lock_guard<std::mutex> lock(g_configQueueMutex);
     g_pendingConfigVars[key] = value;
+}
+
+void RemixRenderer::QueueLights(std::vector<ExtractedLight>&& lights) {
+    std::lock_guard<std::mutex> lock(g_lightQueueMutex);
+    g_lightSnapshot = std::move(lights);
+    g_lightSnapshotPending = true;
 }
 
 bool RemixRenderer::HasTextureHandle(uint64_t hash) {

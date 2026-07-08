@@ -99,6 +99,12 @@ namespace RemixRenderer {
     // logged once per key at the drain site, then silenced.
     void QueueConfigVariable(const char* key, const char* value);
 
+    // Queue a full snapshot of the loaded cells' placed lights from the game
+    // thread (same never-block-on-the-API-mutex contract as
+    // QueueConfigVariable). OnFrame drains it on the Remix thread, diffs by
+    // hash against the live light handles, and draws every light each frame.
+    void QueueLights(std::vector<ExtractedLight>&& lights);
+
     // True if a Remix-side texture handle currently exists for `hash`.
     // Used by the extraction cache to decide whether a cache hit must
     // re-supply pixel data so SubmitDrawable can recreate a handle that was

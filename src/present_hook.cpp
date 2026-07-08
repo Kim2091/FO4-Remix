@@ -517,7 +517,31 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
 
     // Phase 1B: cell orchestration retired. Geometry capture is now event-driven
     // via semantic_capture (BSLightingShaderProperty render-pass hook). Terrain
-    // and lights regress until later phases revive them on event-driven paths.
+    // regresses until a later phase revives it on an event-driven path.
+
+    // Placed lights (revived 2026-07-07; became visible the moment the
+    // Vault-111 walls sealed and skybox leakage stopped lighting interiors).
+    // Poll the loaded cells' LIGH refs here on the game thread -- every 60
+    // frames, or immediately when the player's cell changes -- and queue a
+    // full snapshot; RemixRenderer::OnFrame diffs and applies it on the
+    // Remix thread. Extraction cost is a flat object-list walk per loaded
+    // cell, trivial at this cadence.
+    if (g_remix.ready && g_gameDataReady && g_config.lightsEnabled) {
+        static uint32_t s_lightPollCounter = 60;
+        static uintptr_t s_lastLightCell = 0;
+        const uintptr_t cellNow = BsExtraction::GetPlayerCellPtr();
+        ++s_lightPollCounter;
+        if (cellNow && (s_lightPollCounter >= 60 || cellNow != s_lastLightCell)) {
+            s_lightPollCounter = 0;
+            s_lastLightCell = cellNow;
+            std::vector<ExtractedLight> lights;
+            for (const auto& ci : BsExtraction::GetLoadedCells()) {
+                auto cellLights = BsExtraction::ExtractCellLights(ci.cellPtr);
+                lights.insert(lights.end(), cellLights.begin(), cellLights.end());
+            }
+            RemixRenderer::QueueLights(std::move(lights));
+        }
+    }
 
     return g_originalPresent(swapChain, syncInterval, flags);
 }

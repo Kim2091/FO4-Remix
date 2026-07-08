@@ -109,6 +109,22 @@ struct CellInfo {
     uint32_t formID;
 };
 
+// Placed light extracted from a cell's LIGH-based references. Revived
+// 2026-07-07 (retired with the cell pipeline in phase 1B): with the
+// Vault-111 walls fixed, sealed interiors lost the skybox light that had
+// been leaking through the holes -- placed lights are the actual
+// illumination source and must reach Remix as analytical lights.
+struct ExtractedLight {
+    uint64_t hash;          // stable ID from the REFR formID
+    float position[3];      // world position (Beth X/Y already swapped)
+    float radiance[3];      // HDR RGB radiance (pre config multipliers)
+    float radius;           // FO4 falloff radius in game units
+    bool isSpotLight;       // LIGH flags bit 0x100
+    float spotDirection[3]; // spot direction (X/Y swapped)
+    float spotFOV;          // full cone angle, degrees
+    float spotSoftness;     // cone edge softness
+};
+
 // ---------------------------------------------------------------------------
 // Texture post-processing modes (shared between bs_extraction and skinning)
 // ---------------------------------------------------------------------------
@@ -184,6 +200,10 @@ namespace BsExtraction {
 
     // Returns all cells currently loaded by the engine (from DataHandler::cellList).
     std::vector<CellInfo> GetLoadedCells();
+
+    // Extract all placed LIGH-reference lights from the given cell.
+    // Game thread only (raw reads of the cell's object list).
+    std::vector<ExtractedLight> ExtractCellLights(uintptr_t cellPtr);
 
     // Drop the internal texture cache (call on cell change if desired).
     void ClearTextureCache();

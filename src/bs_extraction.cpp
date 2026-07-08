@@ -1779,3 +1779,110 @@ bool BsExtraction::GetCachedTextureStats(uint64_t hash, uint32_t* outW, uint32_t
     }
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// Placed-light extraction (revived 2026-07-07)
+// ---------------------------------------------------------------------------
+// Ported from the retired cell-pipeline light_extractor (deleted in phase 1B,
+// recovered from 375ec3e~1). Offsets were memory-scan-verified then and are
+// unchanged in 1.10.980. Runs on the game thread; raw reads of the cell's
+// object list, matching this file's other cell walks.
+
+static constexpr uintptr_t OFF_REFR_ROT_L       = 0xC0;   // Euler radians (3 floats)
+static constexpr uintptr_t OFF_REFR_BASE_FORM_L = 0xE0;
+static constexpr uintptr_t OFF_FORM_TYPE_L      = 0x1A;
+static constexpr uint8_t   FORM_TYPE_LIGH_L     = 34;
+
+// TESObjectLIGH DATA subrecord (radius=+0x4, color=+0x8, flags=+0xC, fov=+0x14
+// from base+0x148; FNAM fade right after the 0x38-byte DATA block).
+static constexpr uintptr_t OFF_LIGH_DATA_L   = 0x148;
+static constexpr uintptr_t OFF_DATA_RADIUS_L = 0x04;
+static constexpr uintptr_t OFF_DATA_COLOR_L  = 0x08;
+static constexpr uintptr_t OFF_DATA_FLAGS_L  = 0x0C;
+static constexpr uintptr_t OFF_DATA_FOV_L    = 0x14;
+static constexpr uintptr_t OFF_LIGH_FADE_L   = OFF_LIGH_DATA_L + 0x38;
+static constexpr uint32_t  LIGH_FLAG_SPOTLIGHT_L = 0x100;
+
+// FO4 light -> HDR radiance conversion; radius-scaled so lights carry to
+// their intended range at Bethesda scene scale (~70 units/meter). Tuned so
+// ini [Lights] Intensity=1.0 is reasonable.
+static constexpr float kLightIntensityScale = 0.1f;
+
+std::vector<ExtractedLight> BsExtraction::ExtractCellLights(uintptr_t cellPtr)
+{
+    std::vector<ExtractedLight> result;
+    if (!cellPtr) return result;
+
+    struct SimpleArray {
+        uintptr_t* entries;
+        uint32_t capacity;
+        uint32_t pad0C;
+        uint32_t count;
+    };
+    auto& objectList = *reinterpret_cast<SimpleArray*>(cellPtr + OFF_CELL_OBJECT_LIST);
+    if (!objectList.entries) return result;
+
+    for (uint32_t i = 0; i < objectList.count && i < 65536; i++) {
+        uintptr_t refrPtr = objectList.entries[i];
+        if (!refrPtr) continue;
+
+        uintptr_t baseForm = *reinterpret_cast<uintptr_t*>(refrPtr + OFF_REFR_BASE_FORM_L);
+        if (!baseForm) continue;
+        if (*reinterpret_cast<uint8_t*>(baseForm + OFF_FORM_TYPE_L) != FORM_TYPE_LIGH_L) continue;
+
+        float* refrPos = reinterpret_cast<float*>(refrPtr + OFF_REFR_POS);
+        float* refrRot = reinterpret_cast<float*>(refrPtr + OFF_REFR_ROT_L);
+
+        uintptr_t dataBase = baseForm + OFF_LIGH_DATA_L;
+        uint32_t rawRadius = *reinterpret_cast<uint32_t*>(dataBase + OFF_DATA_RADIUS_L);
+        uint32_t rawColor  = *reinterpret_cast<uint32_t*>(dataBase + OFF_DATA_COLOR_L);
+        uint32_t rawFlags  = *reinterpret_cast<uint32_t*>(dataBase + OFF_DATA_FLAGS_L);
+        float spotFOV      = *reinterpret_cast<float*>(dataBase + OFF_DATA_FOV_L);
+        float fade         = *reinterpret_cast<float*>(baseForm + OFF_LIGH_FADE_L);
+
+        if (rawRadius == 0 || rawRadius > 100000) continue;
+        if (!(fade > 0.0f) || fade > 100.0f) fade = 1.0f;
+
+        const float r = (rawColor & 0xFF) / 255.0f;
+        const float g = ((rawColor >> 8) & 0xFF) / 255.0f;
+        const float b = ((rawColor >> 16) & 0xFF) / 255.0f;
+        const float intensity = fade * kLightIntensityScale * (float)rawRadius;
+
+        ExtractedLight light = {};
+        const uint32_t refrFormID = *reinterpret_cast<uint32_t*>(refrPtr + OFF_FORM_ID);
+        light.hash = FnvHashCombine(0xCBF29CE484222325ULL, (uint64_t)refrFormID);
+
+        // Beth X/Y swap, matching BuildRemixTransform's mesh convention.
+        light.position[0] = refrPos[1];
+        light.position[1] = refrPos[0];
+        light.position[2] = refrPos[2];
+
+        light.radiance[0] = r * intensity;
+        light.radiance[1] = g * intensity;
+        light.radiance[2] = b * intensity;
+        light.radius = (float)rawRadius;
+
+        light.isSpotLight = (rawFlags & LIGH_FLAG_SPOTLIGHT_L) != 0;
+        if (light.isSpotLight) {
+            const float rx = refrRot[0];  // pitch
+            const float rz = refrRot[2];  // yaw
+            // Default light direction is -Z (down), rotated by the REFR.
+            const float dx = sinf(rz) * cosf(rx);
+            const float dy = cosf(rz) * cosf(rx);
+            const float dz = -sinf(rx);
+            light.spotDirection[0] = dy;  // X/Y swap
+            light.spotDirection[1] = dx;
+            light.spotDirection[2] = dz;
+            light.spotFOV = spotFOV;
+            light.spotSoftness = 0.2f;
+        }
+
+        result.push_back(light);
+    }
+
+    if (g_config.logLights && !result.empty()) {
+        _MESSAGE("FO4RemixPlugin: [Lights] cell=0x%llX extracted %zu placed lights",
+                 (unsigned long long)cellPtr, result.size());
+    }
+    return result;
+}
