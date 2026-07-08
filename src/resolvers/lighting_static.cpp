@@ -1442,6 +1442,14 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         mesh.boneCount    = boneCount;
         mesh.blendWeights = std::move(parsed.blendWeights);
         mesh.blendIndices = std::move(parsed.blendIndices);
+        // Skinned-key side index (Tick's live app-culled refresh + OnFrame's
+        // hidden-geometry skip -- hair-under-hats, 2026-07-08).
+        state.isSkinnedActor = true;
+        // [FaceAnim] expressions probe: track the first facegen head's bone
+        // motion (heads carry ~10 bones; eyes/mouths only 1).
+        if (headDiag && tri->GetAsBSDynamicTriShape() && boneCount >= 8) {
+            SkinnedMeshes::SetFaceProbe(hash);
+        }
         // Instance transform = bare Beth->Remix mirror P. The bone matrices
         // (queued per Tick by SkinnedMeshes::UpdateAndQueue) take bind-pose
         // model space -> Beth WORLD space, so the instance carries only the
@@ -1584,6 +1592,107 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // ---- [WindDiag] inside-out investigation (2026-07-08) ----
     LogWindingDiag(tri, mesh, parsed, mat, propFlagsEarly, state);
 
+    // ---- Skin / hair tint (2026-07-08 broken-NPC-colors fix) ----
+    // FO4 authors unpigmented/grayscale diffuse maps for tinted body parts and
+    // multiplies the real color in at draw time; without it NPCs render pale
+    // with gray hair. Two DISTINCT color sources, decompiler-proven
+    // (scripts/dynamic_trishape_desc.md):
+    //   SKIN -- BSLightingShaderMaterialSkinTint (bodies, hands, rear head):
+    //     kTintColor NiColorA at material+0xC0, stored LINEAR. The engine
+    //     multiplies it in linear shader space after the sRGB sample decode,
+    //     so baking it into the (sRGB-sampled) diffuse needs gamma
+    //     compensation t^(1/2.2): srgb_decode(diffuse * t^(1/2.2)) ==
+    //     diffuse_linear * t. (User-verified skin colors on this path.)
+    //   HAIR -- NPC hair is a BSLightingShaderMaterialGlowmap (type 2) with
+    //     the Hair shader flag; the per-NPC hue is NOT in the material, it is
+    //     the pEmissiveColor on the PROPERTY (+0xB8, NiColor*) times
+    //     fEmitColorScale (+0xC8). Render color = pow(pEmissiveColor*scale,
+    //     2.2), i.e. the constant is stored GAMMA -- so baking it into the
+    //     sRGB diffuse is a DIRECT multiply, no exponent:
+    //     srgb_decode(diffuse * (c*scale)) == diffuse_linear *
+    //     pow(c*scale,2.2). (This is why the "teal hair" needed both fixes:
+    //     the emissive path is skipped for hair in ExtractEmissiveData, and
+    //     the color moves here as a diffuse tint. The shared HairColor_LGrad
+    //     LUT's tonal shaping is not yet replicated -- a flat multiply is the
+    //     first approximation.)
+    // Classes/hair identified by RTTI leaf + the Hair flag, NOT GetType()
+    // (live logs showed hair as type 2 where the F4SE enum says HairTint=6).
+    uint32_t diffuseTint = 0xFFFFFFu;
+    {
+        char matLeaf[64] = "";
+        SemanticCapture::GetLeafClassName(mat, matLeaf, sizeof(matLeaf));
+        const bool isSkinTint =
+            std::strcmp(matLeaf, "BSLightingShaderMaterialSkinTint") == 0;
+        const bool isHairTintMat =
+            std::strcmp(matLeaf, "BSLightingShaderMaterialHairTint") == 0;
+        // Hair discriminator: the shared HairColor gradient LUT bound in
+        // spLookupTexture. The F4SE kShaderFlags_Hair (bit 46) is WRONG for
+        // this build -- it matched landscape terrain and never real hair
+        // (2026-07-08 run: 24/24 "hair" tint hits were BSLightingShaderMaterial-
+        // Landscape, zero actual hair), the same enum drift that makes hair
+        // report GetType()==2. The LUT name is build-independent: exactly one
+        // "HairColor_LGrad" texture exists game-wide and only hair binds it.
+        const NiTexture* lut = mat->spLookupTexture;
+        const char* lutName = (lut && lut->name.c_str()) ? lut->name.c_str() : nullptr;
+        const bool isHair = NameContainsCI(lutName, "haircolor");
+
+        if (isSkinTint || isHairTintMat) {
+            // Material kTintColor, linear-stored -> gamma-compensated bake.
+            const float* tc = reinterpret_cast<const float*>(
+                reinterpret_cast<uintptr_t>(mat) + 0xC0);
+            bool sane = true;
+            for (int c = 0; c < 3; ++c)
+                if (!(tc[c] >= 0.0f && tc[c] <= 1.0f)) sane = false;
+            if (sane) {
+                uint32_t packed = 0;
+                for (int c = 0; c < 3; ++c) {
+                    const float g = std::pow(tc[c], 1.0f / 2.2f);
+                    packed = (packed << 8) | (uint32_t)(g * 255.0f + 0.5f);
+                }
+                diffuseTint = packed;
+            }
+            static std::atomic<int> sTintLogs{0};
+            if (sTintLogs.fetch_add(1, std::memory_order_relaxed) < 24) {
+                _MESSAGE("FO4RemixPlugin: [Tint] skin shape=\"%s\" mat=%s "
+                         "kTintColor=(%.3f,%.3f,%.3f) -> %06X%s",
+                         tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                         matLeaf, tc[0], tc[1], tc[2], diffuseTint,
+                         sane ? "" : " (implausible -- ignored)");
+            }
+        } else if (isHair && state.property) {
+            // Property pEmissiveColor * fEmitColorScale, gamma-stored ->
+            // direct multiply (no exponent).
+            const uintptr_t pp = reinterpret_cast<uintptr_t>(state.property);
+            const float* pEmis = *reinterpret_cast<float**>(pp + 0xB8);
+            const float scale = *reinterpret_cast<float*>(pp + 0xC8);
+            float r = 1.0f, g = 1.0f, b = 1.0f;
+            bool sane = false;
+            if (pEmis) {
+                const float s = (scale >= 0.0f && scale <= 8.0f) ? scale : 1.0f;
+                r = pEmis[0] * s; g = pEmis[1] * s; b = pEmis[2] * s;
+                sane = (r == r && g == g && b == b);  // reject NaN
+                auto clamp01 = [](float v) {
+                    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+                };
+                r = clamp01(r); g = clamp01(g); b = clamp01(b);
+            }
+            if (sane) {
+                diffuseTint = ((uint32_t)(r * 255.0f + 0.5f) << 16) |
+                              ((uint32_t)(g * 255.0f + 0.5f) << 8) |
+                               (uint32_t)(b * 255.0f + 0.5f);
+            }
+            static std::atomic<int> sHairTintLogs{0};
+            if (sHairTintLogs.fetch_add(1, std::memory_order_relaxed) < 24) {
+                _MESSAGE("FO4RemixPlugin: [Tint] hair shape=\"%s\" mat=%s "
+                         "pEmis=%p emis=(%.3f,%.3f,%.3f) scale=%.3f -> %06X%s",
+                         tri->m_name.c_str() ? tri->m_name.c_str() : "", matLeaf,
+                         (void*)pEmis, pEmis ? pEmis[0] : 0.0f,
+                         pEmis ? pEmis[1] : 0.0f, pEmis ? pEmis[2] : 0.0f, scale,
+                         diffuseTint, sane ? "" : " (no color -- untinted)");
+            }
+        }
+    }
+
     std::vector<ExtractedTexture> newTextures;
     // For alpha-tested or alpha-blended geometry: synthesize alpha from RGB
     // luminance if the diffuse is BC1 (no alpha channel). BGS LOD foliage
@@ -1617,7 +1726,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             : TexturePostProcess::None;
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
-        /*minRoughness=*/0, albedoLumFloor);
+        /*minRoughness=*/0, albedoLumFloor, diffuseTint);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
     // Smoothness/spec-mask (_s.dds) -> per-pixel roughness, RESTORED

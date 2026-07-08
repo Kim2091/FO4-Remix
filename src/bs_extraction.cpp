@@ -1,7 +1,8 @@
 #include "bs_extraction.h"
 #include "config.h"
-#include "fo4_diagnostics.h"  // Diagnostics::CurrentFrameIndex for readback aging
-#include "remix_renderer.h"   // HasTextureHandle for cache-hit handle recreation
+#include "fo4_diagnostics.h"   // Diagnostics::CurrentFrameIndex for readback aging
+#include "remix_renderer.h"    // HasTextureHandle for cache-hit handle recreation
+#include "semantic_capture.h"  // GetLeafClassName (RTTI gate on the glowmap path)
 
 #include "f4se_common/f4se_version.h"
 #include "f4se_common/Relocation.h"
@@ -18,6 +19,7 @@
 #include <d3d11.h>
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
@@ -729,6 +731,42 @@ static void DiffuseAlphaFromLuminance_Apply(ExtractedTexture& tex, bool forceFor
 // blowing up into confetti; whatever the cap leaves below the floor is
 // topped up with a neutral (gray) fill. Alpha is untouched (cutouts
 // survive).
+// Multiply every pixel's RGB by an 8-bit tint (0xRRGGBB). FO4 tint materials
+// (SkinTint / HairTint) author unpigmented/grayscale diffuse maps and let the
+// shader multiply kTintColor at draw time; this bakes that multiply into the
+// uploaded texture. Alpha untouched. BC inputs decompressed first (same
+// contract as AlbedoLumFloor_Apply); BC7/other left as-is.
+static void TintMultiply_Apply(ExtractedTexture& tex, uint32_t tintRGB)
+{
+    switch (tex.dxgiFormat) {
+        case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB: case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB: case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM: case DXGI_FORMAT_BC5_TYPELESS:
+            if (!DecompressBC(tex, BCTransform::None)) return;
+            break;
+        default:
+            break;
+    }
+    const bool rgba = (tex.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                       tex.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    const bool bgra = (tex.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                       tex.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+    if (!rgba && !bgra) {
+        return;  // BC7/other: can't process without a decoder; leave as-is
+    }
+    const uint32_t tr = (tintRGB >> 16) & 0xFF;
+    const uint32_t tg = (tintRGB >> 8) & 0xFF;
+    const uint32_t tb = tintRGB & 0xFF;
+    const uint32_t c0 = bgra ? tb : tr;   // channel 0 multiplier
+    const uint32_t c2 = bgra ? tr : tb;   // channel 2 multiplier
+    for (uint32_t i = 0; i < tex.width * tex.height; i++) {
+        uint8_t* p = &tex.pixels[i * 4];
+        p[0] = (uint8_t)((p[0] * c0 + 127u) / 255u);
+        p[1] = (uint8_t)((p[1] * tg + 127u) / 255u);
+        p[2] = (uint8_t)((p[2] * c2 + 127u) / 255u);
+    }
+}
+
 static void AlbedoLumFloor_Apply(ExtractedTexture& tex, uint8_t lumFloor)
 {
     // BC input: decompress to RGBA8 first (no channel transform).
@@ -874,7 +912,8 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                                        std::vector<ExtractedTexture>& newTextures,
                                        TexturePostProcess postProcess,
                                        uint8_t minRoughness,
-                                       uint8_t albedoLumFloor)
+                                       uint8_t albedoLumFloor,
+                                       uint32_t tintRGB)
 {
     // Early-bail diagnostic: log when diffuse texture extraction fails because
     // the D3D resource isn't available. Helps distinguish "decal not extracted
@@ -916,6 +955,9 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // non-metal materials sharing a source texture need distinct lifted/
     // unlifted variants (same poisoning argument as the roughness clamp).
     if (albedoLumFloor > 0)                                           hash = FnvHashCombine(hash, 7 | (uint64_t)albedoLumFloor << 8);
+    // Tint variants: differently-tinted NPCs sharing one grayscale source
+    // (every hair color uses HairShortXXGrayscale_d) must not collide.
+    if (tintRGB != 0xFFFFFFu)                                         hash = FnvHashCombine(hash, 8 | (uint64_t)tintRGB << 8);
 
     // Check cache first. A hit normally returns just the hash -- the pixels
     // were already handed to SubmitDrawable when the texture was first
@@ -1129,6 +1171,11 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
             // kept. Non-BC inputs pass through untouched.
             DecompressBC(mip, BCTransform::None);
         }
+        // Skin/hair tint multiply composes AFTER the alpha stage (alpha
+        // untouched -- hair cutouts survive) and BEFORE the luminance floor.
+        if (tintRGB != 0xFFFFFFu) {
+            TintMultiply_Apply(mip, tintRGB);
+        }
         // Metal albedo luminance floor composes AFTER the alpha stage so
         // synthesized / authored cutout alpha is preserved while dark RGB is
         // lifted (hue-preserving; see AlbedoLumFloor_Apply).
@@ -1227,12 +1274,42 @@ void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMateri
 
     if (!shape || !lightingMat) return;
 
-    // 1. Glow map texture from BSLightingShaderMaterialGlowmap
+    // HAIR GUARD (2026-07-08 "bright teal hair"): FO4 NPC hair is genuinely a
+    // BSLightingShaderMaterialGlowmap (GetType()==2) -- but it is NOT emissive.
+    // The engine repurposes this class for the grayscale-to-palette hair path:
+    // pEmissiveColor holds the per-NPC HAIR TINT (consumed as a diffuse tint by
+    // the resolver's [Tint] block), and the +0xC0 glow slot / a set EmitColor
+    // flag are not real light -- extracting either made hair glow in false
+    // color. Discriminate on the shared HairColor gradient LUT bound in
+    // spLookupTexture: the F4SE kShaderFlags_Hair bit is wrong for this build
+    // (it tags landscape, never real hair -- see lighting_static.cpp), but the
+    // LUT name is build-independent (one such texture game-wide, hair-only).
+    {
+        NiTexture* lut = lightingMat->spLookupTexture;
+        const char* ln = (lut && lut->name.c_str()) ? lut->name.c_str() : nullptr;
+        if (ln) {
+            // case-insensitive substring "haircolor"
+            static const char kNeedle[] = "haircolor";
+            for (const char* p = ln; *p; ++p) {
+                size_t i = 0;
+                while (kNeedle[i] && p[i] &&
+                       (char)std::tolower((unsigned char)p[i]) == kNeedle[i]) ++i;
+                if (!kNeedle[i]) return;  // hair: skip all emissive
+            }
+        }
+    }
+
+    // 1. Glow map texture from BSLightingShaderMaterialGlowmap. RTTI-gated so
+    // any other class that happens to report type 2 can't be misread as a
+    // glow-slot owner.
     if (g_config.emissiveGlowMapsEnabled &&
         lightingMat->GetType() == BSLightingShaderMaterialBase::kType_Glowmap)
     {
+        char matLeaf[64] = "";
+        SemanticCapture::GetLeafClassName(lightingMat, matLeaf, sizeof(matLeaf));
         auto* glowMat = static_cast<BSLightingShaderMaterialGlowmap*>(lightingMat);
-        if (glowMat->spGlowMapTexture) {
+        if (std::strcmp(matLeaf, "BSLightingShaderMaterialGlowmap") == 0 &&
+            glowMat->spGlowMapTexture) {
             outTexHash = ExtractMaterialTexture(glowMat->spGlowMapTexture, "emissive", device, newTextures);
         }
     }

@@ -285,12 +285,22 @@ namespace BsExtraction {
     // 506e5e7). BC inputs are decompressed to RGBA8 first; BC7/other pass
     // through unchanged. The floor is folded into the texture cache hash so
     // metal and non-metal users of one source texture get distinct variants.
+    // tintRGB: 0xRRGGBB multiplier applied per-pixel AFTER the postProcess
+    // stage (0xFFFFFF = no-op). Used for FO4's tint-material classes
+    // (BSLightingShaderMaterialSkinTint / HairTint): their diffuse maps are
+    // authored unpigmented (skin) or grayscale (hair) and the vanilla shader
+    // multiplies kTintColor in at runtime -- without it NPCs render pale
+    // with gray hair. The caller passes the tint gamma-compensated (see the
+    // resolver); folded into the texture cache hash so differently-tinted
+    // users of one source texture get distinct variants. BC inputs are
+    // decompressed to RGBA8 first; BC7/other pass through unchanged.
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,
                                     std::vector<ExtractedTexture>& newTextures,
                                     TexturePostProcess postProcess = TexturePostProcess::None,
                                     uint8_t minRoughness = 0,
-                                    uint8_t albedoLumFloor = 0);
+                                    uint8_t albedoLumFloor = 0,
+                                    uint32_t tintRGB = 0xFFFFFFu);
 
     // Extract emissive data from a shape's shader property and material
     void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,

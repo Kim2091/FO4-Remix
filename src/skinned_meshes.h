@@ -55,6 +55,13 @@ namespace SkinnedMeshes {
     // facegen corruption hunt. Capped at 4 shapes per session.
     void LogBones(uint64_t drawableHash, const char* label);
 
+    // [FaceAnim] expressions probe (2026-07-08): mark ONE facegen head
+    // drawable; UpdateAndQueue then periodically logs a few of its composed
+    // bone translations. If they never change during dialogue, the engine
+    // animates faces through something other than these bone worlds. First
+    // caller wins; capped logging inside.
+    void SetFaceProbe(uint64_t drawableHash);
+
     // Drop a drawable's bone tracking (wired into ReleaseDrawable).
     void OnDrawableReleased(uint64_t drawableHash);
 

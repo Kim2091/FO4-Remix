@@ -1326,6 +1326,14 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     s_lastTotalFires = totalFires;
     const bool staleChunkFilterActive = sceneFiring && g_config.cullingLodChunkStaleFrames > 0;
 
+    // Engine-hidden skinned drawables (live app-culled bit mirrored by Tick):
+    // hair suppressed by hats, hidden gore parts. Unlike the age-based chunk
+    // filter this is a direct flag read, so no scene-firing guard is needed
+    // (valid in pause menus too).
+    static std::unordered_set<uint64_t> skinnedCulled;
+    skinnedCulled.clear();
+    SemanticCapture::SnapshotSkinnedCulled(skinnedCulled);
+
     const PerfClock::time_point tSnap1 = PerfClock::now();
     PerfClock::duration dBucket{}, dDraw{};
 
@@ -1367,8 +1375,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         // drawable that was submitted but whose bone set never queues sits
         // invisible in the empty-boneTransforms hold below forever
         // (hypothesis (c)). Counted per frame, logged rate-limited while
-        // any draw is held.
-        uint32_t skinnedTotal = 0, skinnedHeldNoBones = 0;
+        // any draw is held. skinnedHidden counts engine-app-culled skips.
+        uint32_t skinnedTotal = 0, skinnedHeldNoBones = 0, skinnedHidden = 0;
 
         for (auto& [drawHash, inst] : g_drawables) {
             if (!inst.meshHandle) continue;
@@ -1398,6 +1406,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 if (bIt != freshBones.end()) {
                     inst.boneTransforms = std::move(bIt->second);
                 }
+                // Engine hid this geometry (app-culled: hair under a hat,
+                // gore parts) -- skip the draw but keep the handle; it
+                // returns the moment the engine unhides it.
+                if (skinnedCulled.count(drawHash)) { ++skinnedHidden; continue; }
                 // No bone set yet: bind-pose verts are model-space and would
                 // render T-posed at the world origin -- hold the draw until
                 // the first game-thread bone update lands (next Tick).
@@ -1433,7 +1445,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             buckets[inst.meshHandle].members.push_back(&inst);
         }
         bucketCount = buckets.size();
-        if (skinnedHeldNoBones > 0) {
+        if (skinnedHeldNoBones > 0 || skinnedHidden > 0) {
             // First occurrence logs immediately, then every ~300 frames,
             // capped for the session. OnFrame is single-threaded.
             static int      s_heldLogs = 0;
@@ -1442,8 +1454,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 s_sinceLog = 0;
                 ++s_heldLogs;
                 _MESSAGE("FO4RemixPlugin: [HeadDiag] OnFrame skinned=%u "
-                         "heldForEmptyBones=%u",
-                         skinnedTotal, skinnedHeldNoBones);
+                         "heldForEmptyBones=%u engineHidden=%u",
+                         skinnedTotal, skinnedHeldNoBones, skinnedHidden);
             }
         }
         const PerfClock::time_point tBucket1 = PerfClock::now();

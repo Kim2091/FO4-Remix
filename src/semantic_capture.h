@@ -117,6 +117,19 @@ namespace SemanticCapture {
         // walk only the ~dozens of chunk entries instead of the whole map.
         bool  isLODChunk               = false;
 
+        // ---- Skinned-actor visibility (2026-07-08 hair-through-hats) ----
+        // isSkinnedActor: set by the lighting resolver when this drawable
+        // submitted as a skinned mesh; Tick maintains g_skinnedKeys from it.
+        // engineCulled: refreshed once per Tick from the LIVE NiAVObject
+        // flags qword (+0x108, bit 0 = app-culled/hidden): the engine hides
+        // equipment-suppressed geometry (hair under hats, gore parts) by
+        // setting that bit and simply stops firing GetRenderPasses -- a
+        // submitted skinned drawable would otherwise keep rendering through
+        // the hat forever. Read SEH-guarded; on read failure the last state
+        // is kept.
+        bool  isSkinnedActor           = false;
+        bool  engineCulled             = false;
+
         // ---- Merge-instanced capture upgrade (2026-07-04) ----
         // Set by the lighting resolver when a multi-segment merge shape had
         // to submit with a fallback partition because DrawCapture starved:
@@ -244,6 +257,13 @@ namespace SemanticCapture {
     // staleness is meaningless.
     uint64_t SnapshotLodChunkAges(uint64_t currentFrame,
                                   std::unordered_map<uint64_t, uint64_t>& out);
+
+    // Fill `out` with the hashes of skinned drawables whose live NiAVObject
+    // currently carries the app-culled/hidden flag (engine hid them, e.g.
+    // hair suppressed by an equipped hat). O(#skinned drawables). Called
+    // once per Remix frame by OnFrame; the flag itself is refreshed on the
+    // game thread each Tick.
+    void SnapshotSkinnedCulled(std::unordered_set<uint64_t>& out);
 
     // Cumulative game-thread perf counters; consumers diff across reporting
     // windows. fires/fireNs cover the GetRenderPasses detour body (our

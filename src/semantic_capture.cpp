@@ -12,9 +12,11 @@
 
 #include "f4se/PluginAPI.h"  // _MESSAGE
 #include "f4se/NiTypes.h"    // NiTransform, NiMatrix33, NiPoint3
+#include "f4se/NiObjects.h"  // NiAVObject (skinned-visibility name read)
 #include "MinHook.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -22,6 +24,22 @@
 #include <vector>
 
 namespace {
+
+// Case-insensitive substring test (no shlwapi dependency). Used by the
+// skinned-visibility diagnostic to match head/hair/hat drawable names.
+bool NameHasCI(const char* hay, const char* needle) {
+    if (!hay || !needle || !*needle) return false;
+    const size_t n = std::strlen(needle);
+    for (const char* p = hay; *p; ++p) {
+        size_t i = 0;
+        while (i < n && p[i] &&
+               std::tolower((unsigned char)p[i]) ==
+                   std::tolower((unsigned char)needle[i]))
+            ++i;
+        if (i == n) return true;
+    }
+    return false;
+}
 
 // -------- TTL + sweep cadence (Skyrim defaults) --------
 // Drawable eviction TTL. The engine does NOT re-fire GetRenderPasses every
@@ -166,6 +184,24 @@ std::vector<PassKey> g_dirtyPoses;
 // Tick resolve loop (insert), the TTL sweep and ClearDrawableMap (erase), so
 // SnapshotLodChunkAges walks ~dozens of entries per frame, not the whole map.
 std::unordered_set<PassKey> g_lodChunkKeys;
+
+// Keys of submitted SKINNED drawables (DrawableState::isSkinnedActor); same
+// lifecycle/locking as g_lodChunkKeys. Tick refreshes each one's live
+// app-culled flag through this index (O(#skinned) ~ a dozen entries), and
+// SnapshotSkinnedCulled feeds OnFrame's hidden-geometry skip.
+std::unordered_set<PassKey> g_skinnedKeys;
+
+// SEH-guarded qword read for the live NiAVObject flags refresh: geometry
+// pointers can go stale between the engine freeing an actor and the TTL
+// sweep evicting the entry. POD-only locals (SEH + C++ unwinding conflict).
+static bool PeekQwordGuarded(uintptr_t src, uint64_t* out) {
+    __try {
+        *out = *reinterpret_cast<const volatile uint64_t*>(src);
+        return true;
+    } __except (1) {
+        return false;
+    }
+}
 
 // -------- Sweep cadence counter (Tick() rate-limits via this) --------
 std::atomic<uint32_t> g_sweepCounter{0};
@@ -942,11 +978,65 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                     state.nextRetryFrame =
                         currentFrame + RetryDelayFrames(state.resolveAttempts);
                 }
-            } else if (state.isLODChunk) {
-                // Chunk-key side index for SnapshotLodChunkAges. Insert only
-                // on submitted entries -- unsubmitted chunks never reach
-                // OnFrame's draw set. Idempotent across retries.
-                g_lodChunkKeys.insert(key);
+            } else {
+                // Side indexes over submitted entries only -- unsubmitted
+                // drawables never reach OnFrame's draw set. Idempotent
+                // across retries.
+                if (state.isLODChunk)     g_lodChunkKeys.insert(key);
+                if (state.isSkinnedActor) g_skinnedKeys.insert(key);
+            }
+        }
+    }
+
+    // ---- Live visibility DIAGNOSTIC for skinned drawables (hair-under-hats,
+    // 2026-07-08). Hypothesis: the engine hides equipment-suppressed geometry
+    // (hair under a hat) via an NiAVObject flag bit and/or by stopping its
+    // GetRenderPasses fires. The first attempt (app-cull == bit 0 of +0x108)
+    // read ZERO transitions, so the bit is unknown. This pass logs the FULL
+    // flags qword AND the fire-age for skinned head/hair drawables whenever
+    // either changes -- a hat on/off run then reveals which bit toggles (or
+    // proves the signal is staleness, not a flag). No geometry is hidden yet
+    // (engineCulled stays false); the OnFrame skip is dormant until the
+    // signal is identified. Reads SEH-guarded (stale pointers between free
+    // and TTL eviction).
+    {
+        std::lock_guard<std::mutex> lock(g_drawableMutex);
+        // Change-detection state local to this diagnostic (hash -> last
+        // {flags, ageStale}); avoids touching DrawableState::lastFlags, which
+        // the fire hook owns. engineCulled is left false -> OnFrame's skip
+        // stays dormant, so no geometry is hidden while we learn the signal.
+        static std::unordered_map<uint64_t, uint64_t> s_lastVisFlags;
+        static std::unordered_map<uint64_t, bool>     s_wasStale;
+        for (const PassKey key : g_skinnedKeys) {
+            auto it = g_drawableMap.find(key);
+            if (it == g_drawableMap.end()) continue;
+            SemanticCapture::DrawableState& st = it->second;
+            if (!st.geometry) continue;
+            const char* nm = static_cast<NiAVObject*>(st.geometry)->m_name.c_str();
+            const bool nameHair = nm && (NameHasCI(nm, "hair") || NameHasCI(nm, "head") ||
+                                         NameHasCI(nm, "hat")  || NameHasCI(nm, "helm"));
+            if (!nameHair) continue;
+            uint64_t fl = 0;
+            if (!PeekQwordGuarded(
+                    reinterpret_cast<uintptr_t>(st.geometry) + 0x108, &fl))
+                continue;  // stale pointer: keep last state
+            const uint64_t age = (currentFrame > st.lastSeenFrame)
+                ? (currentFrame - st.lastSeenFrame) : 0;
+            const bool stale = age > 30;
+            auto fIt = s_lastVisFlags.find(key);
+            auto sIt = s_wasStale.find(key);
+            const bool changed = fIt == s_lastVisFlags.end() || fIt->second != fl ||
+                                 sIt == s_wasStale.end() || sIt->second != stale;
+            if (changed) {
+                static std::atomic<int> sCullLogs{0};
+                if (sCullLogs.fetch_add(1, std::memory_order_relaxed) < 80) {
+                    _MESSAGE("FO4RemixPlugin: [HeadDiag] skinvis \"%s\" hash=%016llX "
+                             "flags=%016llX age=%llu",
+                             nm ? nm : "", (unsigned long long)key,
+                             (unsigned long long)fl, (unsigned long long)age);
+                }
+                s_lastVisFlags[key] = fl;
+                s_wasStale[key] = stale;
             }
         }
     }
@@ -1003,6 +1093,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                     }
                 }
                 g_lodChunkKeys.erase(it->first);
+                g_skinnedKeys.erase(it->first);
                 it = g_drawableMap.erase(it);
                 ++evicted;
             } else {
@@ -1110,6 +1201,7 @@ void SemanticCapture::ClearDrawableMap() {
     g_drawableMap.clear();
     g_dirtyPoses.clear();
     g_lodChunkKeys.clear();
+    g_skinnedKeys.clear();
 
     _MESSAGE("FO4RemixPlugin: [Reload] cleared %zu drawables (%zu submitted) on PreLoadGame",
              totalCount, submittedCount);
@@ -1147,6 +1239,15 @@ void SemanticCapture::SnapshotActiveDrawables(uint64_t currentFrame,
             if (f & (1ULL << 36)) ++stats->lodFadingOut;
             if (f & (1ULL << 38)) ++stats->forcedFadeOut;
         }
+    }
+}
+
+void SemanticCapture::SnapshotSkinnedCulled(std::unordered_set<uint64_t>& out) {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    for (const PassKey key : g_skinnedKeys) {
+        auto it = g_drawableMap.find(key);
+        if (it == g_drawableMap.end()) continue;
+        if (it->second.engineCulled) out.insert(key);
     }
 }
 

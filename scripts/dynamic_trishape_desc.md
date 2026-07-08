@@ -308,3 +308,99 @@ inverse binds are whatever the head NIF authored.
 - Confirm **no** breakpoint at `0x1416e4930`/`0x1416e4960` fires for a head after creation during
   normal animation (proves no per-frame rewrite; animation is bone-driven only).
 - Confirm the head's skin instance pointer (`+0x140`) equals the source geometry's (no rebind).
+
+---
+
+## Hair tint color plumbing (2026-07-08)
+
+Where the per-NPC HAIR RGB lives at render time, readable from a plugin holding the hair
+`BSTriShape*`. Binary `Fallout4.exe` 1.10.980, Ghidra project `patches/Fallout4`.
+
+### TL;DR pointer chain (all plain derefs from `BSTriShape*`, no vtable calls)
+
+```
+BSTriShape*  (hair = BSDynamicTriShape)
+  +0x138  BSShaderProperty*   shaderProperty        // BSLightingShaderProperty; material GetType()==2 (Glowmap)
+    +0x30   u64    flags                            // EmitColor=bit22, GrayscaleToPalette=bit31, Hair=bit46, TwoSided=bit36
+    +0x58   BSShaderMaterial*  shaderMaterial       // BSLightingShaderMaterialGlowmap: +0x68 spLookupTexture (shared LGrad LUT), +0xB8 fLookupScale
+    +0xB8   NiColor*  pEmissiveColor  -> [+0x00 R, +0x04 G, +0x08 B] float   <<< THE PER-NPC HAIR RGB
+    +0xC8   float   fEmitColorScale                 // multiplier (default 1.0)
+```
+
+**Render-time hair color the GPU receives = `pow(pEmissiveColor.rgb * fEmitColorScale, 2.2)`** (sRGB->linear).
+For CPU replication read `pEmissiveColor.rgb` directly (that is the authored/applied color); apply
+`* fEmitColorScale` and the 2.2 gamma only if you want the exact linear value uploaded to the PS.
+
+The hair material carries **no** color (Glowmap ends at +0xE0); the tint is 100% on the **property**,
+exactly as the Skyrim precedent — the property's only `NiColor` is `pEmissiveColor`.
+
+### Task 1 — where the color is WRITTEN (sink = pEmissiveColor)
+
+- `BSLightingShaderProperty::ctor` **0x142171620**: allocates `pEmissiveColor` (a 12-byte `NiColor`,
+  `prop[0x17]` = prop+0xB8), sets `fEmitColorScale`(prop+0xC8)=1.0, and by default sets flags
+  `EmitColor(22)+GrayscaleToPalette(31)+bit32` (via `SetFlag` **0x142161950**, which is a direct
+  `prop+0x30 |= 1<<bit`).
+- **Material-load writer** `MaterialFile_TransferColors` **0x142163B00** (called by
+  `MaterialFile_ApplyToGeometry` 0x142162D20): copies the BGSM file colors into the property/material:
+  - `prop->pEmissiveColor`: `*puVar = file+0x1c` (R,G); `*(u32*)(puVar+1) = file+0x24` (B)  = BGSM emissive/`cEmittanceColor`
+  - `prop->fEmitColorScale`(+0xC8) = `file+0x64`
+  - material `kSpecularColor`(+0x38)<-file+0xC/+0x14, `fSpecularColorScale`(+0x8C)<-file+0x18,
+    `fSmoothness`(+0x88)<-file+0x34, `fLookupScale`(+0xB8)<-file+0x68.
+  So the material's authored emissive color SEEDS `pEmissiveColor`; the per-NPC hair CLFM overrides
+  the SAME field at runtime.
+- **Per-NPC applier**: copies `TESNPC.headData->hairColor` (`BGSColorForm*`, F4SE GameObjects.cpp:47)
+  into `prop->pEmissiveColor`. It lives in the facegen/head-assembly path — the large fn at
+  ~`0x1406862A0` reads the race `hairColorLUT` (`TESRace+0x6B8`) to resolve a RemappableIndex CLFM
+  (BGSColorForm flags+0x40 bit1) into RGB. The exact byte-level write site was not pinned statically
+  (giant function); the DESTINATION field is proven by both the material-load writer above and the
+  shader reader below. Recommend a live `memwatch` on `prop+0xB8` during hair equip/chargen.
+- `SetHairFlag` **0x1402d9ec0** sets the `Hair` flag (bit46) on the 4 biped hair geometry properties
+  (`geom+0x138`), does NOT touch color.
+
+### Task 2 — shader constant-buffer setup (the tint feed)
+
+`BSLightingShader` vtable @ **0x14290BFE0**: SetupGeometry=slot7 **0x1421FDA30**,
+RestoreGeometry=slot8 0x142201210, texture-bind/SetupMaterial=slot4 0x1421FC630.
+
+In `SetupGeometry` **0x1421FDA30** (`param2`=BSRenderPass; `pass+0x10`=shaderProperty (`lVar35`);
+`pass+0x18`=geometry; `prop+0x58`=material):
+- **Emit/tint color** (UNCONDITIONAL), decomp lines ~1176-1185:
+  ```
+  ec    = *(NiColor**)(prop+0xB8);        // pEmissiveColor
+  scale = *(float*)(prop+0xC8);           // fEmitColorScale
+  PSCB[ reg(0x5a) ].rgb = pow( float3(ec[0],ec[1],ec[2]) * scale, 2.2 );
+  ```
+  `reg(0x5a) = *(u8*)(DAT_143e5ae70 + 0x5a)` = the PS constant register index inside the lighting
+  constant descriptor `DAT_143e5ae70`; `plVar23[1]` = constant-buffer base pointer.
+- **LUT lookup scale**, line ~834 (technique-gated): `PSCB[reg(0x5c)] = material->fLookupScale` (mat+0xB8).
+- SkinTint/HairTint MATERIALS (`material->GetType()==5`) instead push `material->kTintColor` (mat+0xC0,
+  gamma 2.2) into the same `reg(0x5c)` — this path is NOT taken by NPC hair (which is Glowmap type 2).
+
+So for NPC hair the per-object PS tint constant = `pEmissiveColor * fEmitColorScale` (gamma 2.2); no
+color comes from the material.
+
+### Task 3 — how the shader combines grayscale + LGrad LUT + tint
+
+`finalDiffuse.rgb ≈ LUT(u = grayscale[ * fLookupScale]).rgb * tint.rgb`, where the grayscale diffuse
+is remapped through the shared `HairColor_LGrad` LUT (tonal/gradient ramp only) and the per-NPC RGB
+tint = `pEmissiveColor` colorizes it. The LUT is shared game-wide precisely because it carries only
+the ramp; the hue is the RGB tint. (Multiply-vs-row-select inferred from: one shared LUT + arbitrary-
+RGB CLFM colors + a full float3 tint constant. Exact HLSL op would need the Shaders011.fxp hair PS to
+confirm, but the plugin-relevant fact — per-NPC RGB = `pEmissiveColor * fEmitColorScale` — is proven.)
+
+### Task 4 — each hop confirmed offline
+
+| Hop | Offset | Type | Proof |
+|-----|--------|------|-------|
+| shape -> shaderProperty | +0x138 | BSShaderProperty* | geom+0x138 (KB); SetupGeometry reads pass+0x10=prop; live GetType()==2 |
+| prop -> shaderMaterial | +0x58 | BSShaderMaterial* | F4SE BSShaderProperty+0x58; read in MakeValidForRendering + SetupGeometry |
+| prop -> flags | +0x30 | u64 | SetFlag 0x142161950; shader flag tests |
+| prop -> pEmissiveColor | +0xB8 | NiColor* | ctor allocs prop[0x17]; writer 0x142163B00; reader 0x1421FDA30 |
+| pEmissiveColor -> R/G/B | +0x00/+0x04/+0x08 | float | 12-byte NiColor (ctor alloc 0xC) |
+| prop -> fEmitColorScale | +0xC8 | float | ctor=1.0; writer file+0x64; shader multiply |
+
+### Suggested live verification
+- On a hair `BSDynamicTriShape`: `prop=*(shape+0x138); ec=*(NiColor**)(prop+0xB8);` dump `ec[0..2]`
+  and `*(float*)(prop+0xC8)`. Compare `ec.rgb` to `TESNPC::GetHairColor()` `BGSColorForm` color
+  (form+0x30 rgb bytes, or race `hairColorLUT[remappingIndex]` when CLFM flags+0x40 bit1 set).
+- `memwatch prop+0xB8`'s target during hair equip / RaceMenu to catch the runtime CLFM applier.

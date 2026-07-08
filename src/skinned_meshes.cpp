@@ -253,6 +253,15 @@ void SkinnedMeshes::LogBones(uint64_t drawableHash, const char* label) {
     }
 }
 
+// [FaceAnim] probe target (first facegen head registered this session).
+static std::atomic<uint64_t> g_faceProbeHash{0};
+
+void SkinnedMeshes::SetFaceProbe(uint64_t drawableHash) {
+    uint64_t expected = 0;
+    g_faceProbeHash.compare_exchange_strong(expected, drawableHash,
+                                            std::memory_order_relaxed);
+}
+
 void SkinnedMeshes::OnDrawableReleased(uint64_t drawableHash) {
     std::lock_guard<std::mutex> lk(g_mx);
     g_entries.erase(drawableHash);
@@ -338,6 +347,29 @@ void SkinnedMeshes::UpdateAndQueue() {
                 continue;
             }
             e.faults = 0;
+            // [FaceAnim] expressions probe: periodic composed-translation
+            // sample for the marked facegen head. Motion here during
+            // dialogue proves the engine drives expressions through these
+            // bone worlds (and our pipeline should show them); a static
+            // readout means facial animation lives elsewhere.
+            if (it->first == g_faceProbeHash.load(std::memory_order_relaxed) &&
+                n >= 7) {
+                static uint32_t s_probeTick = 0;
+                static std::atomic<int> s_probeLogs{0};
+                if (++s_probeTick % 90 == 0 &&
+                    s_probeLogs.fetch_add(1, std::memory_order_relaxed) < 30) {
+                    const auto& m0 = mats[0].matrix;
+                    const auto& m4 = mats[4].matrix;
+                    const auto& m6 = mats[6].matrix;
+                    _MESSAGE("FO4RemixPlugin: [FaceAnim] hash=%016llX "
+                             "b0t=(%.2f,%.2f,%.2f) b4t=(%.2f,%.2f,%.2f) "
+                             "b6t=(%.2f,%.2f,%.2f)",
+                             (unsigned long long)it->first,
+                             m0[0][3], m0[1][3], m0[2][3],
+                             m4[0][3], m4[1][3], m4[2][3],
+                             m6[0][3], m6[1][3], m6[2][3]);
+                }
+            }
             queued.emplace(it->first, std::move(mats));
             ++it;
         }
