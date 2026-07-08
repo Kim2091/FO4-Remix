@@ -17,6 +17,7 @@
 
 #include <d3d11.h>
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <cmath>
 #include <cstring>
@@ -1266,10 +1267,35 @@ void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMateri
 // should be skipped (effect shader, missing data, NaN positions, bad indices).
 // When logRejections is false, NaN/Inf and bad-index rejections are silent.
 bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections,
-                                      bool applyVertexColors)
+                                      bool applyVertexColors, bool parseSkinning)
 {
-    if (!shape || shape->numVertices == 0 || shape->numTriangles == 0)
+    if (!shape)
         return false;
+
+    // Capped bail logging (2026-07-08 missing-heads investigation): 85
+    // drawables sat permanently at parseFailed with no evidence trail
+    // because every early-out here was silent. Skinned-shape bails always
+    // log; the effect-shader gate additionally requires the skinned flag so
+    // routine particle/effect rejects don't burn the cap.
+    auto logParseBail = [&](const char* reason) {
+        if (!logRejections) return;
+        static std::atomic<int> s_bails{0};
+        if (s_bails.fetch_add(1, std::memory_order_relaxed) < 20) {
+            _MESSAGE("FO4RemixPlugin: [ParseBail] shape \"%s\" %s (dyn=%d skinned=%d desc=%016llX nV=%u nT=%u)",
+                     shape->m_name.c_str() ? shape->m_name.c_str() : "",
+                     reason,
+                     shape->GetAsBSDynamicTriShape() ? 1 : 0,
+                     (shape->vertexDesc & BSGeometry::kFlag_Skinned) ? 1 : 0,
+                     (unsigned long long)shape->vertexDesc,
+                     (unsigned)shape->numVertices, (unsigned)shape->numTriangles);
+        }
+    };
+    const bool descSkinned = (shape->vertexDesc & BSGeometry::kFlag_Skinned) != 0;
+
+    if (shape->numVertices == 0 || shape->numTriangles == 0) {
+        if (descSkinned) logParseBail("zero verts/tris");
+        return false;
+    }
 
     // Skip effect shaders — not real geometry. Per F4SE NiMaterials.h:32,
     // GetFeature() returns 2 for lighting and 1 for effect; water returns
@@ -1280,24 +1306,35 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         if (prop) {
             BSShaderProperty* sp = static_cast<BSShaderProperty*>(prop);
             BSShaderMaterial* mat = sp->shaderMaterial;
-            if (!mat || mat->GetFeature() == 1)
+            if (!mat || mat->GetFeature() == 1) {
+                if (descSkinned)
+                    logParseBail(!mat ? "null shader material" : "effect-shader feature");
                 return false;
+            }
         }
     }
 
-    // Renderer data -> vertex/index buffers
+    // Renderer data -> vertex/index buffers (bails log via logParseBail).
     auto* gfxData = static_cast<BSGraphics::TriShape*>(shape->pRendererData);
-    if (!gfxData || !gfxData->pVB || !gfxData->pIB)
+    if (!gfxData || !gfxData->pVB || !gfxData->pIB) {
+        logParseBail(!gfxData ? "null pRendererData"
+                              : (!gfxData->pVB ? "null pVB" : "null pIB"));
         return false;
+    }
 
     uint8_t* vbData = static_cast<uint8_t*>(gfxData->pVB->pData);
     uint8_t* ibData = static_cast<uint8_t*>(gfxData->pIB->pData);
-    if (!vbData || !ibData)
+    if (!vbData || !ibData) {
+        logParseBail(!vbData ? "null pVB->pData" : "null pIB->pData");
         return false;
+    }
 
     uint64_t desc = shape->vertexDesc;
     uint16_t vertexSize = shape->GetVertexSize();
-    if (vertexSize == 0) return false;
+    if (vertexSize == 0) {
+        logParseBail("vertexSize 0");
+        return false;
+    }
 
     bool hasUVs     = (desc & BSGeometry::kFlag_UVs) != 0;
     bool hasNormals = (desc & BSGeometry::kFlag_Normals) != 0;
@@ -1340,9 +1377,15 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         remixapi_HardcodedVertex& out_v = out.vertices[i];
         memset(&out_v, 0, sizeof(out_v));
 
-        // Position
+        // Position. Dynamic shapes read from dynamicVertices whose element
+        // size is GetDynamicVertexSize() = szVertex nibble * 4: a 16-byte
+        // element is a float4 (XMVECTOR -- FaceGen heads and morphing
+        // meshes), NOT half4. Reading those as halfs produced garbage
+        // positions that silently died at the extent gate ("missing heads",
+        // 2026-07-08); half-sized elements (8 bytes) stay on the half path.
         uint8_t* pv = posData + (uint32_t)i * posStride;
-        if (isDynamic || posHalfFloat) {
+        const bool posIsHalf = isDynamic ? (posStride <= 8) : posHalfFloat;
+        if (posIsHalf) {
             uint16_t* pos = reinterpret_cast<uint16_t*>(pv);
             out_v.position[0] = HalfToFloat(pos[0]);
             out_v.position[1] = HalfToFloat(pos[1]);
@@ -1380,6 +1423,59 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
             memcpy(&out_v.color, v + oColor, 4);
         } else {
             out_v.color = 0xFFFFFFFF;
+        }
+    }
+
+    // Skinning attributes. Nibble 7 of the vertexDesc is the skinning-data
+    // offset (F4SE VertexDesc bitfield; same szVertex-relative convention as
+    // the UV/normal/color nibbles above). Layout at that offset, RenderDoc-
+    // confirmed: 4x float16 blend weights then 4x uint8 bone indices. The
+    // engine's vertex shader consumes weights .xyz and reconstructs the 4th
+    // as 1-(x+y+z); replicate that (the 4th stored half is not trusted).
+    out.hasSkinning = false;
+    if (parseSkinning && (desc & BSGeometry::kFlag_Skinned)) {
+        const uint32_t oSkin = (szVertex + (uint32_t)((desc >> 28) & 0xF)) * 4;
+        if (oSkin + 12 <= vertexSize) {
+            out.blendWeights.resize((size_t)shape->numVertices * 4);
+            out.blendIndices.resize((size_t)shape->numVertices * 4);
+            for (uint16_t i = 0; i < shape->numVertices; i++) {
+                const uint8_t* v = vbData + (uint32_t)i * vertexSize;
+                const uint16_t* wRaw = reinterpret_cast<const uint16_t*>(v + oSkin);
+                float w0 = HalfToFloat(wRaw[0]);
+                float w1 = HalfToFloat(wRaw[1]);
+                float w2 = HalfToFloat(wRaw[2]);
+                // Defensive: NaN/garbage halves become rigid bind to bone 0.
+                if (!(w0 >= 0.0f && w0 <= 1.0f)) w0 = 0.0f;
+                if (!(w1 >= 0.0f && w1 <= 1.0f)) w1 = 0.0f;
+                if (!(w2 >= 0.0f && w2 <= 1.0f)) w2 = 0.0f;
+                // The runtime's skinning shader derives the 4th weight as
+                // 1-(w0+w1+w2) and SKIPS it when negative (skinning.h:103)
+                // -- a triple sum above 1 therefore skins with effective
+                // weight sum > 1 and the vertex overshoots along its world
+                // position vector (world-fixed spike direction). Renormalize
+                // the triple when it exceeds 1; no-op for well-formed data.
+                const float triple = w0 + w1 + w2;
+                if (triple > 1.0f) {
+                    const float inv = 1.0f / triple;
+                    w0 *= inv; w1 *= inv; w2 *= inv;
+                }
+                float w3 = 1.0f - (w0 + w1 + w2);
+                if (w3 < 0.0f) w3 = 0.0f;
+                const uint8_t* bi = v + oSkin + 8;
+                float* wOut = &out.blendWeights[(size_t)i * 4];
+                uint32_t* iOut = &out.blendIndices[(size_t)i * 4];
+                wOut[0] = w0; wOut[1] = w1; wOut[2] = w2; wOut[3] = w3;
+                iOut[0] = bi[0]; iOut[1] = bi[1]; iOut[2] = bi[2]; iOut[3] = bi[3];
+                if (w0 + w1 + w2 + w3 <= 0.0f) {
+                    wOut[0] = 1.0f;  // degenerate row: rigid to its first bone
+                }
+            }
+            out.hasSkinning = true;
+        } else if (logRejections) {
+            _MESSAGE("FO4RemixPlugin: [Skinning] shape \"%s\" skinned desc=%016llX but "
+                     "oSkin=%u+12 > stride=%u -- skinning attributes skipped",
+                     shape->m_name.c_str() ? shape->m_name.c_str() : "",
+                     (unsigned long long)desc, oSkin, vertexSize);
         }
     }
 

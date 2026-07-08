@@ -5,6 +5,7 @@
 #include "resolvers/lighting_static.h"
 #include "resolvers/water.h"
 #include "remix_renderer.h"
+#include "skinned_meshes.h"
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -768,6 +769,17 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             g_loadingScreenActive.store(false, std::memory_order_relaxed);
             loadingGate = false;
         }
+    }
+
+    // ---- Skinned bone updates (2026-07-08) ----
+    // Once per Tick (== once per game frame), read every registered skinned
+    // drawable's live bone world transforms, compose bind->world matrices,
+    // and queue them to the renderer for the per-instance bones ext. Gated
+    // off during load screens: the loader thread is tearing down the very
+    // skeletons the registry points into (the reads are SEH-guarded, but a
+    // half-freed skeleton can read as plausible garbage).
+    if (!loadingGate && g_config.skinningEnabled) {
+        SkinnedMeshes::UpdateAndQueue();
     }
 
     // ---- Resolve loop: every call, attempt one resolve per unsubmitted drawable ----

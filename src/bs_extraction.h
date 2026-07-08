@@ -102,6 +102,24 @@ struct ExtractedMesh {
     // extraction time; see ExtractMaterialTexture's albedoLumFloor param.
     float metallicConstant          = 0.0f;
     float roughnessConstantOverride = -1.0f;
+
+    // Skinned mesh (2026-07-08). When hasSkinning is true:
+    //   - blendWeights/blendIndices are 4-per-vertex remixapi skinning
+    //     streams (see ParsedGeometry); SubmitDrawable fills
+    //     remixapi_MeshInfoSkinning and the runtime GPU-skins the mesh in
+    //     OBJECT space at BLAS build (re-skinned when the per-instance bone
+    //     set changes, keyed by boneHash).
+    //   - worldTransform is the bare Beth->Remix mirror P: bone matrices
+    //     (queued per frame by SkinnedMeshes::UpdateAndQueue) produce Beth
+    //     WORLD coordinates, so the instance transform carries only the
+    //     mirror -- which also makes the runtime's facing flip fire, same
+    //     mechanism as the BatchedMirrorBase fix.
+    //   - the mesh cache key is the drawable hash (no cross-drawable mesh
+    //     sharing): each actor's BLAS must re-skin against its own bones.
+    bool hasSkinning = false;
+    uint32_t boneCount = 0;
+    std::vector<float>    blendWeights;
+    std::vector<uint32_t> blendIndices;
 };
 
 struct CellInfo {
@@ -177,6 +195,19 @@ struct ParsedGeometry {
     uint16_t vertexSize;
     uint8_t* vbData;        // raw vertex buffer pointer (for blend weight reading)
     bool isDynamic;
+
+    // Skinning attributes (filled only when parseSkinning is requested AND
+    // the shape's vertexDesc has kFlag_Skinned AND the skinning attribute
+    // fits the stride). 4 entries per vertex, remixapi layout.
+    //
+    // VB layout (RenderDoc-confirmed 2026-07-08 + F4SE VertexDesc bitfield:
+    // skinning attribute is desc nibble 7): 4x float16 weights followed by
+    // 4x uint8 bone indices. The engine's vertex shader uses weights .xyz
+    // and reconstructs the 4th as 1-(x+y+z) -- we replicate that instead of
+    // trusting the 4th stored half.
+    bool hasSkinning = false;
+    std::vector<float>    blendWeights;   // numVertices * 4
+    std::vector<uint32_t> blendIndices;   // numVertices * 4 (u8 widened)
 };
 
 // Forward declarations for F4SE types used in shared function signatures
@@ -227,7 +258,7 @@ namespace BsExtraction {
     // baking them unconditionally rendered whole objects black. When false
     // (or when the mesh has no color stream), vertices get 0xFFFFFFFF.
     bool ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections = true,
-                            bool applyVertexColors = true);
+                            bool applyVertexColors = true, bool parseSkinning = false);
 
     // Get the BSLightingShaderMaterialBase from a shape, or nullptr
     BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape);

@@ -81,6 +81,8 @@ add_library(FO4RemixPlugin SHARED
     src/startup_diag.cpp
     src/semantic_capture.h
     src/semantic_capture.cpp
+    src/skinned_meshes.h
+    src/skinned_meshes.cpp
     src/resolvers/lighting_static.h
     src/resolvers/lighting_static.cpp
     src/resolvers/water.h

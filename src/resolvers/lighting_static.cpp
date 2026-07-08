@@ -3,6 +3,7 @@
 #include "../bs_extraction.h"
 #include "../semantic_capture.h"
 #include "../remix_renderer.h"
+#include "../skinned_meshes.h"
 #include "../config.h"
 #include "../draw_capture.h"
 #include "../fo4_diagnostics.h"
@@ -1054,8 +1055,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     BSTriShape* tri = obj->GetAsBSTriShape();
     if (!tri) return false;  // not a BSTriShape (particle system, segmented shape, ...)
 
-    // 1B scope: skip skinned. Skinning regression accepted; later phase revives.
-    if (tri->vertexDesc & BSGeometry::kFlag_Skinned) {
+    // Skinned meshes (revived 2026-07-08 behind [Skinning] Enabled): parsed
+    // with blend weights/indices, registered with SkinnedMeshes for per-Tick
+    // bone updates, and submitted with the bare mirror-P instance transform
+    // (bones produce Beth world coordinates). See skinned_meshes.h for the
+    // composition math and the post-mortem of the retired pre-1B module.
+    const bool isSkinned = (tri->vertexDesc & BSGeometry::kFlag_Skinned) != 0;
+    if (isSkinned && !g_config.skinningEnabled) {
         ResolverTrace::g_lastStep.store(Trace::kSkinSkipped, std::memory_order_relaxed);
         return false;
     }
@@ -1121,7 +1127,14 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     ResolverTrace::g_lastStep.store(Trace::kParseStart, std::memory_order_relaxed);
     ParsedGeometry parsed;
     if (!BsExtraction::ParseShapeGeometry(tri, parsed, /*logRejections=*/g_config.logRejections,
-                                          applyVertexColors)) {
+                                          applyVertexColors, /*parseSkinning=*/isSkinned)) {
+        return false;
+    }
+    if (isSkinned && !parsed.hasSkinning) {
+        // Desc says skinned but the skinning attribute didn't fit the
+        // stride: without weights the mesh would render as a model-space
+        // blob. Skip permanently-ish (retries are cheap and keep the log
+        // line from ParseShapeGeometry capped by logRejections).
         return false;
     }
 
@@ -1172,6 +1185,79 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         if (propFlagsEarly & kFlag_TwoSided) {
             mesh.isTwoSided = true;
         }
+    }
+
+    // ---- Skinned drawable wiring (2026-07-08) ----
+    if (isSkinned) {
+        uint32_t boneCount = 0;
+        if (!SkinnedMeshes::Register(hash, tri, boneCount)) {
+            // Skin instance not ready yet (streaming) or failed validation:
+            // standard retry-next-tick contract.
+            return false;
+        }
+        // Blend indices reference the skin instance's bone array; clamp any
+        // out-of-range index to bone 0 rather than letting the runtime's
+        // skinning shader read a garbage matrix slot. Clamps are LOGGED
+        // (capped): a nonzero count means the VB indexes a bigger bone table
+        // than Register derived -- the clamp visual is vertices spiking
+        // toward the skeleton root, so this must be treated as a bug signal,
+        // not sanitization noise.
+        uint32_t clamped = 0, maxIdx = 0;
+        for (auto& idx : parsed.blendIndices) {
+            if (idx > maxIdx) maxIdx = idx;
+            if (idx >= boneCount) { idx = 0; ++clamped; }
+        }
+        if (clamped > 0) {
+            static std::atomic<int> sClampLogs{0};
+            if (sClampLogs.fetch_add(1, std::memory_order_relaxed) < 12) {
+                _MESSAGE("FO4RemixPlugin: [Skinning] shape \"%s\" clamped %u/%zu "
+                         "blend indices (max=%u boneCount=%u)",
+                         tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                         clamped, parsed.blendIndices.size(), maxIdx, boneCount);
+            }
+        }
+        // [SkinVtx] weight-sanity scan (2026-07-08 spike hunt). The parse
+        // renormalizes triple sums > 1, so seeing over>0 here would mean the
+        // renorm didn't cover the real anomaly; the worst-vertex dump gives
+        // the raw decode for offline comparison either way.
+        {
+            const size_t vCount = parsed.blendWeights.size() / 4;
+            float maxTriple = 0.0f;
+            size_t over = 0, worst = 0;
+            for (size_t v = 0; v < vCount; ++v) {
+                const float t = parsed.blendWeights[v * 4 + 0] +
+                                parsed.blendWeights[v * 4 + 1] +
+                                parsed.blendWeights[v * 4 + 2];
+                if (t > 1.001f) ++over;
+                if (t > maxTriple) { maxTriple = t; worst = v; }
+            }
+            static std::atomic<int> sVtxLogs{0};
+            if (vCount > 0 && sVtxLogs.fetch_add(1, std::memory_order_relaxed) < 16) {
+                const float* w = &parsed.blendWeights[worst * 4];
+                const uint32_t* bi = &parsed.blendIndices[worst * 4];
+                _MESSAGE("FO4RemixPlugin: [SkinVtx] shape=\"%s\" verts=%zu bones=%u "
+                         "tripleOver1=%zu maxTriple=%.4f worst=v%zu "
+                         "w=(%.3f,%.3f,%.3f,%.3f) idx=(%u,%u,%u,%u)",
+                         tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                         vCount, boneCount, over, maxTriple, worst,
+                         w[0], w[1], w[2], w[3], bi[0], bi[1], bi[2], bi[3]);
+            }
+        }
+        mesh.hasSkinning  = true;
+        mesh.boneCount    = boneCount;
+        mesh.blendWeights = std::move(parsed.blendWeights);
+        mesh.blendIndices = std::move(parsed.blendIndices);
+        // Instance transform = bare Beth->Remix mirror P. The bone matrices
+        // (queued per Tick by SkinnedMeshes::UpdateAndQueue) take bind-pose
+        // model space -> Beth WORLD space, so the instance carries only the
+        // mirror -- which is also what makes the runtime's facing flip fire
+        // (isObjectToWorldMirrored, same mechanism as BatchedMirrorBase).
+        static const float kMirrorP[3][4] = {
+            { 0.0f, 1.0f, 0.0f, 0.0f },
+            { 1.0f, 0.0f, 0.0f, 0.0f },
+            { 0.0f, 0.0f, 1.0f, 0.0f },
+        };
+        std::memcpy(mesh.worldTransform, kMirrorP, sizeof(kMirrorP));
     }
 
     // Detect FO4 worldspace LOD chunk and tag the mesh so OnFrame can apply

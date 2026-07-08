@@ -4,6 +4,7 @@
 #include "bs_extraction.h"
 #include <vector>
 #include <cstdint>
+#include <unordered_map>
 #include <unordered_set>
 
 struct OverlayData {
@@ -104,6 +105,14 @@ namespace RemixRenderer {
     // QueueConfigVariable). OnFrame drains it on the Remix thread, diffs by
     // hash against the live light handles, and draws every light each frame.
     void QueueLights(std::vector<ExtractedLight>&& lights);
+
+    // Queue composed bind->world bone matrix sets for skinned drawables from
+    // the game thread (SkinnedMeshes::UpdateAndQueue, once per Tick; same
+    // never-block-on-the-API-mutex contract as QueueLights). OnFrame drains
+    // into the matching DrawableInstances and chains
+    // remixapi_InstanceInfoBoneTransformsEXT on their draws.
+    void QueueBoneTransforms(
+        std::unordered_map<uint64_t, std::vector<remixapi_Transform>>&& bones);
 
     // True if a Remix-side texture handle currently exists for `hash`.
     // Used by the extraction cache to decide whether a cache hit must

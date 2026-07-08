@@ -3,6 +3,7 @@
 #include "remix_api.h"
 #include "fo4_diagnostics.h"
 #include "semantic_capture.h"
+#include "skinned_meshes.h"
 #include "resolvers/lighting_static.h"  // Trace::SetStep + Trace::Step constants
 
 #include "remix/remix_c.h"
@@ -257,6 +258,18 @@ namespace {
         // traversal backface-culls ordinary opaque geometry. Folded into the
         // material cache key so bucket members agree.
         bool                         isTwoSided           = false;
+
+        // Skinned drawable (2026-07-08). worldTransform holds the bare
+        // Beth->Remix mirror P (bones produce Beth WORLD coordinates); the
+        // livePoses per-frame pose update is SKIPPED for skinned instances
+        // (bone updates carry all motion -- the shape's own transform must
+        // not stomp P). boneTransforms is refreshed each frame from the
+        // bone queue (SkinnedMeshes::UpdateAndQueue on the game thread);
+        // OnFrame chains remixapi_InstanceInfoBoneTransformsEXT and SKIPS
+        // drawing until the first bone set arrives (bind-pose verts are
+        // model-space -- drawn boneless they'd T-pose at the world origin).
+        bool                            isSkinned = false;
+        std::vector<remixapi_Transform> boneTransforms;
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
@@ -310,6 +323,14 @@ namespace {
     bool g_lightSnapshotPending = false;
     std::vector<ExtractedLight> g_lightSnapshot;
     std::unordered_map<uint64_t, remixapi_LightHandle> g_lights;  // Remix thread only
+
+    // Skinned bone sync (2026-07-08). The game thread queues composed
+    // bind->world matrix sets per skinned drawable (QueueBoneTransforms from
+    // SkinnedMeshes::UpdateAndQueue, once per Tick; never touches the API
+    // mutex); OnFrame drains into DrawableInstance::boneTransforms on the
+    // Remix thread and chains the bones ext on each skinned draw.
+    std::mutex g_boneQueueMutex;
+    std::unordered_map<uint64_t, std::vector<remixapi_Transform>> g_boneQueue;
 }
 
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
@@ -966,7 +987,13 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     // byte-stable hash over (vertices, indices), so identical NIF instances
     // with identical materials share a single cached handle.
     MeshCacheKey meshKey{};
-    meshKey.contentHash  = g_config.gpuInstancingEnabled ? ContentHashOf(mesh) : hash;
+    // Skinned meshes never share a handle across drawables: the runtime
+    // re-skins a mesh's geometry against its instance's bone set (boneHash-
+    // keyed, rtx_scene_manager.cpp:351), so two actors on one handle would
+    // fight over the same skinned BLAS. Key by drawable hash instead.
+    meshKey.contentHash  = mesh.hasSkinning
+        ? hash
+        : (g_config.gpuInstancingEnabled ? ContentHashOf(mesh) : hash);
     meshKey.materialHash = matHash;
 
     remixapi_MeshHandle meshHandle = nullptr;
@@ -984,6 +1011,20 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         surface.indices_values  = mesh.indices.empty() ? nullptr : mesh.indices.data();
         surface.indices_count   = (uint32_t)mesh.indices.size();
         surface.skinning_hasvalue = 0;
+        if (mesh.hasSkinning &&
+            mesh.blendWeights.size() == mesh.vertices.size() * 4 &&
+            mesh.blendIndices.size() == mesh.vertices.size() * 4) {
+            // 4-bone rigid layout (FO4 VB: 4x f16 weights + 4x u8 indices,
+            // widened at parse). The runtime packs indices back to bytes and
+            // GPU-skins in object space; per-frame bone sets arrive via the
+            // InstanceInfoBoneTransformsEXT chain in OnFrame.
+            surface.skinning_hasvalue = 1;
+            surface.skinning_value.bonesPerVertex      = 4;
+            surface.skinning_value.blendWeights_values = mesh.blendWeights.data();
+            surface.skinning_value.blendWeights_count  = (uint32_t)mesh.blendWeights.size();
+            surface.skinning_value.blendIndices_values = mesh.blendIndices.data();
+            surface.skinning_value.blendIndices_count  = (uint32_t)mesh.blendIndices.size();
+        }
         surface.material = matHandle;
 
         remixapi_MeshInfo meshInfo = {};
@@ -1036,6 +1077,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     // Decal tag for the OnFrame DECAL_STATIC categoryFlag.
     inst.isDecal              = mesh.isDecal;
     inst.isTwoSided           = mesh.isTwoSided;
+    inst.isSkinned            = mesh.hasSkinning;
 
     g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
@@ -1057,6 +1099,10 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 }
 
 void RemixRenderer::ReleaseDrawable(uint64_t hash) {
+    // Drop bone tracking regardless of drawable presence (registration can
+    // outlive a failed submit).
+    SkinnedMeshes::OnDrawableReleased(hash);
+
     std::lock_guard<std::mutex> lock(g_renderStateMutex);
 
     auto it = g_drawables.find(hash);
@@ -1253,6 +1299,16 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     const PerfClock::time_point tSnap0 = PerfClock::now();
     SemanticCapture::DrainDirtyPoses(livePoses);
 
+    // Drain queued skinned bone sets (game thread queues one composed set
+    // per skinned drawable per Tick via SkinnedMeshes::UpdateAndQueue).
+    // Applied to DrawableInstance::boneTransforms in the member loop below.
+    static std::unordered_map<uint64_t, std::vector<remixapi_Transform>> freshBones;
+    freshBones.clear();
+    {
+        std::lock_guard<std::mutex> boneLock(g_boneQueueMutex);
+        freshBones.swap(g_boneQueue);
+    }
+
     // Stale-chunk filter inputs. The engine fires GetRenderPasses every frame
     // for geometry that survives its culling and HIDES worldspace LOD chunks
     // when their cells attach at full detail -- so a chunk whose fire age
@@ -1318,13 +1374,26 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // the current pose. Drawables without a live transform fall back
             // to the baked transform from SubmitDrawable.
             auto poseIt = livePoses.find(drawHash);
-            if (poseIt != livePoses.end()) {
+            if (poseIt != livePoses.end() && !inst.isSkinned) {
+                // Skinned instances keep their bare mirror-P base: bone
+                // matrices carry all motion, and the shape's own transform
+                // (what livePoses holds) must not stomp it.
                 const auto& pose = poseIt->second;
                 for (int r = 0; r < 3; ++r) {
                     for (int c = 0; c < 4; ++c) {
                         inst.worldTransform[r][c] = pose[r * 4 + c];
                     }
                 }
+            }
+            if (inst.isSkinned) {
+                auto bIt = freshBones.find(drawHash);
+                if (bIt != freshBones.end()) {
+                    inst.boneTransforms = std::move(bIt->second);
+                }
+                // No bone set yet: bind-pose verts are model-space and would
+                // render T-posed at the world origin -- hold the draw until
+                // the first game-thread bone update lands (next Tick).
+                if (inst.boneTransforms.empty()) continue;
             }
             if (inst.isLODChunk) {
                 // Stale-fire filter: the engine hid this chunk (its cells
@@ -1403,8 +1472,9 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
             }
 
-            remixapi_InstanceInfoGpuInstancingEXT gpuExt   = {};
-            remixapi_InstanceInfoBlendEXT         blendExt = {};
+            remixapi_InstanceInfoGpuInstancingEXT  gpuExt   = {};
+            remixapi_InstanceInfoBlendEXT          blendExt = {};
+            remixapi_InstanceInfoBoneTransformsEXT bonesExt = {};
 
             // Per-instance blend ext (2026-05-01). Built when the bucket's
             // drawables need per-instance alpha state. The material was built
@@ -1461,6 +1531,19 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 }
                 // pNext: blendExt directly, or nullptr if not needed.
                 instance.pNext = needBlendExt ? (void*)&blendExt : nullptr;
+                // Skinned draw: chain the per-instance bone set. The base
+                // transform is the bare mirror P (set at submit); bones are
+                // Beth-world (det>0), so P both places the actor in Remix
+                // space and drives the runtime's mirrored-facing flip.
+                // Skinned meshes are keyed per-drawable in the mesh cache,
+                // so they always land on this single-member path.
+                if (member->isSkinned && !member->boneTransforms.empty()) {
+                    bonesExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
+                    bonesExt.pNext = instance.pNext;
+                    bonesExt.boneTransforms_values = member->boneTransforms.data();
+                    bonesExt.boneTransforms_count  = (uint32_t)member->boneTransforms.size();
+                    instance.pNext = &bonesExt;
+                }
             } else {
                 // Batched path: identity base, per-instance transforms in pNext.
                 ++batchedBucketCount;
@@ -1903,6 +1986,20 @@ void RemixRenderer::QueueLights(std::vector<ExtractedLight>&& lights) {
     std::lock_guard<std::mutex> lock(g_lightQueueMutex);
     g_lightSnapshot = std::move(lights);
     g_lightSnapshotPending = true;
+}
+
+void RemixRenderer::QueueBoneTransforms(
+    std::unordered_map<uint64_t, std::vector<remixapi_Transform>>&& bones) {
+    std::lock_guard<std::mutex> lock(g_boneQueueMutex);
+    if (g_boneQueue.empty()) {
+        g_boneQueue = std::move(bones);
+    } else {
+        // OnFrame hasn't drained the previous Tick's sets yet (Remix thread
+        // running slower than the game thread): newest set per drawable wins.
+        for (auto& kv : bones) {
+            g_boneQueue[kv.first] = std::move(kv.second);
+        }
+    }
 }
 
 bool RemixRenderer::HasTextureHandle(uint64_t hash) {
