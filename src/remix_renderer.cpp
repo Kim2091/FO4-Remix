@@ -1474,19 +1474,45 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 // node-stable in unordered_map, so sorting by pointer is
                 // deterministic for a drawable's lifetime.
                 std::sort(bucket.members.begin(), bucket.members.end());
+                // Mirrored-facing fix (2026-07-08, [Performance]
+                // BatchedMirrorBase). The runtime composes each per-instance
+                // transform into the TLAS transform (rtx_accel_manager.cpp:
+                // 1135), which per the Vulkan spec CANNOT change facing, and
+                // XORs its facing-flip compensation from the BASE transform
+                // only (isObjectToWorldMirrored, rtx_instance_manager.cpp:
+                // 1300). Every FO4 placement is mirrored (det<0: the Beth->
+                // Remix X/Y swap times a det>0 rotation and positive scale),
+                // so an identity base left batched instances WITHOUT the flip
+                // that single-member draws get -- repeated single-sided
+                // statics (street lamps, PA stands, merge-expanded records)
+                // rendered inside-out while unique placements were correct
+                // (WindDiag 2026-07-08: byte-identical submissions, opposite
+                // visual result). Hoist the X/Y-swap reflection P into the
+                // base and pre-multiply each member by P^-1 (= P, a row 0/1
+                // swap): composed placement P*(P^-1*M) == M is unchanged,
+                // the base carries the mirror, and the runtime applies the
+                // same flip as the single-member path.
+                const bool mirrorBase = g_config.batchedMirrorBase;
                 bucket.transforms.reserve(bucket.members.size());
                 for (const DrawableInstance* member : bucket.members) {
                     remixapi_Transform xform = {};
                     for (int r = 0; r < 3; ++r) {
+                        const int srcRow = mirrorBase ? (r == 0 ? 1 : (r == 1 ? 0 : 2)) : r;
                         for (int c = 0; c < 4; ++c) {
-                            xform.matrix[r][c] = member->worldTransform[r][c];
+                            xform.matrix[r][c] = member->worldTransform[srcRow][c];
                         }
                     }
                     bucket.transforms.push_back(xform);
                 }
-                instance.transform.matrix[0][0] = 1.0f;
-                instance.transform.matrix[1][1] = 1.0f;
-                instance.transform.matrix[2][2] = 1.0f;
+                if (mirrorBase) {
+                    instance.transform.matrix[0][1] = 1.0f;
+                    instance.transform.matrix[1][0] = 1.0f;
+                    instance.transform.matrix[2][2] = 1.0f;
+                } else {
+                    instance.transform.matrix[0][0] = 1.0f;
+                    instance.transform.matrix[1][1] = 1.0f;
+                    instance.transform.matrix[2][2] = 1.0f;
+                }
 
                 gpuExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_GPU_INSTANCING_EXT;
                 // pNext chain on gpuExt: blendExt -> nullptr if needed.

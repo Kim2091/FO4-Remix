@@ -537,3 +537,209 @@ the 3rd dword of the second register = cb2[7].z).
   DrawIndexed with `startIndex = 3·prefix(band)` (§1.3), the VS recovers the same group→record
   mapping the CPU-side rule in §1.4 derives from the retained u16 table — so CPU extraction and the
   GPU path are provably consistent.
+
+---
+
+## 8. Two-sided/cull flag chain (2026-07-07)
+
+**Question:** power-armor stands (PArig02) and street-lamp posts render inside-out in the path
+tracer when single-sided backface culling is honored. Is it (a) the plugin reading the wrong
+two-sided bit, (b) content winding opposing authored normals, or a third mechanism (envmap pass
+forcing cull-off)?
+
+### 8.0 VERDICT
+
+**Neither (a) nor (b).** Decompiler-proven: BGSM `bTwoSided` lands EXACTLY on **bit 36 of the
+64-bit flags qword at `BSShaderProperty+0x30`** -- the bit the plugin already reads -- and bit 36 is
+the engine's ONLY cull-mode input for lighting draws (bit36 -> `D3D11_CULL_NONE`, else
+`D3D11_CULL_BACK`; `FrontCounterClockwise=TRUE` fixed in all 108 rasterizer states). Archive ground
+truth: **every affected BGSM has `bTwoSided=0`** (vanilla draws them single-sided, cull-back), and
+**every affected NIF's winding agrees with its authored normals** (<=0.03% opposing triangles,
+CCW-outward under the right-hand rule). Vanilla correctness comes from plain backface culling of
+consistent content -- there is no vanilla-side tolerance mechanism and no envmap cull override.
+The inside-out symptom therefore CANNOT originate in engine cull state or authored content; it must
+arise in the plugin->Remix orientation chain (reflection world-transform, parser index 1<->2 flip,
+Remix front-face convention) or in the geometry source used for those specific instances. See 8.5.
+
+### 8.1 Task 1 -- BGSM bTwoSided -> property bit 36 (exact chain, VAs)
+
+**Serializer pins the in-memory material-file struct to the file format.** `FUN_142165B10`
+(BGSM/BGEM writer) emits 'B','G','S|E','M', version u32=2, then every field in canonical BGSM
+v2 order directly from struct offsets:
+
+| file field (v2 order) | material struct offset |
+|---|---|
+| tileFlags u32 | +0x1d8 |
+| fUOffset/fVOffset/fUScale/fVScale | +0x1ac/+0x1b0/+0x1b4/+0x1b8 |
+| fAlpha | +0x60 |
+| bAlphaBlend u8, eAlphaSrc u32, eAlphaDst u32 | +0x78, +0x7c, +0x80 |
+| iAlphaTestRef u8, bAlphaTest u8 | +0x8c, +0x84 |
+| bZBufferWrite, bZBufferTest | +0xb9, +0xba |
+| bScreenSpaceReflections, bWetnessControlSSR | +0xa3, +0x54 |
+| **bDecal** | **+0x91** |
+| **bTwoSided** | **+0x99** |
+| bDecalNoFade, bNonOccluder | +0x94, +0xa4 |
+| bRefraction, bRefractionFalloff, fRefractionPower | +0xbb, +0xc0, +0xbc |
+| bEnvironmentMapping (v<10), fEnvMapMaskScale | +0x17a, +0x180 |
+| bGrayscaleToPaletteColor | +0x1bc |
+
+**Flag applier** `FUN_142163480(matFile, prop, geom, ...)` (called from the material-apply path
+`FUN_142162D20` / swap path `FUN_142169AD0`) maps those bytes onto the property via
+`FUN_142161950` = `BSShaderProperty::SetFlag(prop, bitIndex, bool)`:
+
+```c
+// FUN_142161950: *(u64*)(prop+0x30) bit <bitIndex> := value; prop+0x2c = 0x7fffffff (dirty)
+FUN_142161950(prop, 0x24, *(u8*)(matFile + 0x99));   // bTwoSided -> BIT 36 of the qword
+```
+
+Bit 36 == `1ULL<<36` == `0x0000001000000000` of the SAME qword at property+0x30 the plugin reads.
+**The plugin's `kFlag_TwoSided = 0x0000001000000000` is the correct bit.** Note the applier is
+UNCONDITIONAL: `bTwoSided=0` actively CLEARS bit 36 even if the NIF authored it set -- the BGSM
+always wins for material-file shapes.
+
+Layout cross-checks from the same applier (all consistent with prior confirmed bits): bit 1 <-
+`geom->skinInstance != 0`; bit 37 <- vertexDesc color-attribute presence (`(vd>>0x16)&0x3c`);
+bits 26/27 <- +0x91 (decal/dynamic-decal, param-gated); bits 4/5 <- +0x1bc/+0x1bd
+(grayscaleToPalette color/alpha); bit 7 <- `+0x17a && !+0x14a` (envmap). Alpha side (swap path
+`FUN_142169AD0`): +0x78 -> NiAlphaProperty flag bit0 (blend), +0x7c -> src<<1, +0x80 -> dst<<5,
++0x84 -> bit9 (0x200, alpha test), +0x8c -> threshold byte at alphaProp+0x2a.
+
+### 8.2 Task 2 -- the cull decision is bit 36, applied at pass render time
+
+**Pass-list renderer `FUN_142218AF0`** (iterates BSRenderPass list: pass+0x10=property,
++0x18=geometry, +0x48=technique, +0x40=next) -- per pass:
+
+```c
+if (prop->flags & (1ull<<36))  { state->0x1c2c = 0; dirty |= 8; }   // cull sub-field = 0 (NONE)
+FUN_142218050(pass, technique, ...);                                 // draw
+if (prop->flags & (1ull<<36))  { state->0x1c2c = 1; dirty |= 8; }   // restore = 1 (BACK)
+```
+(bit36 test at 0x142218C31; set-0 at ~0x142218C52; restore-1 at ~0x142218C9D. Same function also
+maps decal bits 26/27 -> DS select +0x1c18 and depth-bias +0x1c30.)
+
+**Per-shader SetupGeometry/RestoreGeometry family** does the identical dance (enumerated by
+scanning all `state+0x1c2c` writers via their `add reg,0x1b70` rebase idiom -- ~35 functions):
+`FUN_142239760` (set, 0x1422397CB), `FUN_1421FDA30` (set, 0x1421FDAA6), `FUN_142233730` (set 0 at
+0x14223400F / restore 1 at 0x1422343AC), `FUN_142219E30` (0x14221A246/0x14221A28D),
+`FUN_142201210` (restore, 0x14220131E). **The instanced/merge dispatch `FUN_1421CCEC0`** (ucType
+switch cases 0x19/0x1a) passes `(propFlags & 1ull<<36)==0` as an explicit *cullBackfaces* bool into
+the batch renderers `FUN_14181F1D0`/`FUN_14181F2B0`/`FUN_14181F400`. The technique resolver
+`FUN_14223A6C0` uses `(flags & 1<<36)==0` ONLY as a shader constant (two-sided lighting), not
+raster state. CPU-side visibility helper `FUN_141832300` also reads geom+0x138 -> prop bit 36.
+
+**No envmap override:** among all cull-field writers, every lighting-family site is bit-36-gated
+0/1 as above. Unconditional writers exist (`=0` at 0x1421BAED7, 0x14221F76D; `=2` i.e. CULL_FRONT
+in shadow-ish paths at 0x1421BCD20, 0x1421BD5B9, 0x1421EE567, ...) but none are in the lighting
+Setup/Restore cluster; nothing keys on the envmap technique or material type. *(Uncertainty: the
+owners of the unconditional writers were not all individually identified; none sits in the
+0x142218-0x14224x lighting cluster.)*
+
+**Rasterizer-state creator `FUN_141855B90`** (fills the 108-entry table `DAT_1438cb3e0` via
+device-wrapper vtbl+0xB0 = CreateRasterizerState) resolves the semantics exactly:
+
+| loop dim | D3D11_RASTERIZER_DESC field | mapping |
+|---|---|---|
+| c28 {0,1} | FillMode | 0 -> 3 (SOLID), 1 -> 2 (WIREFRAME) |
+| **cull {0,1,2}** | **CullMode** | **0 -> 1 (NONE), 1 -> 3 (BACK), 2 -> 2 (FRONT)** |
+| bias {0..8} | DepthBias/SlopeScaled | presets (0, -3/-6/-9, +3/+6/+12, slope +-0.4/0.8/1.2/6.0), clamp -100.0 |
+| c34 {0,1} | ScissorEnable | 0/1 |
+| (constant) | **FrontCounterClockwise** | **TRUE for all 108 states** |
+| (constant) | DepthClipEnable=1, Multisample/AALine=0 | |
+
+So the engine default (sub-field 1) = **CULL_BACK with front = CCW in render-target space**, and
+two-sided (bit 36) = CULL_NONE. That is the entire vanilla mechanism.
+
+### 8.3 Task 3 -- archive ground truth (Materials.ba2 + Meshes.ba2)
+
+BGSM `bTwoSided` (BA2 GNRL + BGSM v2 parse; offset validated on known-two-sided foliage --
+`Vine/Fern01/HedgeRow/TomatoVine/BlastedForestVines = 1`):
+
+| material | bTwoSided | bEnvMap | bAlphaTest |
+|---|---|---|---|
+| SetDressing\PArig\PArig01.BGSM | **0** | 1 | 0 |
+| SetDressing\PArig\PArig02.BGSM | **0** | 1 | 0 |
+| SetDressing\StreetLamps\StreetLamp01.BGSM | **0** | 1 | 1 |
+| SetDressing\StreetLamps\StreetLamp02.BGSM | **0** | 1 | 1 |
+| SetDressing\StreetLamps\ResidentialStreetLamp01.BGSM | **0** | 1 | 0 |
+| SetDressing\StreetLamps\Prewar_ResidentialStreetLamp01.BGSM | **0** | 1 | 0 |
+| Props\Hightech\HightechLamp01/02.BGSM | **0** | 0 | 0 |
+
+NIF winding vs authored normals (fraction of triangles whose right-hand-rule geometric normal
+OPPOSES the summed vertex normals):
+
+| mesh | shape | opposing |
+|---|---|---|
+| SetDressing\PARig\PArig02.nif | PArig02:0 (6075 tris) | **0.0%** (0) |
+| SetDressing\PARig\PARig01.nif | PARig01:0 (6652 tris) | 0.03% (2) |
+| SetDressing\StreetLamps\StreetLamp01.nif | main LOD shape (412 tris) | 0.2% (1) |
+| SetDressing\StreetLamps\StreetLamp02.nif | (1110 tris) | 0.0% |
+| SetDressing\StreetLamps\StreetLampPost01.nif | (744 tris) | 0.0% |
+| SetDressing\StreetLamps\ResidentialStreetLamp01.nif | (777 tris) | 0.0% |
+| SetDressing\StreetLamps\ColonialLamppost01.nif | (262 tris) | 0.0% |
+| LOD\...\ResidentialStreetLamp01_LOD.nif | (194 tris) | 0.0% |
+
+Content is uniformly **CCW-outward** (winding agrees with normals), exactly like ordinary statics.
+
+### 8.4 Task 4 -- synthesis
+
+- **(a) is FALSE.** The plugin reads the right bit; BGSM bTwoSided propagates to bit 36 verbatim
+  (and clears it when 0); the engine's whole cull decision for lighting draws is bit 36.
+- **(b) is FALSE.** Winding agrees with authored normals on >=99.97% of triangles for every
+  affected asset. There is nothing for vanilla to "tolerate".
+- **Vanilla truth:** these assets are single-sided, drawn CULL_BACK with FrontCCW=TRUE, and their
+  outward (normal-agreeing) faces are the kept faces. Any renderer with a matching front-face
+  convention shows them correctly with backface culling on.
+- **Consequence:** the inside-out symptom is produced OUTSIDE the engine flag/content chain -- in
+  the plugin/Remix orientation pipeline. Note the plugin's own uniform convention: Remix world =
+  X/Y-row-swap reflection composed with the engine transform (BuildRemixTransform, det<0 by
+  construction -- semantic_capture.cpp:88-105) compensated by the parser's universal per-triangle
+  index 1<->2 flip; per-instance det<0 records get an extra flip (lighting_static.cpp:2204-2221,
+  the Vault-111 fix). That pair is global, so a broken pair would flip EVERYTHING -- the
+  discriminator is that closed double-shelled geometry masks an inverted convention (you see the
+  far shell, silhouette identical) while thin/open shells (lamp posts = open tubes, PA rig = thin
+  plates/frames) become see-through from the front -- exactly the reported symptom. Alternatively
+  the affected instances may be fed from a geometry path whose winding compensation differs (the
+  capture path copies raw VB positions verbatim + flips indices; precombined bakes are separate
+  data from the loose NIFs analyzed here). Static analysis cannot distinguish these two; live
+  checks below can.
+
+### 8.5 Suggested live verification
+
+1. Log `propFlags` for one affected draw (StreetLamp01/PArig02): expect bit36=0, matching BGSM. If
+   1 -> something upstream sets it and the plugin should already be double-sided (would point to a
+   stale-property read instead).
+2. Dump one submitted Remix triangle (post-transform world space) of a lamp post + camera position;
+   compute its signed orientation toward the camera; do the same for a known-good single-sided wall
+   that culls correctly. If the lamp's kept side disagrees with the wall's, the per-path winding
+   differs (geometry-source bug); if they agree, the whole class is inverted and masked elsewhere.
+3. Verify `det` of the actual submitted 3x4 (`mesh.worldTransform`): BuildRemixTransform bakes a
+   reflection, so det<0 is EXPECTED for every normal submission. The reported "6771/6771 det>0" is
+   consistent only with measuring the engine-side rotation -- re-measure on the Remix matrix; any
+   det>0 there means the parser flip is uncompensated for that path (immediate smoking gun).
+4. Check which resolver path the broken instances take (plain NIF parse vs precombined data vs
+   capture): if precombined, diff the precombined NIF's baked winding against the loose NIF
+   (reflected bakes would show ~100% opposing in the baked copy -- the loose sources above are 0%).
+5. Diagnostic toggle: force `mesh.isTwoSided=true` for `matType==kType_Envmap` only -- if the
+   symptom disappears, it confirms the affected class is exactly the envmap set and buys time while
+   the orientation chain is fixed (do NOT ship: vanilla ground truth is single-sided).
+
+### 8.6 Evidence chain (this section)
+
+| VA | Identity | Proves |
+|---|---|---|
+| 0x142165B10 | BGSM/BGEM serializer | material struct <-> file-field mapping; +0x99 == bTwoSided |
+| 0x142163480 | material->property flag applier | SetFlag(prop, 0x24, mat+0x99) -> bit 36; all cross-check bits |
+| 0x142161950 | BSShaderProperty::SetFlag | bitIndex == raw bit of qword at prop+0x30; dirty at +0x2c |
+| 0x142162D20 / 0x142169AD0 | material apply / swap-apply | callers of the applier; NiAlphaProperty mapping |
+| 0x142218AF0 | pass-list renderer | bit36 -> state+0x1c2c=0 before pass, =1 after (0x142218C31/C52/C9D) |
+| 0x142239760, 0x1421FDA30, 0x142233730, 0x142219E30, 0x142201210 | shader Setup/Restore family | same bit36 -> cull-none idiom per shader class |
+| 0x1421CCEC0 | instanced/merge dispatch | (flags&bit36)==0 passed as cullBackfaces bool (cases 0x19/0x1a) |
+| 0x14223A6C0 | technique/constant setup | bit36 feeds a shader constant only -- not raster |
+| 0x141855B90 | rasterizer-table creator | cull sub-field 0/1/2 -> CULL NONE/BACK/FRONT; FrontCCW=TRUE fixed; fill/bias/scissor dims |
+| 0x1421BAED7, 0x14221F76D | unconditional cull=0 writers | exist, outside lighting cluster (not envmap-keyed) |
+
+Tools note: `Fallout4 - Materials.ba2` / `Meshes.ba2` are BTDX/GNRL, trivially parsed in python
+(24-byte header, 36-byte entries, u16-len name table at the header's nametable offset; zlib when
+packed != 0). BGSM v2 bool block starts right after fAlpha/alpha-blend/test group; offset validated
+against foliage. FO4 BSTriShape vertex data: half3+half pos (unless FullPrec), half2 UV, ubyte4
+normal, vf flags at desc>>44.

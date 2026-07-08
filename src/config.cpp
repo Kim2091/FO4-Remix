@@ -114,11 +114,12 @@ void LoadConfig() {
 
     // [Performance]
     g_config.gpuInstancingEnabled = GetIniBool("Performance", "GpuInstancing", true, dllPath);
+    g_config.batchedMirrorBase = GetIniBool("Performance", "BatchedMirrorBase", true, dllPath);
     g_config.remixMaxFPS = (uint32_t)GetIniInt("Performance", "RemixMaxFPS", 120, dllPath);
     g_config.maxPendingTextureReadbacks = (uint32_t)GetIniInt("Performance", "MaxPendingTextureReadbacks", 256, dllPath);
-    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d RemixMaxFPS=%u MaxPendingTextureReadbacks=%u",
-             g_config.gpuInstancingEnabled, g_config.remixMaxFPS,
-             g_config.maxPendingTextureReadbacks);
+    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d BatchedMirrorBase=%d RemixMaxFPS=%u MaxPendingTextureReadbacks=%u",
+             g_config.gpuInstancingEnabled, g_config.batchedMirrorBase,
+             g_config.remixMaxFPS, g_config.maxPendingTextureReadbacks);
 
     // [Precombines]
     g_config.mergeInstanceExpansion = GetIniBool("Precombines", "MergeInstanceExpansion", true, dllPath);

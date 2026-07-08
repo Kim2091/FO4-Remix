@@ -15,7 +15,10 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cstdio>
 #include <mutex>
+#include <unordered_set>
 #include <vector>
 #include <array>
 #include <cmath>
@@ -838,6 +841,198 @@ namespace ResolverTrace {
 
 namespace Lighting {
 
+// ---------------------------------------------------------------------------
+// [WindDiag] inside-out investigation (2026-07-08). PArig / street-lamp
+// shapes render backface-culled from the front while sharing parse code, the
+// universal winding flip, and transform conventions with content that renders
+// correctly. Log every facing-relevant quantity for the affected shapes
+// (diffuse texture path contains "parig" or "streetlamp") plus the first few
+// generic opaque statics as references, so the discriminator -- vertex-format
+// decode bug, subclass parse branch, transform determinant / scale sign, or
+// winding-vs-normals parity -- can be read off a single run. Note the
+// transform proof to date covered leaf ROTATIONS (det>0); BuildRemixTransform
+// multiplies xf.scale into the linear part, so a negative scale would flip
+// facing while passing that proof -- rotDet and scale are logged separately.
+// Capped (24 targets + 8 refs), hash-deduped, ~7 lines per shape.
+// ---------------------------------------------------------------------------
+static bool NameContainsCI(const char* hay, const char* needle) {
+    if (!hay || !needle || !*needle) return false;
+    const size_t n = std::strlen(needle);
+    for (const char* p = hay; *p; ++p) {
+        size_t i = 0;
+        while (i < n && p[i] &&
+               std::tolower((unsigned char)p[i]) ==
+                   std::tolower((unsigned char)needle[i]))
+            ++i;
+        if (i == n) return true;
+    }
+    return false;
+}
+
+static float WindDiagDet3(const float m[3][4]) {  // det of the 3x3 block
+    return m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+         - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+         + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
+}
+
+static void LogWindingDiag(BSTriShape* tri,
+                           const ExtractedMesh& mesh,
+                           const ParsedGeometry& parsed,
+                           BSLightingShaderMaterialBase* mat,
+                           uint64_t propFlags,
+                           const SemanticCapture::DrawableState& state)
+{
+    NiTexture* dif = mat->spDiffuseTexture;
+    const char* texName = dif ? dif->name.c_str() : nullptr;
+    const bool isTarget = NameContainsCI(texName, "parig") ||
+                          NameContainsCI(texName, "streetlamp");
+
+    // References: only meaty opaque statics -- menu clutter and blended
+    // effects would burn the ref cap before the player reaches a lamp.
+    if (!isTarget && (mesh.indices.size() < 300 || mesh.isDecal ||
+                      mesh.alphaBlendEnabled))
+        return;
+
+    static std::mutex s_mx;
+    static std::unordered_set<uint64_t> s_logged;
+    static int s_targets = 0, s_refs = 0;
+    constexpr int kMaxTargets = 24, kMaxRefs = 8;
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        if (s_logged.count(mesh.hash)) return;
+        if (isTarget) { if (s_targets >= kMaxTargets) return; ++s_targets; }
+        else          { if (s_refs    >= kMaxRefs)    return; ++s_refs;    }
+        s_logged.insert(mesh.hash);
+    }
+
+    const char* tag = isTarget ? "TARGET" : "REF";
+    const unsigned long long h = (unsigned long long)mesh.hash;
+
+    char leaf[64] = "?";
+    SemanticCapture::GetLeafClassName(tri, leaf, sizeof(leaf));
+    char p1Leaf[64] = "", p2Leaf[64] = "";
+    const char* p1Name = "";
+    const char* p2Name = "";
+    if (state.parent1) {
+        SemanticCapture::GetLeafClassName(state.parent1, p1Leaf, sizeof(p1Leaf));
+        const char* n = static_cast<NiAVObject*>(state.parent1)->m_name.c_str();
+        if (n) p1Name = n;
+    }
+    if (state.parent2) {
+        SemanticCapture::GetLeafClassName(state.parent2, p2Leaf, sizeof(p2Leaf));
+        const char* n = static_cast<NiAVObject*>(state.parent2)->m_name.c_str();
+        if (n) p2Name = n;
+    }
+
+    _MESSAGE("FO4RemixPlugin: [WindDiag] %s hash=%016llX shape=\"%s\" leaf=%s "
+             "dyn=%d nV=%u nT=%u tex=\"%s\"",
+             tag, h, tri->m_name.c_str() ? tri->m_name.c_str() : "",
+             leaf, parsed.isDynamic ? 1 : 0,
+             (unsigned)tri->numVertices, (unsigned)tri->numTriangles,
+             texName ? texName : "(null)");
+    _MESSAGE("FO4RemixPlugin: [WindDiag] %s hash=%016llX parents p1=\"%s\"(%s) "
+             "p2=\"%s\"(%s) niFlags=%016llX propFlags=%016llX",
+             tag, h, p1Name, p1Leaf, p2Name, p2Leaf,
+             (unsigned long long)state.initialFlags,
+             (unsigned long long)propFlags);
+
+    // Vertex-format decode, exactly as ParseShapeGeometry computes it.
+    const uint64_t desc = parsed.vertexDesc;
+    const uint32_t szVertex = (uint32_t)((desc >> 4) & 0xF);
+    const uint32_t oUV      = (szVertex + (uint32_t)((desc >>  8) & 0xF)) * 4;
+    const uint32_t oNormal  = (szVertex + (uint32_t)((desc >> 16) & 0xF)) * 4;
+    const uint32_t oColor   = (szVertex + (uint32_t)((desc >> 24) & 0xF)) * 4;
+    const bool halfPos = !(desc & BSGeometry::kFlag_FullPrecision);
+    _MESSAGE("FO4RemixPlugin: [WindDiag] %s hash=%016llX desc=%016llX stride=%u "
+             "szV=%u oUV=%u oN=%u oC=%u halfPos=%d hasUV=%d hasN=%d hasC=%d",
+             tag, h, (unsigned long long)desc, (unsigned)parsed.vertexSize,
+             szVertex, oUV, oNormal, oColor, halfPos ? 1 : 0,
+             (desc & BSGeometry::kFlag_UVs) ? 1 : 0,
+             (desc & BSGeometry::kFlag_Normals) ? 1 : 0,
+             (desc & BSGeometry::kFlag_VertexColors) ? 1 : 0);
+
+    // Transform: engine leaf transform (rot det and scale SEPARATELY) plus
+    // the determinant of the 3x3 actually submitted to Remix (reflection
+    // expected: X/Y swap makes it negative when rotDet*scale^3 is positive).
+    const NiTransform& xf = tri->m_worldTransform;
+    float rd[3][4];
+    std::memcpy(rd, xf.rot.data, sizeof(rd));
+    const float rotDet = WindDiagDet3(rd);
+    const float subDet = WindDiagDet3(mesh.worldTransform);
+    _MESSAGE("FO4RemixPlugin: [WindDiag] %s hash=%016llX xf pos=(%.1f,%.1f,%.1f) "
+             "scale=%.4f rotDet=%.4f submittedDet=%.4f twoSided=%d decal=%d "
+             "matType=%u aTest=%d aBlend=%d",
+             tag, h, xf.pos.x, xf.pos.y, xf.pos.z, xf.scale, rotDet, subDet,
+             mesh.isTwoSided ? 1 : 0, mesh.isDecal ? 1 : 0,
+             (unsigned)mat->GetType(),
+             mesh.alphaTestEnabled ? 1 : 0, mesh.alphaBlendEnabled ? 1 : 0);
+
+    // Winding-vs-authored-normals parity over ALL triangles, in OBJECT space,
+    // on the SUBMITTED (post-flip) index order. meanDot ~ -1 is the majority
+    // convention observed by [MergeWind]; a target at ~+1 means its runtime
+    // winding parity is genuinely opposite to the bulk of content.
+    double dotSum = 0.0;
+    uint32_t dotN = 0, negN = 0, posN = 0;
+    const size_t triCount = mesh.indices.size() / 3;
+    for (size_t t = 0; t < triCount; ++t) {
+        const auto& a = mesh.vertices[mesh.indices[t * 3 + 0]];
+        const auto& b = mesh.vertices[mesh.indices[t * 3 + 1]];
+        const auto& c = mesh.vertices[mesh.indices[t * 3 + 2]];
+        const float e1[3] = { b.position[0] - a.position[0],
+                              b.position[1] - a.position[1],
+                              b.position[2] - a.position[2] };
+        const float e2[3] = { c.position[0] - a.position[0],
+                              c.position[1] - a.position[1],
+                              c.position[2] - a.position[2] };
+        const float g[3] = { e1[1] * e2[2] - e1[2] * e2[1],
+                             e1[2] * e2[0] - e1[0] * e2[2],
+                             e1[0] * e2[1] - e1[1] * e2[0] };
+        const float n[3] = { a.normal[0] + b.normal[0] + c.normal[0],
+                             a.normal[1] + b.normal[1] + c.normal[1],
+                             a.normal[2] + b.normal[2] + c.normal[2] };
+        const float gl = std::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
+        const float nl = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (gl < 1e-12f || nl < 1e-6f) continue;
+        const float d = (g[0] * n[0] + g[1] * n[1] + g[2] * n[2]) / (gl * nl);
+        dotSum += d;
+        ++dotN;
+        if (d < 0.0f) ++negN; else ++posN;
+    }
+    _MESSAGE("FO4RemixPlugin: [WindDiag] %s hash=%016llX parity meanDot=%.4f "
+             "neg=%u pos=%u of %u",
+             tag, h, dotN ? (float)(dotSum / dotN) : 0.0f, negN, posN, dotN);
+
+    // First triangle, submitted order (raw NIF/runtime order = corners 0,2,1
+    // of this -- the universal flip is an involution).
+    if (triCount > 0 && mesh.indices.size() >= 3) {
+        const uint32_t i0 = mesh.indices[0], i1 = mesh.indices[1],
+                       i2 = mesh.indices[2];
+        const auto& a = mesh.vertices[i0];
+        const auto& b = mesh.vertices[i1];
+        const auto& c = mesh.vertices[i2];
+        _MESSAGE("FO4RemixPlugin: [WindDiag] %s hash=%016llX tri0 idx=(%u,%u,%u) "
+                 "p0=(%.3f,%.3f,%.3f) p1=(%.3f,%.3f,%.3f) p2=(%.3f,%.3f,%.3f) "
+                 "n0=(%.2f,%.2f,%.2f)",
+                 tag, h, i0, i1, i2,
+                 a.position[0], a.position[1], a.position[2],
+                 b.position[0], b.position[1], b.position[2],
+                 c.position[0], c.position[1], c.position[2],
+                 a.normal[0], a.normal[1], a.normal[2]);
+    }
+
+    // Raw bytes of vertex 0 straight from the runtime VB, for byte-level
+    // comparison against the NIF ground truth (BA2 extraction).
+    if (parsed.vbData && parsed.vertexSize > 0) {
+        const uint32_t nBytes = parsed.vertexSize < 48 ? parsed.vertexSize : 48;
+        char hex[48 * 3 + 1];
+        for (uint32_t i = 0; i < nBytes; ++i)
+            std::snprintf(hex + i * 3, 4, "%02X ", parsed.vbData[i]);
+        hex[nBytes * 3] = '\0';
+        _MESSAGE("FO4RemixPlugin: [WindDiag] %s hash=%016llX v0raw=%s",
+                 tag, h, hex);
+    }
+}
+
 bool TryResolveStatic(SemanticCapture::DrawableState& state,
                       uint64_t hash,
                       ID3D11Device* device) {
@@ -1100,6 +1295,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                      mesh.roughnessConstantOverride, (unsigned)albedoLumFloor);
         }
     }
+
+    // ---- [WindDiag] inside-out investigation (2026-07-08) ----
+    LogWindingDiag(tri, mesh, parsed, mat, propFlagsEarly, state);
 
     std::vector<ExtractedTexture> newTextures;
     // For alpha-tested or alpha-blended geometry: synthesize alpha from RGB

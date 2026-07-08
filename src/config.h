@@ -178,6 +178,22 @@ struct PluginConfig {
     // unique-mesh-per-drawable rendering path if a regression appears.
     bool gpuInstancingEnabled;
 
+    // Batched-draw mirrored-facing fix (2026-07-08). dxvk-remix decides its
+    // facing-flip compensation for mirrored transforms from the draw call's
+    // BASE transform only (RtInstance::m_isObjectToWorldMirrored,
+    // rtx_instance_manager.cpp:1300) and composes GPU-instancing per-instance
+    // transforms into the TLAS transform (rtx_accel_manager.cpp:1135), which
+    // per the Vulkan spec cannot change facing. The batched path used to send
+    // identity base + det<0 per-instance transforms (every FO4 placement is
+    // mirrored by the Beth->Remix X/Y swap), so batched instances rendered
+    // with facing OPPOSITE to single-member draws of the same data: repeated
+    // single-sided statics (street lamps, PA stands, merge-expanded records,
+    // the "unidentified exterior inverted culling") were inside-out. When
+    // true, OnFrame hoists the X/Y-swap reflection P into the batched base
+    // transform and pre-multiplies each member transform by P^-1 (row 0/1
+    // swap); composed placement is unchanged, facing matches the single path.
+    bool batchedMirrorBase;
+
     // [Precombines]
     // Expand each BSMergeInstancedTriShape into one Remix drawable per
     // hardware instance, with transforms read from the shape's structured
