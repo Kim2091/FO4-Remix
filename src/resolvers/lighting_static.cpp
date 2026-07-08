@@ -1137,15 +1137,33 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         /*minRoughness=*/0, albedoLumFloor);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
-    // Smoothness/spec-mask (_s.dds) extraction REMOVED (2026-07-02). FO4's
-    // packed spec maps translate too inconsistently to naive roughness:
-    // "very smooth" authoring became roughness~0 mirrors (decals needed a
-    // clamp band-aid; metal fences/racks read as black voids reflecting a
-    // dark environment), and per-asset channel packing varies. Dropping the
-    // slot leaves mesh.roughnessTextureHash == 0, so SubmitDrawable builds
-    // materials with roughnessConstant=0.8 -- and saves a GPU readback +
-    // BC decompress + invert per material. Revisit only as part of a real
-    // spec-gloss -> metal-rough conversion (spec color/envmap -> metallic).
+    // Smoothness/spec-mask (_s.dds) -> per-pixel roughness, RESTORED
+    // 2026-07-07 (removed 2026-07-02 in 74c28b9). The removal fell back to
+    // roughnessConstant=0.8, and the [Metal] roughness path derived its
+    // constant from the material's fSmoothness SCALAR -- which FO4 authors
+    // as a multiplier over the _s map: it reads 1.00 on every sampled
+    // material, so 1-fSmoothness clamped at the floor turned the whole
+    // envmap class into 0.15-rough chrome (user report: vault interiors
+    // "ultra shiny", floor a literal mirror). The real per-pixel smoothness
+    // lives in _s.dds G (BC5: R=spec mask, G=smoothness; the InvertRGB
+    // decode path inverts G into roughness). The two 07-02 removal blockers
+    // are resolved since: mirror DECALS get the >= 0.3 floor below, and the
+    // "metal black voids" were the pre-luminance-floor albedo problem (the
+    // floor ships on, and interiors now have real lights).
+    if (g_config.roughnessMapsEnabled) {
+        const uint8_t cfgFloor = (uint8_t)(std::clamp(
+            g_config.roughnessMapFloor, 0.0f, 1.0f) * 255.0f + 0.5f);
+        const uint8_t roughnessFloor =
+            mesh.isDecal ? (std::max)(cfgFloor, (uint8_t)76) : cfgFloor;
+        mesh.roughnessTextureHash = BsExtraction::ExtractMaterialTexture(
+            mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures,
+            TexturePostProcess::InvertRGB, roughnessFloor);
+        // Per-pixel roughness supersedes any scalar-derived constant: the
+        // constant only exists as the fallback for materials with no _s map.
+        if (mesh.roughnessTextureHash != 0) {
+            mesh.roughnessConstantOverride = -1.0f;
+        }
+    }
     BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
                                       mesh.emissiveTextureHash,
                                       mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,

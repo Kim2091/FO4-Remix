@@ -94,10 +94,13 @@ void LoadConfig() {
     g_config.metalMetallic          = GetIniFloat("Materials", "MetalMetallic",         0.85f, dllPath);
     g_config.metalAlbedoLumFloor    = GetIniFloat("Materials", "MetalAlbedoLumFloor",   0.25f, dllPath);
     g_config.metalMinRoughness      = GetIniFloat("Materials", "MetalMinRoughness",     0.15f, dllPath);
-    _MESSAGE("FO4RemixPlugin: Materials - MetalConversionEnabled=%d MetalMetallicEnabled=%d MetalRoughnessEnabled=%d MetalMetallic=%.2f MetalAlbedoLumFloor=%.2f MetalMinRoughness=%.2f",
+    g_config.roughnessMapsEnabled   = GetIniBool("Materials",  "RoughnessMapsEnabled",  true,  dllPath);
+    g_config.roughnessMapFloor      = GetIniFloat("Materials", "RoughnessMapFloor",     0.15f, dllPath);
+    _MESSAGE("FO4RemixPlugin: Materials - MetalConversionEnabled=%d MetalMetallicEnabled=%d MetalRoughnessEnabled=%d MetalMetallic=%.2f MetalAlbedoLumFloor=%.2f MetalMinRoughness=%.2f RoughnessMapsEnabled=%d RoughnessMapFloor=%.2f",
              g_config.metalConversionEnabled, g_config.metalMetallicEnabled,
              g_config.metalRoughnessEnabled, g_config.metalMetallic,
-             g_config.metalAlbedoLumFloor, g_config.metalMinRoughness);
+             g_config.metalAlbedoLumFloor, g_config.metalMinRoughness,
+             g_config.roughnessMapsEnabled, g_config.roughnessMapFloor);
 
     // [Camera]
     g_config.cameraFovFromFrustum = GetIniBool("Camera", "FovFromFrustum", true, dllPath);

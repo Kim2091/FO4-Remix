@@ -134,6 +134,8 @@ struct PluginConfig {
     float metalMetallic;            // metallic at fSmoothness=1; scaled down to 0.2x of this at fSmoothness=0 (default 0.85)
     float metalAlbedoLumFloor;      // 0..1 minimum diffuse luminance, hue-preserving lift below it (default 0.25)
     float metalMinRoughness;        // floor on (1 - fSmoothness) so metals aren't mirrors (default 0.15)
+    bool  roughnessMapsEnabled;     // extract _s.dds -> per-pixel roughness maps (default true; off = roughnessConstant fallback)
+    float roughnessMapFloor;        // 0..1 floor on _s.dds-derived per-pixel roughness (default 0.15; decals clamp at >= 0.3)
 
     // [Camera]
     // FOV source for the Remix camera (2026-07-03). Default true: read the
