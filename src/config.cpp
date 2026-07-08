@@ -8,7 +8,21 @@
 PluginConfig g_config = {};
 
 static bool GetIniBool(const char* section, const char* key, bool def, const char* path) {
-    return GetPrivateProfileIntA(section, key, def ? 1 : 0, path) != 0;
+    // GetPrivateProfileIntA parses NUMBERS only -- the string "true" reads
+    // as 0. That silently disabled every "= true" line in the shipped ini
+    // (GlowMapsEnabled, EmissiveColorEnabled, and the 2026-07-08 [Skinning]
+    // Enabled flip that made the skinning revival look dead). Read the
+    // string and accept the word forms plus numerics.
+    char buf[32] = {};
+    GetPrivateProfileStringA(section, key, "", buf, sizeof(buf), path);
+    if (buf[0] == '\0') return def;
+    if (_stricmp(buf, "true") == 0 || _stricmp(buf, "yes") == 0 ||
+        _stricmp(buf, "on") == 0)
+        return true;
+    if (_stricmp(buf, "false") == 0 || _stricmp(buf, "no") == 0 ||
+        _stricmp(buf, "off") == 0)
+        return false;
+    return atoi(buf) != 0;
 }
 
 static float GetIniFloat(const char* section, const char* key, float def, const char* path) {
