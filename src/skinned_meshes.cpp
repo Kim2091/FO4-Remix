@@ -117,14 +117,18 @@ void ComposeBoneTransform(const XfPod& ib, const XfPod& bw,
 } // namespace
 
 bool SkinnedMeshes::Register(uint64_t drawableHash, BSTriShape* shape,
-                             uint32_t& outBoneCount) {
+                             uint32_t& outBoneCount, const char** outFailReason) {
     outBoneCount = 0;
-    if (!shape) return false;
+    auto fail = [&](const char* reason) {
+        if (outFailReason) *outFailReason = reason;
+        return false;
+    };
+    if (!shape) return fail("null shape");
     const uintptr_t shapeAddr = reinterpret_cast<uintptr_t>(shape);
 
     uintptr_t skinInst = 0;
     if (!PeekBytes(shapeAddr + kOffSkinInstance, &skinInst, 8) || !skinInst)
-        return false;
+        return fail("skinInstance (+0x140) null/unreadable");
 
     // Bone count: the VERTEX BUFFER's u8 indices were baked against the
     // NIF's skin bone list, which is BoneData::transforms -- so ITS count is
@@ -134,24 +138,27 @@ bool SkinnedMeshes::Register(uint64_t drawableHash, BSTriShape* shape,
     // spikes, 2026-07-08). worldTransforms must cover the same range (its
     // pointers are valid even for node-less bones, F4SE BSSkin.h).
     uintptr_t boneData = 0;
-    if (!PeekBytes(skinInst + kOffBoneData, &boneData, 8) || !boneData) return false;
+    if (!PeekBytes(skinInst + kOffBoneData, &boneData, 8) || !boneData)
+        return fail("BSSkin::Instance::boneData null/unreadable");
     uintptr_t btArr = 0;
     uint32_t btCount = 0;
-    if (!PeekBytes(boneData + kOffBoneDataArr, &btArr, 8) || !btArr) return false;
+    if (!PeekBytes(boneData + kOffBoneDataArr, &btArr, 8) || !btArr)
+        return fail("BoneData::transforms array null/unreadable");
     if (!PeekBytes(boneData + kOffBoneDataArr + kTArrCountOff, &btCount, 4))
-        return false;
+        return fail("BoneData::transforms count unreadable");
 
     uintptr_t xfArr = 0;
     uint32_t xfCount = 0;
-    if (!PeekBytes(skinInst + kOffWorldXfArr, &xfArr, 8) || !xfArr) return false;
+    if (!PeekBytes(skinInst + kOffWorldXfArr, &xfArr, 8) || !xfArr)
+        return fail("worldTransforms array null/unreadable");
     if (!PeekBytes(skinInst + kOffWorldXfArr + kTArrCountOff, &xfCount, 4))
-        return false;
+        return fail("worldTransforms count unreadable");
 
     uint32_t nodeCount = 0;
     PeekBytes(skinInst + kOffBonesArr + kTArrCountOff, &nodeCount, 4);
 
     const uint32_t boneCount = btCount < xfCount ? btCount : xfCount;
-    if (boneCount == 0) return false;
+    if (boneCount == 0) return fail("boneCount 0");
     if (boneCount > kMaxBones) {
         if (g_regLogs.fetch_add(1) < kLogCap) {
             _MESSAGE("FO4RemixPlugin: [Skinning] shape \"%s\" boneCount=%u exceeds "
@@ -159,7 +166,7 @@ bool SkinnedMeshes::Register(uint64_t drawableHash, BSTriShape* shape,
                      shape->m_name.c_str() ? shape->m_name.c_str() : "",
                      boneCount, kMaxBones);
         }
-        return false;
+        return fail("boneCount exceeds remixapi cap");
     }
     if (nodeCount != boneCount && g_regLogs.fetch_add(1) < kLogCap) {
         _MESSAGE("FO4RemixPlugin: [Skinning] shape \"%s\" count mismatch: "
@@ -173,7 +180,7 @@ bool SkinnedMeshes::Register(uint64_t drawableHash, BSTriShape* shape,
     e.invBinds.resize(boneCount);
     e.nodeNull.assign(boneCount, 1);
     if (!PeekBytes(xfArr, e.boneXfPtrs.data(), (size_t)boneCount * 8))
-        return false;
+        return fail("worldTransforms bulk read failed");
     // Which bones lack scene-graph NiNodes (BSFlattenedBoneTree bones):
     // their worldTransform pointers target flat-tree entries rather than
     // NiAVObject+0x70 -- tracked for the [SkinDiag] per-bone dump.
@@ -189,10 +196,10 @@ bool SkinnedMeshes::Register(uint64_t drawableHash, BSTriShape* shape,
         }
     }
     for (uint32_t i = 0; i < boneCount; ++i) {
-        if (!e.boneXfPtrs[i]) return false;
+        if (!e.boneXfPtrs[i]) return fail("null bone world-transform ptr");
         if (!PeekBytes(btArr + (uintptr_t)i * kBoneEntryStride + kBoneEntryXfOff,
                        &e.invBinds[i], sizeof(XfPod)))
-            return false;
+            return fail("inverse-bind read failed");
     }
 
     outBoneCount = boneCount;
@@ -206,6 +213,44 @@ bool SkinnedMeshes::Register(uint64_t drawableHash, BSTriShape* shape,
                  shape->m_name.c_str() ? shape->m_name.c_str() : "", boneCount);
     }
     return true;
+}
+
+void SkinnedMeshes::LogBones(uint64_t drawableHash, const char* label) {
+    static std::atomic<int> s_dumps{0};
+    if (s_dumps.fetch_add(1, std::memory_order_relaxed) >= 4) return;
+    std::lock_guard<std::mutex> lk(g_mx);
+    auto it = g_entries.find(drawableHash);
+    if (it == g_entries.end()) {
+        _MESSAGE("FO4RemixPlugin: [HeadDiag] bones \"%s\" hash=%016llX: no entry",
+                 label ? label : "", (unsigned long long)drawableHash);
+        return;
+    }
+    const Entry& e = it->second;
+    const uint32_t n = (uint32_t)e.boneXfPtrs.size();
+    _MESSAGE("FO4RemixPlugin: [HeadDiag] bones \"%s\" hash=%016llX n=%u",
+             label ? label : "", (unsigned long long)drawableHash, n);
+    auto det3 = [](const float r[3][4]) {
+        return r[0][0] * (r[1][1] * r[2][2] - r[1][2] * r[2][1])
+             - r[0][1] * (r[1][0] * r[2][2] - r[1][2] * r[2][0])
+             + r[0][2] * (r[1][0] * r[2][1] - r[1][1] * r[2][0]);
+    };
+    for (uint32_t i = 0; i < n && i < 24; ++i) {
+        const XfPod& ib = e.invBinds[i];
+        XfPod bw;
+        if (!PeekBytes(e.boneXfPtrs[i], &bw, sizeof(bw))) {
+            _MESSAGE("FO4RemixPlugin: [HeadDiag]   bone %2u nodeNull=%u ptr=%p "
+                     "READ-FAIL | ib pos=(%.1f,%.1f,%.1f) det=%.3f",
+                     i, (unsigned)e.nodeNull[i], (void*)e.boneXfPtrs[i],
+                     ib.pos[0], ib.pos[1], ib.pos[2], det3(ib.rot));
+            continue;
+        }
+        _MESSAGE("FO4RemixPlugin: [HeadDiag]   bone %2u nodeNull=%u "
+                 "bw pos=(%.1f,%.1f,%.1f) scale=%.3f det=%.4f | "
+                 "ib pos=(%.1f,%.1f,%.1f) scale=%.3f det=%.4f",
+                 i, (unsigned)e.nodeNull[i],
+                 bw.pos[0], bw.pos[1], bw.pos[2], bw.scale, det3(bw.rot),
+                 ib.pos[0], ib.pos[1], ib.pos[2], ib.scale, det3(ib.rot));
+    }
 }
 
 void SkinnedMeshes::OnDrawableReleased(uint64_t drawableHash) {

@@ -42,7 +42,18 @@ namespace SkinnedMeshes {
     // -- the caller retries next tick like any not-yet-ready resource.
     // outBoneCount receives the bone count for blend-index validation
     // (always <= 256, the remixapi bones-per-instance cap).
-    bool Register(uint64_t drawableHash, BSTriShape* shape, uint32_t& outBoneCount);
+    // outFailReason (optional) receives a static string naming the failed
+    // step on a false return -- the missing-heads investigation needs
+    // Register's silent failure paths attributable per shape ([HeadDiag]).
+    bool Register(uint64_t drawableHash, BSTriShape* shape, uint32_t& outBoneCount,
+                  const char** outFailReason = nullptr);
+
+    // [HeadDiag] one-shot dump of a registered drawable's bone entry: per
+    // bone the LIVE world transform (pos/scale/rotDet), whether its NiNode
+    // slot was null, and the inverse-bind translation/det. Separates "face
+    // bone transforms read garbage" from "positions/weights wrong" for the
+    // facegen corruption hunt. Capped at 4 shapes per session.
+    void LogBones(uint64_t drawableHash, const char* label);
 
     // Drop a drawable's bone tracking (wired into ReleaseDrawable).
     void OnDrawableReleased(uint64_t drawableHash);

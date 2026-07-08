@@ -1340,10 +1340,29 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     bool hasNormals = (desc & BSGeometry::kFlag_Normals) != 0;
     bool hasColors  = (desc & BSGeometry::kFlag_VertexColors) != 0;
 
+    BSDynamicTriShape* dynShape = shape->GetAsBSDynamicTriShape();
+
+    // Attribute offsets are ABSOLUTE dword offsets within the static vertex
+    // record -- including on real dynamic shapes. The engine's facegen
+    // conversion (BSTriShape::CreateDynamicTriShape, VA 0x141831770,
+    // decompiler-proven 2026-07-08, scripts/dynamic_trishape_desc.md) strips
+    // the half4 position from the static record (n0 -= 2: head stride
+    // 32 -> 24) and REBASES every attribute nibble by -2 dwords (UV 8 -> 0,
+    // normal 12 -> 4, skin 20 -> 12), so post-conversion nibbles are already
+    // record-relative. Adding the dynamic-vertex size n1 (:= 3, float3
+    // positions in dynamicVertices) shifted every attribute read 12 bytes
+    // high on heads: UVs/normals decoded garbage and oSkin (24+12) failed
+    // the stride-24 fit gate, whose caller silently dropped every FaceGen
+    // head ("missing heads", 2026-07-08). Non-dynamic shapes keep the n1
+    // term: it is 0 on every well-formed static desc (F4SE: "szVertex: 0
+    // when not dynamic"), which makes the formulas identical there, and the
+    // PR#1 population of non-dynamic shapes carrying a junk n1 nibble keeps
+    // its long-verified behavior.
     uint32_t szVertex = (desc >> 4) & 0xF;
-    uint32_t oUV     = (szVertex + ((desc >>  8) & 0xF)) * 4;
-    uint32_t oNormal = (szVertex + ((desc >> 16) & 0xF)) * 4;
-    uint32_t oColor  = (szVertex + ((desc >> 24) & 0xF)) * 4;
+    const uint32_t attrShift = dynShape ? 0 : szVertex;
+    uint32_t oUV     = (attrShift + ((desc >>  8) & 0xF)) * 4;
+    uint32_t oNormal = (attrShift + ((desc >> 16) & 0xF)) * 4;
+    uint32_t oColor  = (attrShift + ((desc >> 24) & 0xF)) * 4;
 
     bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
 
@@ -1359,7 +1378,7 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     uint8_t* posData = vbData;
     uint32_t posStride = vertexSize;
     bool isDynamic = false;
-    if (BSDynamicTriShape* dynShape = shape->GetAsBSDynamicTriShape()) {
+    if (dynShape) {
         uint8_t* dynVerts = dynShape->dynamicVertices;
         const uint16_t dynVertexSize = dynShape->GetDynamicVertexSize();
         if (dynVerts && dynVertexSize != 0) {
@@ -1378,13 +1397,19 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         memset(&out_v, 0, sizeof(out_v));
 
         // Position. Dynamic shapes read from dynamicVertices whose element
-        // size is GetDynamicVertexSize() = szVertex nibble * 4: a 16-byte
-        // element is a float4 (XMVECTOR -- FaceGen heads and morphing
-        // meshes), NOT half4. Reading those as halfs produced garbage
-        // positions that silently died at the extent gate ("missing heads",
-        // 2026-07-08); half-sized elements (8 bytes) stay on the half path.
+        // size is GetDynamicVertexSize() = szVertex nibble * 4. FaceGen
+        // conversion authors n1=3: a 12-byte element that is HALF4 position
+        // (x, y, z, bitangentX) in the first 8 bytes plus a 4-byte tail
+        // (zeros/flags) -- NOT float3, despite the FullPrecision flag the
+        // conversion sets. Proven byte-exact on 2026-07-08 run 3: the live
+        // buffer of MaleMouthHumanoidDefault decodes as halfs to the
+        // authored NIF half4 positions INCLUDING exact bitangent-X matches
+        // (0.4834/0.4331/0.3613); read as float3 the same bytes produced
+        // the giant "sail" vertices (half pairs reinterpreted as float32
+        // reach 1e3..1e38). Only a 16-byte dynamic element (none observed;
+        // defensive) takes the float path.
         uint8_t* pv = posData + (uint32_t)i * posStride;
-        const bool posIsHalf = isDynamic ? (posStride <= 8) : posHalfFloat;
+        const bool posIsHalf = isDynamic ? (posStride <= 12) : posHalfFloat;
         if (posIsHalf) {
             uint16_t* pos = reinterpret_cast<uint16_t*>(pv);
             out_v.position[0] = HalfToFloat(pos[0]);
@@ -1434,7 +1459,9 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     // as 1-(x+y+z); replicate that (the 4th stored half is not trusted).
     out.hasSkinning = false;
     if (parseSkinning && (desc & BSGeometry::kFlag_Skinned)) {
-        const uint32_t oSkin = (szVertex + (uint32_t)((desc >> 28) & 0xF)) * 4;
+        // attrShift, not szVertex: on converted facegen heads the skin
+        // nibble is already rebased (3 -> byte 12 of the 24-byte record).
+        const uint32_t oSkin = (attrShift + (uint32_t)((desc >> 28) & 0xF)) * 4;
         if (oSkin + 12 <= vertexSize) {
             out.blendWeights.resize((size_t)shape->numVertices * 4);
             out.blendIndices.resize((size_t)shape->numVertices * 4);

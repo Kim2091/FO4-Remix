@@ -17,8 +17,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdarg>
 #include <cstdio>
 #include <mutex>
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <array>
@@ -876,6 +879,63 @@ static float WindDiagDet3(const float m[3][4]) {  // det of the 3x3 block
          + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
 }
 
+// ---------------------------------------------------------------------------
+// [HeadDiag] missing-FaceGen-heads investigation (2026-07-08). Heads never
+// render while every other skinned mesh works; the candidate exits are all
+// SILENT (the post-parse hasSkinning gate, Register's false paths, the
+// noDiffuse retry). Trace every resolver gate for any shape whose own name
+// or captured parent names look like a head part. Logs are per-hash deduped
+// on message CONTENT: a retrying drawable that keeps failing the same gate
+// logs once, and logs again only when it progresses to a different gate.
+// "Headlamp"/"Bulkhead"-style false positives are acceptable noise for a
+// capped diagnostic.
+// ---------------------------------------------------------------------------
+static bool HeadDiagNameMatch(const char* n) {
+    static const char* const kKeys[] = {
+        "head", "hair", "eye", "mouth", "teeth", "beard", "face", "brow"
+    };
+    for (const char* k : kKeys)
+        if (NameContainsCI(n, k)) return true;
+    return false;
+}
+
+static bool HeadDiagMatch(BSTriShape* tri,
+                          const SemanticCapture::DrawableState& state) {
+    if (HeadDiagNameMatch(tri->m_name.c_str())) return true;
+    if (state.parent1 &&
+        HeadDiagNameMatch(static_cast<NiAVObject*>(state.parent1)->m_name.c_str()))
+        return true;
+    if (state.parent2 &&
+        HeadDiagNameMatch(static_cast<NiAVObject*>(state.parent2)->m_name.c_str()))
+        return true;
+    return false;
+}
+
+static void HeadDiagLog(uint64_t hash, const char* fmt, ...) {
+    char msg[448];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(msg, sizeof(msg), fmt, ap);
+    va_end(ap);
+
+    // Per-hash SET of already-logged messages, not just the last one: a
+    // retrying shape alternates "seen" / gate lines every backoff tick, and
+    // last-message dedup let that alternation burn ~a third of the cap on
+    // two shapes (2026-07-08 run 1).
+    static std::mutex s_mx;
+    static std::unordered_map<uint64_t, std::unordered_set<std::string>> s_seen;
+    static int s_logs = 0;
+    constexpr int kCap = 160;
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        if (s_logs >= kCap) return;
+        if (!s_seen[hash].insert(msg).second) return;
+        ++s_logs;
+    }
+    _MESSAGE("FO4RemixPlugin: [HeadDiag] hash=%016llX %s",
+             (unsigned long long)hash, msg);
+}
+
 static void LogWindingDiag(BSTriShape* tri,
                            const ExtractedMesh& mesh,
                            const ParsedGeometry& parsed,
@@ -937,12 +997,15 @@ static void LogWindingDiag(BSTriShape* tri,
              (unsigned long long)state.initialFlags,
              (unsigned long long)propFlags);
 
-    // Vertex-format decode, exactly as ParseShapeGeometry computes it.
+    // Vertex-format decode, exactly as ParseShapeGeometry computes it
+    // (attribute nibbles are absolute; dynamic shapes' descs arrive
+    // pre-rebased by the engine's facegen conversion, so no n1 term there).
     const uint64_t desc = parsed.vertexDesc;
-    const uint32_t szVertex = (uint32_t)((desc >> 4) & 0xF);
-    const uint32_t oUV      = (szVertex + (uint32_t)((desc >>  8) & 0xF)) * 4;
-    const uint32_t oNormal  = (szVertex + (uint32_t)((desc >> 16) & 0xF)) * 4;
-    const uint32_t oColor   = (szVertex + (uint32_t)((desc >> 24) & 0xF)) * 4;
+    const uint32_t szVertex  = (uint32_t)((desc >> 4) & 0xF);
+    const uint32_t attrShift = parsed.isDynamic ? 0 : szVertex;
+    const uint32_t oUV      = (attrShift + (uint32_t)((desc >>  8) & 0xF)) * 4;
+    const uint32_t oNormal  = (attrShift + (uint32_t)((desc >> 16) & 0xF)) * 4;
+    const uint32_t oColor   = (attrShift + (uint32_t)((desc >> 24) & 0xF)) * 4;
     const bool halfPos = !(desc & BSGeometry::kFlag_FullPrecision);
     _MESSAGE("FO4RemixPlugin: [WindDiag] %s hash=%016llX desc=%016llX stride=%u "
              "szV=%u oUV=%u oN=%u oC=%u halfPos=%d hasUV=%d hasN=%d hasC=%d",
@@ -1061,6 +1124,35 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // (bones produce Beth world coordinates). See skinned_meshes.h for the
     // composition math and the post-mortem of the retired pre-1B module.
     const bool isSkinned = (tri->vertexDesc & BSGeometry::kFlag_Skinned) != 0;
+
+    // [HeadDiag]: identity line fires once per hash (dedup on content), then
+    // each gate below reports the first time this shape fails it.
+    const bool headDiag = HeadDiagMatch(tri, state);
+    if (headDiag) {
+        char leaf[64] = "?";
+        SemanticCapture::GetLeafClassName(tri, leaf, sizeof(leaf));
+        const char* p1 = state.parent1
+            ? static_cast<NiAVObject*>(state.parent1)->m_name.c_str() : nullptr;
+        const char* p2 = state.parent2
+            ? static_cast<NiAVObject*>(state.parent2)->m_name.c_str() : nullptr;
+        // vbSize / numVertices = the PHYSICAL static-VB stride: confirms the
+        // facegen conversion's shared VB really is the position-stripped
+        // 24-byte layout the rewritten desc claims (the one open question in
+        // scripts/dynamic_trishape_desc.md).
+        uint32_t vbSize = 0;
+        if (auto* gfx = static_cast<BSGraphics::TriShape*>(tri->pRendererData)) {
+            if (gfx->pVB) vbSize = gfx->pVB->uiDataSize;
+        }
+        HeadDiagLog(hash,
+                    "seen shape=\"%s\" leaf=%s dyn=%d desc=%016llX skinned=%d "
+                    "nV=%u nT=%u vbSize=%u p1=\"%s\" p2=\"%s\"",
+                    tri->m_name.c_str() ? tri->m_name.c_str() : "", leaf,
+                    tri->GetAsBSDynamicTriShape() ? 1 : 0,
+                    (unsigned long long)tri->vertexDesc, isSkinned ? 1 : 0,
+                    (unsigned)tri->numVertices, (unsigned)tri->numTriangles,
+                    vbSize, p1 ? p1 : "", p2 ? p2 : "");
+    }
+
     if (isSkinned && !g_config.skinningEnabled) {
         ResolverTrace::g_lastStep.store(Trace::kSkinSkipped, std::memory_order_relaxed);
         return false;
@@ -1128,6 +1220,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     ParsedGeometry parsed;
     if (!BsExtraction::ParseShapeGeometry(tri, parsed, /*logRejections=*/g_config.logRejections,
                                           applyVertexColors, /*parseSkinning=*/isSkinned)) {
+        if (headDiag) HeadDiagLog(hash, "GATE parse FAILED (see [ParseBail])");
         return false;
     }
     if (isSkinned && !parsed.hasSkinning) {
@@ -1135,7 +1228,93 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // stride: without weights the mesh would render as a model-space
         // blob. Skip permanently-ish (retries are cheap and keep the log
         // line from ParseShapeGeometry capped by logRejections).
+        if (headDiag) {
+            const uint64_t d = tri->vertexDesc;
+            const uint32_t shift =
+                tri->GetAsBSDynamicTriShape() ? 0 : (uint32_t)((d >> 4) & 0xF);
+            const uint32_t oSkin = (shift + (uint32_t)((d >> 28) & 0xF)) * 4;
+            HeadDiagLog(hash,
+                        "GATE hasSkinning=0: oSkin=%u+12 > stride=%u "
+                        "(desc=%016llX) -- dropped every retry",
+                        oSkin, (unsigned)tri->GetVertexSize(),
+                        (unsigned long long)d);
+        }
         return false;
+    }
+
+    // [HeadDiag] geometry stats, once per hash (parsed positions include the
+    // dynamicVertices decode for facegen shapes; the raw first floats of the
+    // dynamic buffer discriminate float3-packed real positions from
+    // uninitialized heap or a different element layout, and dynSize vs 12N
+    // validates the decompiled creation-path allocation).
+    if (headDiag) {
+        static std::mutex s_gmx;
+        static std::unordered_set<uint64_t> s_geomLogged;
+        bool first = false;
+        {
+            std::lock_guard<std::mutex> lk(s_gmx);
+            first = s_geomLogged.insert(hash).second;
+        }
+        if (first) {
+            float maxAbs = 0.0f;
+            uint32_t suspect = 0;
+            for (const auto& v : parsed.vertices) {
+                float m = std::abs(v.position[0]);
+                m = (std::max)(m, std::abs(v.position[1]));
+                m = (std::max)(m, std::abs(v.position[2]));
+                if (m > maxAbs) maxAbs = m;
+                if (m > 1000.0f) ++suspect;
+            }
+            float maxTriple = 0.0f;
+            uint32_t maxIdx = 0;
+            const size_t nW = parsed.blendWeights.size() / 4;
+            for (size_t v = 0; v < nW; ++v) {
+                const float t = parsed.blendWeights[v * 4 + 0] +
+                                parsed.blendWeights[v * 4 + 1] +
+                                parsed.blendWeights[v * 4 + 2];
+                if (t > maxTriple) maxTriple = t;
+                for (int k = 0; k < 4; ++k)
+                    if (parsed.blendIndices[v * 4 + k] > maxIdx)
+                        maxIdx = parsed.blendIndices[v * 4 + k];
+            }
+            char dyn[320] = "";
+            if (BSDynamicTriShape* ds = tri->GetAsBSDynamicTriShape()) {
+                const uint8_t* db = ds->dynamicVertices;
+                const uint32_t nV = tri->numVertices;
+                if (db && nV >= 8) {
+                    // Raw bytes: the packing verdict (float3 vs half4 vs
+                    // half3 vs interleaved) lives in the bit patterns, and
+                    // %.2f floats destroy it. head = first 48 bytes; mid8N /
+                    // mid6N = 12 bytes at the half4/half3 fill boundaries --
+                    // valid coordinates there vs heap garbage discriminates
+                    // how much of the 12N allocation the engine actually
+                    // wrote.
+                    char hexHead[48 * 2 + 1];
+                    for (int k = 0; k < 48; ++k)
+                        std::snprintf(hexHead + k * 2, 3, "%02X", db[k]);
+                    char hex8N[12 * 2 + 1], hex6N[12 * 2 + 1];
+                    const uint8_t* p8 = db + (size_t)8 * nV;
+                    const uint8_t* p6 = db + (size_t)6 * nV;
+                    for (int k = 0; k < 12; ++k) {
+                        std::snprintf(hex8N + k * 2, 3, "%02X", p8[k]);
+                        std::snprintf(hex6N + k * 2, 3, "%02X", p6[k]);
+                    }
+                    std::snprintf(dyn, sizeof(dyn),
+                                  " dynSize=%u expected12N=%u dynHex0..47=%s "
+                                  "at8N=%s at6N=%s",
+                                  ds->uiDynamicDataSize, nV * 12u,
+                                  hexHead, hex8N, hex6N);
+                }
+            }
+            HeadDiagLog(hash,
+                        "geom maxAbsPos=%.1f suspect1e3=%u v0=(%.2f,%.2f,%.2f) "
+                        "wMaxTriple=%.3f wMaxIdx=%u%s",
+                        maxAbs, suspect,
+                        parsed.vertices.empty() ? 0.0f : parsed.vertices[0].position[0],
+                        parsed.vertices.empty() ? 0.0f : parsed.vertices[0].position[1],
+                        parsed.vertices.empty() ? 0.0f : parsed.vertices[0].position[2],
+                        maxTriple, maxIdx, dyn);
+        }
     }
 
     // Reject shapes with garbage extents (defensive guard against malformed input).
@@ -1145,6 +1324,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             std::abs(v.position[1]) > kMaxExtent ||
             std::abs(v.position[2]) > kMaxExtent) {
             ResolverTrace::g_lastStep.store(Trace::kExtentRejected, std::memory_order_relaxed);
+            if (headDiag) {
+                HeadDiagLog(hash, "GATE extent reject: v=(%.1f,%.1f,%.1f)",
+                            v.position[0], v.position[1], v.position[2]);
+            }
             return false;
         }
     }
@@ -1190,10 +1373,22 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // ---- Skinned drawable wiring (2026-07-08) ----
     if (isSkinned) {
         uint32_t boneCount = 0;
-        if (!SkinnedMeshes::Register(hash, tri, boneCount)) {
+        const char* skinFail = nullptr;
+        if (!SkinnedMeshes::Register(hash, tri, boneCount, &skinFail)) {
             // Skin instance not ready yet (streaming) or failed validation:
             // standard retry-next-tick contract.
+            if (headDiag) {
+                HeadDiagLog(hash, "GATE SkinnedMeshes::Register: %s",
+                            skinFail ? skinFail : "?");
+            }
             return false;
+        }
+        // Facegen bone-source dump (capped inside): the corruption
+        // discriminator between garbage face-bone transforms and garbage
+        // positions/weights.
+        if (headDiag && tri->GetAsBSDynamicTriShape()) {
+            SkinnedMeshes::LogBones(hash, tri->m_name.c_str()
+                                              ? tri->m_name.c_str() : "");
         }
         // Blend indices reference the skin instance's bone array; clamp any
         // out-of-range index to bone 0 rather than letting the runtime's
@@ -1301,11 +1496,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     // ---- Material + textures ----
     auto* mat = BsExtraction::GetLightingMaterial(tri);
-    if (!mat) return false;
+    if (!mat) {
+        if (headDiag) HeadDiagLog(hash, "GATE no lighting material");
+        return false;
+    }
 
     // 1B scope: skip landscape (terrain regression accepted; Phase 5 revives).
     if (mat->GetType() == BSLightingShaderMaterialBase::kType_Landscape) {
         ResolverTrace::g_lastStep.store(Trace::kLandscapeSkipped, std::memory_order_relaxed);
+        if (headDiag) HeadDiagLog(hash, "GATE landscape material skip");
         return false;
     }
 
@@ -1454,7 +1653,16 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                       mesh.emissiveIntensity);
 
     // No diffuse -> can't render lit; retry next frame in case texture resolves later.
-    if (mesh.diffuseTextureHash == 0) return false;
+    if (mesh.diffuseTextureHash == 0) {
+        if (headDiag) {
+            NiTexture* dt = mat->spDiffuseTexture;
+            HeadDiagLog(hash,
+                        "GATE noDiffuse: matType=%u tex=%p name=\"%s\" -- retry",
+                        (unsigned)mat->GetType(), (void*)dt,
+                        (dt && dt->name.c_str()) ? dt->name.c_str() : "");
+        }
+        return false;
+    }
 
     ResolverTrace::g_lastStep.store(Trace::kTexturesExtracted, std::memory_order_relaxed);
 
@@ -2552,6 +2760,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // Update DrawableState to mark submission and track refcount targets.
     state.submittedToRemix = true;
     state.meshHash = hash;
+    if (headDiag) {
+        HeadDiagLog(hash, "SUBMITTED skinned=%d bones=%u diffuse=%016llX matType=%u",
+                    mesh.hasSkinning ? 1 : 0, mesh.boneCount,
+                    (unsigned long long)mesh.diffuseTextureHash,
+                    (unsigned)mat->GetType());
+    }
     // Note: state.materialHash is left at 0 here. SubmitDrawable's hash
     // computation is internal to remix_renderer; if you want symmetric
     // tracking, expose a helper or have SubmitDrawable take an out-param.

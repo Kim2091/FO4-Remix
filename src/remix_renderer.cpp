@@ -1363,6 +1363,13 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         std::unordered_map<remixapi_MeshHandle, DrawBucket> buckets;
         buckets.reserve(g_drawables.size());
 
+        // [HeadDiag] hold accounting (2026-07-08 missing-heads): a skinned
+        // drawable that was submitted but whose bone set never queues sits
+        // invisible in the empty-boneTransforms hold below forever
+        // (hypothesis (c)). Counted per frame, logged rate-limited while
+        // any draw is held.
+        uint32_t skinnedTotal = 0, skinnedHeldNoBones = 0;
+
         for (auto& [drawHash, inst] : g_drawables) {
             if (!inst.meshHandle) continue;
             // (Engine-active filter removed 2026-07-02 -- with the window at
@@ -1386,6 +1393,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 }
             }
             if (inst.isSkinned) {
+                ++skinnedTotal;
                 auto bIt = freshBones.find(drawHash);
                 if (bIt != freshBones.end()) {
                     inst.boneTransforms = std::move(bIt->second);
@@ -1393,7 +1401,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 // No bone set yet: bind-pose verts are model-space and would
                 // render T-posed at the world origin -- hold the draw until
                 // the first game-thread bone update lands (next Tick).
-                if (inst.boneTransforms.empty()) continue;
+                if (inst.boneTransforms.empty()) { ++skinnedHeldNoBones; continue; }
             }
             if (inst.isLODChunk) {
                 // Stale-fire filter: the engine hid this chunk (its cells
@@ -1425,6 +1433,19 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             buckets[inst.meshHandle].members.push_back(&inst);
         }
         bucketCount = buckets.size();
+        if (skinnedHeldNoBones > 0) {
+            // First occurrence logs immediately, then every ~300 frames,
+            // capped for the session. OnFrame is single-threaded.
+            static int      s_heldLogs = 0;
+            static uint32_t s_sinceLog = 300;
+            if (s_heldLogs < 40 && ++s_sinceLog > 300) {
+                s_sinceLog = 0;
+                ++s_heldLogs;
+                _MESSAGE("FO4RemixPlugin: [HeadDiag] OnFrame skinned=%u "
+                         "heldForEmptyBones=%u",
+                         skinnedTotal, skinnedHeldNoBones);
+            }
+        }
         const PerfClock::time_point tBucket1 = PerfClock::now();
         dBucket = tBucket1 - tBucket0;
 
