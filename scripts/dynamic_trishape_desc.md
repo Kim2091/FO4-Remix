@@ -574,3 +574,21 @@ mesh with dark weathered verts has mean≈0.45 but mode=255; and the mean of two
 between rows, producing colors that exist in no row — the bright-purple painted-PA torso). Per-pixel
 diffuse remap through the LUT row in ExtractMaterialTexture (PaletteRemap_Apply) replaces the old flat
 u=0.75 tint, which could not reproduce the ramp's rust->paint hue shift along U.
+
+### cb2[3].x provenance — exe-side confirmation (2026-07-09, static analysis)
+
+Decompiled `BSLightingShader::SetupGeometry` **0x1421FDA30** (vtable slot 7; NOT SetupMaterial 0x1421FC630,
+which only handles the UV transform + SRV binds) uploads the per-material PS constants. The palette-scale
+write (material read at 0x1421FE64B):
+```c
+PSCB[ (byte)desc[0x5c] * 4 ] = *(float*)(material + 0xB8);   // desc = shader-reflection table 0x143E5AE70
+```
+Register mapping is table-driven per technique; for the palette PS it resolves to c3.x (matches the blob).
+The register is SHARED: HairTint/SkinTint materials (cached SLSF1 bit 18 at shader+0x190) write `kTintColor`
+(float4, mat+0xC0) there instead; the mat+0xB8 scalar path runs when bit18 clear && bit26 set. Reading the
+material field directly (as the plugin does) bypasses the gate and is always valid.
+
+Provenance chain: BGSM **file+0x68** (`fGrayscaleToPaletteScale`) → `TransferColors` 0x142163B00 →
+runtime `BSLightingShaderMaterialBase::fLookupScale` **material+0xB8** → SetupGeometry → PS c3.x.
+NOTE: the `+0x1bc/+0x1bd` grayscale bools quoted earlier in this doc are BGSM FILE offsets, not runtime
+material offsets — the runtime base material ends at 0xC0.
