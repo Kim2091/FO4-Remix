@@ -905,6 +905,78 @@ static void ConvertNormalToOctahedral(ExtractedTexture& tex)
 }
 
 // ---------------------------------------------------------------------------
+// Grayscale-to-palette lookup sampling (2026-07-08 over-dirty fix)
+// ---------------------------------------------------------------------------
+// FO4 recolors clothing/clutter via a grayscale diffuse + a 2D palette LUT
+// (spLookupTexture): the shader samples LUT(u = tonal value, v = vertexColor.x
+// palette row). We approximate that as a per-material TINT -- sample the LUT
+// once at a representative tonal value for the mesh's palette row and multiply
+// it into the grayscale diffuse (same mechanism as the hair fix). The decoded
+// LUT mip0 is cached by texture name so repeated samples are free.
+namespace {
+struct DecodedLut { uint32_t w = 0, h = 0; bool bgra = false; std::vector<uint8_t> rgba; };
+std::unordered_map<uint64_t, DecodedLut> g_lutCache;
+}
+
+// Returns 0=ready (outRGB valid), 1=pending (async readback in flight, retry),
+// 2=failed (no/undecodable LUT). u,v in [0,1]: u along width (tonal ramp),
+// v along height (palette row).
+int BsExtraction::SampleLookupColor(NiTexture* lut, ID3D11Device* device,
+                                    float u, float v, uint32_t& outRGB) {
+    outRGB = 0xFFFFFFu;
+    if (!lut || !device) return 2;
+    BSRenderData* rd = lut->rendererData;
+    if (!rd || !rd->resource) return 2;
+    const char* nm = lut->name.c_str();
+    const uint64_t key = FnvHashCombine(FnvHash(nm ? nm : ""), 0x1071ULL);
+
+    auto cit = g_lutCache.find(key);
+    if (cit == g_lutCache.end() || cit->second.rgba.empty()) {
+        ID3D11Texture2D* t2d = nullptr;
+        if (FAILED(rd->resource->QueryInterface(
+                __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t2d))) || !t2d)
+            return 2;
+        std::vector<ExtractedTexture> mips;
+        ReadbackStatus st = ReadbackAllMipsAsync(device, t2d, key, mips);
+        t2d->Release();
+        if (st == ReadbackStatus::Pending) return 1;
+        if (st != ReadbackStatus::Ready || mips.empty()) return 2;
+        ExtractedTexture m = std::move(mips[0]);
+        DecompressBC2(m);
+        if (m.dxgiFormat != DXGI_FORMAT_R8G8B8A8_UNORM &&
+            m.dxgiFormat != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
+            m.dxgiFormat != DXGI_FORMAT_B8G8R8A8_UNORM &&
+            m.dxgiFormat != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
+            DecompressBC(m, BCTransform::None);
+        }
+        const bool rgba = (m.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                           m.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+        const bool bgra = (m.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                           m.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+        if ((!rgba && !bgra) || m.width == 0 || m.height == 0 ||
+            m.pixels.size() < (size_t)m.width * m.height * 4)
+            return 2;
+        DecodedLut dl;
+        dl.w = m.width; dl.h = m.height; dl.bgra = bgra;
+        dl.rgba = std::move(m.pixels);
+        cit = g_lutCache.emplace(key, std::move(dl)).first;
+    }
+    const DecodedLut& dl = cit->second;
+    if (u < 0.0f) u = 0.0f; if (u > 1.0f) u = 1.0f;
+    if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+    uint32_t x = (uint32_t)(u * (dl.w - 1) + 0.5f);
+    uint32_t y = (uint32_t)(v * (dl.h - 1) + 0.5f);
+    if (x >= dl.w) x = dl.w - 1;
+    if (y >= dl.h) y = dl.h - 1;
+    const uint8_t* p = &dl.rgba[((size_t)y * dl.w + x) * 4];
+    const uint32_t r = dl.bgra ? p[2] : p[0];
+    const uint32_t g = p[1];
+    const uint32_t b = dl.bgra ? p[0] : p[2];
+    outRGB = (r << 16) | (g << 8) | b;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Generic texture extraction from any NiTexture slot
 // ---------------------------------------------------------------------------
 uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotName,

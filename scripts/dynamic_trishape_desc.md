@@ -404,3 +404,120 @@ confirm, but the plugin-relevant fact — per-NPC RGB = `pEmissiveColor * fEmitC
   and `*(float*)(prop+0xC8)`. Compare `ec.rgb` to `TESNPC::GetHairColor()` `BGSColorForm` color
   (form+0x30 rgb bytes, or race `hairColorLUT[remappingIndex]` when CLFM flags+0x40 bit1 set).
 - `memwatch prop+0xB8`'s target during hair equip / RaceMenu to catch the runtime CLFM applier.
+
+---
+
+## Vertex colors & dirt/detail (2026-07-08)
+
+Binary `Fallout4.exe` 1.10.980 (Ghidra project `patches/Fallout4`) + `Data\Fallout4 - Shaders.ba2`
+-> `ShadersFX\Shaders011.fxp` (DXBC blobs disassembled via `d3dcompiler_47!D3DDisassemble`).
+
+Answers the plugin question: what is the true "Vertex Colors" shader flag bit in this build, how does the
+vanilla lighting PS combine the vertex color, and why does re-multiplying it look "too dirty / gray".
+
+### TL;DR
+
+1. **Vertex Colors flag = merged BIT 37** (flags2 bit 5, mask `1<<37 = 0x0000002000000000`). The plugin's
+   current `1<<37` gate is **CORRECT** and is NOT affected by the enum drift that broke bit 46 (Hair).
+2. **Combine op (standard technique) = straight per-component linear multiply**:
+   `albedo.rgb = diffuse.rgb * vertexColor.rgb`. Not gentler, not alpha-only.
+3. **Dirt is NOT a separate texture slot.** It is either baked into the diffuse texture or *is* the per-vertex
+   COLOR RGB itself (artist AO/dirt). The one thing that behaves like a hidden "color layer" is the
+   **grayscale-to-palette LUT** (`spLookupTexture +0x68`), used by ~1/3 of lighting permutations.
+4. **Recommended plugin test**: multiply `vertexColor.rgb` into albedo **iff `(flags & 1<<37)` AND NOT
+   `(flags & 1<<4)`** (GrayscaleToPaletteColor). When bit 4 is set the vertex color is a *palette-row selector*,
+   not a tint — multiplying it into the (grayscale) diffuse is the most likely cause of "denim -> gray".
+
+### Task 1 — true Vertex-Colors bit = 37 (proven two independent ways)
+
+`SetFlag` (`0x142161950`) takes a **raw qword bit index** (flags1 = bits 0-31, flags2 = bits 32-63).
+
+- **BGSM flag applier `0x142163480`**: `SetFlag(prop, 0x25 /*=37*/, hasVertexColor)`, where `hasVertexColor`
+  is computed from the geometry's runtime vertex descriptor color attribute (`(desc >> 22) & 0x3c`, the
+  Color nibble n6 byte-offset), **not** from a BGSM bool. So bit 37 = "this geometry has a COLOR stream".
+- **`BSLightingShaderProperty::MakeValidForRendering 0x1421718E0`, first instruction**:
+  `SetFlag(prop, 0x25, ((geom->vertexDesc >> 22) & 0x3c) != 0)` — the engine re-derives bit 37 from the
+  vertex layout every time it validates the property.
+
+Cross-checked anchors from the same applier confirm the whole SLSF map for this build:
+`Skinned=bit1`, `GrayscaleToPaletteColor=bit4 (<-mat+0x1bc)`, `GrayscaleToPaletteAlpha=bit5 (<-mat+0x1bd)`,
+`EnvMapping=bit7`, `TwoSided=bit36 (<-mat+0x99)`, `Vertex_Colors=bit37`.
+Note: the ctor `0x142171620` default-sets bits 22/31/32 (EmitColor / ZBuffer_Test / ZBuffer_Write) — so the
+old F4SE/KB label "GrayscaleToPalette = bit31" is itself **drifted/wrong**; the real grayscale-to-palette-color
+flag is **bit 4** (flags1 mask `0x10`).
+
+### Task 2 — how vanilla combines vertex color
+
+Disassembly of the standard **deferred** object/character lighting PS (blob `@0x636dc8` in Shaders011.fxp),
+albedo path:
+```
+sample r1.xyz = t0 (diffuse) at uv
+mul   r1.xyz, r1.xyz, v6.xyz          ; albedo.rgb = diffuse.rgb * vertexColor.rgb   (v6 = COLOR0)
+mad   o0.xyz, r1.xyz, r0.x, r0.yzw    ; GBufferAlbedo = albedo * matScale + emissive/detail additive
+```
+- Vertex color RGB is a **straight per-component multiply**, in **linear space**, using the color **raw**
+  (no `pow`/gamma applied to it). The diffuse `t0` is sampled sRGB->linear; the product is the linear albedo
+  written to the GBuffer albedo target.
+- Vertex color **alpha** `v#.w` is handled separately: it multiplies the material/diffuse alpha and gates the
+  emissive/detail additive (`mul ... , v6.w` / `mad r0.x, diffuseAlpha, v#.w, -alphaRef`). It is **not** folded
+  into RGB.
+- Forward-lit variant (blob `@0x366e7c`): `o0.xyz = litColor.rgb * vertexColor.rgb + additive` — same multiply,
+  just after shading instead of into the GBuffer.
+
+So the op is exactly `finalAlbedo.rgb = diffuse.rgb * vertexColor.rgb` for the standard technique — the plugin's
+straight multiply matches vanilla and is **not** too strong *for standard meshes*.
+
+### Task 3 — is "dirt" a separate mechanism?
+
+No dedicated dirt/detail texture slot in the standard technique. Slots sampled by the default lighting PS:
+`spDiffuse(+0x48)=t0`, `spNormal(+0x50)=t1`, `spSmoothnessSpecMask(+0x60)=t2`; a glow/detail *additive* from
+`t13/t14` gated by `COLOR1.w`; and (palette path only) `spLookupTexture(+0x68)=t5`. There is **no** second dirt
+UV set or dirt layer. FO4 "dirt" is therefore one of:
+- baked into the diffuse texture, or
+- the per-vertex **COLOR RGB** itself (artist-painted AO/dirt), applied as the straight multiply above, or
+- (for palette meshes) part of the grayscale-to-palette ramp.
+
+### Task 3b — the grayscale-to-palette trap (the "gray" cause)
+
+When `SLSF1 GrayscaleToPaletteColor` (**bit 4**) is set, the lighting PS takes a different permutation
+(blob `@0x7b7e68`): the diffuse texture is a **grayscale** image, and the final color comes from a 2D palette
+LUT (`spLookupTexture +0x68` = t5) sampled at `(grayscale diffuse intensity, palette-row)`, where the
+**palette row is selected by `vertexColor.x`** (`pow(vc.x, 1/2.2)` -> V coordinate). Here the vertex color is a
+*selector*, not a tint, and RGB is NOT multiplied.
+
+Prevalence: of 242 lighting-family COLOR-input pixel shaders in the package, **132 do the straight RGB multiply,
+77 use `vertexColor.x` as a grayscale-palette selector, 33 use only alpha/red**. ~1/3 of permutations must not
+receive a naive RGB multiply. FO4 uses grayscale-to-palette heavily for clothing and world clutter, which
+matches the "systemic across NPCs AND world objects" symptom.
+
+If the plugin (a) shows the raw grayscale diffuse as albedo and (b) multiplies the near-neutral
+`vertexColor.rgb` palette-selector into it, the result is `gray * gray = gray` — exactly the reported
+"blue denim comes out mostly gray."
+
+### Task 4 — bottom line for the plugin
+
+Given a `BSTriShape` whose shader flags are readable at `prop = *(shape+0x138); flags = *(u64*)(prop+0x30)`:
+
+- **Test to multiply vertex color into albedo**:
+  `useVC = (flags & (1ull<<37)) != 0  &&  (flags & (1ull<<4)) == 0`   // has-vertex-colors AND not grayscale-palette
+- **Op when useVC**: `albedo.rgb *= vertexColor.rgb`, where `vertexColor` is the raw UNORM color stream
+  ([0,1], no gamma applied). This is a straight per-component **linear** multiply — identical to vanilla, so do
+  **not** soften it for these meshes. Keep vertex color **alpha** for alpha, do not fold it into RGB.
+- **When `flags & (1<<4)` (GrayscaleToPaletteColor)**: do NOT multiply vertex RGB. The true albedo is
+  `spLookupTexture(+0x68)` sampled at `(diffuse grayscale, vertexColor.x)`. Minimum fix = skip the vertex-color
+  multiply for these meshes; full fix = replicate the palette LUT (or bake per-instance palette color) so the
+  base color is not grayscale.
+- Optional (path-tracer hygiene, separate from the gray bug): even on standard meshes the vertex color often
+  encodes baked AO/dirt; a path tracer recomputes occlusion, so a remaster may choose to attenuate the vertex
+  AO to avoid double-darkening. That is an art choice, not a correctness bug — the gray symptom is the
+  grayscale-to-palette case above.
+
+### Suggested live verification
+
+- On a "gray denim" NPC clothing `BSTriShape`: read `flags = *(u64*)(*(shape+0x138)+0x30)` and check
+  `flags & 0x10` (bit 4, GrayscaleToPaletteColor) and `flags & (1<<37)` (bit 37). Expect bit 4 set on the
+  meshes that render gray.
+- For such a mesh, confirm `spDiffuse(+0x48)` is a grayscale texture and `spLookupTexture(+0x68)` is a small
+  palette/LUT texture; the LUT + vertexColor.x is the missing color.
+- On a standard (non-palette) clothing mesh: bit 4 clear, bit 37 set, diffuse is full-color — the plugin's
+  RGB multiply is correct there.

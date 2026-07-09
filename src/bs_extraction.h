@@ -263,6 +263,15 @@ namespace BsExtraction {
     // Get the BSLightingShaderMaterialBase from a shape, or nullptr
     BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape);
 
+    // Sample a grayscale-to-palette lookup texture (spLookupTexture) at
+    // (u,v) in [0,1] -- u the tonal ramp, v the palette row (vertexColor.x).
+    // Returns 0=ready (outRGB = 0xRRGGBB), 1=pending (async readback, retry
+    // next tick like any not-yet-ready texture), 2=failed. Used to recolor
+    // FO4 grayscale-to-palette clothing/clutter, whose per-NPC/instance color
+    // lives in this LUT rather than the diffuse. The decoded LUT is cached.
+    int SampleLookupColor(NiTexture* lut, ID3D11Device* device,
+                          float u, float v, uint32_t& outRGB);
+
     // Generic texture extraction from any NiTexture slot.
     //
     // minRoughness: when non-zero AND postProcess == InvertRGB, clamps the

@@ -1212,8 +1212,21 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // (power-armor stands, chain-link fences, workstations) while their
     // textures loaded fine: the log's WorkstationChemistry propFlags
     // 0x8180400281 has bit 37 CLEAR, yet its painted colors were applied.
+    // Merged bit 37 (flags2 bit 5) means "geometry HAS a vertex-color stream"
+    // -- decompiler-proven for this build (SetFlag(prop,0x25,...) driven by the
+    // vertexDesc color nibble; scripts/dynamic_trishape_desc.md). The vanilla
+    // combine is a straight albedo.rgb *= vertexColor.rgb.
     constexpr uint64_t kFlag_VertexColors = 1ULL << 37;
-    const bool applyVertexColors = (propFlagsEarly & kFlag_VertexColors) != 0;
+    // SLSF1 GrayscaleToPaletteColor (merged bit 4, mask 0x10): the diffuse is
+    // GRAYSCALE and vertexColor.x is a PALETTE-ROW selector into spLookupTexture
+    // -- NOT a tint. Multiplying that near-gray selector into the grayscale
+    // diffuse is what turned blue denim (and clothing/clutter generally) gray
+    // (2026-07-08). For these meshes DON'T multiply the vertex color; the real
+    // color is applied below as a LUT-sampled diffuse tint.
+    constexpr uint64_t kFlag_GrayscaleToPalette = 0x10ULL;
+    const bool isGrayscaleToPalette = (propFlagsEarly & kFlag_GrayscaleToPalette) != 0;
+    const bool applyVertexColors =
+        (propFlagsEarly & kFlag_VertexColors) != 0 && !isGrayscaleToPalette;
 
     // ---- Parse vertex / index data ----
     ResolverTrace::g_lastStep.store(Trace::kParseStart, std::memory_order_relaxed);
@@ -1690,6 +1703,46 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                          pEmis ? pEmis[1] : 0.0f, pEmis ? pEmis[2] : 0.0f, scale,
                          diffuseTint, sane ? "" : " (no color -- untinted)");
             }
+        } else if (isGrayscaleToPalette) {
+            // General grayscale-to-palette (non-hair clothing/clutter): the
+            // diffuse is grayscale and the color is LUT[u=tonal, v=vertexColor.x
+            // palette row]. Approximate as a per-mesh tint: sample the LUT at
+            // the mesh's mean red (palette row) and a near-light tonal value,
+            // then multiply into the grayscale diffuse (direct multiply, same
+            // gamma treatment as hair). Pending LUT readback retries next tick.
+            uint32_t meanRed = 255;
+            if (parsed.vbData && parsed.vertexSize > 0) {
+                const uint64_t d = parsed.vertexDesc;
+                const uint32_t szV = (uint32_t)((d >> 4) & 0xF);
+                const uint32_t shift = parsed.isDynamic ? 0u : szV;
+                const uint32_t oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
+                if (oColor + 4 <= parsed.vertexSize) {
+                    const size_t nV = tri->numVertices;
+                    uint64_t sum = 0;
+                    for (size_t i = 0; i < nV; ++i)
+                        sum += parsed.vbData[i * parsed.vertexSize + oColor];
+                    if (nV) meanRed = (uint32_t)(sum / nV);
+                }
+            }
+            const float v = meanRed / 255.0f;
+            uint32_t pal = 0xFFFFFFu;
+            const int st = BsExtraction::SampleLookupColor(
+                mat->spLookupTexture, device, /*u=*/0.75f, v, pal);
+            if (st == 1) {
+                // LUT not read back yet -- retry like any pending texture.
+                if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending");
+                return false;
+            }
+            if (st == 0) diffuseTint = pal;
+            static std::atomic<int> sGtpLogs{0};
+            if (sGtpLogs.fetch_add(1, std::memory_order_relaxed) < 24) {
+                const NiTexture* l = mat->spLookupTexture;
+                _MESSAGE("FO4RemixPlugin: [Tint] palette shape=\"%s\" mat=%s "
+                         "row=%.3f lut=\"%s\" st=%d -> %06X",
+                         tri->m_name.c_str() ? tri->m_name.c_str() : "", matLeaf,
+                         v, (l && l->name.c_str()) ? l->name.c_str() : "",
+                         st, diffuseTint);
+            }
         }
     }
 
@@ -1774,6 +1827,68 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     }
 
     ResolverTrace::g_lastStep.store(Trace::kTexturesExtracted, std::memory_order_relaxed);
+
+    // ---- [DetailDiag] over-dirty clothing/buildings (2026-07-08) ----
+    // NPC outfits and world objects render far grayer/dirtier than vanilla
+    // (systemic across NPCs + statics). Leading suspect: the per-vertex COLOR
+    // stream is being multiplied into the albedo when vanilla would not (or
+    // would apply it gentler) -- and the enum drift that just broke the Hair
+    // flag makes our SLSF2_Vertex_Colors bit (37) suspect. Log, once per hash
+    // for shapes that CARRY a color stream: propFlags, whether we applied the
+    // colors, the raw vertex-color mean/min (dark colors = the "dirt"), the
+    // material class/type, and the diffuse path -- so the applied-vs-authored
+    // and flag-vs-darkness correlation can be read off one run.
+    {
+        const uint64_t d = parsed.vertexDesc;
+        const bool hasColorStream = (d & (1ULL << 49)) != 0;
+        if (hasColorStream && parsed.vbData && parsed.vertexSize > 0) {
+            const uint32_t szV = (uint32_t)((d >> 4) & 0xF);
+            const uint32_t shift = parsed.isDynamic ? 0u : szV;
+            const uint32_t oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
+            if (oColor + 4 <= parsed.vertexSize) {
+                static std::mutex s_dmx;
+                static std::unordered_set<uint64_t> s_dseen;
+                bool first = false;
+                {
+                    std::lock_guard<std::mutex> lk(s_dmx);
+                    static int s_dlogs = 0;
+                    if (s_dlogs < 48 && s_dseen.insert(hash).second) {
+                        ++s_dlogs; first = true;
+                    }
+                }
+                if (first) {
+                    // parsed.vertices was std::move'd into mesh.vertices
+                    // above -- use the shape's own count and read raw colors
+                    // straight from the (still-valid) engine VB pointer.
+                    const size_t nV = tri->numVertices;
+                    uint32_t sr = 0, sg = 0, sb = 0, sa = 0;
+                    uint8_t mnr = 255, mng = 255, mnb = 255;
+                    for (size_t i = 0; i < nV; ++i) {
+                        const uint8_t* c = parsed.vbData + i * parsed.vertexSize + oColor;
+                        sr += c[0]; sg += c[1]; sb += c[2]; sa += c[3];
+                        if (c[0] < mnr) mnr = c[0];
+                        if (c[1] < mng) mng = c[1];
+                        if (c[2] < mnb) mnb = c[2];
+                    }
+                    const size_t n = nV ? nV : 1;
+                    char matLeaf[64] = "?";
+                    SemanticCapture::GetLeafClassName(mat, matLeaf, sizeof(matLeaf));
+                    const char* dn = (mat->spDiffuseTexture && mat->spDiffuseTexture->name.c_str())
+                        ? mat->spDiffuseTexture->name.c_str() : "";
+                    _MESSAGE("FO4RemixPlugin: [DetailDiag] \"%s\" mat=%s type=%u "
+                             "propFlags=%016llX applyVtxCol=%d nV=%zu "
+                             "vcMean=(%u,%u,%u,a%u) vcMin=(%u,%u,%u) diffuse=\"%s\"",
+                             tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                             matLeaf, (unsigned)mat->GetType(),
+                             (unsigned long long)propFlagsEarly,
+                             applyVertexColors ? 1 : 0, nV,
+                             (unsigned)(sr / n), (unsigned)(sg / n),
+                             (unsigned)(sb / n), (unsigned)(sa / n),
+                             mnr, mng, mnb, dn);
+                }
+            }
+        }
+    }
 
     // ---- Merge-instanced transform read (2026-07-03) ----
     // BSMergeInstancedTriShape carries per-instance placements in a
