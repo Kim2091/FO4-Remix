@@ -116,6 +116,17 @@ target_compile_definitions(FO4RemixPlugin PRIVATE
 # Force-include compatibility header
 target_compile_options(FO4RemixPlugin PRIVATE /FI"f4se_compat.h")
 
+# Debug info in Release: PDB alongside the DLL (no runtime cost; /OPT:REF/ICF
+# keep the binary identical to a no-/Zi build). WER LocalDumps full dumps land
+# in %LOCALAPPDATA%\CrashDumps -- with the matching PDB a crash offset maps
+# straight to a source line (the 2026-07-09 fail-fast hunt had none).
+target_compile_options(FO4RemixPlugin PRIVATE "$<$<CONFIG:Release>:/Zi>")
+target_link_options(FO4RemixPlugin PRIVATE
+    "$<$<CONFIG:Release>:/DEBUG>"
+    "$<$<CONFIG:Release>:/OPT:REF>"
+    "$<$<CONFIG:Release>:/OPT:ICF>"
+)
+
 # Output name without lib prefix
 set_target_properties(FO4RemixPlugin PROPERTIES
     PREFIX ""

@@ -835,6 +835,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // sufficient, reintroduce a much higher cap (~64) here.
 
         std::lock_guard<std::mutex> lock(g_drawableMutex);
+        int upgradesThisTick = 0;  // texture re-capture storm cap (see below)
         for (auto& [key, state] : g_drawableMap) {
             if (state.submittedToRemix) {
                 bool doReresolve = false;
@@ -899,9 +900,16 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 // downgrades), so walking away can't blur a sharp capture; once
                 // at the streamed max, live == submitted and it stops firing.
                 // submittedDiffuseWidth is 0 for non-lighting drawables (water),
-                // so this branch never touches them.
+                // so this branch never touches them. Capped at 3 upgrades per
+                // Tick: arriving at a texture-dense cell (Boston Airport)
+                // makes hundreds of drawables upgrade-eligible in the same
+                // few seconds, and each re-resolve allocates full-res RGBA
+                // mip chains -- the uncapped storm was the 2026-07-08/09
+                // fail-fast crashes. Skipped drawables re-qualify on their
+                // next 128-frame slot, so the backlog drains within seconds.
                 else if (g_config.textureUpgradeOnApproach &&
                          state.submittedDiffuseWidth != 0 &&
+                         upgradesThisTick < 3 &&
                          ((currentFrame ^ key) & 127) == 0) {
                     const uint32_t liveW =
                         BsExtraction::GetMaterialDiffuseResidentWidth(state.material);
@@ -924,6 +932,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                         state.resolveAttempts = 0;
                         state.nextRetryFrame = 0;
                         state.lastSeenFrame = currentFrame;
+                        ++upgradesThisTick;
                         static std::atomic<int> sTexUpLogs{0};
                         const int tn = sTexUpLogs.fetch_add(1, std::memory_order_relaxed);
                         if (tn < 60) {

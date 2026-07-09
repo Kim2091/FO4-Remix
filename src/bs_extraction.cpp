@@ -96,6 +96,18 @@ static float UnpackByte(uint8_t b) {
 // Texture cache — keyed by hash derived from ID3D11Resource pointer
 // ---------------------------------------------------------------------------
 static std::unordered_map<uint64_t, ExtractedTexture> g_textureCache;
+// Resolution-variant index (TextureUpgradeOnApproach): pre-resolution-fold
+// hash -> (full cache key, mip0 width) of the LARGEST variant extracted so
+// far. When a strictly larger variant lands, the superseded entry's pixels
+// are evicted from g_textureCache -- without this, an upgrade wave (arriving
+// at a texture-dense cell) accumulates every (texture x resolution) variant's
+// decompressed RGBA mip chain (~22MB per 2048^2) until allocation fails
+// (2026-07-08/09 Boston-Airport fail-fast crashes). Smaller late variants
+// (another drawable first-resolving while less is streamed in) are left
+// alone; their own upgrade supersedes them soon after. Remix-side handles
+// need nothing here: they are refcounted per drawable and destroyed on
+// ReleaseDrawable.
+static std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> g_texResVariantIndex;
 
 // ---------------------------------------------------------------------------
 // Compute mip-0 byte size for a given DXGI_FORMAT, width, height.
@@ -1224,6 +1236,7 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // before); nothing streams them progressively. Opt-in ([Materials]
     // TextureUpgradeOnApproach): default OFF keeps the name-only key (and thus
     // byte-identical caching + no upgrade churn).
+    const uint64_t preResolutionHash = hash;  // for superseded-variant eviction
     if (g_config.textureUpgradeOnApproach) {
         ID3D11Texture2D* t2d = nullptr;
         if (SUCCEEDED(resource->QueryInterface(
@@ -1549,6 +1562,22 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                  (unsigned)extracted.dxgiFormat, hash,
                  postProcess == TexturePostProcess::InvertRGB ? " (inverted)" :
                  postProcess == TexturePostProcess::Octahedral ? " (octahedral)" : "");
+    }
+
+    // Evict the superseded smaller resolution variant (see
+    // g_texResVariantIndex): keeps the CPU pixel cache at ~one variant per
+    // texture instead of accumulating every mip level the streamer ever had
+    // resident. Only when the resolution fold is active (hash differs from
+    // the pre-fold hash); only supersede strictly-smaller variants.
+    if (hash != preResolutionHash) {
+        auto [vit, inserted] = g_texResVariantIndex.try_emplace(
+            preResolutionHash, hash, extracted.width);
+        if (!inserted && vit->second.first != hash) {
+            if (extracted.width > vit->second.second) {
+                g_textureCache.erase(vit->second.first);
+                vit->second = { hash, extracted.width };
+            }
+        }
     }
 
     g_textureCache[hash] = extracted;
@@ -2217,6 +2246,7 @@ void BsExtraction::ClearTextureCache()
 {
     _MESSAGE("FO4RemixPlugin: ClearTextureCache - clearing %zu entries", g_textureCache.size());
     g_textureCache.clear();
+    g_texResVariantIndex.clear();
 }
 
 bool BsExtraction::GetCachedTextureStats(uint64_t hash, uint32_t* outW, uint32_t* outH,
