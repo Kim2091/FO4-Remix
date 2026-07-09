@@ -213,6 +213,30 @@ Concrete guidance:
 
 ## Runtime dynamicVertices semantics (2026-07-08)
 
+> **CORRECTION (2026-07-09, live memwatch proof): the "written exactly once /
+> nobody writes at runtime" conclusion below is WRONG.** During dialogue and
+> ambient expressions (blinks) the engine writes fresh CPU-deformed
+> model-space positions into a facegen head's `+0x180` buffer **every frame**.
+> Live frida session (1.11.191 exe): sampling every BSDynamicTriShape on the
+> heap at ~6.5 Hz for 45 s while an NPC talked showed exactly the talking
+> NPC's face parts changing on ~every sample — head (nV=1689, ~1378 verts
+> changed per sample), mouth (nV=401), eye parts (nV=98/104) — plus a distant
+> NPC blinking (15/294 samples); every other facegen buffer stayed
+> byte-identical. `MemoryAccessMonitor` resolved the writing instruction to
+> **VCRUNTIME140.dll memcpy** — a bulk copy, so the LockDynamicData-xref
+> enumeration below missed it (inlined lock and/or a cached `+0x180` pointer
+> at the call site; the engine-side caller was not pinned). Everything else
+> below (coordinate space = bind-pose model space, GPU-skinned by the
+> source 10-bone skin instance, gore-part sentinels, skin instance kept)
+> stands. Plugin consequence: a one-time position snapshot freezes faces;
+> the fix is the FaceMorphRefresh path (fingerprint the live buffer, re-upload
+> positions on change). Also note: the rendered per-NPC FaceGeom NIF is
+> skinned to only 10 coarse bones (HEAD/Neck/Chest/collarbones — ba2-verified,
+> zero `skin_bone_*`), and the mouth to 1 bone, so fine facial motion CANNOT
+> ride the render mesh's own skinning; the dense ~60-bone `skin_bone_*` rig
+> lives in the `*_faceBones.nif` variants, which the engine uses as the
+> deformation SOURCE for the per-frame CPU write, not as rendered geometry.
+
 Follow-up static analysis (Ghidra project `patches/Fallout4`) answering: who writes `+0x180`
 at runtime for facegen heads, what happens for gore parts, and the coordinate space.
 
@@ -233,7 +257,7 @@ at runtime for facegen heads, what happens for gore parts, and the coordinate sp
 | `0x1418a9610` | half-precision dynamic READ-back: dyn buffer float16 -> CPU float arrays (inverse of above). |
 | `0x1418303b0` | alternate BSDynamicTriShape creator (0x1b0 alloc, one-time fill via LockDynamicData). |
 
-### 1. Who writes dynamicVertices at runtime for facegen heads — NOBODY (baked once)
+### 1. Who writes dynamicVertices at runtime for facegen heads — NOBODY (baked once) **[WRONG — disproven live 2026-07-09, see CORRECTION above]**
 
 The float3 positions are written **exactly once, at conversion time**, inside
 `CreateDynamicTriShape` (`0x141831770`):

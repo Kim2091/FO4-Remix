@@ -1458,6 +1458,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // Skinned-key side index (Tick's live app-culled refresh + OnFrame's
         // hidden-geometry skip -- hair-under-hats, 2026-07-08).
         state.isSkinnedActor = true;
+        // FaceGen morph watch (2026-07-09): skinned dynamic shapes are the
+        // facegen class whose dynamicVertices the engine rewrites per frame
+        // during dialogue/expressions (live-proven; see semantic_capture.h).
+        // Tick fingerprints the live buffer and queues position refreshes.
+        state.faceMorphWatch  = tri->GetAsBSDynamicTriShape() != nullptr;
+        mesh.isFaceGenDynamic = state.faceMorphWatch;
         // [FaceAnim] expressions probe: track the first facegen head's bone
         // motion (heads carry ~10 bones; eyes/mouths only 1).
         if (headDiag && tri->GetAsBSDynamicTriShape() && boneCount >= 8) {
