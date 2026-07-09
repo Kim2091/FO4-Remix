@@ -521,3 +521,56 @@ Given a `BSTriShape` whose shader flags are readable at `prop = *(shape+0x138); 
   palette/LUT texture; the LUT + vertexColor.x is the missing color.
 - On a standard (non-palette) clothing mesh: bit 4 clear, bit 37 set, diffuse is full-color — the plugin's
   RGB multiply is correct there.
+
+---
+
+## Grayscale-to-palette: EXACT engine math (2026-07-09 re-disassembly — supersedes Task 3b above)
+
+Task 3b's "palette row = pow(vc.x, 1/2.2)" was incomplete and its direction misleading in isolation.
+Full re-disassembly of the palette lighting PS (blob `@0x7b7e68` in `ShadersFX\Shaders011.fxp`,
+`d3dcompiler_47!D3DDisassemble`), palette branch verbatim:
+
+```
+mov r3.x, v4.w / mov r3.y, v5.w          ; uv
+sample r3.zw, r3.xy, t0.xzyw, s0         ; diffuse: r3.z = t0.GREEN, r3.w = t0.alpha
+log r0.w, v6.x ; mul 0.454545 ; exp      ; r0.w = pow(vertexColor.x, 1/2.2)
+log r1.w, r3.z ; mul 0.454545 ; exp r4.x ; r4.x = pow(diffuse.g, 1/2.2)   <- U
+add r0.w, -r0.w, 1.0                     ; 1 - pow(vc.x, 1/2.2)
+add r4.y, -r0.w, cb2[3].x                ; V = cb2[3].x - 1 + pow(vc.x, 1/2.2)
+sample_l r4.xyzw, r4.xy, t5, s5, lod=0   ; LUT fetch, always mip 0
+...
+mul o0.xyz, r0.xxxx, r4.xyzx             ; albedo = LUT.rgb (times LOD-fade) — REPLACES the gray
+mul r3.x, r4.w, r3.x                     ; LUT.alpha scales the specmask (t2), not the alpha
+mul r4.w, r3.w, v6.w                     ; alpha = diffuse.a * vertexColor.a (alpha test input)
+```
+
+Key corrections / additions:
+
+1. **`V = GrayscaleToPaletteScale - 1 + pow(vc.x, 1/2.2)`.** `cb2[3].x` is the BGSM
+   `fGrayscaleToPaletteScale` = runtime `BSLightingShaderMaterialBase::fLookupScale` (**material+0xB8**,
+   F4SE NiMaterials.h). This term is LOAD-BEARING: a ba2 survey of all 354 palette BGSMs shows color
+   variants of one LUT differ ONLY by scale (WoodSidingBlue02=0.65, Pink=0.60, Purple=0.55, GreenLt=0.45,
+   Tan=0.35, White=1.0, all on PaintedWoodGrad01; T-60 PA=1.0; T45body01=0.0 — 0 is authored, allow it).
+   Since vertex color is typically white (`pow(1)=1`), **V ≈ scale** for most world meshes; darker vc.x
+   shifts the row DOWN from the material's scale.
+2. **The VS passes COLOR0 through raw** — scanned all 851 VS in the package: plain `mov`, or a
+   compiled-out `pow(c,1)` `log`/`exp` pair (identity). So `v6.x` = the raw UNORM byte from the stream.
+3. **U = pow(diffuseSample.g, 1/2.2)** — t0 is sampled through its sRGB SRV (runtime diffuses are
+   BC1/BC3_UNORM_SRGB even though the ba2 stores UNORM — the loader promotes), then re-gamma'd, so
+   U ≈ the stored gray byte. Uses the GREEN channel (BC1's high-precision channel).
+4. **The LUT fetch REPLACES albedo rgb** (no vertex-color multiply, no diffuse multiply);
+   `LUT.a` scales the specmask; final alpha = `diffuse.a * vertexColor.a`.
+5. Palette LUT gradient textures ship as `B8G8R8A8_UNORM`/`BC1_UNORM` in the ba2 — check the RUNTIME
+   resource format for the SRV gamma, do not assume sRGB.
+
+Empirical validation (ba2-extracted LUTs vs the plugin log's runtime samples): the old raw-`vc.x` row
+sampled `Rust01LGrad` at 0.043 → cyan `#94F2FC` (the "wrong-color cars"); PaintedWoodGrad at
+0.447-0.478 → sage `#BAC0A9` on white picket fences (= the GreenLt row, i.e. exactly one wrong-scale
+row off). With `V = scale` (white vc): GreenLt(0.45) → sage, White(1.0) → off-white `#A8A6A1` — the
+authored names line up with the rows, confirming the formula end-to-end.
+
+Plugin implementation (2026-07-09): per-mesh row = MODE of the red byte (NOT the mean — a mostly-white
+mesh with dark weathered verts has mean≈0.45 but mode=255; and the mean of two distinct rows lands
+between rows, producing colors that exist in no row — the bright-purple painted-PA torso). Per-pixel
+diffuse remap through the LUT row in ExtractMaterialTexture (PaletteRemap_Apply) replaces the old flat
+u=0.75 tint, which could not reproduce the ramp's rust->paint hue shift along U.

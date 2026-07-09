@@ -71,6 +71,18 @@ namespace SemanticCapture {
         // secondary record; ReleaseDrawable does not consult it.
         std::unordered_set<uint64_t> textureHashes;
 
+        // ---- Texture re-capture-on-approach (2026-07-08) ----
+        // Resident WIDTH (px) of this drawable's diffuse texture at the moment
+        // it submitted. FO4 streams textures progressively, so a drawable first
+        // resolved at distance captures a reduced mip and (because the texture
+        // cache is name-keyed) would lock that blurry version for the session.
+        // The Tick polls the LIVE diffuse resolution ~every 128 frames for
+        // submitted lighting drawables; when the engine has streamed a strictly
+        // larger mip in (player approached), it releases + re-resolves so the
+        // resolution-folded texture hash yields a fresh full-res texture. 0 for
+        // non-lighting drawables (never set) -> poll skips them.
+        uint16_t submittedDiffuseWidth = 0;
+
         // Last resolver gate that returned false. Snapshotted from
         // Resolvers::Trace::LastStep() after each resolver call when
         // submittedToRemix is still false. 0 (kIdle) means "never been resolved"

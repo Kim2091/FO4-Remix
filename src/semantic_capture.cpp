@@ -1,4 +1,5 @@
 #include "semantic_capture.h"
+#include "bs_extraction.h"     // GetMaterialDiffuseResidentWidth (tex re-capture poll)
 #include "config.h"
 #include "draw_capture.h"
 #include "fo4_diagnostics.h"
@@ -836,7 +837,9 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         for (auto& [key, state] : g_drawableMap) {
             if (state.submittedToRemix) {
-                // Capture upgrade poll (2026-07-04): this merge shape
+                bool doReresolve = false;
+
+                // Merge capture upgrade poll (2026-07-04): this merge shape
                 // submitted with a fallback partition because the engine
                 // wasn't drawing its cluster while the watch was armed.
                 // Keep a background watch alive (~1 Hz per drawable) and,
@@ -881,10 +884,60 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                                  "landed -> re-resolving with engine draws",
                                  un, (unsigned long long)key);
                     }
-                    // fall through: resolve this tick with the fresh capture
-                } else {
-                    continue;
+                    doReresolve = true;
                 }
+                // Texture re-capture-on-approach poll (2026-07-08): the plugin
+                // captured this lighting drawable's textures at whatever mip FO4
+                // had streamed when it first resolved (often reduced at distance;
+                // the name-keyed texture cache then locked that blurry version
+                // for the session -> "blobby", washed-out detail, flat NPC skin).
+                // Poll the LIVE diffuse resolution ~every 128 frames (staggered
+                // by key). When the engine has since streamed a STRICTLY larger
+                // mip in (player approached), release + re-resolve: the
+                // resolution-folded texture hash yields a fresh full-res texture
+                // + material via the normal resolve path. Only upgrades (never
+                // downgrades), so walking away can't blur a sharp capture; once
+                // at the streamed max, live == submitted and it stops firing.
+                // submittedDiffuseWidth is 0 for non-lighting drawables (water),
+                // so this branch never touches them.
+                else if (g_config.textureUpgradeOnApproach &&
+                         state.submittedDiffuseWidth != 0 &&
+                         ((currentFrame ^ key) & 127) == 0) {
+                    const uint32_t liveW =
+                        BsExtraction::GetMaterialDiffuseResidentWidth(state.material);
+                    if (liveW > (uint32_t)state.submittedDiffuseWidth) {
+                        unsigned long excCode = 0;
+                        if (CallReleaseDrawableGuarded(state.meshHash, &excCode) != 0) {
+                            _MESSAGE("FO4RemixPlugin: [TexUpgrade] CRASH CAUGHT in "
+                                     "ReleaseDrawable hash=0x%llX exception=0x%08lX",
+                                     (unsigned long long)state.meshHash, excCode);
+                        }
+                        for (uint64_t xh : state.extraMeshHashes) {
+                            if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                                _MESSAGE("FO4RemixPlugin: [TexUpgrade] CRASH CAUGHT in "
+                                         "ReleaseDrawable extra=0x%llX exception=0x%08lX",
+                                         (unsigned long long)xh, excCode);
+                            }
+                        }
+                        state.extraMeshHashes.clear();
+                        state.submittedToRemix = false;
+                        state.resolveAttempts = 0;
+                        state.nextRetryFrame = 0;
+                        state.lastSeenFrame = currentFrame;
+                        static std::atomic<int> sTexUpLogs{0};
+                        const int tn = sTexUpLogs.fetch_add(1, std::memory_order_relaxed);
+                        if (tn < 60) {
+                            _MESSAGE("FO4RemixPlugin: [TexUpgrade] #%d hash=0x%llX diffuse "
+                                     "%upx -> %upx streamed in, re-resolving",
+                                     tn, (unsigned long long)key,
+                                     (unsigned)state.submittedDiffuseWidth, liveW);
+                        }
+                        doReresolve = true;
+                    }
+                }
+
+                if (!doReresolve) continue;
+                // fall through: resolve this tick with the upgraded input
             }
             // Freshness gate (widened 2026-07-02, was age > 1). The engine
             // fires GetRenderPasses roughly once per cell ATTACH -- passes

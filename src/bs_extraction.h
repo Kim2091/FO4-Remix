@@ -263,12 +263,25 @@ namespace BsExtraction {
     // Get the BSLightingShaderMaterialBase from a shape, or nullptr
     BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape);
 
+    // Current resident WIDTH (px) of a lighting material's diffuse D3D
+    // texture, SEH-guarded (0 on null/fault/non-Texture2D). FO4 streams
+    // textures in progressively, so the resource behind a material is whatever
+    // mip level is currently resident -- often reduced when the object first
+    // appears at distance. The Tick's re-capture-on-approach poll compares this
+    // live width against the resolution captured at submit
+    // (DrawableState::submittedDiffuseWidth) and re-resolves the drawable when
+    // the engine has since streamed a sharper mip in, so the full-resolution
+    // texture reaches Remix instead of the locked-in blurry first capture.
+    uint32_t GetMaterialDiffuseResidentWidth(void* material);
+
     // Sample a grayscale-to-palette lookup texture (spLookupTexture) at
-    // (u,v) in [0,1] -- u the tonal ramp, v the palette row (vertexColor.x).
-    // Returns 0=ready (outRGB = 0xRRGGBB), 1=pending (async readback, retry
-    // next tick like any not-yet-ready texture), 2=failed. Used to recolor
-    // FO4 grayscale-to-palette clothing/clutter, whose per-NPC/instance color
-    // lives in this LUT rather than the diffuse. The decoded LUT is cached.
+    // (u,v) in [0,1] -- u the tonal ramp, v the FINAL engine palette row
+    // (caller computes GrayscaleToPaletteScale - 1 + pow(vertexColor.x,
+    // 1/2.2); see the palette branch in lighting_static.cpp). Returns
+    // 0=ready (outRGB = 0xRRGGBB), 1=pending (async readback, retry next
+    // tick like any not-yet-ready texture), 2=failed. The decoded LUT is
+    // cached and shared with ExtractMaterialTexture's palette remap; a
+    // ready (0) return guarantees the remap can find the decoded LUT.
     int SampleLookupColor(NiTexture* lut, ID3D11Device* device,
                           float u, float v, uint32_t& outRGB);
 
@@ -303,13 +316,27 @@ namespace BsExtraction {
     // resolver); folded into the texture cache hash so differently-tinted
     // users of one source texture get distinct variants. BC inputs are
     // decompressed to RGBA8 first; BC7/other pass through unchanged.
+    // paletteLut/paletteRowV (2026-07-09 grayscale-to-palette remap): when
+    // paletteLut is non-null and SampleLookupColor has already decoded it,
+    // the diffuse RGB is REPLACED per-pixel with the engine's palette fetch
+    //   rgb = LUT(u = pow(diffuseLinear.g, 1/2.2), v = paletteRowV)
+    // exactly like the decompiled palette lighting PS (a flat tint cannot
+    // reproduce the ramp's dark->bright hue shift, e.g. rust->paint on
+    // vehicles). Alpha untouched; composes at the tint slot (after the
+    // alpha stage, before the luminance floor); tintRGB then acts only as
+    // the fallback for undecodable (BC7) diffuses. paletteRowV is the FINAL
+    // engine V (caller applies scale/pow). LUT name + quantized row are
+    // folded into the cache hash so meshes sharing one grayscale source but
+    // different palette rows get distinct variants.
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,
                                     std::vector<ExtractedTexture>& newTextures,
                                     TexturePostProcess postProcess = TexturePostProcess::None,
                                     uint8_t minRoughness = 0,
                                     uint8_t albedoLumFloor = 0,
-                                    uint32_t tintRGB = 0xFFFFFFu);
+                                    uint32_t tintRGB = 0xFFFFFFu,
+                                    NiTexture* paletteLut = nullptr,
+                                    float paletteRowV = 0.0f);
 
     // Extract emissive data from a shape's shader property and material
     void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,

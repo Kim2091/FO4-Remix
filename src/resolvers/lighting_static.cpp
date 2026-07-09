@@ -1631,6 +1631,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // Classes/hair identified by RTTI leaf + the Hair flag, NOT GetType()
     // (live logs showed hair as type 2 where the F4SE enum says HairTint=6).
     uint32_t diffuseTint = 0xFFFFFFu;
+    NiTexture* paletteLut = nullptr;  // grayscale-to-palette per-pixel remap
+    float paletteRowV = 0.0f;         // final engine LUT row (scale+pow applied)
     {
         char matLeaf[64] = "";
         SemanticCapture::GetLeafClassName(mat, matLeaf, sizeof(matLeaf));
@@ -1704,27 +1706,62 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                          diffuseTint, sane ? "" : " (no color -- untinted)");
             }
         } else if (isGrayscaleToPalette) {
-            // General grayscale-to-palette (non-hair clothing/clutter): the
-            // diffuse is grayscale and the color is LUT[u=tonal, v=vertexColor.x
-            // palette row]. Approximate as a per-mesh tint: sample the LUT at
-            // the mesh's mean red (palette row) and a near-light tonal value,
-            // then multiply into the grayscale diffuse (direct multiply, same
-            // gamma treatment as hair). Pending LUT readback retries next tick.
-            uint32_t meanRed = 255;
-            if (parsed.vbData && parsed.vertexSize > 0) {
+            // General grayscale-to-palette (clothing, clutter, painted wood,
+            // vehicles, painted power armor): the diffuse is grayscale and
+            // the engine REPLACES the albedo with a palette-LUT fetch.
+            // Decompiled palette PS (blob @0x7b7e68 in Shaders011.fxp,
+            // re-disassembled 2026-07-09):
+            //   albedo.rgb = LUT(u = pow(diffuse.g, 1/2.2),
+            //                    v = GrayscaleToPaletteScale - 1
+            //                        + pow(vertexColor.x, 1/2.2))
+            // The lighting VS passes COLOR0 through raw (851-VS scan of the
+            // package: plain mov, or a compiled-out pow(c,1) log/exp pair),
+            // so vc.x is the raw UNORM byte. The old approximation ignored
+            // the pow AND the per-material scale AND used the row MEAN --
+            // wrong palette row for anything whose scale isn't the row's
+            // fixed point (cyan cars, sage "white" picket fences, red T-60
+            // hot-rod paint), and the mean of two regions' rows lands
+            // BETWEEN palette rows producing colors that exist in no row
+            // (bright-purple painted-PA torso).
+            //   row: per-mesh MODE of the red byte = dominant palette row
+            //     (per-vertex rows can't vary inside one Remix texture).
+            //   pixels: ExtractMaterialTexture remaps the diffuse through
+            //     the LUT row per-pixel (paletteLut/paletteRowV below) -- a
+            //     flat tint can't reproduce the ramp's rust->paint hue
+            //     shift. The u=0.75 sample here is only the fallback tint
+            //     for undecodable (BC7) diffuses.
+            uint32_t rowByte = 255, rowMin = 255, rowMax = 0;
+            const bool hasColorStream = (parsed.vertexDesc & (1ULL << 49)) != 0;
+            if (hasColorStream && parsed.vbData && parsed.vertexSize > 0) {
                 const uint64_t d = parsed.vertexDesc;
                 const uint32_t szV = (uint32_t)((d >> 4) & 0xF);
                 const uint32_t shift = parsed.isDynamic ? 0u : szV;
                 const uint32_t oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
                 if (oColor + 4 <= parsed.vertexSize) {
+                    uint32_t histo[256] = {};
                     const size_t nV = tri->numVertices;
-                    uint64_t sum = 0;
-                    for (size_t i = 0; i < nV; ++i)
-                        sum += parsed.vbData[i * parsed.vertexSize + oColor];
-                    if (nV) meanRed = (uint32_t)(sum / nV);
+                    for (size_t i = 0; i < nV; ++i) {
+                        const uint8_t r = parsed.vbData[i * parsed.vertexSize + oColor];
+                        ++histo[r];
+                        if (r < rowMin) rowMin = r;
+                        if (r > rowMax) rowMax = r;
+                    }
+                    uint32_t best = 0;
+                    for (uint32_t b = 0; b < 256; ++b)
+                        if (histo[b] > best) { best = histo[b]; rowByte = (uint8_t)b; }
                 }
             }
-            const float v = meanRed / 255.0f;
+            // GrayscaleToPaletteScale = fLookupScale (material+0xB8, F4SE
+            // NiMaterials.h). The BGSM survey proves it's the load-bearing
+            // row selector: every color variant of a shared LUT differs
+            // ONLY by this scale (WoodSidingBlue02=0.65, Pink=0.60,
+            // GreenLt=0.45 -> the sage row our fences wrongly got, Tan=0.35,
+            // White=1.0). 0.0 is authored (T45body01) -- allow it; NaN or
+            // out-of-range reads (layout drift) fall back to 1.
+            float scale = mat->fLookupScale;
+            if (!(scale >= 0.0f && scale <= 2.0f)) scale = 1.0f;
+            float v = scale - 1.0f + std::pow(rowByte / 255.0f, 1.0f / 2.2f);
+            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
             uint32_t pal = 0xFFFFFFu;
             const int st = BsExtraction::SampleLookupColor(
                 mat->spLookupTexture, device, /*u=*/0.75f, v, pal);
@@ -1733,14 +1770,20 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending");
                 return false;
             }
-            if (st == 0) diffuseTint = pal;
+            if (st == 0) {
+                diffuseTint = pal;                   // fallback (BC7 diffuse)
+                paletteLut  = mat->spLookupTexture;  // per-pixel engine remap
+                paletteRowV = v;
+            }
             static std::atomic<int> sGtpLogs{0};
             if (sGtpLogs.fetch_add(1, std::memory_order_relaxed) < 24) {
                 const NiTexture* l = mat->spLookupTexture;
                 _MESSAGE("FO4RemixPlugin: [Tint] palette shape=\"%s\" mat=%s "
-                         "row=%.3f lut=\"%s\" st=%d -> %06X",
+                         "rowByte=%u (spread %u..%u) scale=%.3f v=%.3f "
+                         "lut=\"%s\" st=%d fallback=%06X",
                          tri->m_name.c_str() ? tri->m_name.c_str() : "", matLeaf,
-                         v, (l && l->name.c_str()) ? l->name.c_str() : "",
+                         rowByte, rowMin, rowMax, scale, v,
+                         (l && l->name.c_str()) ? l->name.c_str() : "",
                          st, diffuseTint);
             }
         }
@@ -1779,7 +1822,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             : TexturePostProcess::None;
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
-        /*minRoughness=*/0, albedoLumFloor, diffuseTint);
+        /*minRoughness=*/0, albedoLumFloor, diffuseTint, paletteLut, paletteRowV);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
     // Smoothness/spec-mask (_s.dds) -> per-pixel roughness, RESTORED
@@ -1827,6 +1870,19 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     }
 
     ResolverTrace::g_lastStep.store(Trace::kTexturesExtracted, std::memory_order_relaxed);
+
+    // Record the resident diffuse resolution this submit captured at, so the
+    // Tick's re-capture-on-approach poll can detect when the engine later
+    // streams a sharper mip in and re-resolve for the full-res texture (see
+    // DrawableState::submittedDiffuseWidth and GetMaterialDiffuseResidentWidth).
+    // Must match what ExtractMaterialTexture folded into the diffuse hash --
+    // both read the live diffuse resource width, so a later strictly-larger
+    // live width is a genuine streamed upgrade. Opt-in; left 0 when off so the
+    // Tick poll skips this drawable (and the per-submit GetDesc is avoided).
+    if (g_config.textureUpgradeOnApproach) {
+        state.submittedDiffuseWidth = (uint16_t)(std::min)(
+            BsExtraction::GetMaterialDiffuseResidentWidth(mat), 0xFFFFu);
+    }
 
     // ---- [DetailDiag] over-dirty clothing/buildings (2026-07-08) ----
     // NPC outfits and world objects render far grayer/dirtier than vanilla

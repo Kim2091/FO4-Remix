@@ -914,8 +914,136 @@ static void ConvertNormalToOctahedral(ExtractedTexture& tex)
 // it into the grayscale diffuse (same mechanism as the hair fix). The decoded
 // LUT mip0 is cached by texture name so repeated samples are free.
 namespace {
-struct DecodedLut { uint32_t w = 0, h = 0; bool bgra = false; std::vector<uint8_t> rgba; };
+struct DecodedLut {
+    uint32_t w = 0, h = 0;
+    bool bgra = false;
+    bool srgb = false;   // runtime resource format was *_SRGB (captured
+                         // BEFORE decompression -- DecompressBC drops the tag)
+    std::vector<uint8_t> rgba;
+};
 std::unordered_map<uint64_t, DecodedLut> g_lutCache;
+
+// Runtime-format gamma test. The engine promotes color textures to sRGB
+// formats at load (runtime diffuses log as BC1/BC3_UNORM_SRGB even though the
+// ba2 stores plain UNORM), so the RESOURCE format is what its SRV decodes by.
+bool IsSrgbColorFormat(DXGI_FORMAT f)
+{
+    switch (f) {
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        case DXGI_FORMAT_BC1_UNORM_SRGB:
+        case DXGI_FORMAT_BC2_UNORM_SRGB:
+        case DXGI_FORMAT_BC3_UNORM_SRGB:
+        case DXGI_FORMAT_BC7_UNORM_SRGB:
+            return true;
+        default:
+            return false;
+    }
+}
+
+inline float SrgbToLinear(float c)
+{
+    return c <= 0.04045f ? c * (1.0f / 12.92f)
+                         : std::pow((c + 0.055f) * (1.0f / 1.055f), 2.4f);
+}
+
+inline float LinearToSrgb(float c)
+{
+    c = c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+    return c <= 0.0031308f ? c * 12.92f
+                           : 1.055f * std::pow(c, 1.0f / 2.4f) - 0.055f;
+}
+
+// Hardware-style bilinear fetch from a decoded LUT: texel centers at
+// (i+0.5)/N, clamp addressing, per-texel sRGB decode BEFORE filtering (D3D11
+// filters sRGB textures in linear space). Matches the palette PS's
+// sample_l(t5) with a linear-clamp sampler.
+void LutSampleLinear(const DecodedLut& dl, float u, float v, float out[3])
+{
+    auto fetch = [&](int x, int y, float px[3]) {
+        x = x < 0 ? 0 : (x >= (int)dl.w ? (int)dl.w - 1 : x);
+        y = y < 0 ? 0 : (y >= (int)dl.h ? (int)dl.h - 1 : y);
+        const uint8_t* p = &dl.rgba[((size_t)y * dl.w + x) * 4];
+        const float r = (dl.bgra ? p[2] : p[0]) * (1.0f / 255.0f);
+        const float g = p[1] * (1.0f / 255.0f);
+        const float b = (dl.bgra ? p[0] : p[2]) * (1.0f / 255.0f);
+        px[0] = dl.srgb ? SrgbToLinear(r) : r;
+        px[1] = dl.srgb ? SrgbToLinear(g) : g;
+        px[2] = dl.srgb ? SrgbToLinear(b) : b;
+    };
+    const float fx = u * dl.w - 0.5f;
+    const float fy = v * dl.h - 0.5f;
+    const int x0 = (int)std::floor(fx);
+    const int y0 = (int)std::floor(fy);
+    const float wx = fx - x0, wy = fy - y0;
+    float p00[3], p10[3], p01[3], p11[3];
+    fetch(x0, y0, p00); fetch(x0 + 1, y0, p10);
+    fetch(x0, y0 + 1, p01); fetch(x0 + 1, y0 + 1, p11);
+    for (int c = 0; c < 3; ++c) {
+        const float top = p00[c] + (p10[c] - p00[c]) * wx;
+        const float bot = p01[c] + (p11[c] - p01[c]) * wx;
+        out[c] = top + (bot - top) * wy;
+    }
+}
+
+// Grayscale byte -> palette color, precomputed for all 256 gray values so the
+// per-pixel remap is a table lookup. Engine math (palette lighting PS, blob
+// @0x7b7e68 in Shaders011.fxp, re-disassembled 2026-07-09):
+//   u = pow(diffuseSample.g, 1/2.2)   -- t0 sampled through its (sRGB) SRV,
+//                                        then re-gamma'd: u ~= the stored byte
+//   albedo.rgb = LUT(u, rowV).rgb     -- REPLACES the gray, per pixel
+// rowV is the caller's final V (scale - 1 + pow(vc.x, 1/2.2)). Output bytes
+// are sRGB-encoded to match every other diffuse byte this plugin ships.
+struct PaletteRemapTable { uint8_t rgb[256][3]; };
+
+bool BuildPaletteRemapTable(const DecodedLut& dl, float rowV, bool diffuseSrgb,
+                            PaletteRemapTable& out)
+{
+    if (!dl.w || !dl.h || dl.rgba.size() < (size_t)dl.w * dl.h * 4) return false;
+    for (int gb = 0; gb < 256; ++gb) {
+        const float sampled = diffuseSrgb ? SrgbToLinear(gb * (1.0f / 255.0f))
+                                          : gb * (1.0f / 255.0f);
+        const float u = std::pow(sampled, 1.0f / 2.2f);
+        float lin[3];
+        LutSampleLinear(dl, u, rowV, lin);
+        for (int c = 0; c < 3; ++c)
+            out.rgb[gb][c] = (uint8_t)(LinearToSrgb(lin[c]) * 255.0f + 0.5f);
+    }
+    return true;
+}
+}
+
+// Per-mip palette remap. Same input contract as TintMultiply_Apply: BC1/BC3/
+// BC5 are decompressed first, BC7/other decline (return false -> the caller
+// falls back to the flat tint, which also declines on BC7 -- net unchanged).
+// Gray is read from GREEN (the engine samples t0 and uses .g -- BC1's
+// highest-precision channel); alpha is untouched so cutouts survive.
+static bool PaletteRemap_Apply(ExtractedTexture& tex, const PaletteRemapTable& table)
+{
+    switch (tex.dxgiFormat) {
+        case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB: case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB: case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM: case DXGI_FORMAT_BC5_TYPELESS:
+            if (!DecompressBC(tex, BCTransform::None)) return false;
+            break;
+        default:
+            break;
+    }
+    const bool rgba = (tex.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                       tex.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
+    const bool bgra = (tex.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                       tex.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB);
+    if (!rgba && !bgra) return false;
+    const uint32_t rI = bgra ? 2u : 0u;
+    const uint32_t bI = bgra ? 0u : 2u;
+    for (uint32_t i = 0; i < tex.width * tex.height; i++) {
+        uint8_t* p = &tex.pixels[i * 4];
+        const uint8_t g = p[1];
+        p[rI] = table.rgb[g][0];
+        p[1]  = table.rgb[g][1];
+        p[bI] = table.rgb[g][2];
+    }
+    return true;
 }
 
 // Returns 0=ready (outRGB valid), 1=pending (async readback in flight, retry),
@@ -942,6 +1070,10 @@ int BsExtraction::SampleLookupColor(NiTexture* lut, ID3D11Device* device,
         if (st == ReadbackStatus::Pending) return 1;
         if (st != ReadbackStatus::Ready || mips.empty()) return 2;
         ExtractedTexture m = std::move(mips[0]);
+        // Runtime gamma, captured before decompression (which drops the
+        // _SRGB tag): the palette remap must decode LUT bytes the same way
+        // the engine's SRV does.
+        const bool lutSrgb = IsSrgbColorFormat(m.dxgiFormat);
         DecompressBC2(m);
         if (m.dxgiFormat != DXGI_FORMAT_R8G8B8A8_UNORM &&
             m.dxgiFormat != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
@@ -957,7 +1089,7 @@ int BsExtraction::SampleLookupColor(NiTexture* lut, ID3D11Device* device,
             m.pixels.size() < (size_t)m.width * m.height * 4)
             return 2;
         DecodedLut dl;
-        dl.w = m.width; dl.h = m.height; dl.bgra = bgra;
+        dl.w = m.width; dl.h = m.height; dl.bgra = bgra; dl.srgb = lutSrgb;
         dl.rgba = std::move(m.pixels);
         cit = g_lutCache.emplace(key, std::move(dl)).first;
     }
@@ -977,6 +1109,40 @@ int BsExtraction::SampleLookupColor(NiTexture* lut, ID3D11Device* device,
 }
 
 // ---------------------------------------------------------------------------
+// Re-capture-on-approach helper (2026-07-08): current resident width of a
+// lighting material's diffuse texture. SEH-guarded because it runs from the
+// Tick's upgrade poll against a submitted drawable whose material pointer may
+// have been freed (cell detach) between polls. No C++ objects with destructors
+// in this frame so __try is legal; ID3D11Texture2D is released by hand.
+// ---------------------------------------------------------------------------
+uint32_t BsExtraction::GetMaterialDiffuseResidentWidth(void* material) {
+    if (!material) return 0;
+    uint32_t width = 0;
+    __try {
+        BSLightingShaderMaterialBase* mat =
+            reinterpret_cast<BSLightingShaderMaterialBase*>(material);
+        NiTexture* tex = mat->spDiffuseTexture;
+        if (tex) {
+            BSRenderData* rd = tex->rendererData;
+            if (rd && rd->resource) {
+                ID3D11Texture2D* t2d = nullptr;
+                if (SUCCEEDED(rd->resource->QueryInterface(
+                        __uuidof(ID3D11Texture2D),
+                        reinterpret_cast<void**>(&t2d))) && t2d) {
+                    D3D11_TEXTURE2D_DESC d;
+                    t2d->GetDesc(&d);
+                    width = d.Width;
+                    t2d->Release();
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        width = 0;
+    }
+    return width;
+}
+
+// ---------------------------------------------------------------------------
 // Generic texture extraction from any NiTexture slot
 // ---------------------------------------------------------------------------
 uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotName,
@@ -985,8 +1151,14 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                                        TexturePostProcess postProcess,
                                        uint8_t minRoughness,
                                        uint8_t albedoLumFloor,
-                                       uint32_t tintRGB)
+                                       uint32_t tintRGB,
+                                       NiTexture* paletteLut,
+                                       float paletteRowV)
 {
+    // Clamp the palette row once: it is both the cache-key quantization and
+    // the LUT V coordinate (hardware clamp addressing).
+    if (paletteRowV < 0.0f) paletteRowV = 0.0f;
+    if (paletteRowV > 1.0f) paletteRowV = 1.0f;
     // Early-bail diagnostic: log when diffuse texture extraction fails because
     // the D3D resource isn't available. Helps distinguish "decal not extracted
     // because path doesn't reach here" vs "decal not extracted because the
@@ -1030,6 +1202,38 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // Tint variants: differently-tinted NPCs sharing one grayscale source
     // (every hair color uses HairShortXXGrayscale_d) must not collide.
     if (tintRGB != 0xFFFFFFu)                                         hash = FnvHashCombine(hash, 8 | (uint64_t)tintRGB << 8);
+    // Palette-remap variants: meshes sharing one grayscale source but
+    // selecting different LUTs or different palette rows must not collide.
+    // Row quantized to the byte grid the remap table is built on.
+    if (paletteLut) {
+        const char* lutName = paletteLut->name.c_str();
+        hash = FnvHashCombine(hash, FnvHash(lutName ? lutName : ""));
+        hash = FnvHashCombine(hash, 10 | ((uint64_t)(uint8_t)(paletteRowV * 255.0f + 0.5f) << 8));
+    }
+    // Resident RESOLUTION variant (2026-07-08 re-capture-on-approach): FO4
+    // streams textures in progressively, so `resource` is whatever mip level
+    // is currently resident -- often reduced (1/2, 1/4) when the object first
+    // appears at distance. Folding the resident width/height into the cache key
+    // means that when the engine later streams a sharper mip in, the SAME
+    // texture NAME hashes to a NEW key -> cache miss -> full-res re-extract. The
+    // Tick's upgrade poll (semantic_capture.cpp) releases + re-resolves the
+    // affected drawables so the sharper texture actually reaches Remix. Without
+    // this the name-only key locked the first (blurry) capture for the whole
+    // session (blobby textures, washed-out detail, flat NPC skin -- 2048->512).
+    // Non-Texture2D resources (cubemaps) leave the fold off (name-based, as
+    // before); nothing streams them progressively. Opt-in ([Materials]
+    // TextureUpgradeOnApproach): default OFF keeps the name-only key (and thus
+    // byte-identical caching + no upgrade churn).
+    if (g_config.textureUpgradeOnApproach) {
+        ID3D11Texture2D* t2d = nullptr;
+        if (SUCCEEDED(resource->QueryInterface(
+                __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t2d))) && t2d) {
+            D3D11_TEXTURE2D_DESC rd; t2d->GetDesc(&rd);
+            t2d->Release();
+            if (rd.Width) hash = FnvHashCombine(
+                hash, 0xA00000000ULL | ((uint64_t)rd.Width << 16) | (rd.Height & 0xFFFFu));
+        }
+    }
 
     // Check cache first. A hit normally returns just the hash -- the pixels
     // were already handed to SubmitDrawable when the texture was first
@@ -1070,6 +1274,27 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     tex2D->Release();
 
     if (rbStatus != ReadbackStatus::Ready || mips.empty()) return 0;
+
+    // Runtime gamma of the source resource, captured before any decompression
+    // (DecompressBC drops the _SRGB tag). Drives the palette remap's U decode:
+    // the engine samples the grayscale diffuse through THIS format's SRV.
+    const bool srcIsSrgb = IsSrgbColorFormat(mips[0].dxgiFormat);
+
+    // Grayscale-to-palette remap table: built once per texture (256 gray
+    // values -> LUT row colors), applied per mip below. Requires the LUT to
+    // be decoded already -- the resolver's SampleLookupColor pending-gate
+    // guarantees that before the diffuse extraction runs.
+    PaletteRemapTable palTable;
+    bool palTableValid = false;
+    if (paletteLut) {
+        const char* lutName = paletteLut->name.c_str();
+        const uint64_t lutKey = FnvHashCombine(FnvHash(lutName ? lutName : ""), 0x1071ULL);
+        auto lit = g_lutCache.find(lutKey);
+        if (lit != g_lutCache.end() && !lit->second.rgba.empty()) {
+            palTableValid = BuildPaletteRemapTable(lit->second, paletteRowV,
+                                                   srcIsSrgb, palTable);
+        }
+    }
 
     // Per-mip pipeline: BC2 (DXT3) -> RGBA8, then any further BC decompression
     // handled by the post-process stage's BC5/BC1 decoders. Each step operates
@@ -1243,9 +1468,18 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
             // kept. Non-BC inputs pass through untouched.
             DecompressBC(mip, BCTransform::None);
         }
+        // Grayscale-to-palette remap REPLACES the gray RGB with the LUT row
+        // (engine-exact; see PaletteRemap_Apply). Composes at the tint slot:
+        // AFTER the alpha stage (cutouts survive), BEFORE the luminance
+        // floor. When it declines (BC7 input), the flat-tint fallback below
+        // applies instead.
+        bool remapped = false;
+        if (palTableValid) {
+            remapped = PaletteRemap_Apply(mip, palTable);
+        }
         // Skin/hair tint multiply composes AFTER the alpha stage (alpha
         // untouched -- hair cutouts survive) and BEFORE the luminance floor.
-        if (tintRGB != 0xFFFFFFu) {
+        if (!remapped && tintRGB != 0xFFFFFFu) {
             TintMultiply_Apply(mip, tintRGB);
         }
         // Metal albedo luminance floor composes AFTER the alpha stage so

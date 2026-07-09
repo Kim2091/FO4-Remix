@@ -136,6 +136,15 @@ struct PluginConfig {
     float metalMinRoughness;        // floor on (1 - fSmoothness) so metals aren't mirrors (default 0.15)
     bool  roughnessMapsEnabled;     // extract _s.dds -> per-pixel roughness maps (default true; off = roughnessConstant fallback)
     float roughnessMapFloor;        // 0..1 floor on _s.dds-derived per-pixel roughness (default 0.15; decals clamp at >= 0.3)
+    // Re-capture-on-approach (2026-07-08): FO4 streams textures progressively,
+    // so an object first resolved at distance captures a reduced mip and the
+    // name-keyed texture cache locks that blurry version for the session. When
+    // on, the Tick polls each submitted lighting drawable's live diffuse
+    // resolution (~every 128 frames) and, when the engine has streamed a
+    // sharper mip in, releases + re-resolves it for the full-res texture.
+    // DEFAULT OFF: the release+re-resolve churn causes lag spikes while moving,
+    // and the win is a progressive sharpen rather than immediate. Opt-in.
+    bool  textureUpgradeOnApproach; // default false
 
     // [Camera]
     // FOV source for the Remix camera (2026-07-03). Default true: read the
