@@ -238,7 +238,30 @@ static void RemixThreadFunc() {
         // Pump messages before rendering so input is processed even when frames are slow
         PumpMessages();
 
-        RemixRenderer::OnFrame(cam, overlay);
+        // Top-level backstop (2026-07-09): every remixapi call inside OnFrame
+        // is individually guarded (RemixCallGuarded -- the July-8/9 airport
+        // crashes were an uncaught dxvk std::out_of_range terminating the
+        // process from this thread), but a C++ exception from anywhere else
+        // in the frame body would still land on this noexcept thread proc and
+        // terminate. Skip the frame instead: state is per-frame rebuilt, so
+        // the next iteration recovers.
+        try {
+            RemixRenderer::OnFrame(cam, overlay);
+        } catch (const std::exception& e) {
+            static std::atomic<int> sOnFrameCatch{0};
+            const int n = sOnFrameCatch.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [RemixThread] OnFrame C++ exception #%d "
+                         "what=%s -- frame skipped", n, e.what());
+            }
+        } catch (...) {
+            static std::atomic<int> sOnFrameCatchU{0};
+            const int n = sOnFrameCatchU.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [RemixThread] OnFrame unknown C++ "
+                         "exception #%d -- frame skipped", n);
+            }
+        }
 
         // Pump again after rendering
         PumpMessages();

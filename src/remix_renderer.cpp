@@ -157,6 +157,56 @@ static int CallDrawInstanceGuarded(remixapi_Interface* api,
 }
 
 // ---------------------------------------------------------------------------
+// Generic guard for every remixapi call on the frame path (2026-07-09
+// Boston-Airport terminate fix). dxvk-remix (/MD) throws std::out_of_range
+// from internal resource-map .at() lookups when a stale/destroyed handle
+// reaches the API; the July-8 crash dumps (three identical) show that
+// exception propagating out of an UNGUARDED OnFrame call site, crossing into
+// this /MT module uncaught, and killing the process via terminate ->
+// __fastfail(7). With the guard, a bad handle costs one skipped call plus a
+// capped log line. Same inner/outer split as CallDrawInstanceGuarded (SEH
+// cannot share a frame with unwindable objects, C2712); the callable is
+// passed by reference so the __try frame owns nothing unwindable.
+// Returns 0 = clean, 1 = SEH caught, 2 = C++ exception caught.
+static std::atomic<int> g_remixGuardLogCount{0};
+static constexpr int kRemixGuardLogCap = 32;
+
+template <typename F>
+static int RemixCallCxxGuarded(const char* site, F& fn) {
+    try {
+        fn();
+        return 0;
+    } catch (const std::exception& e) {
+        int n = g_remixGuardLogCount.fetch_add(1, std::memory_order_relaxed);
+        if (n < kRemixGuardLogCap) {
+            _MESSAGE("FO4RemixPlugin: [RemixGuard] %s C++ exception #%d what=%s",
+                     site, n, e.what());
+        }
+        return 2;
+    } catch (...) {
+        int n = g_remixGuardLogCount.fetch_add(1, std::memory_order_relaxed);
+        if (n < kRemixGuardLogCap) {
+            _MESSAGE("FO4RemixPlugin: [RemixGuard] %s unknown C++ exception #%d", site, n);
+        }
+        return 2;
+    }
+}
+
+template <typename F>
+static int RemixCallGuarded(const char* site, F&& fn) {
+    __try {
+        return RemixCallCxxGuarded(site, fn);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        int n = g_remixGuardLogCount.fetch_add(1, std::memory_order_relaxed);
+        if (n < kRemixGuardLogCap) {
+            _MESSAGE("FO4RemixPlugin: [RemixGuard] %s SEH exception #%d code=0x%08lX",
+                     site, n, GetExceptionCode());
+        }
+        return 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Scene tracking state
 // ---------------------------------------------------------------------------
 // Textures are shared across cells (same texture may appear in multiple cells)
@@ -384,7 +434,9 @@ bool RemixRenderer::GetVramStats(VramStats* out) {
     if (!api || !api->GetVramStats) return false;
 
     remixapi_VramStats s = {};
-    if (api->GetVramStats(&s) != REMIXAPI_ERROR_CODE_SUCCESS) return false;
+    remixapi_ErrorCode vramErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+    RemixCallGuarded("GetVramStats", [&] { vramErr = api->GetVramStats(&s); });
+    if (vramErr != REMIXAPI_ERROR_CODE_SUCCESS) return false;
     out->totalAllocatedBytes               = s.totalAllocatedBytes;
     out->totalUsedBytes                    = s.totalUsedBytes;
     out->poolRetainedBytes                 = s.poolRetainedBytes;
@@ -436,7 +488,9 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
         const bool stale = (it->second.refCount == 0) && (age > ttlFrames);
         if (stale) {
             if (it->second.handle) {
-                api->DestroyMaterial(it->second.handle);
+                remixapi_MaterialHandle h = it->second.handle;
+                RemixCallGuarded("DestroyMaterial(sweep)",
+                                 [&] { api->DestroyMaterial(h); });
             }
             it = g_materialCache.erase(it);
             ++result.staleMaterialCount;
@@ -537,7 +591,11 @@ RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
         for (uint64_t texHash : staleTextures) {
             auto texIt = g_textureHandles.find(texHash);
             if (texIt != g_textureHandles.end() && texIt->second.refCount == 0) {
-                if (texIt->second.handle) api->DestroyTexture(texIt->second.handle);
+                if (texIt->second.handle) {
+                    remixapi_TextureHandle h = texIt->second.handle;
+                    RemixCallGuarded("DestroyTexture(sweep)",
+                                     [&] { api->DestroyTexture(h); });
+                }
                 g_textureHandles.erase(texIt);
                 ++result.orphanTexturesDestroyed;
             }
@@ -1272,7 +1330,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     camInfo.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
     camInfo.pNext = &camParams;
     camInfo.type = REMIXAPI_CAMERA_TYPE_WORLD;
-    api->SetupCamera(&camInfo);
+    RemixCallGuarded("SetupCamera", [&] { api->SetupCamera(&camInfo); });
 
     bool hasAnyMeshes = false;
 
@@ -1757,7 +1815,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         instance.transform = xform;
         instance.doubleSided = 1;
         instance.categoryFlags = 0;
-        api->DrawInstance(&instance);
+        RemixCallGuarded("DrawInstance(fallback)",
+                         [&] { api->DrawInstance(&instance); });
     }
 
     // ------------------------------------------------------------------
@@ -1785,7 +1844,11 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
             for (auto it = g_lights.begin(); it != g_lights.end();) {
                 if (desired.find(it->first) == desired.end()) {
-                    if (it->second) api->DestroyLight(it->second);
+                    if (it->second) {
+                        remixapi_LightHandle h = it->second;
+                        RemixCallGuarded("DestroyLight",
+                                         [&] { api->DestroyLight(h); });
+                    }
                     it = g_lights.erase(it);
                 } else {
                     ++it;
@@ -1839,8 +1902,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 info.ignoreViewModel = false;
 
                 remixapi_LightHandle handle = nullptr;
-                if (api->CreateLight(&info, &handle) ==
-                        REMIXAPI_ERROR_CODE_SUCCESS && handle) {
+                remixapi_ErrorCode lightErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+                RemixCallGuarded("CreateLight",
+                                 [&] { lightErr = api->CreateLight(&info, &handle); });
+                if (lightErr == REMIXAPI_ERROR_CODE_SUCCESS && handle) {
                     g_lights.emplace(lhash, handle);
                     ++created;
                     const int ln = sLightLogs.fetch_add(1,
@@ -1867,7 +1932,11 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             }
         }
         for (const auto& [lhash, handle] : g_lights) {
-            if (handle) api->DrawLightInstance(handle);
+            if (handle) {
+                remixapi_LightHandle h = handle;
+                RemixCallGuarded("DrawLightInstance",
+                                 [&] { api->DrawLightInstance(h); });
+            }
         }
     }
 
@@ -1882,7 +1951,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         && api->DrawScreenOverlay) {
         remixapi_Format fmt = DxgiToRemixFormat(static_cast<DXGI_FORMAT>(overlay.dxgiFormat));
         if (fmt != static_cast<remixapi_Format>(0)) {
-            api->DrawScreenOverlay(overlay.pixels.data(), overlay.width, overlay.height, fmt, 1.0f);
+            RemixCallGuarded("DrawScreenOverlay", [&] {
+                api->DrawScreenOverlay(overlay.pixels.data(), overlay.width,
+                                       overlay.height, fmt, 1.0f);
+            });
         }
     }
 
@@ -1953,7 +2025,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     presentInfo.sType = REMIXAPI_STRUCT_TYPE_PRESENT_INFO;
     presentInfo.hwndOverride = nullptr;
     const PerfClock::time_point tPresent0 = PerfClock::now();
-    api->Present(&presentInfo);
+    RemixCallGuarded("Present", [&] { api->Present(&presentInfo); });
     const PerfClock::time_point tEnd = PerfClock::now();
     s_accPresentNs += nsSince(tPresent0, tEnd);
     s_accTotalNs   += nsSince(tEnter, tEnd);
