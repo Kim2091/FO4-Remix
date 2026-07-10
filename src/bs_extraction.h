@@ -333,6 +333,25 @@ namespace BsExtraction {
     // engine V (caller applies scale/pow). LUT name + quantized row are
     // folded into the cache hash so meshes sharing one grayscale source but
     // different palette rows get distinct variants.
+    // outPending (2026-07-09): when non-null, set true iff the texture is
+    // still IN FLIGHT in the async pipeline (GPU readback or worker decode)
+    // -- i.e. a retry will eventually return a hash. A 0 return with
+    // *outPending == false means the texture genuinely can't be extracted
+    // (missing resource, unsupported format, failed conversion). Callers
+    // that submit materials should retry while pending instead of shipping
+    // a material without the slot: since decode moved off-thread the four
+    // slots of one drawable complete at DIFFERENT ticks, and hash-0-means-
+    // absent submitted objects permanently missing their normal/roughness.
+    //
+    // supplyPixels (2026-07-09): false = "probe" mode -- fill hashes, start
+    // any not-yet-started readback/decode, consume finished decodes into the
+    // internal cache, but NEVER copy pixel buffers into newTextures. True =
+    // full behavior (pixels re-supplied whenever the Remix-side handle is
+    // missing). The resolver probes all slots first and only runs a
+    // supplying pass on the attempt that actually submits, so each
+    // texture's pixels are copied exactly once instead of on every retry
+    // (~22MB per slot per retry while a sibling slot was still decoding --
+    // the 2026-07-09 "slower pop-in" report).
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,
                                     std::vector<ExtractedTexture>& newTextures,
@@ -341,12 +360,17 @@ namespace BsExtraction {
                                     uint8_t albedoLumFloor = 0,
                                     uint32_t tintRGB = 0xFFFFFFu,
                                     NiTexture* paletteLut = nullptr,
-                                    float paletteRowV = 0.0f);
+                                    float paletteRowV = 0.0f,
+                                    bool* outPending = nullptr,
+                                    bool supplyPixels = true);
 
-    // Extract emissive data from a shape's shader property and material
+    // Extract emissive data from a shape's shader property and material.
+    // outPending / supplyPixels forward to the glow-map slot's
+    // ExtractMaterialTexture call (see above).
     void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
                              ID3D11Device* device, std::vector<ExtractedTexture>& newTextures,
-                             uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity);
+                             uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity,
+                             bool* outPending = nullptr, bool supplyPixels = true);
 
     // Read alpha-test + alpha-blend state from the geometry's NiAlphaProperty
     // (effectState slot) and write it into mesh.alphaTest* / alphaBlend* fields.

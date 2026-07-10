@@ -1562,8 +1562,14 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                                        uint8_t albedoLumFloor,
                                        uint32_t tintRGB,
                                        NiTexture* paletteLut,
-                                       float paletteRowV)
+                                       float paletteRowV,
+                                       bool* outPending,
+                                       bool supplyPixels)
 {
+    // Default: not pending. Every in-flight exit below sets it true; plain
+    // failures (missing resource, unsupported format) leave it false so the
+    // caller can distinguish "retry" from "this slot doesn't exist".
+    if (outPending) *outPending = false;
     // Clamp the palette row once: it is both the cache-key quantization and
     // the LUT V coordinate (hardware clamp addressing).
     if (paletteRowV < 0.0f) paletteRowV = 0.0f;
@@ -1658,7 +1664,9 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // handle; the copy only happens in the handle-missing case.
     auto it = g_textureCache.find(hash);
     if (it != g_textureCache.end()) {
-        if (!RemixRenderer::HasTextureHandle(hash)) {
+        // Probe mode never copies: the pixels are re-supplied by the caller's
+        // supplying pass on the attempt that actually submits.
+        if (supplyPixels && !RemixRenderer::HasTextureHandle(hash)) {
             newTextures.push_back(it->second);
         }
         return hash;
@@ -1680,6 +1688,7 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                 g_texConvDone.erase(dit);
                 havePacked = true;
             } else if (g_texConvInflight.count(hash)) {
+                if (outPending) *outPending = true;
                 return 0;  // decode in flight; resolver retries next tick
             }
         }
@@ -1712,8 +1721,14 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                 }
             }
 
-            g_textureCache[hash] = packed;
-            newTextures.push_back(std::move(packed));
+            if (supplyPixels) {
+                g_textureCache[hash] = packed;             // copy stays cached
+                newTextures.push_back(std::move(packed));  // moved to submit list
+            } else {
+                // Probe mode: park the decode in the cache without the extra
+                // copy; the supplying pass cache-hits it later.
+                g_textureCache[hash] = std::move(packed);
+            }
             return hash;
         }
     }
@@ -1737,6 +1752,10 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     ReadbackStatus rbStatus = ReadbackAllMipsAsync(device, tex2D, hash, mips);
     tex2D->Release();
 
+    if (rbStatus == ReadbackStatus::Pending) {
+        if (outPending) *outPending = true;
+        return 0;
+    }
     if (rbStatus != ReadbackStatus::Ready || mips.empty()) return 0;
 
     // Readback landed: package the conversion (BC decode + transforms + mip
@@ -1775,6 +1794,7 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
 
     job.mips = std::move(mips);
     EnqueueTextureConversion(std::move(job));
+    if (outPending) *outPending = true;  // decode just queued; retry consumes it
     return 0;
 }
 
@@ -1795,11 +1815,13 @@ BSLightingShaderMaterialBase* BsExtraction::GetLightingMaterial(BSTriShape* shap
 // Extract emissive data from a shape's shader property and material
 void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
                                 ID3D11Device* device, std::vector<ExtractedTexture>& newTextures,
-                                uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity)
+                                uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity,
+                                bool* outPending, bool supplyPixels)
 {
     outTexHash = 0;
     outR = outG = outB = 0.0f;
     outIntensity = 0.0f;
+    if (outPending) *outPending = false;
 
     if (!shape || !lightingMat) return;
 
@@ -1839,7 +1861,12 @@ void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMateri
         auto* glowMat = static_cast<BSLightingShaderMaterialGlowmap*>(lightingMat);
         if (std::strcmp(matLeaf, "BSLightingShaderMaterialGlowmap") == 0 &&
             glowMat->spGlowMapTexture) {
-            outTexHash = ExtractMaterialTexture(glowMat->spGlowMapTexture, "emissive", device, newTextures);
+            outTexHash = ExtractMaterialTexture(glowMat->spGlowMapTexture, "emissive", device, newTextures,
+                                                TexturePostProcess::None,
+                                                /*minRoughness=*/0, /*albedoLumFloor=*/0,
+                                                /*tintRGB=*/0xFFFFFFu,
+                                                /*paletteLut=*/nullptr, /*paletteRowV=*/0.0f,
+                                                outPending, supplyPixels);
         }
     }
 

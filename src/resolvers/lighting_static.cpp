@@ -1986,11 +1986,53 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         (mesh.alphaTestEnabled || mesh.alphaBlendEnabled)
             ? TexturePostProcess::DiffuseAlphaFromLuminance
             : TexturePostProcess::None;
+
+    // Stash phase-1 output for a retry (the parse is the expensive part of
+    // an attempt; textures normally land within a few ticks of async
+    // readback + worker decode). Dropped once the backoff goes exponential
+    // so a never-resolving drawable doesn't pin its vertex copy in memory.
+    auto stashPhase1Cache = [&]() {
+        if (state.resolveAttempts > kResolveCacheMaxAttempts) return;
+        if (cached) {
+            cached->mesh = std::move(mesh);
+            state.resolveCache = std::move(cacheHolder);
+        } else {
+            auto rc = std::make_shared<ResolveCache>();
+            rc->mesh           = std::move(mesh);
+            rc->albedoLumFloor = albedoLumFloor;
+            rc->diffuseTint    = paletteBranch ? 0xFFFFFFu : diffuseTint;
+            rc->paletteBranch  = paletteBranch;
+            rc->paletteRowByte = paletteRowByte;
+            state.resolveCache = std::move(rc);
+        }
+    };
+
+    // ---- Texture probe pass (2026-07-09) ----
+    // Fill the hash fields and start any not-yet-started readback/decode,
+    // but copy NO pixel buffers (supplyPixels=false). Since decode moved to
+    // worker threads the four slots complete at DIFFERENT ticks, and the old
+    // single consuming pass had two measured failure modes:
+    //   - diffuse finishing LAST: every 1-frame retry re-copied the already
+    //     decoded sibling chains (~22MB each) into newTextures and threw
+    //     them away at the diffuse gate -- multi-ms memcpy per retry that
+    //     crowded real submissions out of the ResolveBudget ("slower
+    //     pop-in", 2026-07-09);
+    //   - diffuse finishing FIRST: the drawable submitted immediately and
+    //     PERMANENTLY without its still-decoding normal/roughness/emissive
+    //     (a 0 hash was indistinguishable from "slot doesn't exist").
+    // Any slot still pending -> cheap retry, no copies. The supplying pass
+    // below runs only on the attempt that submits.
+    bool pendDiffuse = false, pendNormal = false, pendRough = false,
+         pendEmissive = false;
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
-        /*minRoughness=*/0, albedoLumFloor, diffuseTint, paletteLut, paletteRowV);
+        /*minRoughness=*/0, albedoLumFloor, diffuseTint, paletteLut, paletteRowV,
+        &pendDiffuse, /*supplyPixels=*/false);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
+        mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral,
+        /*minRoughness=*/0, /*albedoLumFloor=*/0, /*tintRGB=*/0xFFFFFFu,
+        /*paletteLut=*/nullptr, /*paletteRowV=*/0.0f,
+        &pendNormal, /*supplyPixels=*/false);
     // Smoothness/spec-mask (_s.dds) -> per-pixel roughness, RESTORED
     // 2026-07-07 (removed 2026-07-02 in 74c28b9). The removal fell back to
     // roughnessConstant=0.8, and the [Metal] roughness path derived its
@@ -2004,14 +2046,18 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // are resolved since: mirror DECALS get the >= 0.3 floor below, and the
     // "metal black voids" were the pre-luminance-floor albedo problem (the
     // floor ships on, and interiors now have real lights).
+    uint8_t roughnessFloor = 0;
     if (g_config.roughnessMapsEnabled) {
         const uint8_t cfgFloor = (uint8_t)(std::clamp(
             g_config.roughnessMapFloor, 0.0f, 1.0f) * 255.0f + 0.5f);
-        const uint8_t roughnessFloor =
+        roughnessFloor =
             mesh.isDecal ? (std::max)(cfgFloor, (uint8_t)76) : cfgFloor;
         mesh.roughnessTextureHash = BsExtraction::ExtractMaterialTexture(
             mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures,
-            TexturePostProcess::InvertRGB, roughnessFloor);
+            TexturePostProcess::InvertRGB, roughnessFloor,
+            /*albedoLumFloor=*/0, /*tintRGB=*/0xFFFFFFu,
+            /*paletteLut=*/nullptr, /*paletteRowV=*/0.0f,
+            &pendRough, /*supplyPixels=*/false);
         // Per-pixel roughness supersedes any scalar-derived constant: the
         // constant only exists as the fallback for materials with no _s map.
         if (mesh.roughnessTextureHash != 0) {
@@ -2021,29 +2067,25 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
                                       mesh.emissiveTextureHash,
                                       mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
-                                      mesh.emissiveIntensity);
+                                      mesh.emissiveIntensity,
+                                      &pendEmissive, /*supplyPixels=*/false);
 
-    // No diffuse -> can't render lit; retry next frame in case texture resolves later.
-    if (mesh.diffuseTextureHash == 0) {
-        // Stash phase-1 output for the retry (the parse is the expensive part
-        // of an attempt; textures normally land within a few ticks of async
-        // readback + worker decode). Dropped once the backoff goes
-        // exponential so a never-resolving drawable doesn't pin its vertex
-        // copy in memory.
-        if (state.resolveAttempts <= kResolveCacheMaxAttempts) {
-            if (cached) {
-                cached->mesh = std::move(mesh);
-                state.resolveCache = std::move(cacheHolder);
-            } else {
-                auto rc = std::make_shared<ResolveCache>();
-                rc->mesh           = std::move(mesh);
-                rc->albedoLumFloor = albedoLumFloor;
-                rc->diffuseTint    = paletteBranch ? 0xFFFFFFu : diffuseTint;
-                rc->paletteBranch  = paletteBranch;
-                rc->paletteRowByte = paletteRowByte;
-                state.resolveCache = std::move(rc);
-            }
+    // Any slot still in the async pipeline: retry next tick. Cheap -- the
+    // probe made no copies, and the phase-1 stash skips the re-parse.
+    if (pendDiffuse || pendNormal || pendRough || pendEmissive) {
+        stashPhase1Cache();
+        if (headDiag) {
+            HeadDiagLog(hash, "GATE texturesPending d=%d n=%d r=%d e=%d -- retry",
+                        pendDiffuse ? 1 : 0, pendNormal ? 1 : 0,
+                        pendRough ? 1 : 0, pendEmissive ? 1 : 0);
         }
+        return false;
+    }
+
+    // No diffuse (and not pending) -> can't render lit; retry via backoff in
+    // case the engine backs the resource later.
+    if (mesh.diffuseTextureHash == 0) {
+        stashPhase1Cache();
         if (headDiag) {
             NiTexture* dt = mat->spDiffuseTexture;
             HeadDiagLog(hash,
@@ -2053,6 +2095,29 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         }
         return false;
     }
+
+    // ---- Texture supply pass ----
+    // Everything is decoded; re-run the extractions with supplyPixels=true so
+    // any texture whose Remix-side handle is missing gets its pixels copied
+    // into newTextures -- exactly once, on this submitting attempt. Pure
+    // cache hits: no readback, no decode, identical hashes.
+    mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
+        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
+        /*minRoughness=*/0, albedoLumFloor, diffuseTint, paletteLut, paletteRowV);
+    mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
+        mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
+    if (g_config.roughnessMapsEnabled) {
+        mesh.roughnessTextureHash = BsExtraction::ExtractMaterialTexture(
+            mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures,
+            TexturePostProcess::InvertRGB, roughnessFloor);
+        if (mesh.roughnessTextureHash != 0) {
+            mesh.roughnessConstantOverride = -1.0f;
+        }
+    }
+    BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
+                                      mesh.emissiveTextureHash,
+                                      mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
+                                      mesh.emissiveIntensity);
 
     // Textures resolved: the phase-1 cache (if any) is consumed by this
     // attempt; cacheHolder frees it at return.
