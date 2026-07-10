@@ -827,170 +827,106 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_GateVram);
         // Skip resolve loop; eviction sweep below still runs.
     } else {
-        // Per-Tick submission budget removed: VRAM gate above and input
-        // validation in SubmitDrawable are now the load-bearing protection
-        // against the dxvk-remix freeze. The budget cap (was 4) starved
-        // streaming during normal play (proven by the Pip-Boy-only mesh-
-        // load symptom). If the freeze recurs without those gates being
-        // sufficient, reintroduce a much higher cap (~64) here.
+        // ---- Budgeted resolve loop (2026-07-09 hitching fix) ----
+        // Two problems with the old single-pass loop, both proven by the
+        // 2026-07-09 session log:
+        //   (1) Unbounded burst: a cell attach makes hundreds of drawables
+        //       resolvable in the same tick, and each resolve pays mesh
+        //       parse + CPU BC-decompress of every texture mip + Remix
+        //       handle creation -- ALL on the game render thread inside
+        //       hkPresent. Measured 12.6ms AVERAGE tick over a 610-frame
+        //       streaming window (idle: 9us); the "hitching when camera
+        //       moves / new geometry loads" report.
+        //   (2) Whole-burst mutex hold: g_drawableMutex was held across the
+        //       entire loop, so the engine's GetRenderPasses fires AND the
+        //       Remix thread's snapshot calls stalled behind the burst
+        //       (OnFrame snap phase: 1us idle -> 23ms avg in that window).
+        // Fix: phase A collects due keys under a brief lock (pure map scan,
+        // no engine/D3D work); phase B re-locks PER KEY and stops once
+        // ResolveBudgetMs is spent, resuming next tick. New geometry
+        // resolves before upgrade polls (holes beat sharpening). Entries
+        // stay due until processed, so the backlog self-drains: submitted
+        // entries leave the due set, failures schedule their own backoff.
+        //
+        // (The 2026-07-01 COUNT cap of 4 starved streaming because it also
+        // counted near-free Pending polls; a TIME budget lets dozens of
+        // cheap polls through and only defers the expensive decodes.)
+        const double budgetMs = (double)g_config.resolveBudgetMs;
+        const auto tResolve0 = std::chrono::steady_clock::now();
+        auto resolveElapsedMs = [&tResolve0]() {
+            return std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - tResolve0).count();
+        };
 
-        std::lock_guard<std::mutex> lock(g_drawableMutex);
-        int upgradesThisTick = 0;  // texture re-capture storm cap (see below)
-        for (auto& [key, state] : g_drawableMap) {
-            if (state.submittedToRemix) {
-                bool doReresolve = false;
-
-                // Merge capture upgrade poll (2026-07-04): this merge shape
-                // submitted with a fallback partition because the engine
-                // wasn't drawing its cluster while the watch was armed.
-                // Keep a background watch alive (~1 Hz per drawable) and,
-                // the moment a capture lands (the cluster became visible),
-                // release the fallback and re-resolve: Query finds the
-                // completed watch and the exact baked geometry replaces
-                // the fallback via the normal resolve path.
-                if (state.mergeCaptureUpgradePending &&
-                    ((currentFrame ^ key) & 63) == 0 &&
-                    DrawCapture::EnsureWatch(state.mergeWatchBuf,
-                                             state.mergeWatchSrv, key,
-                                             state.mergeWatchRecordCount,
-                                             state.mergeWatchSegTris)) {
-                    unsigned long excCode = 0;
-                    if (CallReleaseDrawableGuarded(state.meshHash, &excCode) != 0) {
-                        _MESSAGE("FO4RemixPlugin: [MergeUpgrade] CRASH CAUGHT in "
-                                 "ReleaseDrawable hash=0x%llX exception=0x%08lX",
-                                 (unsigned long long)state.meshHash, excCode);
-                    }
-                    for (uint64_t xh : state.extraMeshHashes) {
-                        if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
-                            _MESSAGE("FO4RemixPlugin: [MergeUpgrade] CRASH CAUGHT in "
-                                     "ReleaseDrawable extra=0x%llX exception=0x%08lX",
-                                     (unsigned long long)xh, excCode);
-                        }
-                    }
-                    state.extraMeshHashes.clear();
-                    state.submittedToRemix = false;
-                    state.resolveAttempts = 0;
-                    state.nextRetryFrame = 0;
-                    // The geometry is provably alive (the engine just drew
-                    // it, and this state holds a +1 NiPointer ref); touch
-                    // lastSeenFrame so the freshness gate below doesn't
-                    // retire the re-resolve of a long-ago-attached shape.
-                    state.lastSeenFrame = currentFrame;
-                    // The resolver re-sets this if it has to fall back again.
-                    state.mergeCaptureUpgradePending = false;
-                    static std::atomic<int> sUpgradeLogs{0};
-                    const int un = sUpgradeLogs.fetch_add(1, std::memory_order_relaxed);
-                    if (un < 40) {
-                        _MESSAGE("FO4RemixPlugin: [MergeUpgrade] #%d hash=0x%llX capture "
-                                 "landed -> re-resolving with engine draws",
-                                 un, (unsigned long long)key);
-                    }
-                    doReresolve = true;
-                }
-                // Texture re-capture-on-approach poll (2026-07-08): the plugin
-                // captured this lighting drawable's textures at whatever mip FO4
-                // had streamed when it first resolved (often reduced at distance;
-                // the name-keyed texture cache then locked that blurry version
-                // for the session -> "blobby", washed-out detail, flat NPC skin).
-                // Poll the LIVE diffuse resolution ~every 128 frames (staggered
-                // by key). When the engine has since streamed a STRICTLY larger
-                // mip in (player approached), release + re-resolve: the
-                // resolution-folded texture hash yields a fresh full-res texture
-                // + material via the normal resolve path. Only upgrades (never
-                // downgrades), so walking away can't blur a sharp capture; once
-                // at the streamed max, live == submitted and it stops firing.
-                // submittedDiffuseWidth is 0 for non-lighting drawables (water),
-                // so this branch never touches them. Capped at 3 upgrades per
-                // Tick: arriving at a texture-dense cell (Boston Airport)
-                // makes hundreds of drawables upgrade-eligible in the same
-                // few seconds, and each re-resolve allocates full-res RGBA
-                // mip chains -- the uncapped storm was the 2026-07-08/09
-                // fail-fast crashes. Skipped drawables re-qualify on their
-                // next 128-frame slot, so the backlog drains within seconds.
-                else if (g_config.textureUpgradeOnApproach &&
+        // Phase A: collect due keys. Cheap predicates only -- the lock is
+        // held for a linear map scan (sub-ms), not the resolve work.
+        std::vector<PassKey> dueNew;    // unsubmitted, inside window, retry-due
+        std::vector<PassKey> duePolls;  // submitted, upgrade-poll slot hit
+        {
+            std::lock_guard<std::mutex> lock(g_drawableMutex);
+            for (auto& [key, state] : g_drawableMap) {
+                if (state.submittedToRemix) {
+                    if ((state.mergeCaptureUpgradePending &&
+                         ((currentFrame ^ key) & 63) == 0) ||
+                        (g_config.textureUpgradeOnApproach &&
                          state.submittedDiffuseWidth != 0 &&
-                         upgradesThisTick < 3 &&
-                         ((currentFrame ^ key) & 127) == 0) {
-                    const uint32_t liveW =
-                        BsExtraction::GetMaterialDiffuseResidentWidth(state.material);
-                    if (liveW > (uint32_t)state.submittedDiffuseWidth) {
-                        unsigned long excCode = 0;
-                        if (CallReleaseDrawableGuarded(state.meshHash, &excCode) != 0) {
-                            _MESSAGE("FO4RemixPlugin: [TexUpgrade] CRASH CAUGHT in "
-                                     "ReleaseDrawable hash=0x%llX exception=0x%08lX",
-                                     (unsigned long long)state.meshHash, excCode);
-                        }
-                        for (uint64_t xh : state.extraMeshHashes) {
-                            if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
-                                _MESSAGE("FO4RemixPlugin: [TexUpgrade] CRASH CAUGHT in "
-                                         "ReleaseDrawable extra=0x%llX exception=0x%08lX",
-                                         (unsigned long long)xh, excCode);
-                            }
-                        }
-                        state.extraMeshHashes.clear();
-                        state.submittedToRemix = false;
-                        state.resolveAttempts = 0;
-                        state.nextRetryFrame = 0;
-                        state.lastSeenFrame = currentFrame;
-                        ++upgradesThisTick;
-                        static std::atomic<int> sTexUpLogs{0};
-                        const int tn = sTexUpLogs.fetch_add(1, std::memory_order_relaxed);
-                        if (tn < 60) {
-                            _MESSAGE("FO4RemixPlugin: [TexUpgrade] #%d hash=0x%llX diffuse "
-                                     "%upx -> %upx streamed in, re-resolving",
-                                     tn, (unsigned long long)key,
-                                     (unsigned)state.submittedDiffuseWidth, liveW);
-                        }
-                        doReresolve = true;
+                         ((currentFrame ^ key) & 127) == 0)) {
+                        duePolls.push_back(key);
                     }
+                    continue;
                 }
-
-                if (!doReresolve) continue;
-                // fall through: resolve this tick with the upgraded input
+                // Freshness gate (widened 2026-07-02, was age > 1). The
+                // engine fires GetRenderPasses roughly once per cell ATTACH
+                // -- passes are cached afterwards. Loading a save into a
+                // different area fires the destination cell's geometry
+                // DURING the load screen, when extraction fails (texture
+                // rendererData/resources not backed yet); with a 2-frame
+                // window those drawables aged out before becoming
+                // resolvable and, since the engine never re-fires cached
+                // passes, the player's own cell stayed permanently empty
+                // while later-attaching neighbor cells appeared. The async
+                // texture readback (Pending on first attempt) needs the
+                // wider window for the same reason.
+                //
+                // Pointer-safety: the old tight gate was a pre-filter
+                // against dereferencing freed BSGeometry (parse_start AVs).
+                // Entries whose cell detaches inside the window are caught
+                // by the CallResolverGuarded SEH backstop below -- bounded
+                // risk, and the window is ini-tunable ([SemanticCapture]
+                // ResolveRetryWindowFrames).
+                const uint64_t age = (currentFrame > state.lastSeenFrame)
+                    ? (currentFrame - state.lastSeenFrame) : 0;
+                if (age > g_config.resolveRetryWindowFrames) continue;
+                // Backoff gate: a prior failure scheduled this entry's next
+                // attempt; skip until due. See DrawableState::resolveAttempts.
+                if (currentFrame < state.nextRetryFrame) continue;
+                dueNew.push_back(key);
             }
-            // Freshness gate (widened 2026-07-02, was age > 1). The engine
-            // fires GetRenderPasses roughly once per cell ATTACH -- passes
-            // are cached afterwards. Loading a save into a different area
-            // fires the destination cell's geometry DURING the load screen,
-            // when extraction fails (texture rendererData/resources not
-            // backed yet); with a 2-frame window those drawables aged out
-            // before becoming resolvable and, since the engine never
-            // re-fires cached passes, the player's own cell stayed
-            // permanently empty while later-attaching neighbor cells
-            // appeared (user-reported symptom). The async texture readback
-            // (Pending on first attempt) needs the wider window for the
-            // same reason.
-            //
-            // Pointer-safety: the old tight gate was a pre-filter against
-            // dereferencing freed BSGeometry (parse_start AVs). Entries
-            // whose cell detaches inside the window are now caught by the
-            // CallResolverGuarded SEH backstop below and marked permanently
-            // skipped -- bounded risk, and the window is ini-tunable
-            // ([SemanticCapture] ResolveRetryWindowFrames).
+        }
+
+        // Gates + resolver call + retry bookkeeping for one entry. Caller
+        // holds g_drawableMutex; `state` is the live map entry for `key`.
+        // Returns true when the resolver actually ran (counts against the
+        // time budget implicitly -- the clock, not a count, is the limit).
+        //
+        // SEH-guarded: stale geometry pointers (freed while the entry sat
+        // inside the retry window) can dereference freed memory. Catch the
+        // AV and back off HARD -- but do NOT permanently blacklist the key.
+        // The engine reuses those exact pointer values when it rebuilds the
+        // world (same PassKey), so a permanent skip turned one transient
+        // mid-load race into "this drawable can never render again this
+        // session" (the missing-destination-cell-after-load report). If the
+        // geometry stays dead, its fires stop and the retry-window gate
+        // retires the entry naturally.
+        auto attemptResolve = [&](PassKey key,
+                                  SemanticCapture::DrawableState& state) -> bool {
+            // Re-check the gates under the lock: the fire hook / a poll
+            // release may have touched the entry between phase A and now.
             const uint64_t age = (currentFrame > state.lastSeenFrame)
                 ? (currentFrame - state.lastSeenFrame) : 0;
-            if (age > g_config.resolveRetryWindowFrames) continue;
+            if (age > g_config.resolveRetryWindowFrames) return false;
+            if (currentFrame < state.nextRetryFrame) return false;
 
-            // Backoff gate: a prior failure scheduled this entry's next
-            // attempt; skip until due. See DrawableState::resolveAttempts.
-            if (currentFrame < state.nextRetryFrame) continue;
-
-            // Note: the resolver may take a few hundred microseconds for
-            // texture readbacks. We hold the mutex during the call, which
-            // serializes resolver work with hot-path captures. If profile
-            // shows hot-path back-pressure, move this loop to a snapshot+
-            // unlock+resolve+lock-to-update pattern. Default first.
-            //
-            // SEH-guarded: stale geometry pointers (freed while the entry
-            // sat inside the retry window) can dereference freed memory.
-            // Catch the AV and back off HARD -- but do NOT permanently
-            // blacklist the key. The engine reuses those exact pointer
-            // values when it rebuilds the world (same PassKey), so a
-            // permanent skip turned one transient mid-load race into "this
-            // drawable can never render again this session" (the missing-
-            // destination-cell-after-load report). If the geometry stays
-            // dead, its fires stop and the retry-window gate above retires
-            // the entry naturally.
             unsigned long excCode = 0;
             const bool crashed = CallResolverGuarded(&state, key, device, &excCode) != 0;
             if (crashed) {
@@ -1046,6 +982,169 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 // across retries.
                 if (state.isLODChunk)     g_lodChunkKeys.insert(key);
                 if (state.isSkinnedActor) g_skinnedKeys.insert(key);
+            }
+            return true;
+        };
+
+        // Phase B: process new geometry first, then upgrade polls, locking
+        // per key so hook fires and OnFrame snapshots interleave between
+        // items instead of stalling for the whole burst. The budget check
+        // runs between items only -- a release+re-resolve pair is never
+        // split -- and always lets the first item through so one expensive
+        // resolve can't stall the queue forever.
+        size_t attempted = 0;
+        bool   budgetHit = false;
+        int    upgradesThisTick = 0;  // texture re-capture storm cap
+
+        for (const PassKey key : dueNew) {
+            if (budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs) {
+                budgetHit = true;
+                break;
+            }
+            std::lock_guard<std::mutex> lock(g_drawableMutex);
+            auto it = g_drawableMap.find(key);
+            if (it == g_drawableMap.end()) continue;      // evicted meanwhile
+            if (it->second.submittedToRemix) continue;    // resolved meanwhile
+            if (attemptResolve(key, it->second)) ++attempted;
+        }
+
+        for (const PassKey key : duePolls) {
+            if (budgetHit ||
+                (budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs)) {
+                budgetHit = true;
+                break;
+            }
+            std::lock_guard<std::mutex> lock(g_drawableMutex);
+            auto it = g_drawableMap.find(key);
+            if (it == g_drawableMap.end()) continue;
+            auto& state = it->second;
+            if (!state.submittedToRemix) continue;  // released meanwhile
+
+            bool doReresolve = false;
+
+            // Merge capture upgrade poll (2026-07-04): this merge shape
+            // submitted with a fallback partition because the engine
+            // wasn't drawing its cluster while the watch was armed.
+            // Keep a background watch alive (~1 Hz per drawable) and,
+            // the moment a capture lands (the cluster became visible),
+            // release the fallback and re-resolve: Query finds the
+            // completed watch and the exact baked geometry replaces
+            // the fallback via the normal resolve path.
+            if (state.mergeCaptureUpgradePending &&
+                ((currentFrame ^ key) & 63) == 0 &&
+                DrawCapture::EnsureWatch(state.mergeWatchBuf,
+                                         state.mergeWatchSrv, key,
+                                         state.mergeWatchRecordCount,
+                                         state.mergeWatchSegTris)) {
+                unsigned long excCode = 0;
+                if (CallReleaseDrawableGuarded(state.meshHash, &excCode) != 0) {
+                    _MESSAGE("FO4RemixPlugin: [MergeUpgrade] CRASH CAUGHT in "
+                             "ReleaseDrawable hash=0x%llX exception=0x%08lX",
+                             (unsigned long long)state.meshHash, excCode);
+                }
+                for (uint64_t xh : state.extraMeshHashes) {
+                    if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                        _MESSAGE("FO4RemixPlugin: [MergeUpgrade] CRASH CAUGHT in "
+                                 "ReleaseDrawable extra=0x%llX exception=0x%08lX",
+                                 (unsigned long long)xh, excCode);
+                    }
+                }
+                state.extraMeshHashes.clear();
+                state.submittedToRemix = false;
+                state.resolveAttempts = 0;
+                state.nextRetryFrame = 0;
+                // The geometry is provably alive (the engine just drew
+                // it, and this state holds a +1 NiPointer ref); touch
+                // lastSeenFrame so the freshness gate doesn't retire the
+                // re-resolve of a long-ago-attached shape.
+                state.lastSeenFrame = currentFrame;
+                // The resolver re-sets this if it has to fall back again.
+                state.mergeCaptureUpgradePending = false;
+                static std::atomic<int> sUpgradeLogs{0};
+                const int un = sUpgradeLogs.fetch_add(1, std::memory_order_relaxed);
+                if (un < 40) {
+                    _MESSAGE("FO4RemixPlugin: [MergeUpgrade] #%d hash=0x%llX capture "
+                             "landed -> re-resolving with engine draws",
+                             un, (unsigned long long)key);
+                }
+                doReresolve = true;
+            }
+            // Texture re-capture-on-approach poll (2026-07-08): the plugin
+            // captured this lighting drawable's textures at whatever mip FO4
+            // had streamed when it first resolved (often reduced at distance;
+            // the name-keyed texture cache then locked that blurry version
+            // for the session -> "blobby", washed-out detail, flat NPC skin).
+            // Poll the LIVE diffuse resolution ~every 128 frames (staggered
+            // by key). When the engine has since streamed a STRICTLY larger
+            // mip in (player approached), release + re-resolve: the
+            // resolution-folded texture hash yields a fresh full-res texture
+            // + material via the normal resolve path. Only upgrades (never
+            // downgrades), so walking away can't blur a sharp capture; once
+            // at the streamed max, live == submitted and it stops firing.
+            // submittedDiffuseWidth is 0 for non-lighting drawables (water),
+            // so this branch never touches them. Capped at 3 upgrades per
+            // Tick on top of the time budget (each re-resolve allocates
+            // full-res RGBA mip chains; the uncapped storm was the
+            // 2026-07-08/09 fail-fast crashes). Skipped drawables re-qualify
+            // on their next 128-frame slot, so the backlog drains within
+            // seconds.
+            else if (g_config.textureUpgradeOnApproach &&
+                     state.submittedDiffuseWidth != 0 &&
+                     upgradesThisTick < 3 &&
+                     ((currentFrame ^ key) & 127) == 0) {
+                const uint32_t liveW =
+                    BsExtraction::GetMaterialDiffuseResidentWidth(state.material);
+                if (liveW > (uint32_t)state.submittedDiffuseWidth) {
+                    unsigned long excCode = 0;
+                    if (CallReleaseDrawableGuarded(state.meshHash, &excCode) != 0) {
+                        _MESSAGE("FO4RemixPlugin: [TexUpgrade] CRASH CAUGHT in "
+                                 "ReleaseDrawable hash=0x%llX exception=0x%08lX",
+                                 (unsigned long long)state.meshHash, excCode);
+                    }
+                    for (uint64_t xh : state.extraMeshHashes) {
+                        if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                            _MESSAGE("FO4RemixPlugin: [TexUpgrade] CRASH CAUGHT in "
+                                     "ReleaseDrawable extra=0x%llX exception=0x%08lX",
+                                     (unsigned long long)xh, excCode);
+                        }
+                    }
+                    state.extraMeshHashes.clear();
+                    state.submittedToRemix = false;
+                    state.resolveAttempts = 0;
+                    state.nextRetryFrame = 0;
+                    state.lastSeenFrame = currentFrame;
+                    ++upgradesThisTick;
+                    static std::atomic<int> sTexUpLogs{0};
+                    const int tn = sTexUpLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (tn < 60) {
+                        _MESSAGE("FO4RemixPlugin: [TexUpgrade] #%d hash=0x%llX diffuse "
+                                 "%upx -> %upx streamed in, re-resolving",
+                                 tn, (unsigned long long)key,
+                                 (unsigned)state.submittedDiffuseWidth, liveW);
+                    }
+                    doReresolve = true;
+                }
+            }
+
+            if (!doReresolve) continue;
+            // Resolve immediately with the upgraded input -- same lock hold
+            // as the release above, so the handle gap is one resolve, never
+            // a budget-break away.
+            if (attemptResolve(key, state)) ++attempted;
+        }
+
+        // Spike/budget diagnostic (rate-limited): one line whenever the
+        // resolve phase ran long or deferred work, so hitching reports can
+        // be checked against exactly what this tick did.
+        const double spentMs = resolveElapsedMs();
+        if (budgetHit || spentMs > 8.0) {
+            static uint64_t s_lastSpikeLogFrame = 0;
+            if (currentFrame - s_lastSpikeLogFrame >= 120) {
+                s_lastSpikeLogFrame = currentFrame;
+                _MESSAGE("FO4RemixPlugin: [ResolveBudget] tick spent %.1fms "
+                         "(budget %.1fms%s) attempted=%zu dueNew=%zu duePolls=%zu",
+                         spentMs, budgetMs, budgetHit ? ", HIT -- deferring rest" : "",
+                         attempted, dueNew.size(), duePolls.size());
             }
         }
     }

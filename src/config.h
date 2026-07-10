@@ -246,6 +246,19 @@ struct PluginConfig {
     // ~2-3 ticks, so N slots resolve ~N textures per few frames. Staging
     // VRAM is transient (~1.4MB per 1K BC7 chain). 0 = built-in default.
     uint32_t maxPendingTextureReadbacks;
+
+    // Per-Tick wall-clock budget (milliseconds) for the semantic-capture
+    // resolve loop (2026-07-09 hitching fix). Tick runs on the game render
+    // thread inside hkPresent; a cell attach makes hundreds of drawables
+    // resolvable in the same tick, and each resolve pays mesh parse + CPU
+    // BC-decompress of every texture mip + Remix handle creation -- measured
+    // 12.6ms AVERAGE per game frame during streaming windows (spikes far
+    // higher), the "hitching when new geometry loads" report. The loop now
+    // stops after this many ms and picks the backlog up next tick (entries
+    // stay due; the work self-drains). At least one resolve always runs per
+    // tick so a single over-budget item can't stall progress. 0 = unbounded
+    // (legacy burst behavior).
+    float resolveBudgetMs;
 };
 
 // Global config instance
