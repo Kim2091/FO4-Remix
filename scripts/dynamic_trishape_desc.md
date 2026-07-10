@@ -229,8 +229,11 @@ Concrete guidance:
 > below (coordinate space = bind-pose model space, GPU-skinned by the
 > source 10-bone skin instance, gore-part sentinels, skin instance kept)
 > stands. Plugin consequence: a one-time position snapshot freezes faces;
-> the fix is the FaceMorphRefresh path (fingerprint the live buffer, re-upload
-> positions on change). Also note: the rendered per-NPC FaceGeom NIF is
+> the fix direction is a FaceMorphRefresh path (fingerprint the live buffer,
+> re-upload positions on change). v1 (2703b05) was REVERTED in 96cbf56 --
+> refreshed faces rendered invisible; suspect = CreateMesh issued with the
+> same meshInfo.hash as the still-live handle, then destroying the old handle
+> unregistered the shared hash entry. See the revert commit for the handoff. Also note: the rendered per-NPC FaceGeom NIF is
 > skinned to only 10 coarse bones (HEAD/Neck/Chest/collarbones — ba2-verified,
 > zero `skin_bone_*`), and the mouth to 1 bone, so fine facial motion CANNOT
 > ride the render mesh's own skinning; the dense ~60-bone `skin_bone_*` rig
