@@ -214,14 +214,18 @@ std::atomic<uint64_t> g_loadingScreenSinceFrame{0};
 constexpr uint64_t    kLoadingGateFailsafeFrames = 3600;  // ~60s: clear a stuck flag
 
 // -------- Resolve retry backoff --------
-// Attempts 1-4 retry next frame (async readback polling stays tight), then
-// the delay doubles per attempt: 2, 4, 8, ... capped at 512 frames.
+// Attempts 1-8 retry next frame, then the delay doubles per attempt:
+// 2, 4, 8, ... capped at 512 frames. The tight window covers the async
+// texture pipeline's normal latency: GPU readback lands in ~2-3 ticks and
+// the worker-thread decode (2026-07-09) adds a few more -- backing off
+// before both stages finish would add whole backoff delays to every
+// texture-heavy drawable's pop-in.
 constexpr uint64_t kMaxRetryDelayFrames   = 512;
 constexpr uint64_t kCrashRetryDelayFrames = 120;
 
 static uint64_t RetryDelayFrames(uint32_t attempts) {
-    if (attempts <= 4) return 1;
-    const uint32_t shift = (attempts - 4u < 10u) ? (attempts - 4u) : 10u;
+    if (attempts <= 8) return 1;
+    const uint32_t shift = (attempts - 8u < 10u) ? (attempts - 8u) : 10u;
     const uint64_t delay = 1ull << shift;
     return delay < kMaxRetryDelayFrames ? delay : kMaxRetryDelayFrames;
 }

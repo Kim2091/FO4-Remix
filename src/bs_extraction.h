@@ -239,6 +239,11 @@ namespace BsExtraction {
     // Drop the internal texture cache (call on cell change if desired).
     void ClearTextureCache();
 
+    // Join the async texture-conversion worker threads (see
+    // ExtractMaterialTexture's decode pipeline). Queued jobs are dropped.
+    // Call once at plugin shutdown; safe to call when no worker ever started.
+    void StopTextureConversionWorkers();
+
     // Diagnostic (2026-07-06 black-merge investigation): content statistics
     // of a cached extracted texture. Returns false on cache miss. meanRGBA is
     // computed from a stride sample of mip 0 when the cached format is

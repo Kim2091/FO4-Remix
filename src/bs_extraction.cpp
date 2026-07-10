@@ -22,8 +22,13 @@
 #include <cctype>
 #include <cfloat>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <fstream>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <wrl/client.h>
@@ -1155,6 +1160,382 @@ uint32_t BsExtraction::GetMaterialDiffuseResidentWidth(void* material) {
 }
 
 // ---------------------------------------------------------------------------
+// Async texture conversion workers (2026-07-09 pop-in speed).
+//
+// Everything downstream of the GPU readback -- BC decompression, octahedral
+// normal encoding, smoothness inversion, palette/tint/lum-floor bakes, mip
+// packing -- is pure CPU work on plugin-owned buffers, and it dominated the
+// resolve loop's cost (a 2048^2 BC chain is ~5.6M texels of scalar decode;
+// normals additionally pay per-pixel sqrt + octahedral math). Running it
+// inline serialized the whole streaming burst onto the game render thread;
+// under the ResolveBudgetMs cap that made pop-in crawl (~180ms of decode
+// throughput per second of game time). These workers run the conversion in
+// parallel off-thread: ExtractMaterialTexture enqueues a job when the
+// readback lands and returns "pending" (0); the resolver's normal retry
+// finds the finished result a tick or two later and only pays cache-store +
+// Remix upload on the game thread.
+//
+// Thread contract: jobs carry copies/moves of everything they touch (raw
+// mips, palette table, params) -- no engine pointers, no shared caches.
+// g_textureCache / g_lutCache stay game-thread-only; the only cross-thread
+// state is the queue + done map under g_texConvMutex.
+// ---------------------------------------------------------------------------
+struct TextureConversionJob {
+    uint64_t hash = 0;
+    std::vector<ExtractedTexture> mips;   // raw readback output, moved in
+    TexturePostProcess postProcess = TexturePostProcess::None;
+    uint8_t  minRoughness   = 0;
+    uint8_t  albedoLumFloor = 0;
+    uint32_t tintRGB        = 0xFFFFFFu;
+    PaletteRemapTable palTable = {};
+    bool     palTableValid  = false;
+    bool     isDiffuseSlot  = false;      // debug-dump routing only
+    std::string texName;                  // logging only
+};
+
+struct CompletedTextureConversion {
+    ExtractedTexture packed;   // pixels empty => conversion dropped/failed
+    uint64_t doneFrame = 0;    // for the orphan TTL sweep
+};
+
+static std::mutex                       g_texConvMutex;
+static std::condition_variable          g_texConvCv;
+static std::deque<TextureConversionJob> g_texConvJobs;
+static std::unordered_map<uint64_t, CompletedTextureConversion> g_texConvDone;
+static std::unordered_set<uint64_t>     g_texConvInflight;  // queued or converting
+static std::vector<std::thread>         g_texConvWorkers;
+static bool                             g_texConvStop = false;  // guarded by g_texConvMutex
+
+// The conversion tail moved out of ExtractMaterialTexture: pure function of
+// the job, runs on a worker thread. Returns the packed mip chain; empty
+// pixels signal "drop" (exactly the cases that returned 0 inline before).
+static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
+{
+    std::vector<ExtractedTexture>& mips = job.mips;
+    const char* texName = job.texName.c_str();
+    const TexturePostProcess postProcess = job.postProcess;
+
+    // Per-mip pipeline: BC2 (DXT3) -> RGBA8, then any further BC decompression
+    // handled by the post-process stage's BC5/BC1 decoders. Each step operates
+    // on a single mip so the existing single-mip-aware functions need no
+    // changes.
+    for (auto& mip : mips) {
+        DecompressBC2(mip);
+    }
+
+    // --- Debug dump: BC3 alpha cutout (right after readback) ---
+    // See the black-merge investigation notes; fires for the first N BC3
+    // diffuse extractions per process. Counters are atomics now that this
+    // runs on worker threads (ticket races would at most skew a filename).
+    {
+        static std::atomic<int> s_dumpBC3Alpha{0};
+        static std::atomic<int> s_logDiffuseFormat{0};
+        if (job.isDiffuseSlot) {
+            const auto& mip0 = mips[0];
+            if (s_logDiffuseFormat.fetch_add(1, std::memory_order_relaxed) < 9999) {
+                _MESSAGE("FO4RemixPlugin: DEBUG diffuse-extract tex='%s' fmt=%u %ux%u mips=%zu pp=%d",
+                         texName,
+                         (unsigned)mip0.dxgiFormat,
+                         mip0.width, mip0.height, mips.size(),
+                         (int)postProcess);
+            }
+            const bool isBC3 = (mip0.dxgiFormat == DXGI_FORMAT_BC3_UNORM ||
+                                mip0.dxgiFormat == DXGI_FORMAT_BC3_UNORM_SRGB ||
+                                mip0.dxgiFormat == DXGI_FORMAT_BC3_TYPELESS);
+            if (isBC3 && mip0.width >= 4 && mip0.height >= 4) {
+                const int ticket = s_dumpBC3Alpha.fetch_add(1, std::memory_order_relaxed);
+                if (ticket < 30) {
+                    const uint32_t numBlocksX = mip0.width / 4;
+                    const uint32_t numBlocksY = mip0.height / 4;
+                    std::vector<uint8_t> rgba(mip0.width * mip0.height * 4, 0);
+                    uint32_t aMin = 255, aMax = 0, aSum = 0, aCount = 0;
+
+                    for (uint32_t by = 0; by < numBlocksY; by++) {
+                        for (uint32_t bx = 0; bx < numBlocksX; bx++) {
+                            const uint8_t* block = mip0.pixels.data() + (by * numBlocksX + bx) * 16;
+                            uint8_t alphas[4][4];
+                            DecodeBC3AlphaBlock(block, alphas);
+                            for (uint32_t y = 0; y < 4; y++) {
+                                for (uint32_t x = 0; x < 4; x++) {
+                                    const uint8_t a = alphas[y][x];
+                                    const uint32_t px = (by * 4 + y) * mip0.width + (bx * 4 + x);
+                                    rgba[px * 4 + 0] = a;
+                                    rgba[px * 4 + 1] = a;
+                                    rgba[px * 4 + 2] = a;
+                                    rgba[px * 4 + 3] = 255;
+                                    if (a < aMin) aMin = a;
+                                    if (a > aMax) aMax = a;
+                                    aSum += a;
+                                    aCount++;
+                                }
+                            }
+                        }
+                    }
+
+                    char path[256];
+                    snprintf(path, sizeof(path), "c:/temp/fo4_debug_bc3_alpha_%d.tga", ticket);
+                    DebugDumpTGA(path, rgba.data(), mip0.width, mip0.height);
+                    const uint32_t aMean = aCount > 0 ? aSum / aCount : 0;
+                    _MESSAGE("FO4RemixPlugin: DEBUG dumped BC3 alpha -> %s tex='%s' min=%u max=%u mean=%u",
+                             path, texName, aMin, aMax, aMean);
+                }
+            }
+        }
+    }
+
+    // --- Debug dump: diffuse control (no post-processing) ---
+    if (postProcess == TexturePostProcess::None) {
+        static std::atomic<int> s_dumpDiffuse{0};
+        if (s_dumpDiffuse.load(std::memory_order_relaxed) < 2) {
+            const int ticket = s_dumpDiffuse.fetch_add(1, std::memory_order_relaxed);
+            if (ticket < 2) {
+                ExtractedTexture tmp = mips[0];
+                bool isBC1tmp = (tmp.dxgiFormat == DXGI_FORMAT_BC1_UNORM ||
+                                 tmp.dxgiFormat == DXGI_FORMAT_BC1_UNORM_SRGB ||
+                                 tmp.dxgiFormat == DXGI_FORMAT_BC1_TYPELESS);
+                if (isBC1tmp) {
+                    DecompressBC(tmp, BCTransform::None);
+                }
+                if (tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                    tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+                    char path[256];
+                    snprintf(path, sizeof(path), "c:/temp/fo4_debug_diffuse_%d.tga", ticket);
+                    DebugDumpTGA(path, tmp.pixels.data(), tmp.width, tmp.height);
+                    _MESSAGE("FO4RemixPlugin: DEBUG dumped diffuse -> %s (%ux%u)", path, tmp.width, tmp.height);
+                }
+            }
+        }
+    }
+
+    // --- Debug dump: raw BC5 decode (before post-processing) ---
+    {
+        static std::atomic<int> s_dumpNormalRaw{0}, s_dumpRoughnessRaw{0};
+        int ticket = -1;
+        const char* rawName = nullptr;
+        if (postProcess == TexturePostProcess::Octahedral &&
+            s_dumpNormalRaw.load(std::memory_order_relaxed) < 3) {
+            ticket = s_dumpNormalRaw.fetch_add(1, std::memory_order_relaxed);
+            rawName = "c:/temp/fo4_debug_normal_raw_%d.tga";
+        } else if (postProcess == TexturePostProcess::InvertRGB &&
+                   s_dumpRoughnessRaw.load(std::memory_order_relaxed) < 3) {
+            ticket = s_dumpRoughnessRaw.fetch_add(1, std::memory_order_relaxed);
+            rawName = "c:/temp/fo4_debug_roughness_raw_%d.tga";
+        }
+        if (rawName && ticket >= 0 && ticket < 3) {
+            ExtractedTexture tmp = mips[0]; // copy mip 0
+            bool isBC5tmp = (tmp.dxgiFormat == DXGI_FORMAT_BC5_UNORM ||
+                             tmp.dxgiFormat == DXGI_FORMAT_BC5_SNORM ||
+                             tmp.dxgiFormat == DXGI_FORMAT_BC5_TYPELESS);
+            if (isBC5tmp) {
+                DecompressBC(tmp, BCTransform::NormalReconstructZ);
+            }
+            if (tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
+                char path[256];
+                snprintf(path, sizeof(path), rawName, ticket);
+                DebugDumpTGA(path, tmp.pixels.data(), tmp.width, tmp.height);
+                _MESSAGE("FO4RemixPlugin: DEBUG dumped raw decode -> %s (%ux%u)", path, tmp.width, tmp.height);
+            }
+        }
+    }
+
+    // Apply post-processing per-mip. SmoothnessToRoughness and
+    // ConvertNormalToOctahedral both run BC decode internally if needed and
+    // emit RGBA8, so mips that started in different BC formats end up in a
+    // common output format -- which matters because we concatenate them
+    // into a single packed buffer below.
+    for (auto& mip : mips) {
+        if (postProcess == TexturePostProcess::InvertRGB) {
+            SmoothnessToRoughness(mip);
+            // Clamp roughness for decal surfaces. Bethesda's smoothness map is
+            // often set to "very smooth" on decals; after InvertRGB that
+            // becomes near-zero roughness (mirror) which the path tracer
+            // renders literally. Vanilla DX11 hides this with specular
+            // highlights. Clamping the RGB channels (which carry roughness
+            // after our inversion) to >= minRoughness prevents mirror surfaces
+            // while preserving relative variation. Only applied on the BC1/
+            // BC3/BC5 -> RGBA8 path; BC7 / unknown formats fall through
+            // SmoothnessToRoughness as-is and are not clamped here (acceptable
+            // since they're rare).
+            if (job.minRoughness > 0 &&
+                (mip.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                 mip.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
+                 mip.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                 mip.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
+                for (uint32_t i = 0; i < mip.width * mip.height; i++) {
+                    if (mip.pixels[i * 4 + 0] < job.minRoughness) mip.pixels[i * 4 + 0] = job.minRoughness;
+                    if (mip.pixels[i * 4 + 1] < job.minRoughness) mip.pixels[i * 4 + 1] = job.minRoughness;
+                    if (mip.pixels[i * 4 + 2] < job.minRoughness) mip.pixels[i * 4 + 2] = job.minRoughness;
+                }
+            }
+        } else if (postProcess == TexturePostProcess::Octahedral) {
+            ConvertNormalToOctahedral(mip);
+        } else if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminance) {
+            DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/false);
+        } else if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminanceForceBC3) {
+            DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/true);
+        } else if (postProcess == TexturePostProcess::ForceRGBA8) {
+            // Decompress-only: BC1/BC3 (incl. SRGB) -> RGBA8, authored alpha
+            // kept. Non-BC inputs pass through untouched.
+            DecompressBC(mip, BCTransform::None);
+        }
+        // Grayscale-to-palette remap REPLACES the gray RGB with the LUT row
+        // (engine-exact; see PaletteRemap_Apply). Composes at the tint slot:
+        // AFTER the alpha stage (cutouts survive), BEFORE the luminance
+        // floor. When it declines (BC7 input), the flat-tint fallback below
+        // applies instead.
+        bool remapped = false;
+        if (job.palTableValid) {
+            remapped = PaletteRemap_Apply(mip, job.palTable);
+        }
+        // Skin/hair tint multiply composes AFTER the alpha stage (alpha
+        // untouched -- hair cutouts survive) and BEFORE the luminance floor.
+        if (!remapped && job.tintRGB != 0xFFFFFFu) {
+            TintMultiply_Apply(mip, job.tintRGB);
+        }
+        // Metal albedo luminance floor composes AFTER the alpha stage so
+        // synthesized / authored cutout alpha is preserved while dark RGB is
+        // lifted (hue-preserving; see AlbedoLumFloor_Apply).
+        if (job.albedoLumFloor > 0) {
+            AlbedoLumFloor_Apply(mip, job.albedoLumFloor);
+        }
+    }
+
+    // --- Debug dump: after post-processing (mip 0 only) ---
+    {
+        static std::atomic<int> s_dumpNormalPost{0}, s_dumpRoughnessPost{0};
+        int ticket = -1;
+        const char* postName = nullptr;
+        if (postProcess == TexturePostProcess::Octahedral &&
+            s_dumpNormalPost.load(std::memory_order_relaxed) < 3) {
+            ticket = s_dumpNormalPost.fetch_add(1, std::memory_order_relaxed);
+            postName = "c:/temp/fo4_debug_normal_post_%d.tga";
+        } else if (postProcess == TexturePostProcess::InvertRGB &&
+                   s_dumpRoughnessPost.load(std::memory_order_relaxed) < 3) {
+            ticket = s_dumpRoughnessPost.fetch_add(1, std::memory_order_relaxed);
+            postName = "c:/temp/fo4_debug_roughness_post_%d.tga";
+        }
+        if (postName && ticket >= 0 && ticket < 3 &&
+            (mips[0].dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
+             mips[0].dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
+            char path[256];
+            snprintf(path, sizeof(path), postName, ticket);
+            DebugDumpTGA(path, mips[0].pixels.data(), mips[0].width, mips[0].height);
+            _MESSAGE("FO4RemixPlugin: DEBUG dumped post-process -> %s (%ux%u)", path, mips[0].width, mips[0].height);
+        }
+    }
+
+    // --- Sanity: every mip must share the same final dxgiFormat. The pipeline
+    // above produces RGBA8 for any BC source; uncompressed sources stay in
+    // their original (BGRA8 / RGBA8) format. Mixed formats across mips would
+    // mean a mid-chain decompression diverged -- bail rather than ship a
+    // malformed packed buffer that dxvk-remix would interpret as garbage.
+    DXGI_FORMAT chainFmt = mips[0].dxgiFormat;
+    for (auto& mip : mips) {
+        if (mip.dxgiFormat != chainFmt) {
+            _MESSAGE("FO4RemixPlugin: ExtractMaterialTexture - mip format mismatch "
+                     "(mip0=%u midmip=%u) for hash=0x%016llX, dropping",
+                     (unsigned)chainFmt, (unsigned)mip.dxgiFormat, job.hash);
+            return {};
+        }
+    }
+
+    // Concatenate all mips into a single packed buffer. Remix expects the
+    // mip chain tightly packed, mip0 first, no padding.
+    ExtractedTexture extracted;
+    extracted.hash       = job.hash;
+    extracted.width      = mips[0].width;
+    extracted.height     = mips[0].height;
+    extracted.dxgiFormat = chainFmt;
+    extracted.mipLevels  = (uint32_t)mips.size();
+
+    size_t total = 0;
+    for (const auto& mip : mips) total += mip.pixels.size();
+    extracted.pixels.reserve(total);
+    for (auto& mip : mips) {
+        extracted.pixels.insert(extracted.pixels.end(),
+                                mip.pixels.begin(), mip.pixels.end());
+    }
+    return extracted;
+}
+
+static void TextureConversionWorkerMain()
+{
+    for (;;) {
+        TextureConversionJob job;
+        {
+            std::unique_lock<std::mutex> lk(g_texConvMutex);
+            g_texConvCv.wait(lk, [] { return g_texConvStop || !g_texConvJobs.empty(); });
+            if (g_texConvStop) return;   // queued jobs dropped on shutdown, by design
+            job = std::move(g_texConvJobs.front());
+            g_texConvJobs.pop_front();
+        }
+        ExtractedTexture packed = ConvertReadbackMips(job);
+        {
+            std::lock_guard<std::mutex> lk(g_texConvMutex);
+            g_texConvDone[job.hash] = { std::move(packed),
+                                        Diagnostics::CurrentFrameIndex() };
+            g_texConvInflight.erase(job.hash);
+        }
+    }
+}
+
+static void EnqueueTextureConversion(TextureConversionJob&& job)
+{
+    std::lock_guard<std::mutex> lk(g_texConvMutex);
+    if (g_texConvStop) return;
+
+    // Orphan sweep: a completed result whose caller stopped retrying (drawable
+    // evicted mid-flight, or the resident-resolution fold changed the hash)
+    // would pin its pixel buffer forever. Only walks once the map has grown
+    // past what a healthy pipeline keeps in flight.
+    if (g_texConvDone.size() > 64) {
+        const uint64_t now = Diagnostics::CurrentFrameIndex();
+        for (auto it = g_texConvDone.begin(); it != g_texConvDone.end();) {
+            if (now - it->second.doneFrame > 600) {
+                it = g_texConvDone.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    g_texConvInflight.insert(job.hash);
+    g_texConvJobs.push_back(std::move(job));
+
+    if (g_texConvWorkers.empty()) {
+        const unsigned hw = std::thread::hardware_concurrency();
+        const unsigned count = hw >= 16 ? 4u : (hw >= 8 ? 3u : 2u);
+        for (unsigned i = 0; i < count; ++i) {
+            g_texConvWorkers.emplace_back([] {
+                // Below-normal priority: decode throughput matters, but never
+                // at the cost of the game's own render/worker threads when the
+                // CPU is saturated.
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                TextureConversionWorkerMain();
+            });
+        }
+        _MESSAGE("FO4RemixPlugin: [TexConvert] started %u texture decode workers", count);
+    }
+    g_texConvCv.notify_one();
+}
+
+void BsExtraction::StopTextureConversionWorkers()
+{
+    {
+        std::lock_guard<std::mutex> lk(g_texConvMutex);
+        if (g_texConvWorkers.empty()) return;
+        g_texConvStop = true;
+    }
+    g_texConvCv.notify_all();
+    for (auto& t : g_texConvWorkers) {
+        if (t.joinable()) t.join();
+    }
+    g_texConvWorkers.clear();
+    _MESSAGE("FO4RemixPlugin: [TexConvert] texture decode workers stopped");
+}
+
+// ---------------------------------------------------------------------------
 // Generic texture extraction from any NiTexture slot
 // ---------------------------------------------------------------------------
 uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotName,
@@ -1267,6 +1648,60 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
         return hash;
     }
 
+    // Async conversion rendezvous: a prior attempt's readback completed and
+    // its decode ran (or is running) on a worker thread. Consume the result
+    // here, or keep reporting "pending". Checked BEFORE the readback path so
+    // a completed decode can't re-trigger a fresh GPU readback for the same
+    // hash.
+    {
+        ExtractedTexture packed;
+        bool havePacked = false;
+        {
+            std::lock_guard<std::mutex> lk(g_texConvMutex);
+            auto dit = g_texConvDone.find(hash);
+            if (dit != g_texConvDone.end()) {
+                packed = std::move(dit->second.packed);
+                g_texConvDone.erase(dit);
+                havePacked = true;
+            } else if (g_texConvInflight.count(hash)) {
+                return 0;  // decode in flight; resolver retries next tick
+            }
+        }
+        if (havePacked) {
+            if (packed.pixels.empty()) return 0;  // conversion dropped (format mismatch)
+
+            if (g_config.logTextures) {
+                _MESSAGE("FO4RemixPlugin: Extracted %s texture \"%s\" %ux%u mips=%u fmt=%u hash=0x%016llX%s",
+                         slotName, texName ? texName : "<null>",
+                         packed.width, packed.height, packed.mipLevels,
+                         (unsigned)packed.dxgiFormat, hash,
+                         postProcess == TexturePostProcess::InvertRGB ? " (inverted)" :
+                         postProcess == TexturePostProcess::Octahedral ? " (octahedral)" : "");
+            }
+
+            // Evict the superseded smaller resolution variant (see
+            // g_texResVariantIndex): keeps the CPU pixel cache at ~one variant
+            // per texture instead of accumulating every mip level the streamer
+            // ever had resident. Only when the resolution fold is active (hash
+            // differs from the pre-fold hash); only supersede strictly-smaller
+            // variants.
+            if (hash != preResolutionHash) {
+                auto [vit, inserted] = g_texResVariantIndex.try_emplace(
+                    preResolutionHash, hash, packed.width);
+                if (!inserted && vit->second.first != hash) {
+                    if (packed.width > vit->second.second) {
+                        g_textureCache.erase(vit->second.first);
+                        vit->second = { hash, packed.width };
+                    }
+                }
+            }
+
+            g_textureCache[hash] = packed;
+            newTextures.push_back(std::move(packed));
+            return hash;
+        }
+    }
+
     // QueryInterface to ID3D11Texture2D
     ID3D11Texture2D* tex2D = nullptr;
     HRESULT hr = resource->QueryInterface(__uuidof(ID3D11Texture2D),
@@ -1288,303 +1723,46 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
 
     if (rbStatus != ReadbackStatus::Ready || mips.empty()) return 0;
 
+    // Readback landed: package the conversion (BC decode + transforms + mip
+    // packing) for the worker pool and keep reporting "pending" (0). The
+    // resolver's normal retry finds the finished result in the rendezvous
+    // block above a tick or two later. Everything the job needs is copied or
+    // moved -- no engine pointers cross the thread boundary.
+    TextureConversionJob job;
+    job.hash           = hash;
+    job.postProcess    = postProcess;
+    job.minRoughness   = minRoughness;
+    job.albedoLumFloor = albedoLumFloor;
+    job.tintRGB        = tintRGB;
+    job.isDiffuseSlot  = slotName && std::strcmp(slotName, "diffuse") == 0;
+    job.texName        = texName ? texName : "";
+
     // Runtime gamma of the source resource, captured before any decompression
     // (DecompressBC drops the _SRGB tag). Drives the palette remap's U decode:
     // the engine samples the grayscale diffuse through THIS format's SRV.
     const bool srcIsSrgb = IsSrgbColorFormat(mips[0].dxgiFormat);
 
-    // Grayscale-to-palette remap table: built once per texture (256 gray
-    // values -> LUT row colors), applied per mip below. Requires the LUT to
-    // be decoded already -- the resolver's SampleLookupColor pending-gate
-    // guarantees that before the diffuse extraction runs.
-    PaletteRemapTable palTable;
-    bool palTableValid = false;
+    // Grayscale-to-palette remap table: built here on the game thread (it
+    // reads g_lutCache, which is game-thread-only) and copied into the job.
+    // Requires the LUT to be decoded already -- the resolver's
+    // SampleLookupColor pending-gate guarantees that before the diffuse
+    // extraction runs.
     if (paletteLut) {
         const char* lutName = paletteLut->name.c_str();
         const uint64_t lutKey = FnvHashCombine(FnvHash(lutName ? lutName : ""), 0x1071ULL);
         auto lit = g_lutCache.find(lutKey);
         if (lit != g_lutCache.end() && !lit->second.rgba.empty()) {
-            palTableValid = BuildPaletteRemapTable(lit->second, paletteRowV,
-                                                   srcIsSrgb, palTable);
+            job.palTableValid = BuildPaletteRemapTable(lit->second, paletteRowV,
+                                                       srcIsSrgb, job.palTable);
         }
     }
 
-    // Per-mip pipeline: BC2 (DXT3) -> RGBA8, then any further BC decompression
-    // handled by the post-process stage's BC5/BC1 decoders. Each step operates
-    // on a single mip so the existing single-mip-aware functions need no
-    // changes.
-    for (auto& mip : mips) {
-        DecompressBC2(mip);
-    }
-
-    // --- Debug dump: BC3 alpha cutout (right after readback) ---
-    // Captures the EXACT BC3 alpha bytes that ReadbackAllMips produced.
-    // If dump shows a clean cutout matching the BA2 file -> bytes leaving
-    // this plugin function are intact, bug is downstream (upload or Remix
-    // sampling). If dump shows all-1.0 white -> Bethesda's runtime handed
-    // us a BC3 texture with alpha stripped/replaced, and the readback path
-    // needs investigation. Fires for diffuse textures on BC3 inputs only,
-    // first 3 dumps per process. Also logs format/dims for first 5 diffuse
-    // extractions regardless of format so we can confirm whether decal
-    // diffuse comes back as BC3 at all.
-    {
-        static int s_dumpBC3Alpha = 0;
-        static int s_logDiffuseFormat = 0;
-        // Filter on slotName == "diffuse" so we see ALL diffuse extractions.
-        const bool isDiffuseSlot = slotName && std::strcmp(slotName, "diffuse") == 0;
-        if (isDiffuseSlot) {
-            const auto& mip0 = mips[0];
-            if (s_logDiffuseFormat < 9999) {
-                _MESSAGE("FO4RemixPlugin: DEBUG diffuse-extract tex='%s' fmt=%u %ux%u mips=%zu pp=%d",
-                         texName ? texName : "(null)",
-                         (unsigned)mip0.dxgiFormat,
-                         mip0.width, mip0.height, mips.size(),
-                         (int)postProcess);
-                s_logDiffuseFormat++;
-            }
-            const bool isBC3 = (mip0.dxgiFormat == DXGI_FORMAT_BC3_UNORM ||
-                                mip0.dxgiFormat == DXGI_FORMAT_BC3_UNORM_SRGB ||
-                                mip0.dxgiFormat == DXGI_FORMAT_BC3_TYPELESS);
-            // Dump first 30 BC3 diffuses regardless of name. The "decal" name
-            // filter was too restrictive -- DebrisPile/TrashDecal etc don't
-            // necessarily have "decal" in the texture FILENAME.
-            if (s_dumpBC3Alpha < 30 && isBC3 && mip0.width >= 4 && mip0.height >= 4) {
-                const uint32_t numBlocksX = mip0.width / 4;
-                const uint32_t numBlocksY = mip0.height / 4;
-                std::vector<uint8_t> rgba(mip0.width * mip0.height * 4, 0);
-                uint32_t aMin = 255, aMax = 0, aSum = 0, aCount = 0;
-
-                for (uint32_t by = 0; by < numBlocksY; by++) {
-                    for (uint32_t bx = 0; bx < numBlocksX; bx++) {
-                        const uint8_t* block = mip0.pixels.data() + (by * numBlocksX + bx) * 16;
-                        uint8_t alphas[4][4];
-                        DecodeBC3AlphaBlock(block, alphas);
-                        for (uint32_t y = 0; y < 4; y++) {
-                            for (uint32_t x = 0; x < 4; x++) {
-                                const uint8_t a = alphas[y][x];
-                                const uint32_t px = (by * 4 + y) * mip0.width + (bx * 4 + x);
-                                rgba[px * 4 + 0] = a;
-                                rgba[px * 4 + 1] = a;
-                                rgba[px * 4 + 2] = a;
-                                rgba[px * 4 + 3] = 255;
-                                if (a < aMin) aMin = a;
-                                if (a > aMax) aMax = a;
-                                aSum += a;
-                                aCount++;
-                            }
-                        }
-                    }
-                }
-
-                char path[256];
-                snprintf(path, sizeof(path), "c:/temp/fo4_debug_bc3_alpha_%d.tga", s_dumpBC3Alpha++);
-                DebugDumpTGA(path, rgba.data(), mip0.width, mip0.height);
-                const uint32_t aMean = aCount > 0 ? aSum / aCount : 0;
-                _MESSAGE("FO4RemixPlugin: DEBUG dumped BC3 alpha -> %s tex='%s' min=%u max=%u mean=%u",
-                         path, texName ? texName : "(null)", aMin, aMax, aMean);
-            }
-        }
-    }
-
-    // --- Debug dump: diffuse control (no post-processing) ---
-    // Only dump mip 0 -- the lower mips are auto-generated and uninteresting
-    // for visual debugging. The dump runs at first-extraction (s_dump counter)
-    // so it captures the highest-resolution image we'll ever present.
-    if (postProcess == TexturePostProcess::None) {
-        static int s_dumpDiffuse = 0;
-        if (s_dumpDiffuse < 2) {
-            ExtractedTexture tmp = mips[0];
-            // Decompress BC1 to RGBA so we can dump it
-            bool isBC1tmp = (tmp.dxgiFormat == DXGI_FORMAT_BC1_UNORM ||
-                             tmp.dxgiFormat == DXGI_FORMAT_BC1_UNORM_SRGB ||
-                             tmp.dxgiFormat == DXGI_FORMAT_BC1_TYPELESS);
-            if (isBC1tmp) {
-                DecompressBC(tmp, BCTransform::None); // reuses the BC1 decode path to get RGBA
-            }
-            if (tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-                char path[256];
-                snprintf(path, sizeof(path), "c:/temp/fo4_debug_diffuse_%d.tga", s_dumpDiffuse++);
-                DebugDumpTGA(path, tmp.pixels.data(), tmp.width, tmp.height);
-                _MESSAGE("FO4RemixPlugin: DEBUG dumped diffuse -> %s (%ux%u)", path, tmp.width, tmp.height);
-            }
-        }
-    }
-
-    // --- Debug dump: raw BC5 decode (before post-processing) ---
-    // Dump mip 0 of first 3 normal + first 3 roughness textures for inspection.
-    {
-        static int s_dumpNormalRaw = 0, s_dumpRoughnessRaw = 0;
-        bool dumpRaw = false;
-        if (postProcess == TexturePostProcess::Octahedral && s_dumpNormalRaw < 3) dumpRaw = true;
-        if (postProcess == TexturePostProcess::InvertRGB  && s_dumpRoughnessRaw < 3) dumpRaw = true;
-
-        if (dumpRaw) {
-            // BC5 needs decompression to RGBA before we can dump, so do a temporary decode of mip 0
-            ExtractedTexture tmp = mips[0]; // copy mip 0
-            bool isBC5tmp = (tmp.dxgiFormat == DXGI_FORMAT_BC5_UNORM ||
-                             tmp.dxgiFormat == DXGI_FORMAT_BC5_SNORM ||
-                             tmp.dxgiFormat == DXGI_FORMAT_BC5_TYPELESS);
-            if (isBC5tmp) {
-                DecompressBC(tmp, BCTransform::NormalReconstructZ); // decodes to RGBA with reconstructed Z
-            }
-            if (tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                tmp.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB) {
-                char path[256];
-                if (postProcess == TexturePostProcess::Octahedral)
-                    snprintf(path, sizeof(path), "c:/temp/fo4_debug_normal_raw_%d.tga", s_dumpNormalRaw++);
-                else
-                    snprintf(path, sizeof(path), "c:/temp/fo4_debug_roughness_raw_%d.tga", s_dumpRoughnessRaw++);
-                DebugDumpTGA(path, tmp.pixels.data(), tmp.width, tmp.height);
-                _MESSAGE("FO4RemixPlugin: DEBUG dumped raw decode -> %s (%ux%u)", path, tmp.width, tmp.height);
-            }
-        }
-    }
-
-    // Apply post-processing per-mip. SmoothnessToRoughness and
-    // ConvertNormalToOctahedral both run BC decode internally if needed and
-    // emit RGBA8, so mips that started in different BC formats end up in a
-    // common output format -- which matters because we concatenate them
-    // into a single packed buffer below.
-    for (auto& mip : mips) {
-        if (postProcess == TexturePostProcess::InvertRGB) {
-            SmoothnessToRoughness(mip);
-            // Clamp roughness for decal surfaces. Bethesda's smoothness map is
-            // often set to "very smooth" on decals; after InvertRGB that
-            // becomes near-zero roughness (mirror) which the path tracer
-            // renders literally. Vanilla DX11 hides this with specular
-            // highlights. Clamping the RGB channels (which carry roughness
-            // after our inversion) to >= minRoughness prevents mirror surfaces
-            // while preserving relative variation. Only applied on the BC1/
-            // BC3/BC5 -> RGBA8 path; BC7 / unknown formats fall through
-            // SmoothnessToRoughness as-is and are not clamped here (acceptable
-            // since they're rare).
-            if (minRoughness > 0 &&
-                (mip.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                 mip.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB ||
-                 mip.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM ||
-                 mip.dxgiFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB)) {
-                for (uint32_t i = 0; i < mip.width * mip.height; i++) {
-                    if (mip.pixels[i * 4 + 0] < minRoughness) mip.pixels[i * 4 + 0] = minRoughness;
-                    if (mip.pixels[i * 4 + 1] < minRoughness) mip.pixels[i * 4 + 1] = minRoughness;
-                    if (mip.pixels[i * 4 + 2] < minRoughness) mip.pixels[i * 4 + 2] = minRoughness;
-                }
-            }
-        } else if (postProcess == TexturePostProcess::Octahedral) {
-            ConvertNormalToOctahedral(mip);
-        } else if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminance) {
-            DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/false);
-        } else if (postProcess == TexturePostProcess::DiffuseAlphaFromLuminanceForceBC3) {
-            DiffuseAlphaFromLuminance_Apply(mip, /*forceForBC3=*/true);
-        } else if (postProcess == TexturePostProcess::ForceRGBA8) {
-            // Decompress-only: BC1/BC3 (incl. SRGB) -> RGBA8, authored alpha
-            // kept. Non-BC inputs pass through untouched.
-            DecompressBC(mip, BCTransform::None);
-        }
-        // Grayscale-to-palette remap REPLACES the gray RGB with the LUT row
-        // (engine-exact; see PaletteRemap_Apply). Composes at the tint slot:
-        // AFTER the alpha stage (cutouts survive), BEFORE the luminance
-        // floor. When it declines (BC7 input), the flat-tint fallback below
-        // applies instead.
-        bool remapped = false;
-        if (palTableValid) {
-            remapped = PaletteRemap_Apply(mip, palTable);
-        }
-        // Skin/hair tint multiply composes AFTER the alpha stage (alpha
-        // untouched -- hair cutouts survive) and BEFORE the luminance floor.
-        if (!remapped && tintRGB != 0xFFFFFFu) {
-            TintMultiply_Apply(mip, tintRGB);
-        }
-        // Metal albedo luminance floor composes AFTER the alpha stage so
-        // synthesized / authored cutout alpha is preserved while dark RGB is
-        // lifted (hue-preserving; see AlbedoLumFloor_Apply).
-        if (albedoLumFloor > 0) {
-            AlbedoLumFloor_Apply(mip, albedoLumFloor);
-        }
-    }
-
-    // --- Debug dump: after post-processing (mip 0 only) ---
-    {
-        static int s_dumpNormalPost = 0, s_dumpRoughnessPost = 0;
-        bool dumpPost = false;
-        if (postProcess == TexturePostProcess::Octahedral && s_dumpNormalPost < 3) dumpPost = true;
-        if (postProcess == TexturePostProcess::InvertRGB  && s_dumpRoughnessPost < 3) dumpPost = true;
-
-        if (dumpPost && (mips[0].dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                         mips[0].dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)) {
-            char path[256];
-            if (postProcess == TexturePostProcess::Octahedral)
-                snprintf(path, sizeof(path), "c:/temp/fo4_debug_normal_post_%d.tga", s_dumpNormalPost++);
-            else
-                snprintf(path, sizeof(path), "c:/temp/fo4_debug_roughness_post_%d.tga", s_dumpRoughnessPost++);
-            DebugDumpTGA(path, mips[0].pixels.data(), mips[0].width, mips[0].height);
-            _MESSAGE("FO4RemixPlugin: DEBUG dumped post-process -> %s (%ux%u)", path, mips[0].width, mips[0].height);
-        }
-    }
-
-    // --- Sanity: every mip must share the same final dxgiFormat. The pipeline
-    // above produces RGBA8 for any BC source; uncompressed sources stay in
-    // their original (BGRA8 / RGBA8) format. Mixed formats across mips would
-    // mean a mid-chain decompression diverged -- bail rather than ship a
-    // malformed packed buffer that dxvk-remix would interpret as garbage.
-    DXGI_FORMAT chainFmt = mips[0].dxgiFormat;
-    for (auto& mip : mips) {
-        if (mip.dxgiFormat != chainFmt) {
-            _MESSAGE("FO4RemixPlugin: ExtractMaterialTexture - mip format mismatch "
-                     "(mip0=%u midmip=%u) for hash=0x%016llX, dropping",
-                     (unsigned)chainFmt, (unsigned)mip.dxgiFormat, hash);
-            return 0;
-        }
-    }
-
-    // Concatenate all mips into a single packed buffer. Remix expects the
-    // mip chain tightly packed, mip0 first, no padding.
-    ExtractedTexture extracted;
-    extracted.hash       = hash;
-    extracted.width      = mips[0].width;
-    extracted.height     = mips[0].height;
-    extracted.dxgiFormat = chainFmt;
-    extracted.mipLevels  = (uint32_t)mips.size();
-
-    size_t total = 0;
-    for (const auto& mip : mips) total += mip.pixels.size();
-    extracted.pixels.reserve(total);
-    for (auto& mip : mips) {
-        extracted.pixels.insert(extracted.pixels.end(),
-                                mip.pixels.begin(), mip.pixels.end());
-    }
-
-    if (g_config.logTextures) {
-        const char* texName = tex->name.c_str();
-        _MESSAGE("FO4RemixPlugin: Extracted %s texture \"%s\" %ux%u mips=%u fmt=%u hash=0x%016llX%s",
-                 slotName, texName ? texName : "<null>",
-                 extracted.width, extracted.height, extracted.mipLevels,
-                 (unsigned)extracted.dxgiFormat, hash,
-                 postProcess == TexturePostProcess::InvertRGB ? " (inverted)" :
-                 postProcess == TexturePostProcess::Octahedral ? " (octahedral)" : "");
-    }
-
-    // Evict the superseded smaller resolution variant (see
-    // g_texResVariantIndex): keeps the CPU pixel cache at ~one variant per
-    // texture instead of accumulating every mip level the streamer ever had
-    // resident. Only when the resolution fold is active (hash differs from
-    // the pre-fold hash); only supersede strictly-smaller variants.
-    if (hash != preResolutionHash) {
-        auto [vit, inserted] = g_texResVariantIndex.try_emplace(
-            preResolutionHash, hash, extracted.width);
-        if (!inserted && vit->second.first != hash) {
-            if (extracted.width > vit->second.second) {
-                g_textureCache.erase(vit->second.first);
-                vit->second = { hash, extracted.width };
-            }
-        }
-    }
-
-    g_textureCache[hash] = extracted;
-    newTextures.push_back(std::move(extracted));
-
-    return hash;
+    job.mips = std::move(mips);
+    EnqueueTextureConversion(std::move(job));
+    return 0;
 }
+
+
 
 // Get the BSLightingShaderMaterialBase from a shape, or nullptr
 BSLightingShaderMaterialBase* BsExtraction::GetLightingMaterial(BSTriShape* shape)
