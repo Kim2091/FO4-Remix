@@ -76,14 +76,6 @@ struct PluginConfig {
 
     // [Skinning]
     bool  skinningEnabled;   // Extract and animate skinned meshes (characters, creatures)
-    // FaceGen morph refresh (2026-07-09): re-upload a facegen head/mouth/eye
-    // mesh when the engine rewrites its dynamicVertices (dialogue lip sync,
-    // blinks, expressions). Interval = frames between per-drawable content
-    // checks (staggered by hash); maxPerTick bounds mesh rebuilds queued per
-    // game Tick so a crowded dialogue scene can't storm CreateMesh.
-    bool     faceMorphRefreshEnabled;
-    uint32_t faceMorphCheckIntervalFrames;
-    uint32_t faceMorphMaxPerTick;
 
     // [Emissive]
     bool  emissiveGlowMapsEnabled;  // Extract glow map textures from BSLightingShaderMaterialGlowmap

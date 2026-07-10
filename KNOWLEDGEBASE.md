@@ -549,9 +549,6 @@ from FO4 is outstanding.
 | Lights | `RadiusMultiplier` | float | 1.0 | sphere-light radius multiplier | (plumbed) |
 | Lights | `ColorStrength` | float | 1.0 | 0 = white, 1 = full game color | (plumbed) |
 | Skinning | `Enabled` | bool | 1 | extract animated skinned meshes | (plumbed; resolvers currently skip skinned) |
-| Skinning | `FaceMorphRefreshEnabled` | bool | 1 | facial animation: fingerprint each facegen `BSDynamicTriShape`'s live `dynamicVertices` (the engine rewrites it per frame during dialogue/blinks — live-proven 2026-07-09) and re-upload positions on change; OnFrame swaps the private mesh handle in place (create → swap → destroy) | `semantic_capture.cpp` (Tick watch), `remix_renderer.cpp` (`QueueFaceMorphPositions` + OnFrame `[FaceMorph]` block) |
-| Skinning | `FaceMorphCheckIntervalFrames` | uint32 | 2 | frames between per-face content checks (staggered by hash) | `semantic_capture.cpp` |
-| Skinning | `FaceMorphMaxPerTick` | uint32 | 8 | cap on face mesh rebuilds queued per Tick | `semantic_capture.cpp` |
 | Emissive | `GlowMapsEnabled` | bool | 1 | extract `BSLightingShaderMaterialGlowmap::spGlowMapTexture` | `bs_extraction.cpp` (`ExtractEmissiveData`) |
 | Emissive | `EmissiveColorEnabled` | bool | 1 | use `pEmissiveColor` + `fEmitColorScale` | `bs_extraction.cpp` (`ExtractEmissiveData`) |
 | Emissive | `Intensity` | float | 1.0 | global multiplier on `fEmitColorScale` | `remix_renderer.cpp:787` |

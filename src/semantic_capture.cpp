@@ -836,56 +836,9 @@ void SemanticCapture::Tick(ID3D11Device* device) {
 
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         int upgradesThisTick = 0;  // texture re-capture storm cap (see below)
-        uint32_t faceRefreshesThisTick = 0;  // FaceGen morph rebuild cap
         for (auto& [key, state] : g_drawableMap) {
             if (state.submittedToRemix) {
                 bool doReresolve = false;
-
-                // ---- FaceGen morph watch (2026-07-09) ----
-                // LIVE-PROVEN: the engine memcpy's fresh CPU-deformed
-                // model-space positions into a facegen BSDynamicTriShape's
-                // dynamicVertices EVERY FRAME during dialogue and ambient
-                // expressions (blinks); idle faces stay byte-identical. Our
-                // one-time snapshot at resolve is why faces were frozen.
-                // Fingerprint the live buffer at a staggered cadence; on
-                // change, decode positions and queue them -- OnFrame swaps
-                // the drawable's PRIVATE mesh handle in place. NOT a
-                // re-resolve: textures/material/skinning are unchanged by a
-                // morph, so the full parse/extract path stays cold.
-                if (state.faceMorphWatch &&
-                    g_config.faceMorphRefreshEnabled &&
-                    !state.engineCulled &&
-                    faceRefreshesThisTick < g_config.faceMorphMaxPerTick &&
-                    (g_config.faceMorphCheckIntervalFrames <= 1 ||
-                     ((currentFrame ^ key) %
-                      g_config.faceMorphCheckIntervalFrames) == 0)) {
-                    // Reused buffers: Tick runs only on the game thread.
-                    static std::vector<uint8_t> s_faceRaw;
-                    static std::vector<float>   s_faceXyz;
-                    uint32_t liveVerts = 0;
-                    if (BsExtraction::SnapshotDynamicVertices(state.geometry,
-                                                              s_faceRaw,
-                                                              liveVerts)) {
-                        uint64_t fp = 0xCBF29CE484222325ULL;
-                        for (uint8_t b : s_faceRaw) {
-                            fp ^= b;
-                            fp *= 0x100000001B3ULL;
-                        }
-                        if (fp == 0) fp = 1;  // keep 0 = "no baseline yet"
-                        if (state.faceMorphFingerprint == 0) {
-                            state.faceMorphFingerprint = fp;
-                        } else if (fp != state.faceMorphFingerprint) {
-                            state.faceMorphFingerprint = fp;
-                            if (BsExtraction::DecodeDynamicPositions(
-                                    s_faceRaw, liveVerts, s_faceXyz)) {
-                                RemixRenderer::QueueFaceMorphPositions(
-                                    state.meshHash,
-                                    std::vector<float>(s_faceXyz));
-                                ++faceRefreshesThisTick;
-                            }
-                        }
-                    }
-                }
 
                 // Merge capture upgrade poll (2026-07-04): this merge shape
                 // submitted with a fallback partition because the engine

@@ -114,16 +114,6 @@ namespace RemixRenderer {
     void QueueBoneTransforms(
         std::unordered_map<uint64_t, std::vector<remixapi_Transform>>&& bones);
 
-    // FaceGen morph refresh (2026-07-09). Queue decoded model-space float3
-    // positions for a facegen dynamic drawable whose live dynamicVertices
-    // changed (SemanticCapture::Tick, game thread; same never-block contract
-    // as QueueBoneTransforms -- newest set per drawable wins). OnFrame
-    // rebuilds that drawable's PRIVATE skinned mesh handle in place before
-    // the draw loop: same content hash, material, indices and skinning
-    // streams -- only positions move, exactly like the engine's own
-    // dynamic-buffer rewrite.
-    void QueueFaceMorphPositions(uint64_t drawableHash, std::vector<float>&& xyz);
-
     // True if a Remix-side texture handle currently exists for `hash`.
     // Used by the extraction cache to decide whether a cache hit must
     // re-supply pixel data so SubmitDrawable can recreate a handle that was

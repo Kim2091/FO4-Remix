@@ -120,17 +120,6 @@ struct ExtractedMesh {
     uint32_t boneCount = 0;
     std::vector<float>    blendWeights;
     std::vector<uint32_t> blendIndices;
-
-    // FaceGen morph refresh (2026-07-09). True for skinned BSDynamicTriShape
-    // drawables (facegen heads/mouths/eyes/hair). LIVE-PROVEN mechanism:
-    // during dialogue and ambient expressions (blinks) the engine memcpy's
-    // freshly CPU-deformed model-space positions into the shape's
-    // dynamicVertices buffer EVERY FRAME (writer = vcruntime memcpy;
-    // ~1378/1689 head verts changed per frame while an NPC talked; idle
-    // faces stay byte-identical -- 2026-07-09 frida session). The renderer
-    // keeps a CPU copy of these meshes so SemanticCapture::Tick can queue
-    // fresh positions and OnFrame can swap the private mesh handle in place.
-    bool isFaceGenDynamic = false;
 };
 
 struct CellInfo {
@@ -273,25 +262,6 @@ namespace BsExtraction {
 
     // Get the BSLightingShaderMaterialBase from a shape, or nullptr
     BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape);
-
-    // ---- FaceGen morph refresh (2026-07-09) ----
-    // SEH-guarded snapshot of a live BSDynamicTriShape's dynamicVertices
-    // buffer (raw bytes; +0x170 size, +0x180 pointer). Returns false when
-    // the pointer chain is stale/unreadable or the size is implausible
-    // (0 or > 4 MiB). Runs on the game thread where the engine writes the
-    // buffer, so a copy is at worst one frame torn -- the next Tick's
-    // fingerprint check re-syncs it.
-    bool SnapshotDynamicVertices(void* geometry, std::vector<uint8_t>& outRaw,
-                                 uint32_t& outNumVertices);
-
-    // Decode a snapshot from SnapshotDynamicVertices into float3 model-space
-    // positions (x,y,z per vertex). Elements <= 12 bytes decode as half4
-    // position (x,y,z,bitangentX + tail), matching ParseShapeGeometry's
-    // dynamic-path decode; 16-byte elements decode as float3 (defensive,
-    // none observed). Returns false on a size that isn't a whole element
-    // multiple.
-    bool DecodeDynamicPositions(const std::vector<uint8_t>& raw,
-                                uint32_t numVertices, std::vector<float>& outXyz);
 
     // Current resident WIDTH (px) of a lighting material's diffuse D3D
     // texture, SEH-guarded (0 on null/fault/non-Texture2D). FO4 streams

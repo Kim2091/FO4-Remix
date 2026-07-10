@@ -142,19 +142,6 @@ namespace SemanticCapture {
         bool  isSkinnedActor           = false;
         bool  engineCulled             = false;
 
-        // ---- FaceGen morph watch (2026-07-09) ----
-        // faceMorphWatch: set by the lighting resolver for skinned
-        // BSDynamicTriShape drawables (facegen heads/mouths/eyes/hair).
-        // LIVE-PROVEN: the engine memcpy's fresh CPU-deformed model-space
-        // positions into dynamicVertices every frame during dialogue and
-        // ambient expressions; idle faces stay byte-identical. Tick
-        // fingerprints the live buffer at a staggered cadence and, on
-        // change, queues decoded positions to the renderer, which swaps the
-        // drawable's PRIVATE skinned mesh handle in place -- no re-resolve
-        // (textures/material/skinning are unchanged by a morph).
-        bool     faceMorphWatch        = false;
-        uint64_t faceMorphFingerprint  = 0;
-
         // ---- Merge-instanced capture upgrade (2026-07-04) ----
         // Set by the lighting resolver when a multi-segment merge shape had
         // to submit with a fallback partition because DrawCapture starved:
