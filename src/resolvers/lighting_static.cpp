@@ -1097,6 +1097,29 @@ static void LogWindingDiag(BSTriShape* tri,
     }
 }
 
+// Phase-1 output cached across texture-pending retries (2026-07-09 pop-in
+// speed; stored type-erased in DrawableState::resolveCache). Holds the fully
+// built mesh (vertices/indices/transform/flags/skinning; texture-hash fields
+// are refreshed every attempt by the extraction calls) plus the small tint
+// derivation results, so a retry whose textures are still in the async
+// readback/decode pipeline skips the per-vertex parse work entirely.
+struct ResolveCache {
+    ExtractedMesh mesh;
+    uint8_t  albedoLumFloor = 0;
+    // Tint from the skin/hair branch, or 0xFFFFFF. For palette meshes this
+    // stays 0xFFFFFF (the branches are exclusive); the LUT fallback tint is
+    // re-sampled per attempt from paletteRowByte below.
+    uint32_t diffuseTint    = 0xFFFFFFu;
+    bool     paletteBranch  = false;  // grayscale-to-palette branch was taken
+    uint32_t paletteRowByte = 255;    // per-mesh MODE of the vc red byte
+};
+
+// Retry-backoff ceiling for keeping the phase-1 cache alive. Beyond this
+// many failed attempts the delays go exponential (seconds-scale waits), and
+// holding a full vertex copy for a drawable that may never resolve isn't
+// worth the memory -- the eventual retry just re-parses.
+constexpr uint32_t kResolveCacheMaxAttempts = 12;
+
 bool TryResolveStatic(SemanticCapture::DrawableState& state,
                       uint64_t hash,
                       ID3D11Device* device) {
@@ -1228,6 +1251,78 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     const bool applyVertexColors =
         (propFlagsEarly & kFlag_VertexColors) != 0 && !isGrayscaleToPalette;
 
+    // ---- Material fetch (hoisted above the parse 2026-07-09: both the
+    // phase-1 path and the cached-retry path below need it) ----
+    auto* mat = BsExtraction::GetLightingMaterial(tri);
+    if (!mat) {
+        if (headDiag) HeadDiagLog(hash, "GATE no lighting material");
+        return false;
+    }
+
+    // 1B scope: skip landscape (terrain regression accepted; Phase 5 revives).
+    if (mat->GetType() == BSLightingShaderMaterialBase::kType_Landscape) {
+        ResolverTrace::g_lastStep.store(Trace::kLandscapeSkipped, std::memory_order_relaxed);
+        if (headDiag) HeadDiagLog(hash, "GATE landscape material skip");
+        return false;
+    }
+
+    ResolverTrace::g_lastStep.store(Trace::kMaterialFetched, std::memory_order_relaxed);
+
+    // Shared phase-1 outputs: produced fresh below, or restored from the
+    // cache a prior texture-pending attempt left behind.
+    ExtractedMesh mesh{};
+    uint8_t  albedoLumFloor = 0;
+    uint32_t diffuseTint    = 0xFFFFFFu;
+    NiTexture* paletteLut   = nullptr;  // grayscale-to-palette per-pixel remap
+    float    paletteRowV    = 0.0f;     // final engine LUT row (scale+pow applied)
+    bool     paletteBranch  = false;
+    uint32_t paletteRowByte = 255;
+
+    // ---- Cached-retry fast path (2026-07-09) ----
+    // Ownership moves OUT of the state immediately: if this attempt crashes
+    // (SEH catch in Tick) the cache is already gone and the next attempt
+    // re-parses cleanly instead of resuming from a moved-from mesh. Pending
+    // returns below re-stash it.
+    std::shared_ptr<void> cacheHolder = std::move(state.resolveCache);
+    ResolveCache* cached = static_cast<ResolveCache*>(cacheHolder.get());
+    if (cached) {
+        mesh           = std::move(cached->mesh);
+        albedoLumFloor = cached->albedoLumFloor;
+        diffuseTint    = cached->diffuseTint;
+        paletteBranch  = cached->paletteBranch;
+        paletteRowByte = cached->paletteRowByte;
+        if (paletteBranch) {
+            // Re-sample the palette LUT from the cached row byte (the
+            // histogram over the engine VB was phase-1 work); the LUT decode
+            // itself is cached inside SampleLookupColor after the first hit.
+            float scale = mat->fLookupScale;
+            if (!(scale >= 0.0f && scale <= 2.0f)) scale = 1.0f;
+            float v = scale - 1.0f + std::pow(paletteRowByte / 255.0f, 1.0f / 2.2f);
+            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            uint32_t pal = 0xFFFFFFu;
+            const int st = BsExtraction::SampleLookupColor(
+                mat->spLookupTexture, device, /*u=*/0.75f, v, pal);
+            if (st == 1) {
+                cached->mesh = std::move(mesh);
+                state.resolveCache = std::move(cacheHolder);
+                if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending (cached)");
+                return false;
+            }
+            if (st == 0) {
+                diffuseTint = pal;                   // fallback (BC7 diffuse)
+                paletteLut  = mat->spLookupTexture;  // per-pixel engine remap
+                paletteRowV = v;
+            }
+        }
+    }
+    if (!cached) {
+    // ==================================================================
+    // PHASE 1: parse + mesh build + tint derivation. Skipped entirely on
+    // cached retries (the dominant retry class: textures still in the
+    // async readback/decode pipeline). Kept at original indentation to
+    // preserve diff/blame history.
+    // ==================================================================
+
     // ---- Parse vertex / index data ----
     ResolverTrace::g_lastStep.store(Trace::kParseStart, std::memory_order_relaxed);
     ParsedGeometry parsed;
@@ -1347,8 +1442,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     ResolverTrace::g_lastStep.store(Trace::kParseOK, std::memory_order_relaxed);
 
-    // ---- Build mesh ----
-    ExtractedMesh mesh{};
+    // ---- Build mesh ---- (declared at function scope above; filled here)
     mesh.hash = hash;
     mesh.vertices = std::move(parsed.vertices);
     mesh.indices  = std::move(parsed.indices);
@@ -1515,21 +1609,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     ResolverTrace::g_lastStep.store(Trace::kBuildMeshOK, std::memory_order_relaxed);
 
-    // ---- Material + textures ----
-    auto* mat = BsExtraction::GetLightingMaterial(tri);
-    if (!mat) {
-        if (headDiag) HeadDiagLog(hash, "GATE no lighting material");
-        return false;
-    }
-
-    // 1B scope: skip landscape (terrain regression accepted; Phase 5 revives).
-    if (mat->GetType() == BSLightingShaderMaterialBase::kType_Landscape) {
-        ResolverTrace::g_lastStep.store(Trace::kLandscapeSkipped, std::memory_order_relaxed);
-        if (headDiag) HeadDiagLog(hash, "GATE landscape material skip");
-        return false;
-    }
-
-    ResolverTrace::g_lastStep.store(Trace::kMaterialFetched, std::memory_order_relaxed);
+    // (Material fetch + landscape gate hoisted above the parse, 2026-07-09 --
+    // the cached-retry path needs the material before phase 1 would run.)
 
     // ---- Metal conversion, take 2 (spec-gloss -> metal-rough, 2026-07-02) ----
     // FO4's "shiny metal" pathway is BSLightingShaderMaterialEnvmap: near-
@@ -1563,7 +1644,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // fights the floor). Both derivations are therefore opt-in via
     // [Materials] MetalMetallicEnabled / MetalRoughnessEnabled, default OFF;
     // when off, materials keep the legacy constants (metallic 0, rough 0.8).
-    uint8_t albedoLumFloor = 0;
+    // (albedoLumFloor is declared at function scope for the retry cache.)
     if (g_config.metalConversionEnabled &&
         mat->GetType() == BSLightingShaderMaterialBase::kType_Envmap) {
         float smooth = mat->fSmoothness;
@@ -1630,9 +1711,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     //     first approximation.)
     // Classes/hair identified by RTTI leaf + the Hair flag, NOT GetType()
     // (live logs showed hair as type 2 where the F4SE enum says HairTint=6).
-    uint32_t diffuseTint = 0xFFFFFFu;
-    NiTexture* paletteLut = nullptr;  // grayscale-to-palette per-pixel remap
-    float paletteRowV = 0.0f;         // final engine LUT row (scale+pow applied)
+    // (diffuseTint / paletteLut / paletteRowV are declared at function scope
+    // for the retry cache.)
     {
         char matLeaf[64] = "";
         SemanticCapture::GetLeafClassName(mat, matLeaf, sizeof(matLeaf));
@@ -1758,6 +1838,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             // GreenLt=0.45 -> the sage row our fences wrongly got, Tan=0.35,
             // White=1.0). 0.0 is authored (T45body01) -- allow it; NaN or
             // out-of-range reads (layout drift) fall back to 1.
+            // Record for the retry cache: the cached path re-derives v from
+            // this byte + the live material scale instead of re-walking the VB.
+            paletteBranch  = true;
+            paletteRowByte = rowByte;
             float scale = mat->fLookupScale;
             if (!(scale >= 0.0f && scale <= 2.0f)) scale = 1.0f;
             float v = scale - 1.0f + std::pow(rowByte / 255.0f, 1.0f / 2.2f);
@@ -1767,6 +1851,18 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 mat->spLookupTexture, device, /*u=*/0.75f, v, pal);
             if (st == 1) {
                 // LUT not read back yet -- retry like any pending texture.
+                // Stash phase-1 so the retry skips the parse (mesh is fully
+                // built at this point; diffuseTint is still the pre-palette
+                // 0xFFFFFF because the tint branches are exclusive).
+                if (state.resolveAttempts <= kResolveCacheMaxAttempts) {
+                    auto rc = std::make_shared<ResolveCache>();
+                    rc->mesh           = std::move(mesh);
+                    rc->albedoLumFloor = albedoLumFloor;
+                    rc->diffuseTint    = 0xFFFFFFu;
+                    rc->paletteBranch  = true;
+                    rc->paletteRowByte = rowByte;
+                    state.resolveCache = std::move(rc);
+                }
                 if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending");
                 return false;
             }
@@ -1787,6 +1883,76 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                          st, diffuseTint);
             }
         }
+    }
+
+    // ---- [DetailDiag] over-dirty clothing/buildings (2026-07-08) ----
+    // NPC outfits and world objects render far grayer/dirtier than vanilla
+    // (systemic across NPCs + statics). Leading suspect: the per-vertex COLOR
+    // stream is being multiplied into the albedo when vanilla would not (or
+    // would apply it gentler) -- and the enum drift that just broke the Hair
+    // flag makes our SLSF2_Vertex_Colors bit (37) suspect. Log, once per hash
+    // for shapes that CARRY a color stream: propFlags, whether we applied the
+    // colors, the raw vertex-color mean/min (dark colors = the "dirt"), the
+    // material class/type, and the diffuse path -- so the applied-vs-authored
+    // and flag-vs-darkness correlation can be read off one run.
+    // (Moved into phase 1 2026-07-09: it reads `parsed`, which no longer
+    // exists on the cached-retry path. Now logs at first parse rather than
+    // first successful diffuse extraction -- same once-per-hash cap.)
+    {
+        const uint64_t d = parsed.vertexDesc;
+        const bool hasColorStream = (d & (1ULL << 49)) != 0;
+        if (hasColorStream && parsed.vbData && parsed.vertexSize > 0) {
+            const uint32_t szV = (uint32_t)((d >> 4) & 0xF);
+            const uint32_t shift = parsed.isDynamic ? 0u : szV;
+            const uint32_t oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
+            if (oColor + 4 <= parsed.vertexSize) {
+                static std::mutex s_dmx;
+                static std::unordered_set<uint64_t> s_dseen;
+                bool first = false;
+                {
+                    std::lock_guard<std::mutex> lk(s_dmx);
+                    static int s_dlogs = 0;
+                    if (s_dlogs < 48 && s_dseen.insert(hash).second) {
+                        ++s_dlogs; first = true;
+                    }
+                }
+                if (first) {
+                    // parsed.vertices was std::move'd into mesh.vertices
+                    // above -- use the shape's own count and read raw colors
+                    // straight from the (still-valid) engine VB pointer.
+                    const size_t nV = tri->numVertices;
+                    uint32_t sr = 0, sg = 0, sb = 0, sa = 0;
+                    uint8_t mnr = 255, mng = 255, mnb = 255;
+                    for (size_t i = 0; i < nV; ++i) {
+                        const uint8_t* c = parsed.vbData + i * parsed.vertexSize + oColor;
+                        sr += c[0]; sg += c[1]; sb += c[2]; sa += c[3];
+                        if (c[0] < mnr) mnr = c[0];
+                        if (c[1] < mng) mng = c[1];
+                        if (c[2] < mnb) mnb = c[2];
+                    }
+                    const size_t n = nV ? nV : 1;
+                    char matLeaf[64] = "?";
+                    SemanticCapture::GetLeafClassName(mat, matLeaf, sizeof(matLeaf));
+                    const char* dn = (mat->spDiffuseTexture && mat->spDiffuseTexture->name.c_str())
+                        ? mat->spDiffuseTexture->name.c_str() : "";
+                    _MESSAGE("FO4RemixPlugin: [DetailDiag] \"%s\" mat=%s type=%u "
+                             "propFlags=%016llX applyVtxCol=%d nV=%zu "
+                             "vcMean=(%u,%u,%u,a%u) vcMin=(%u,%u,%u) diffuse=\"%s\"",
+                             tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                             matLeaf, (unsigned)mat->GetType(),
+                             (unsigned long long)propFlagsEarly,
+                             applyVertexColors ? 1 : 0, nV,
+                             (unsigned)(sr / n), (unsigned)(sg / n),
+                             (unsigned)(sb / n), (unsigned)(sa / n),
+                             mnr, mng, mnb, dn);
+                }
+            }
+        }
+    }
+
+    // ==================================================================
+    // end PHASE 1
+    // ==================================================================
     }
 
     std::vector<ExtractedTexture> newTextures;
@@ -1859,6 +2025,25 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     // No diffuse -> can't render lit; retry next frame in case texture resolves later.
     if (mesh.diffuseTextureHash == 0) {
+        // Stash phase-1 output for the retry (the parse is the expensive part
+        // of an attempt; textures normally land within a few ticks of async
+        // readback + worker decode). Dropped once the backoff goes
+        // exponential so a never-resolving drawable doesn't pin its vertex
+        // copy in memory.
+        if (state.resolveAttempts <= kResolveCacheMaxAttempts) {
+            if (cached) {
+                cached->mesh = std::move(mesh);
+                state.resolveCache = std::move(cacheHolder);
+            } else {
+                auto rc = std::make_shared<ResolveCache>();
+                rc->mesh           = std::move(mesh);
+                rc->albedoLumFloor = albedoLumFloor;
+                rc->diffuseTint    = paletteBranch ? 0xFFFFFFu : diffuseTint;
+                rc->paletteBranch  = paletteBranch;
+                rc->paletteRowByte = paletteRowByte;
+                state.resolveCache = std::move(rc);
+            }
+        }
         if (headDiag) {
             NiTexture* dt = mat->spDiffuseTexture;
             HeadDiagLog(hash,
@@ -1868,6 +2053,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         }
         return false;
     }
+
+    // Textures resolved: the phase-1 cache (if any) is consumed by this
+    // attempt; cacheHolder frees it at return.
 
     ResolverTrace::g_lastStep.store(Trace::kTexturesExtracted, std::memory_order_relaxed);
 
@@ -1884,67 +2072,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             BsExtraction::GetMaterialDiffuseResidentWidth(mat), 0xFFFFu);
     }
 
-    // ---- [DetailDiag] over-dirty clothing/buildings (2026-07-08) ----
-    // NPC outfits and world objects render far grayer/dirtier than vanilla
-    // (systemic across NPCs + statics). Leading suspect: the per-vertex COLOR
-    // stream is being multiplied into the albedo when vanilla would not (or
-    // would apply it gentler) -- and the enum drift that just broke the Hair
-    // flag makes our SLSF2_Vertex_Colors bit (37) suspect. Log, once per hash
-    // for shapes that CARRY a color stream: propFlags, whether we applied the
-    // colors, the raw vertex-color mean/min (dark colors = the "dirt"), the
-    // material class/type, and the diffuse path -- so the applied-vs-authored
-    // and flag-vs-darkness correlation can be read off one run.
-    {
-        const uint64_t d = parsed.vertexDesc;
-        const bool hasColorStream = (d & (1ULL << 49)) != 0;
-        if (hasColorStream && parsed.vbData && parsed.vertexSize > 0) {
-            const uint32_t szV = (uint32_t)((d >> 4) & 0xF);
-            const uint32_t shift = parsed.isDynamic ? 0u : szV;
-            const uint32_t oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
-            if (oColor + 4 <= parsed.vertexSize) {
-                static std::mutex s_dmx;
-                static std::unordered_set<uint64_t> s_dseen;
-                bool first = false;
-                {
-                    std::lock_guard<std::mutex> lk(s_dmx);
-                    static int s_dlogs = 0;
-                    if (s_dlogs < 48 && s_dseen.insert(hash).second) {
-                        ++s_dlogs; first = true;
-                    }
-                }
-                if (first) {
-                    // parsed.vertices was std::move'd into mesh.vertices
-                    // above -- use the shape's own count and read raw colors
-                    // straight from the (still-valid) engine VB pointer.
-                    const size_t nV = tri->numVertices;
-                    uint32_t sr = 0, sg = 0, sb = 0, sa = 0;
-                    uint8_t mnr = 255, mng = 255, mnb = 255;
-                    for (size_t i = 0; i < nV; ++i) {
-                        const uint8_t* c = parsed.vbData + i * parsed.vertexSize + oColor;
-                        sr += c[0]; sg += c[1]; sb += c[2]; sa += c[3];
-                        if (c[0] < mnr) mnr = c[0];
-                        if (c[1] < mng) mng = c[1];
-                        if (c[2] < mnb) mnb = c[2];
-                    }
-                    const size_t n = nV ? nV : 1;
-                    char matLeaf[64] = "?";
-                    SemanticCapture::GetLeafClassName(mat, matLeaf, sizeof(matLeaf));
-                    const char* dn = (mat->spDiffuseTexture && mat->spDiffuseTexture->name.c_str())
-                        ? mat->spDiffuseTexture->name.c_str() : "";
-                    _MESSAGE("FO4RemixPlugin: [DetailDiag] \"%s\" mat=%s type=%u "
-                             "propFlags=%016llX applyVtxCol=%d nV=%zu "
-                             "vcMean=(%u,%u,%u,a%u) vcMin=(%u,%u,%u) diffuse=\"%s\"",
-                             tri->m_name.c_str() ? tri->m_name.c_str() : "",
-                             matLeaf, (unsigned)mat->GetType(),
-                             (unsigned long long)propFlagsEarly,
-                             applyVertexColors ? 1 : 0, nV,
-                             (unsigned)(sr / n), (unsigned)(sg / n),
-                             (unsigned)(sb / n), (unsigned)(sa / n),
-                             mnr, mng, mnb, dn);
-                }
-            }
-        }
-    }
+    // ([DetailDiag] moved into phase 1, 2026-07-09 -- it reads `parsed`,
+    // which does not exist on the cached-retry path.)
 
     // ---- Merge-instanced transform read (2026-07-03) ----
     // BSMergeInstancedTriShape carries per-instance placements in a
@@ -2433,8 +2562,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                              (unsigned long long)(rSum / nv), (unsigned long long)(gSum / nv),
                              (unsigned long long)(bSum / nv), (unsigned long long)(aSum / nv),
                              rMin, rMax, uMin, uMax, vMin, vMax,
-                             (unsigned long long)parsed.vertexDesc,
-                             (unsigned)parsed.vertexSize,
+                             (unsigned long long)tri->vertexDesc,
+                             (unsigned)tri->GetVertexSize(),
                              dTexName, (unsigned long long)mesh.diffuseTextureHash,
                              tw, th, tfmt, tMean[0], tMean[1], tMean[2], tMean[3]);
                 }

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -167,6 +168,19 @@ namespace SemanticCapture {
         // the cap the resolver treats it as a plain reject and the
         // capture/fallback chain still renders something.
         uint16_t mergeT7Deferrals           = 0;
+
+        // ---- Phase-1 resolve cache (2026-07-09 pop-in speed) ----
+        // The lighting resolver's parse + mesh build + tint derivation runs
+        // dozens-to-hundreds of times per streaming burst, and until the
+        // drawable's textures finish their async readback + decode (a few
+        // ticks) every retry re-did that per-vertex work just to throw it
+        // away at the diffuse gate. The resolver stashes its phase-1 output
+        // here between texture-pending retries (opaque: the concrete type
+        // lives in lighting_static.cpp; the type-erased shared_ptr deleter
+        // frees it correctly on eviction / ClearDrawableMap). Cleared on
+        // successful submit and once the retry backoff goes exponential so
+        // a permanently-failing drawable doesn't pin its vertex copy.
+        std::shared_ptr<void> resolveCache;
     };
 
     // Convert a Bethesda NiTransform (engine row-vector convention: world =
