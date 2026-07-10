@@ -247,6 +247,17 @@ struct PluginConfig {
     // VRAM is transient (~1.4MB per 1K BC7 chain). 0 = built-in default.
     uint32_t maxPendingTextureReadbacks;
 
+    // Percentage of logical CPU cores given to the async texture-decode
+    // worker pool (BC decompression + per-pixel transforms off the game
+    // render thread; see bs_extraction.cpp). Workers run at below-normal
+    // priority, so this sets decode throughput -- i.e. how fast textures
+    // finish during streaming -- without contending with the game's own
+    // threads when the CPU saturates. Resolved worker count is
+    // round(cores * percent / 100), clamped to [1, cores - 1]; the pool
+    // must never be empty (queued textures would never finish and nothing
+    // would render). Default 25 (%): 2 workers on 8 cores, 4 on 16, 8 on 32.
+    uint32_t decodeWorkerPercent;
+
     // Per-Tick wall-clock budget (milliseconds) for the semantic-capture
     // resolve loop (2026-07-09 hitching fix). Tick runs on the game render
     // thread inside hkPresent; a cell attach makes hundreds of drawables

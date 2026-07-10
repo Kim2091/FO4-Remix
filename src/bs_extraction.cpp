@@ -1504,8 +1504,16 @@ static void EnqueueTextureConversion(TextureConversionJob&& job)
     g_texConvJobs.push_back(std::move(job));
 
     if (g_texConvWorkers.empty()) {
-        const unsigned hw = std::thread::hardware_concurrency();
-        const unsigned count = hw >= 16 ? 4u : (hw >= 8 ? 3u : 2u);
+        // Pool size = [Performance] DecodeWorkerPercent of logical cores,
+        // clamped to [1, cores - 1]: at least one worker (an empty pool
+        // would strand every queued texture) and at least one core left
+        // untouched. hardware_concurrency() can return 0 on exotic setups;
+        // treat that as 4 cores.
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 4;
+        unsigned count = (hw * g_config.decodeWorkerPercent + 50u) / 100u;
+        if (count < 1) count = 1;
+        if (hw > 1 && count > hw - 1) count = hw - 1;
         for (unsigned i = 0; i < count; ++i) {
             g_texConvWorkers.emplace_back([] {
                 // Below-normal priority: decode throughput matters, but never
@@ -1515,7 +1523,9 @@ static void EnqueueTextureConversion(TextureConversionJob&& job)
                 TextureConversionWorkerMain();
             });
         }
-        _MESSAGE("FO4RemixPlugin: [TexConvert] started %u texture decode workers", count);
+        _MESSAGE("FO4RemixPlugin: [TexConvert] started %u texture decode workers "
+                 "(%u%% of %u logical cores)",
+                 count, g_config.decodeWorkerPercent, hw);
     }
     g_texConvCv.notify_one();
 }
