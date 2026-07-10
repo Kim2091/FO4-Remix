@@ -107,7 +107,8 @@ static float UnpackByte(uint8_t b) {
 // ---------------------------------------------------------------------------
 struct CachedTexture {
     ExtractedTexture tex;
-    uint64_t         touch = 0;
+    uint64_t         touch = 0;       // monotonic use-stamp (LRU order)
+    uint64_t         touchFrame = 0;  // frame of last use (cold gating)
 };
 static std::unordered_map<uint64_t, CachedTexture> g_textureCache;
 static uint64_t g_textureCacheTouchCounter = 0;
@@ -153,9 +154,20 @@ static void TextureCacheInsert(uint64_t key, ExtractedTexture&& t)
     CachedTexture& slot = g_textureCache[key];
     g_textureCacheBytes -= slot.tex.pixels.size();  // 0 for a fresh slot
     g_textureCacheBytes += t.pixels.size();
-    slot.tex   = std::move(t);
-    slot.touch = ++g_textureCacheTouchCounter;
+    slot.tex        = std::move(t);
+    slot.touch      = ++g_textureCacheTouchCounter;
+    slot.touchFrame = Diagnostics::CurrentFrameIndex();
 }
+
+// Entries younger than this many frames are HOT and never evicted, no
+// matter the budget. This cache is the working set that re-supplies Remix
+// handles: the 2026-07-10 deployment proved that budget-only eviction of
+// hot entries melts down -- every evicted texture immediately re-readbacks
+// and re-decodes (its drawable is still resolving), which re-inserts and
+// evicts others, a feedback loop that saturated the decode pool and the
+// allocator until the process died. 600 frames ~= 10s, matching the
+// Remix-side TTL grace.
+constexpr uint64_t kTexCacheColdFrames = 600;
 
 static void TextureCacheEnforceBudget()
 {
@@ -164,31 +176,46 @@ static void TextureCacheEnforceBudget()
     const size_t budget = (size_t)budgetMiB * 1024u * 1024u;
     if (g_textureCacheBytes <= budget) return;
 
-    // Evict oldest-first down to a low-water mark (90% of budget) in one
-    // sorted pass, so the cache doesn't sit at the budget edge re-scanning
-    // on every subsequent insert. The newest entry is never evicted: its
-    // pixels may belong to the submit in progress.
-    std::vector<std::pair<uint64_t, uint64_t>> byAge;  // (touch, key)
-    byAge.reserve(g_textureCache.size());
+    // SOFT cap: evict COLD entries (untouched for kTexCacheColdFrames)
+    // oldest-first down to a low-water mark. If the whole working set is
+    // hot, the cache is allowed to exceed the budget -- unbounded growth
+    // was the pre-budget status quo and is strictly safer than thrashing
+    // the live set.
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    std::vector<std::pair<uint64_t, uint64_t>> coldByAge;  // (touch, key)
+    coldByAge.reserve(g_textureCache.size());
     for (const auto& [k, c] : g_textureCache) {
-        byAge.emplace_back(c.touch, k);
+        const uint64_t age = now > c.touchFrame ? now - c.touchFrame : 0;
+        if (age > kTexCacheColdFrames) {
+            coldByAge.emplace_back(c.touch, k);
+        }
     }
-    std::sort(byAge.begin(), byAge.end());
+
+    static std::atomic<int> sEvictLogs{0};
+    if (coldByAge.empty()) {
+        const int n = sEvictLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 24) {
+            _MESSAGE("FO4RemixPlugin: [TexCache] over budget (%zu MiB > %llu MiB) "
+                     "but all %zu entries are hot -- not evicting",
+                     g_textureCacheBytes / (1024u * 1024u),
+                     (unsigned long long)budgetMiB, g_textureCache.size());
+        }
+        return;
+    }
+    std::sort(coldByAge.begin(), coldByAge.end());
 
     const size_t lowWater = budget - budget / 10;
     uint32_t evicted = 0;
-    for (const auto& [touch, key] : byAge) {
-        if (g_textureCacheBytes <= lowWater || g_textureCache.size() <= 1) break;
-        if (touch == g_textureCacheTouchCounter) break;  // newest entry
+    for (const auto& [touch, key] : coldByAge) {
+        if (g_textureCacheBytes <= lowWater) break;
         TextureCacheErase(key);
         ++evicted;
     }
     if (evicted) {
-        static std::atomic<int> sEvictLogs{0};
         const int n = sEvictLogs.fetch_add(1, std::memory_order_relaxed);
         if (n < 24) {
             _MESSAGE("FO4RemixPlugin: [TexCache] budget %llu MiB exceeded: "
-                     "evicted %u LRU entries, now %zu entries / %zu MiB",
+                     "evicted %u cold entries, now %zu entries / %zu MiB",
                      (unsigned long long)budgetMiB, evicted,
                      g_textureCache.size(),
                      g_textureCacheBytes / (1024u * 1024u));
@@ -1935,7 +1962,8 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
 
     auto it = g_textureCache.find(hash);
     if (it != g_textureCache.end()) {
-        it->second.touch = ++g_textureCacheTouchCounter;
+        it->second.touch      = ++g_textureCacheTouchCounter;
+        it->second.touchFrame = Diagnostics::CurrentFrameIndex();
         // Probe mode never copies: the pixels are re-supplied by the caller's
         // supplying pass on the attempt that actually submits.
         if (supplyPixels && !RemixRenderer::HasTextureHandle(hash)) {
