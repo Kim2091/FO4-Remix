@@ -142,6 +142,17 @@ bool TryResolve(SemanticCapture::DrawableState& state,
     Resolvers::Trace::SetStep(Resolvers::Trace::kSubmitStart);
     auto status = RemixRenderer::SubmitDrawable(hash, mesh, newTextures);
     if (status != RemixRenderer::SubmitStatus::kSubmitted) {
+        // Rate-limited failure log: this used to fail silently, and a
+        // persistently-failing water drawable re-parses its whole geometry
+        // on every poll with nothing in the log to say why water is absent.
+        static std::atomic<int> sFailLogs{0};
+        const int n = sFailLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 12) {
+            _MESSAGE("FO4RemixPlugin: [ResolverWater] SubmitDrawable FAILED #%d "
+                     "hash=0x%llX name=\"%s\"",
+                     n, (unsigned long long)hash,
+                     obj->m_name.c_str() ? obj->m_name.c_str() : "(null)");
+        }
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmitFailed);
         return false;
     }
