@@ -68,16 +68,20 @@ namespace RemixRenderer {
     // g_materialCache (creating cache entries as needed). Stores the resulting
     // mesh handle + material refcount in g_drawables.
     //
-    // Called from semantic_capture's resolve loop on the Remix thread.
+    // Called from semantic_capture's resolve loop on the GAME thread (via
+    // SemanticCapture::Tick from hkPresent). Handle creation is safe there
+    // (the runtime serializes each API call internally).
     SubmitStatus SubmitDrawable(uint64_t hash,
                                 const ExtractedMesh& mesh,
                                 const std::vector<ExtractedTexture>& newTextures);
 
-    // Release the drawable identified by hash: destroy its mesh handle,
-    // decrement material refcount (destroy when 0, cascading texture refcount
-    // decrements). Idempotent on missing hash.
-    //
-    // Called from semantic_capture's TTL eviction path on the Remix thread.
+    // Release the drawable identified by hash: drop its mesh-cache refcount,
+    // decrement material refcount (cascading texture refcount decrements).
+    // Handles whose refcount reaches zero are erased from the caches and
+    // parked for deferred destruction at the top of the next OnFrame -- this
+    // runs on the GAME thread (Tick TTL eviction, reload waves, merge
+    // upgrades), where an inline Destroy* can invalidate a handle the Remix
+    // thread's frame in flight still references. Idempotent on missing hash.
     void ReleaseDrawable(uint64_t hash);
 
     // Forward a key/value to Remix's runtime config registry. Takes the
