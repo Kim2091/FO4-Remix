@@ -1514,6 +1514,12 @@ static void EnqueueTextureConversion(TextureConversionJob&& job)
         unsigned count = (hw * g_config.decodeWorkerPercent + 50u) / 100u;
         if (count < 1) count = 1;
         if (hw > 1 && count > hw - 1) count = hw - 1;
+        // Bandwidth ceiling: decode is DRAM-bound; more workers past this
+        // point contend with the game instead of adding throughput
+        // (8 workers measured slower than 4 on a 32-logical-core machine).
+        if (g_config.decodeWorkerMax > 0 && count > g_config.decodeWorkerMax) {
+            count = g_config.decodeWorkerMax;
+        }
         for (unsigned i = 0; i < count; ++i) {
             g_texConvWorkers.emplace_back([] {
                 // Below-normal priority: decode throughput matters, but never

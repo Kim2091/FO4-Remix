@@ -137,10 +137,12 @@ void LoadConfig() {
     g_config.decodeWorkerPercent = (uint32_t)GetIniInt("Performance", "DecodeWorkerPercent", 25, dllPath);
     if (g_config.decodeWorkerPercent < 1)   g_config.decodeWorkerPercent = 1;
     if (g_config.decodeWorkerPercent > 100) g_config.decodeWorkerPercent = 100;
-    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d BatchedMirrorBase=%d RemixMaxFPS=%u MaxPendingTextureReadbacks=%u ResolveBudgetMs=%.1f DecodeWorkerPercent=%u",
+    g_config.decodeWorkerMax = (uint32_t)GetIniInt("Performance", "DecodeWorkerMax", 4, dllPath);
+    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d BatchedMirrorBase=%d RemixMaxFPS=%u MaxPendingTextureReadbacks=%u ResolveBudgetMs=%.1f DecodeWorkerPercent=%u DecodeWorkerMax=%u",
              g_config.gpuInstancingEnabled, g_config.batchedMirrorBase,
              g_config.remixMaxFPS, g_config.maxPendingTextureReadbacks,
-             g_config.resolveBudgetMs, g_config.decodeWorkerPercent);
+             g_config.resolveBudgetMs, g_config.decodeWorkerPercent,
+             g_config.decodeWorkerMax);
 
     // [Precombines]
     g_config.mergeInstanceExpansion = GetIniBool("Precombines", "MergeInstanceExpansion", true, dllPath);

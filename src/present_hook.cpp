@@ -213,6 +213,19 @@ static void RemixThreadFunc() {
     timeBeginPeriod(1);
 
     using PaceClock = std::chrono::steady_clock;
+
+    // Persistent HUD overlay (2026-07-09 flicker fix). The runtime composites
+    // the overlay only on frames that SUBMIT one -- dispatchScreenOverlay
+    // consumes m_pendingScreenOverlay per dispatch (rtx_fork_overlay.cpp) --
+    // while the game produces captures at game fps and this thread renders at
+    // RemixMaxFPS. Passing only FRESH captures through left every in-between
+    // Remix frame HUD-less: a beat-frequency flicker between the two loops,
+    // and a total HUD loss when the game window was unfocused (alt-tab to the
+    // Remix window stops the game's Presents -> no captures at all). Keep the
+    // last capture across iterations and resubmit it every frame; a fresh
+    // capture replaces it via buffer swap (no extra copies).
+    OverlayData lastOverlay;
+
     while (g_remix.running) {
         const PaceClock::time_point frameStart = PaceClock::now();
 
@@ -223,17 +236,17 @@ static void RemixThreadFunc() {
             cam = g_remix.sharedCamera;
         }
 
-        // Grab latest overlay data from game thread
-        OverlayData overlay;
+        // Swap in the latest overlay capture from the game thread, if any.
         if (g_overlay.ready) {
             std::lock_guard<std::mutex> lock(g_overlay.mutex);
-            overlay.pixels.swap(g_overlay.pixels);
-            overlay.width = g_overlay.width;
-            overlay.height = g_overlay.height;
-            overlay.dxgiFormat = static_cast<uint32_t>(g_overlay.dxgiFormat);
-            overlay.valid = true;
+            lastOverlay.pixels.swap(g_overlay.pixels);
+            lastOverlay.width = g_overlay.width;
+            lastOverlay.height = g_overlay.height;
+            lastOverlay.dxgiFormat = static_cast<uint32_t>(g_overlay.dxgiFormat);
+            lastOverlay.valid = true;
             g_overlay.ready = false;
         }
+        const OverlayData& overlay = lastOverlay;
 
         // Pump messages before rendering so input is processed even when frames are slow
         PumpMessages();

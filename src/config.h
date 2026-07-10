@@ -258,6 +258,14 @@ struct PluginConfig {
     // would render). Default 25 (%): 2 workers on 8 cores, 4 on 16, 8 on 32.
     uint32_t decodeWorkerPercent;
 
+    // Absolute ceiling on the decode pool regardless of the percentage
+    // (0 = no cap). BC decode is memory-bandwidth-bound, not compute-bound:
+    // on a 32-logical-core machine the 25% default resolved to 8 workers and
+    // measured SLOWER than 4 (2026-07-09 user report) -- past ~4 threads the
+    // decoders fight each other and the game for DRAM instead of adding
+    // throughput. Default 4.
+    uint32_t decodeWorkerMax;
+
     // Per-Tick wall-clock budget (milliseconds) for the semantic-capture
     // resolve loop (2026-07-09 hitching fix). Tick runs on the game render
     // thread inside hkPresent; a cell attach makes hundreds of drawables
