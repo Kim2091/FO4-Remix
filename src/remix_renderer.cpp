@@ -1308,10 +1308,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
-    // Destroy handles parked by game-thread release paths since last frame.
-    // This is the one point where a destroy provably cannot overlap a frame
-    // in flight: the previous Present has returned (same thread), no draw of
-    // the new frame has been recorded yet, and g_remixApiMutex is held.
+    // Destroy handles parked by game-thread release paths. This is the one
+    // point where a destroy provably cannot overlap a frame in flight: the
+    // previous Present has returned (same thread), no draw of the new frame
+    // has been recorded yet, and g_remixApiMutex is held.
     // g_renderStateMutex is held ACROSS the destroy calls, not just a swap:
     // handles are hash-valued, so a game-thread SubmitDrawable re-creating
     // identical content between a swap-out and the destroy would produce
@@ -1321,7 +1321,24 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // (its create re-registers cleanly). The runtime's Destroy* only queues
     // a CS command under its own lock -- no GPU wait -- so the hold is
     // short, and it matches the old inline-destroy locking exactly.
-    if (g_hasPendingDestroys.exchange(false, std::memory_order_acquire)) {
+    //
+    // Drained on a CADENCE, not every frame (2026-07-10): each DestroyTexture
+    // bumps the runtime's texture-cache generation (the preserve-path fix for
+    // the stale-albedo-slot corruption), which sends the NEXT frame's draws
+    // down the dynamic path. A steady destroy trickle (TextureUpgradeOnApproach
+    // while moving) would keep the ~93-95% preserve win suppressed every
+    // frame; batching destroys to every kDestroyDrainPeriodFrames confines the
+    // re-translation cost to one frame per period. Longer parking is free --
+    // the handles are already erased from the plugin caches -- and it widens
+    // the CancelParkedHandle rescue window (re-created content avoids its
+    // destroy+re-upload entirely).
+    constexpr uint64_t kDestroyDrainPeriodFrames = 30;
+    static uint64_t s_lastDrainFrame = 0;
+    const uint64_t drainNow = Diagnostics::CurrentFrameIndex();
+    if (g_hasPendingDestroys.load(std::memory_order_acquire) &&
+        drainNow - s_lastDrainFrame >= kDestroyDrainPeriodFrames) {
+        g_hasPendingDestroys.store(false, std::memory_order_release);
+        s_lastDrainFrame = drainNow;
         std::lock_guard<std::mutex> rsLock(g_renderStateMutex);
         DestroyParkedHandles(api, g_pendingDestroys);
         g_pendingDestroys.meshes.clear();
