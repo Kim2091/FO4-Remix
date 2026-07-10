@@ -65,9 +65,6 @@ struct PluginConfig {
     bool logLights;          // Log extracted light info
     bool logBoneDiag;        // One-shot bone matrix diagnostic dump (first skinned mesh, bone 0)
 
-    // [Limits]
-    float maxExtent;         // Reject shapes with extent larger than this (default 10000)
-
     // [Lights]
     bool  lightsEnabled;     // Master toggle for all extracted lights
     float lightIntensity;    // Multiplier for light radiance (default 1.0)
@@ -236,6 +233,16 @@ struct PluginConfig {
     // (equal-block split, else whole mesh x all records).
     bool mergeInstanceDrawCapture;
 
+    // Render merge-expanded precombine geometry double-sided (default true,
+    // the 2026-07-07 vanilla-faithful choice: baked kit content winding is
+    // not consistently front-facing under our decode). Set false for the
+    // single-sided experiment -- the inside-out evidence that forced
+    // double-siding predated the batchedMirrorBase fix, which may have been
+    // the real culprit; single-sided merges re-enable the per-instance
+    // mirrored-record winding flip and would be a path-tracing perf win if
+    // the content winding holds up.
+    bool mergeTwoSided;
+
     // Frame-rate target for the Remix render thread. The thread loop paces to
     // this by sleeping only the unused remainder of the frame budget after
     // OnFrame returns. 0 = uncapped (yield-only between frames).
@@ -265,6 +272,16 @@ struct PluginConfig {
     // decoders fight each other and the game for DRAM instead of adding
     // throughput. Default 4.
     uint32_t decodeWorkerMax;
+
+    // Byte budget (MiB) for the CPU-side decoded-texture cache in
+    // bs_extraction (the name+resolution-keyed mip-chain cache that feeds
+    // SubmitDrawable re-supplies). Decoded RGBA chains are large (~22 MiB
+    // per 2048^2) and the cache previously grew without bound for the whole
+    // session (multi-hour play = unbounded RAM). When the budget is
+    // exceeded the least-recently-supplied entries are evicted; a later
+    // miss just re-runs the readback+decode, which the async pipeline
+    // already tolerates. 0 = unbounded (legacy).
+    uint32_t cpuTextureCacheMiB;
 
     // Per-Tick wall-clock budget (milliseconds) for the semantic-capture
     // resolve loop (2026-07-09 hitching fix). Tick runs on the game render
