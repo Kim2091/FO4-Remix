@@ -407,7 +407,10 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
    - Builds a mesh cache keyed on `(contentHash, materialHash)` where
      `contentHash` = FNV1a over vertex+index bytes when GPU instancing is
      enabled (the default), or the per-drawable PassKey when disabled.
-     `api->CreateMesh` on miss.
+     `api->CreateMesh` on miss. The API-visible mesh hash is also derived from
+     the complete `(contentHash, materialHash)` key: Remix handles equal the
+     caller's hash and repeated registrations are immutable, so using geometry
+     alone would alias material variants to the first registered surface.
    - Stores the resulting `DrawableInstance` in `g_drawables` with the
      world transform, LOD chunk metadata, and water tag.
 
@@ -434,7 +437,11 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
    After the draw loop: optional `DrawScreenOverlay` for the captured UI,
    the LRU sweeps (`SweepStaleMaterials` first — the lever — then
    `SweepStaleTextures` as backstop) on the
-   `cullingTextureLRUSweepPeriod` cadence, and finally `api->Present`.
+   `cullingTextureLRUSweepPeriod` cadence, and finally `api->Present`. LRU
+   victims are parked, not destroyed inline after draws; the same guarded
+   top-of-frame drain used by `ReleaseDrawable` destroys them before the next
+   frame records any instances. This ordering lets the runtime invalidate and
+   rebuild preserved texture-table indices before they can be sampled.
 
 ## Remix integration
 

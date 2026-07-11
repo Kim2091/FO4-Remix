@@ -95,6 +95,20 @@ static uint64_t ContentHashOf(const ExtractedMesh& m) {
     return h;
 }
 
+// Remix API handles in this fork are the caller-provided 64-bit hash value,
+// and CreateMesh registrations are immutable while that handle is live.  The
+// material therefore has to participate in the API-visible hash just as it
+// participates in MeshCacheKey: otherwise two material variants of identical
+// geometry alias one runtime mesh, which remains bound to whichever material
+// registered first.  FNV the material hash into the geometry hash to keep the
+// result stable across runs while giving every cache key its own handle.
+static uint64_t RuntimeMeshHashOf(const MeshCacheKey& key) {
+    uint64_t h = HashBytes(&key.materialHash, sizeof(key.materialHash), key.contentHash);
+    // A null hash is rejected as an invalid Remix handle.  This branch is
+    // astronomically unlikely, but keep the API contract deterministic.
+    return h != 0 ? h : 0xD6E8FEB86659FD93ULL;
+}
+
 // ---------------------------------------------------------------------------
 // First-N-catches-per-callsite logger for C++ exceptions out of dxvk-remix
 // API calls. We saw 3277 caught C++ exceptions out of SubmitDrawable in the
@@ -537,9 +551,13 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
         const bool stale = (it->second.refCount == 0) && (age > ttlFrames);
         if (stale) {
             if (it->second.handle) {
-                remixapi_MaterialHandle h = it->second.handle;
-                RemixCallGuarded("DestroyMaterial(sweep)",
-                                 [&] { api->DestroyMaterial(h); });
+                // Sweeps run after this frame's DrawInstance calls.  Destroying
+                // inline here lets the runtime free a bindless slot before
+                // Present consumes preserved instances, and its generation bump
+                // is then swallowed by onFrameEnd.  Park it for the guarded
+                // top-of-frame drain, matching ReleaseDrawable.
+                g_pendingDestroys.materials.push_back(it->second.handle);
+                g_hasPendingDestroys.store(true, std::memory_order_release);
             }
             it = g_materialCache.erase(it);
             ++result.staleMaterialCount;
@@ -576,7 +594,8 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
 //   (2) Budget pass -- if currentMaterialTex is over budgetBytes, add the
 //       oldest non-stale textures (with min-age guardrail and per-sweep
 //       cap) to the eviction set.
-// Then defensive orphan-handle destruction (refCount == 0 guard).
+// Then defensive orphan-handle parking (refCount == 0 guard); the next
+// top-of-frame destroy drain performs the API release safely.
 // ---------------------------------------------------------------------------
 RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
         uint64_t currentFrameIndex,
@@ -641,9 +660,13 @@ RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
             auto texIt = g_textureHandles.find(texHash);
             if (texIt != g_textureHandles.end() && texIt->second.refCount == 0) {
                 if (texIt->second.handle) {
-                    remixapi_TextureHandle h = texIt->second.handle;
-                    RemixCallGuarded("DestroyTexture(sweep)",
-                                     [&] { api->DestroyTexture(h); });
+                    // Do not release texture-table slots after draws have been
+                    // recorded.  The top-of-frame drain runs before any new
+                    // DrawInstance, so the runtime generation mismatch forces a
+                    // safe one-frame retranslation before preserved state can
+                    // sample the freed/recycled slot.
+                    g_pendingDestroys.textures.push_back(texIt->second.handle);
+                    g_hasPendingDestroys.store(true, std::memory_order_release);
                 }
                 g_textureHandles.erase(texIt);
                 ++result.orphanTexturesDestroyed;
@@ -697,12 +720,9 @@ static void DecrementMeshCacheRef(const MeshCacheKey& key) {
     if (it->second.refCount != 0) return;
 
     if (it->second.handle) {
-        // Mesh handles are hash-valued (== contentHash) and the runtime
-        // ignores repeated registrations, so buckets {content, matA} and
-        // {content, matB} ALIAS one runtime mesh under the same handle
-        // value. Destroying it while a sibling bucket still draws it would
-        // unregister the live mesh (this was a latent bug even in the old
-        // inline-destroy code). Park it only when no other bucket holds it.
+        // RuntimeMeshHashOf normally makes handles unique per full cache key.
+        // Keep a defensive alias check for the vanishingly unlikely 64-bit hash
+        // collision: destroying one collision peer must not unregister another.
         bool aliased = false;
         for (const auto& [k, m] : g_meshCache) {
             if (&m != &it->second && m.handle == it->second.handle) {
@@ -1116,9 +1136,11 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         cacheIt->second.refCount++;
         meshHandle = cacheIt->second.handle;
     } else {
-        // Cache miss -- create a new Remix mesh handle. Use the content hash
-        // as the Remix-side mesh hash so USD replacement matching is stable
-        // across game runs (instead of the per-drawable PassKey, which isn't).
+        // Cache miss -- create a new Remix mesh handle. The runtime stores the
+        // surface material on this immutable, hash-valued handle, so hash the
+        // complete (geometry, material) key rather than geometry alone. The
+        // derived value is deterministic, so each full key keeps a stable
+        // runtime identity instead of aliasing whichever variant arrived first.
         remixapi_MeshInfoSurfaceTriangles surface = {};
         surface.vertices_values = mesh.vertices.data();
         surface.vertices_count  = (uint32_t)mesh.vertices.size();
@@ -1143,7 +1165,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
         remixapi_MeshInfo meshInfo = {};
         meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-        meshInfo.hash = meshKey.contentHash;
+        meshInfo.hash = RuntimeMeshHashOf(meshKey);
         meshInfo.surfaces_values = &surface;
         meshInfo.surfaces_count  = 1;
 
@@ -2030,9 +2052,9 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // LRU sweeps. Run every cullingTextureLRUSweepPeriod frames.
     //
     //   (1) Material sweep -- the LEVER: materials hold Rc<DxvkImageView>
-    //       refs to textures, so cascade-evicting stale materials is what
-    //       actually drops texture VRAM for shared sets. Gated by budget;
-    //       below budget, no eviction (TTL-only mode skips this gate).
+    //       refs to textures, so parking stale materials for the next guarded
+    //       destroy drain is what drops texture VRAM for shared sets. Gated by
+    //       budget; below budget, no eviction (TTL-only mode skips this gate).
     //
     //   (2) Texture sweep -- the BACKSTOP: catches textures whose cache
     //       entry survives their material. Cheap; runs on the same cadence.
@@ -2063,14 +2085,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                          matResult.cellsEvicted);
             }
 
-            // Re-query VRAM after the material sweep so the texture sweep's
-            // budget gate sees the freed bytes.
-            if (g_config.cullingTextureBudgetMiB > 0) {
-                VramStats vramStatsAfter{};
-                if (RemixRenderer::GetVramStats(&vramStatsAfter)) {
-                    currentMaterialTexBytes = vramStatsAfter.usedMaterialTextureBytes;
-                }
-            }
+            // Material victims are only parked here; their runtime references
+            // are released by a later top-of-frame drain. Keep the pre-sweep
+            // VRAM reading for the texture budget pass instead of pretending
+            // the queued releases have already reclaimed memory.
 
             if (g_config.cullingTextureLRUGraceFrames > 0) {
                 auto texResult = RemixRenderer::SweepStaleTextures(
@@ -2078,7 +2096,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     g_config.cullingTextureLRUGraceFrames,
                     budgetBytes,
                     currentMaterialTexBytes);
-                _MESSAGE("FO4RemixPlugin: [LRU] Texture sweep: %u/%u stale, %u cells evicted, %u budget, %u orphans",
+                _MESSAGE("FO4RemixPlugin: [LRU] Texture sweep: %u/%u stale, %u cells evicted, %u budget, %u orphans parked",
                          texResult.staleTextureCount,
                          texResult.textureHandleCount,
                          texResult.cellsEvicted,
