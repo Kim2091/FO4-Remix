@@ -111,6 +111,36 @@ static void WriteExternalDump(HANDLE proc, DWORD pid, DWORD tid,
 }
 
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
+    // On-demand hang capture: "FO4RemixWatchdog.exe dump <pid>" writes an
+    // immediate all-thread-stacks dump of a LIVE process and exits. Built
+    // for the deadlock hunt (2026-07-12): a hung process is a perfect crime
+    // scene -- every thread parked on exactly the lock it waits for -- and
+    // this needs no debugger attach, so it coexists with the watchdog
+    // instance already attached to the same PID.
+    if (cmdLine && strncmp(cmdLine, "dump", 4) == 0) {
+        const DWORD dumpPid = strtoul(cmdLine + 4, nullptr, 10);
+        if (!dumpPid) return 1;
+        HANDLE proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                                  FALSE, dumpPid);
+        if (!proc) return 2;
+        char dir[MAX_PATH] = {};
+        if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) return 3;
+        char path[MAX_PATH];
+        sprintf_s(path, "%s\\CrashDumps\\FO4Remix_hang_%lu.dmp", dir, dumpPid);
+        HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                  FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file == INVALID_HANDLE_VALUE) { CloseHandle(proc); return 4; }
+        const BOOL ok = MiniDumpWriteDump(
+            proc, dumpPid, file,
+            (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo |
+                            MiniDumpWithIndirectlyReferencedMemory |
+                            MiniDumpWithUnloadedModules),
+            nullptr, nullptr, nullptr);
+        CloseHandle(file);
+        CloseHandle(proc);
+        return ok ? 0 : 5;
+    }
+
     const DWORD pid = strtoul(cmdLine ? cmdLine : "", nullptr, 10);
     if (!pid) return 1;
 
