@@ -1,4 +1,5 @@
 #include "bs_extraction.h"
+#include "bcdec_bc7.h"  // vendored BC7 block decoder (bcdec, MIT/Unlicense)
 #include "config.h"
 #include "fo4_diagnostics.h"   // Diagnostics::CurrentFrameIndex for readback aging
 #include "remix_renderer.h"    // HasTextureHandle for cache-hit handle recreation
@@ -98,9 +99,19 @@ static float UnpackByte(uint8_t b) {
 }
 
 // ---------------------------------------------------------------------------
-// Texture cache — keyed by hash derived from ID3D11Resource pointer
+// Texture cache — keyed by hash derived from ID3D11Resource pointer.
+// `touch` is a monotonic use-stamp (NOT a frame index: a cell-load burst
+// decodes dozens of textures in one frame, and frame-granular stamps tie,
+// degrading eviction to arbitrary-victim under exactly the burst the budget
+// exists to bound).
 // ---------------------------------------------------------------------------
-static std::unordered_map<uint64_t, ExtractedTexture> g_textureCache;
+struct CachedTexture {
+    ExtractedTexture tex;
+    uint64_t         touch = 0;       // monotonic use-stamp (LRU order)
+    uint64_t         touchFrame = 0;  // frame of last use (cold gating)
+};
+static std::unordered_map<uint64_t, CachedTexture> g_textureCache;
+static uint64_t g_textureCacheTouchCounter = 0;
 // Resolution-variant index (TextureUpgradeOnApproach): pre-resolution-fold
 // hash -> (full cache key, mip0 width) of the LARGEST variant extracted so
 // far. When a strictly larger variant lands, the superseded entry's pixels
@@ -113,6 +124,104 @@ static std::unordered_map<uint64_t, ExtractedTexture> g_textureCache;
 // need nothing here: they are refcounted per drawable and destroyed on
 // ReleaseDrawable.
 static std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> g_texResVariantIndex;
+
+// CPU-side cache budget (2026-07-10). Decoded RGBA chains are ~22 MiB per
+// 2048^2 texture and the cache previously grew unbounded for the whole
+// session (the variant eviction above only bounds the upgrade path). A
+// running byte total is kept; past the configured budget ([Performance]
+// CpuTextureCacheMiB) the least-recently-touched entries are evicted down
+// to a low-water mark -- a later need re-runs the readback+decode, which
+// the async pipeline tolerates. Game-thread-only, like the cache itself.
+static size_t g_textureCacheBytes = 0;
+
+// Negative cache: hashes whose decode DROPPED (mip-format mismatch -- a
+// deterministic property of the content; transient readback failures never
+// reach the drop site). Without it every resolver retry re-ran the full GPU
+// readback + worker decode for a texture that can never succeed. Cleared
+// with the cache.
+static std::unordered_set<uint64_t> g_texKnownBad;
+
+static void TextureCacheErase(uint64_t key)
+{
+    auto it = g_textureCache.find(key);
+    if (it == g_textureCache.end()) return;
+    g_textureCacheBytes -= it->second.tex.pixels.size();
+    g_textureCache.erase(it);
+}
+
+static void TextureCacheInsert(uint64_t key, ExtractedTexture&& t)
+{
+    CachedTexture& slot = g_textureCache[key];
+    g_textureCacheBytes -= slot.tex.pixels.size();  // 0 for a fresh slot
+    g_textureCacheBytes += t.pixels.size();
+    slot.tex        = std::move(t);
+    slot.touch      = ++g_textureCacheTouchCounter;
+    slot.touchFrame = Diagnostics::CurrentFrameIndex();
+}
+
+// Entries younger than this many frames are HOT and never evicted, no
+// matter the budget. This cache is the working set that re-supplies Remix
+// handles: the 2026-07-10 deployment proved that budget-only eviction of
+// hot entries melts down -- every evicted texture immediately re-readbacks
+// and re-decodes (its drawable is still resolving), which re-inserts and
+// evicts others, a feedback loop that saturated the decode pool and the
+// allocator until the process died. 600 frames ~= 10s, matching the
+// Remix-side TTL grace.
+constexpr uint64_t kTexCacheColdFrames = 600;
+
+static void TextureCacheEnforceBudget()
+{
+    const uint64_t budgetMiB = g_config.cpuTextureCacheMiB;
+    if (budgetMiB == 0) return;  // unbounded (legacy)
+    const size_t budget = (size_t)budgetMiB * 1024u * 1024u;
+    if (g_textureCacheBytes <= budget) return;
+
+    // SOFT cap: evict COLD entries (untouched for kTexCacheColdFrames)
+    // oldest-first down to a low-water mark. If the whole working set is
+    // hot, the cache is allowed to exceed the budget -- unbounded growth
+    // was the pre-budget status quo and is strictly safer than thrashing
+    // the live set.
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    std::vector<std::pair<uint64_t, uint64_t>> coldByAge;  // (touch, key)
+    coldByAge.reserve(g_textureCache.size());
+    for (const auto& [k, c] : g_textureCache) {
+        const uint64_t age = now > c.touchFrame ? now - c.touchFrame : 0;
+        if (age > kTexCacheColdFrames) {
+            coldByAge.emplace_back(c.touch, k);
+        }
+    }
+
+    static std::atomic<int> sEvictLogs{0};
+    if (coldByAge.empty()) {
+        const int n = sEvictLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 24) {
+            _MESSAGE("FO4RemixPlugin: [TexCache] over budget (%zu MiB > %llu MiB) "
+                     "but all %zu entries are hot -- not evicting",
+                     g_textureCacheBytes / (1024u * 1024u),
+                     (unsigned long long)budgetMiB, g_textureCache.size());
+        }
+        return;
+    }
+    std::sort(coldByAge.begin(), coldByAge.end());
+
+    const size_t lowWater = budget - budget / 10;
+    uint32_t evicted = 0;
+    for (const auto& [touch, key] : coldByAge) {
+        if (g_textureCacheBytes <= lowWater) break;
+        TextureCacheErase(key);
+        ++evicted;
+    }
+    if (evicted) {
+        const int n = sEvictLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 24) {
+            _MESSAGE("FO4RemixPlugin: [TexCache] budget %llu MiB exceeded: "
+                     "evicted %u cold entries, now %zu entries / %zu MiB",
+                     (unsigned long long)budgetMiB, evicted,
+                     g_textureCache.size(),
+                     g_textureCacheBytes / (1024u * 1024u));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Compute mip-0 byte size for a given DXGI_FORMAT, width, height.
@@ -145,6 +254,14 @@ static uint32_t ComputeMip0Size(uint32_t width, uint32_t height, DXGI_FORMAT fmt
             bw = (width + 3) / 4;  if (bw < 1) bw = 1;
             bh = (height + 3) / 4; if (bh < 1) bh = 1;
             return bw * bh * 16;
+
+        // BC4 (single-channel masks; decoded to RGBA8 grayscale in
+        // ConvertReadbackMips -- remixapi has no BC4 format)
+        case DXGI_FORMAT_BC4_TYPELESS:      // 79
+        case DXGI_FORMAT_BC4_UNORM:         // 80
+            bw = (width + 3) / 4;  if (bw < 1) bw = 1;
+            bh = (height + 3) / 4; if (bh < 1) bh = 1;
+            return bw * bh * 8;
 
         // BC5
         case DXGI_FORMAT_BC5_TYPELESS:      // 82
@@ -187,6 +304,8 @@ static bool IsBlockCompressed(DXGI_FORMAT fmt, uint32_t& blockSize)
         case DXGI_FORMAT_BC1_TYPELESS:
         case DXGI_FORMAT_BC1_UNORM:
         case DXGI_FORMAT_BC1_UNORM_SRGB:
+        case DXGI_FORMAT_BC4_TYPELESS:
+        case DXGI_FORMAT_BC4_UNORM:
             blockSize = 8;
             return true;
 
@@ -448,32 +567,53 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
     return outMips.empty() ? ReadbackStatus::Failed : ReadbackStatus::Ready;
 }
 
+// Runtime-format gamma test (defined with the LUT helpers below; needed here
+// so the decompressors can preserve the source's sRGB designation).
+namespace { bool IsSrgbColorFormat(DXGI_FORMAT f); }
+
 // ---------------------------------------------------------------------------
 // BC1/BC3 decode helpers — decompress a 4x4 block to RGBA8
 // ---------------------------------------------------------------------------
-static void DecodeBC1ColorBlock(const uint8_t* block, uint8_t out[4][4][4])
+// `forceFourColor`: BC2/BC3 color blocks are ALWAYS 4-color mode per the
+// D3D spec (the c0<=c1 3-color+transparent mode is BC1-only), and encoders
+// exploit that by emitting unordered endpoints -- decoding them with BC1
+// rules corrupts those blocks (wrong color3 + phantom transparency).
+static void DecodeBC1ColorBlock(const uint8_t* block, uint8_t out[4][4][4],
+                                bool forceFourColor = false)
 {
     uint16_t c0 = block[0] | (block[1] << 8);
     uint16_t c1 = block[2] | (block[3] << 8);
 
-    uint8_t colors[4][3];
+    uint8_t colors[4][4];
     colors[0][0] = ((c0 >> 11) & 0x1F) * 255 / 31;
     colors[0][1] = ((c0 >>  5) & 0x3F) * 255 / 63;
     colors[0][2] = ( c0        & 0x1F) * 255 / 31;
+    colors[0][3] = 255;
     colors[1][0] = ((c1 >> 11) & 0x1F) * 255 / 31;
     colors[1][1] = ((c1 >>  5) & 0x3F) * 255 / 63;
     colors[1][2] = ( c1        & 0x1F) * 255 / 31;
+    colors[1][3] = 255;
 
-    if (c0 > c1) {
+    if (forceFourColor || c0 > c1) {
         for (int i = 0; i < 3; i++) {
             colors[2][i] = (2 * colors[0][i] + colors[1][i] + 1) / 3;
             colors[3][i] = (colors[0][i] + 2 * colors[1][i] + 1) / 3;
         }
+        colors[2][3] = 255;
+        colors[3][3] = 255;
     } else {
+        // 1-bit-alpha mode: index 3 is TRANSPARENT black per the BC1 spec.
+        // Decoding it opaque (the pre-2026-07-10 behavior) turned every
+        // self-decoded BC1 cutout (foliage atlases through the bake paths)
+        // into solid black holes. Callers that synthesize their own alpha
+        // (DiffuseAlphaFromLuminance, BC2/BC3 explicit alpha) overwrite
+        // this anyway.
         for (int i = 0; i < 3; i++) {
             colors[2][i] = (colors[0][i] + colors[1][i]) / 2;
             colors[3][i] = 0;
         }
+        colors[2][3] = 255;
+        colors[3][3] = 0;
     }
 
     uint32_t indices = block[4] | (block[5] << 8) | (block[6] << 16) | (block[7] << 24);
@@ -484,7 +624,7 @@ static void DecodeBC1ColorBlock(const uint8_t* block, uint8_t out[4][4][4])
             out[y][x][0] = colors[idx][0];
             out[y][x][1] = colors[idx][1];
             out[y][x][2] = colors[idx][2];
-            out[y][x][3] = 255;
+            out[y][x][3] = colors[idx][3];
         }
     }
 }
@@ -544,9 +684,9 @@ static bool DecompressBC2(ExtractedTexture& tex)
                 alphas[y][3] = (hi >> 4)   | ((hi >> 4) << 4);
             }
 
-            // Next 8 bytes: BC1 color block
+            // Next 8 bytes: BC1-layout color block (always 4-color for BC2)
             uint8_t block[4][4][4];
-            DecodeBC1ColorBlock(src + 8, block);
+            DecodeBC1ColorBlock(src + 8, block, /*forceFourColor=*/true);
 
             // Combine color + alpha
             for (int y = 0; y < 4; y++) {
@@ -571,11 +711,49 @@ static bool DecompressBC2(ExtractedTexture& tex)
     }
 
     tex.pixels = std::move(rgba);
-    tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // Preserve the source's gamma designation: the decoded bytes are still
+    // sRGB-encoded when the source was sRGB, and tagging them UNORM made
+    // Remix read them as linear (washed-out albedo on every decode path).
+    tex.dxgiFormat = IsSrgbColorFormat((DXGI_FORMAT)tex.dxgiFormat)
+        ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
     return true;
 }
 
-// Unified BC1/BC3/BC5 block decompression with per-pixel transform
+// Signed variant of the BC3/BC4 alpha-style block for BC5_SNORM: endpoints
+// and palette are int8, remapped to [0,255] with -127 -> 0, 127 -> 255 so
+// downstream v/255*2-1 math lands on the authored signed value. (Unsigned
+// decode of SNORM data produced garbage normals.)
+static void DecodeBC4SignedBlock(const uint8_t* block, uint8_t out[4][4])
+{
+    auto clampS8 = [](int v) { return v < -127 ? -127 : v; };  // -128 == -127 per spec
+    const int a0 = clampS8((int8_t)block[0]);
+    const int a1 = clampS8((int8_t)block[1]);
+    int palette[8];
+    palette[0] = a0;
+    palette[1] = a1;
+    if (a0 > a1) {
+        for (int i = 1; i <= 6; i++)
+            palette[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+    } else {
+        for (int i = 1; i <= 4; i++)
+            palette[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+        palette[6] = -127;
+        palette[7] = 127;
+    }
+
+    uint64_t bits = 0;
+    for (int i = 2; i < 8; i++)
+        bits |= (uint64_t)block[i] << ((i - 2) * 8);
+
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            const int s = palette[bits & 7];              // [-127, 127]
+            out[y][x] = (uint8_t)(((s + 127) * 255 + 127) / 254);
+            bits >>= 3;
+        }
+}
+
+// Unified BC1/BC3/BC4/BC5 block decompression with per-pixel transform
 enum class BCTransform { None, InvertRGB, NormalReconstructZ };
 
 static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
@@ -586,15 +764,18 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
     bool isBC3 = (tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM ||
                   tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM_SRGB ||
                   tex.dxgiFormat == DXGI_FORMAT_BC3_TYPELESS);
+    bool isBC4 = (tex.dxgiFormat == DXGI_FORMAT_BC4_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC4_TYPELESS);
     bool isBC5 = (tex.dxgiFormat == DXGI_FORMAT_BC5_UNORM ||
                   tex.dxgiFormat == DXGI_FORMAT_BC5_SNORM ||
                   tex.dxgiFormat == DXGI_FORMAT_BC5_TYPELESS);
+    const bool isBC5Signed = tex.dxgiFormat == DXGI_FORMAT_BC5_SNORM;
 
-    if (!isBC1 && !isBC3 && !isBC5) return false;
+    if (!isBC1 && !isBC3 && !isBC4 && !isBC5) return false;
 
     uint32_t bw = (tex.width + 3) / 4;
     uint32_t bh = (tex.height + 3) / 4;
-    uint32_t blockSize = isBC1 ? 8 : 16;
+    uint32_t blockSize = (isBC1 || isBC4) ? 8 : 16;
 
     std::vector<uint8_t> rgba(tex.width * tex.height * 4);
     const uint8_t* src = tex.pixels.data();
@@ -603,11 +784,30 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
         for (uint32_t bx = 0; bx < bw; bx++) {
             uint8_t block[4][4][4]; // [y][x][rgba]
 
-            if (isBC5) {
+            if (isBC4) {
+                // BC4: one alpha-style block, single channel. Replicate to
+                // RGB (grayscale masks read the same from any channel).
+                uint8_t rChan[4][4];
+                DecodeBC3AlphaBlock(src, rChan);
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++) {
+                        const uint8_t v = (transform == BCTransform::InvertRGB)
+                            ? (uint8_t)(255 - rChan[y][x]) : rChan[y][x];
+                        block[y][x][0] = v;
+                        block[y][x][1] = v;
+                        block[y][x][2] = v;
+                        block[y][x][3] = 255;
+                    }
+            } else if (isBC5) {
                 // BC5: two alpha-style blocks for R and G channels
                 uint8_t rChan[4][4], gChan[4][4];
-                DecodeBC3AlphaBlock(src, rChan);
-                DecodeBC3AlphaBlock(src + 8, gChan);
+                if (isBC5Signed) {
+                    DecodeBC4SignedBlock(src, rChan);
+                    DecodeBC4SignedBlock(src + 8, gChan);
+                } else {
+                    DecodeBC3AlphaBlock(src, rChan);
+                    DecodeBC3AlphaBlock(src + 8, gChan);
+                }
 
                 if (transform == BCTransform::InvertRGB) {
                     // R=specular, G=smoothness. Invert G to get roughness.
@@ -636,7 +836,7 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
             } else if (isBC3) {
                 uint8_t alphas[4][4];
                 DecodeBC3AlphaBlock(src, alphas);
-                DecodeBC1ColorBlock(src + 8, block);
+                DecodeBC1ColorBlock(src + 8, block, /*forceFourColor=*/true);
                 for (int y = 0; y < 4; y++)
                     for (int x = 0; x < 4; x++)
                         block[y][x][3] = alphas[y][x];
@@ -646,8 +846,8 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
             src += blockSize;
 
             // Write decoded pixels to output buffer
-            if (transform == BCTransform::InvertRGB && !isBC5) {
-                // Invert RGB for BC1/BC3 (BC5 already handled above)
+            if (transform == BCTransform::InvertRGB && !isBC5 && !isBC4) {
+                // Invert RGB for BC1/BC3 (BC4/BC5 already handled above)
                 for (int y = 0; y < 4; y++) {
                     uint32_t py = by * 4 + y;
                     if (py >= tex.height) continue;
@@ -662,7 +862,7 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
                     }
                 }
             } else {
-                // No transform, or BC5 already transformed above
+                // No transform, or BC4/BC5 already transformed above
                 for (int y = 0; y < 4; y++) {
                     uint32_t py = by * 4 + y;
                     if (py >= tex.height) continue;
@@ -678,7 +878,65 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
     }
 
     tex.pixels = std::move(rgba);
-    tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // Preserve the source's gamma designation for COLOR decodes: the bytes
+    // stay sRGB-encoded when the source was sRGB, and the old unconditional
+    // UNORM tag made Remix read them as linear -> washed-out albedo on every
+    // tint/palette/lum-floor/cutout bake. Data decodes (roughness invert,
+    // normal reconstruct; BC4/BC5 sources are UNORM anyway) keep UNORM.
+    tex.dxgiFormat = (transform == BCTransform::None &&
+                      IsSrgbColorFormat((DXGI_FORMAT)tex.dxgiFormat))
+        ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    return true;
+}
+
+// Decompress a BC7 texture to RGBA8 via the vendored bcdec decoder
+// (bcdec_bc7.h). BC7 used to be pass-through-only: it displays fine
+// compressed, but every per-pixel transform (palette LUT remap, tint bake,
+// smoothness->roughness inversion, octahedral normal encode, luminance
+// floor) DECLINED on it -- BC7 smoothness maps shipped un-inverted (shiny/
+// dull flipped) and BC7 diffuses lost their tints. Preserves the source's
+// sRGB designation like DecompressBC.
+static bool DecompressBC7(ExtractedTexture& tex)
+{
+    const bool isBC7 = (tex.dxgiFormat == DXGI_FORMAT_BC7_UNORM ||
+                        tex.dxgiFormat == DXGI_FORMAT_BC7_UNORM_SRGB ||
+                        tex.dxgiFormat == DXGI_FORMAT_BC7_TYPELESS);
+    if (!isBC7) return false;
+
+    const uint32_t bw = (tex.width + 3) / 4;
+    const uint32_t bh = (tex.height + 3) / 4;
+    std::vector<uint8_t> rgba((size_t)tex.width * tex.height * 4);
+    const uint8_t* src = tex.pixels.data();
+
+    for (uint32_t by = 0; by < bh; ++by) {
+        for (uint32_t bx = 0; bx < bw; ++bx, src += 16) {
+            if (bx * 4 + 4 <= tex.width && by * 4 + 4 <= tex.height) {
+                // Interior block: decode straight into the output rows.
+                uint8_t* dst = rgba.data() +
+                    ((size_t)by * 4 * tex.width + (size_t)bx * 4) * 4;
+                bcdec_bc7(src, dst, (int)(tex.width * 4));
+            } else {
+                // Edge block of a non-multiple-of-4 mip: bcdec writes full
+                // 4x4 rows, so decode into scratch and copy what's in range.
+                uint8_t scratch[4][4][4];
+                bcdec_bc7(src, scratch, 16);
+                for (uint32_t y = 0; y < 4; ++y) {
+                    const uint32_t py = by * 4 + y;
+                    if (py >= tex.height) break;
+                    for (uint32_t x = 0; x < 4; ++x) {
+                        const uint32_t px = bx * 4 + x;
+                        if (px >= tex.width) continue;
+                        memcpy(&rgba[((size_t)py * tex.width + px) * 4],
+                               scratch[y][x], 4);
+                    }
+                }
+            }
+        }
+    }
+
+    tex.pixels = std::move(rgba);
+    tex.dxgiFormat = IsSrgbColorFormat((DXGI_FORMAT)tex.dxgiFormat)
+        ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
     return true;
 }
 
@@ -1096,7 +1354,9 @@ int BsExtraction::SampleLookupColor(NiTexture* lut, ID3D11Device* device,
             m.dxgiFormat != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
             m.dxgiFormat != DXGI_FORMAT_B8G8R8A8_UNORM &&
             m.dxgiFormat != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
-            DecompressBC(m, BCTransform::None);
+            if (!DecompressBC(m, BCTransform::None)) {
+                DecompressBC7(m);  // BC7-compressed palette/hair LUTs
+            }
         }
         const bool rgba = (m.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
                            m.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
@@ -1219,8 +1479,32 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     // handled by the post-process stage's BC5/BC1 decoders. Each step operates
     // on a single mip so the existing single-mip-aware functions need no
     // changes.
+    // Does this job apply any per-pixel work? Pass-through textures stay in
+    // their compressed source format (the runtime decodes BC natively and
+    // it is far smaller in VRAM); anything with a transform or bake needs
+    // real pixels.
+    const bool needsDecodedPixels =
+        postProcess != TexturePostProcess::None ||
+        job.palTableValid ||
+        job.tintRGB != 0xFFFFFFu ||
+        job.albedoLumFloor > 0;
+
     for (auto& mip : mips) {
         DecompressBC2(mip);
+        // BC4 has no remixapi format, so it can never pass through
+        // compressed -- decode to RGBA8 grayscale up front; the transform
+        // stages below then treat it like any uncompressed input.
+        if (mip.dxgiFormat == DXGI_FORMAT_BC4_UNORM ||
+            mip.dxgiFormat == DXGI_FORMAT_BC4_TYPELESS) {
+            DecompressBC(mip, BCTransform::None);
+        }
+        // BC7 decodes only when pixels are actually needed (2026-07-10).
+        // Every transform used to DECLINE on BC7 -- smoothness maps shipped
+        // un-inverted, octahedral normal encode never ran, tint/palette/
+        // floor bakes fell back to flat approximations.
+        if (needsDecodedPixels) {
+            DecompressBC7(mip);
+        }
     }
 
     // --- Debug dump: BC3 alpha cutout (right after readback) ---
@@ -1232,7 +1516,11 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
         static std::atomic<int> s_logDiffuseFormat{0};
         if (job.isDiffuseSlot) {
             const auto& mip0 = mips[0];
-            if (s_logDiffuseFormat.fetch_add(1, std::memory_order_relaxed) < 9999) {
+            // Gated on LogTextures + a small cap (was <9999 unconditional:
+            // effectively one log line per diffuse decode on the streaming
+            // hot path, from worker threads).
+            if (g_config.logTextures &&
+                s_logDiffuseFormat.fetch_add(1, std::memory_order_relaxed) < 64) {
                 _MESSAGE("FO4RemixPlugin: DEBUG diffuse-extract tex='%s' fmt=%u %ux%u mips=%zu pp=%d",
                          texName,
                          (unsigned)mip0.dxgiFormat,
@@ -1387,6 +1675,14 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
         bool remapped = false;
         if (job.palTableValid) {
             remapped = PaletteRemap_Apply(mip, job.palTable);
+            // The remap table's output bytes are ALWAYS sRGB-encoded
+            // (BuildPaletteRemapTable re-encodes with LinearToSrgb), so the
+            // tag must say so even when the grayscale SOURCE was a plain
+            // UNORM mask -- otherwise Remix linearizes already-gamma bytes
+            // and palette surfaces come out over-dark.
+            if (remapped && mip.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                mip.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            }
         }
         // Skin/hair tint multiply composes AFTER the alpha stage (alpha
         // untouched -- hair cutouts survive) and BEFORE the luminance floor.
@@ -1662,12 +1958,16 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // "player's area empty after loading a save" + submitFailed-retry-storm
     // symptom). Re-supply the cached pixels so SubmitDrawable recreates the
     // handle; the copy only happens in the handle-missing case.
+    if (g_texKnownBad.count(hash)) return 0;  // decode permanently dropped
+
     auto it = g_textureCache.find(hash);
     if (it != g_textureCache.end()) {
+        it->second.touch      = ++g_textureCacheTouchCounter;
+        it->second.touchFrame = Diagnostics::CurrentFrameIndex();
         // Probe mode never copies: the pixels are re-supplied by the caller's
         // supplying pass on the attempt that actually submits.
         if (supplyPixels && !RemixRenderer::HasTextureHandle(hash)) {
-            newTextures.push_back(it->second);
+            newTextures.push_back(it->second.tex);
         }
         return hash;
     }
@@ -1693,7 +1993,13 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
             }
         }
         if (havePacked) {
-            if (packed.pixels.empty()) return 0;  // conversion dropped (format mismatch)
+            if (packed.pixels.empty()) {
+                // Conversion dropped (format mismatch). Remember it so the
+                // resolver's retries short-circuit here instead of re-running
+                // the readback + decode forever.
+                g_texKnownBad.insert(hash);
+                return 0;
+            }
 
             if (g_config.logTextures) {
                 _MESSAGE("FO4RemixPlugin: Extracted %s texture \"%s\" %ux%u mips=%u fmt=%u hash=0x%016llX%s",
@@ -1715,20 +2021,22 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                     preResolutionHash, hash, packed.width);
                 if (!inserted && vit->second.first != hash) {
                     if (packed.width > vit->second.second) {
-                        g_textureCache.erase(vit->second.first);
+                        TextureCacheErase(vit->second.first);
                         vit->second = { hash, packed.width };
                     }
                 }
             }
 
             if (supplyPixels) {
-                g_textureCache[hash] = packed;             // copy stays cached
+                ExtractedTexture cached = packed;          // copy stays cached
+                TextureCacheInsert(hash, std::move(cached));
                 newTextures.push_back(std::move(packed));  // moved to submit list
             } else {
                 // Probe mode: park the decode in the cache without the extra
                 // copy; the supplying pass cache-hits it later.
-                g_textureCache[hash] = std::move(packed);
+                TextureCacheInsert(hash, std::move(packed));
             }
+            TextureCacheEnforceBudget();
             return hash;
         }
     }
@@ -2465,9 +2773,12 @@ std::vector<CellInfo> BsExtraction::GetLoadedCells()
 // ---------------------------------------------------------------------------
 void BsExtraction::ClearTextureCache()
 {
-    _MESSAGE("FO4RemixPlugin: ClearTextureCache - clearing %zu entries", g_textureCache.size());
+    _MESSAGE("FO4RemixPlugin: ClearTextureCache - clearing %zu entries (%zu MiB)",
+             g_textureCache.size(), g_textureCacheBytes / (1024u * 1024u));
     g_textureCache.clear();
     g_texResVariantIndex.clear();
+    g_textureCacheBytes = 0;
+    g_texKnownBad.clear();
 }
 
 bool BsExtraction::GetCachedTextureStats(uint64_t hash, uint32_t* outW, uint32_t* outH,
@@ -2475,7 +2786,7 @@ bool BsExtraction::GetCachedTextureStats(uint64_t hash, uint32_t* outW, uint32_t
 {
     auto it = g_textureCache.find(hash);
     if (it == g_textureCache.end()) return false;
-    const ExtractedTexture& tex = it->second;
+    const ExtractedTexture& tex = it->second.tex;
     if (outW) *outW = tex.width;
     if (outH) *outH = tex.height;
     if (outFmt) *outFmt = (uint32_t)tex.dxgiFormat;

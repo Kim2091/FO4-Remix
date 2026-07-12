@@ -273,14 +273,16 @@ struct PluginConfig {
     // throughput. Default 4.
     uint32_t decodeWorkerMax;
 
-    // Byte budget (MiB) for the CPU-side decoded-texture cache in
+    // SOFT byte budget (MiB) for the CPU-side decoded-texture cache in
     // bs_extraction (the name+resolution-keyed mip-chain cache that feeds
     // SubmitDrawable re-supplies). Decoded RGBA chains are large (~22 MiB
     // per 2048^2) and the cache previously grew without bound for the whole
-    // session (multi-hour play = unbounded RAM). When the budget is
-    // exceeded the least-recently-supplied entries are evicted; a later
-    // miss just re-runs the readback+decode, which the async pipeline
-    // already tolerates. 0 = unbounded (legacy).
+    // session (multi-hour play = unbounded RAM). Past the budget, entries
+    // untouched for kTexCacheColdFrames are evicted oldest-first; HOT
+    // entries are never evicted even over budget -- this cache is the live
+    // working set, and evicting hot entries triggers a re-readback/
+    // re-decode feedback loop (the 2026-07-10 crash-in-5-seconds
+    // deployment). 0 = unbounded (legacy).
     uint32_t cpuTextureCacheMiB;
 
     // Per-Tick wall-clock budget (milliseconds) for the semantic-capture
