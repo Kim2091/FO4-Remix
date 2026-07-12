@@ -98,6 +98,69 @@ static BOOL WINAPI hkTerminateProcess(HANDLE process, UINT exitCode) {
     return g_origTerminateProcess(process, exitCode);
 }
 
+// ---------------------------------------------------------------------------
+// ntdll-layer exit hooks: kernel32's ExitProcess forwards to
+// RtlExitUserProcess, and NtTerminateProcess is the final stop for
+// everything -- callers that go to ntdll directly (some engine fatal
+// handlers, CRT fastpath exits) never touch the kernel32 exports above.
+// ---------------------------------------------------------------------------
+typedef VOID (NTAPI* PFN_RtlExitUserProcess)(NTSTATUS);
+typedef LONG (NTAPI* PFN_NtTerminateProcess)(HANDLE, NTSTATUS);
+static PFN_RtlExitUserProcess g_origRtlExitUserProcess = nullptr;
+static PFN_NtTerminateProcess g_origNtTerminateProcess = nullptr;
+
+static VOID NTAPI hkRtlExitUserProcess(NTSTATUS status) {
+    LogExit("RtlExitUserProcess", (UINT)status, _ReturnAddress());
+    g_origRtlExitUserProcess(status);
+}
+
+static LONG NTAPI hkNtTerminateProcess(HANDLE process, NTSTATUS status) {
+    // NULL/pseudo-handle = current process (that's how RtlExitUserProcess's
+    // final kill and direct self-terminations arrive here).
+    if (!process || process == GetCurrentProcess() ||
+        GetProcessId(process) == GetCurrentProcessId()) {
+        LogExit("NtTerminateProcess", (UINT)status, _ReturnAddress());
+    }
+    return g_origNtTerminateProcess(process, status);
+}
+
+// ---------------------------------------------------------------------------
+// External exit-code watchdog. Everything above dies WITH the process; a
+// separate observer does not. Spawn a hidden PowerShell that waits on this
+// PID and appends "<timestamp> pid=N exit=0xNNNNNNNN" to
+// %LOCALAPPDATA%\CrashDumps\FO4Remix_exitcodes.log. The exit code alone
+// discriminates the silent-death classes (0xC00000FD stack overflow,
+// 0xC0000409 fastfail, DXGI/driver kill codes, clean exits) even when the
+// process is too dead to run a single in-process instruction.
+// ---------------------------------------------------------------------------
+static void SpawnExitCodeWatchdog() {
+    char cmd[1024];
+    sprintf_s(cmd,
+        "powershell.exe -NoProfile -WindowStyle Hidden -Command "
+        "\"$p=[Diagnostics.Process]::GetProcessById(%lu);"
+        "$p.WaitForExit();"
+        "('{0:o} pid=%lu exit=0x{1:X8}' -f (Get-Date),$p.ExitCode) | "
+        "Out-File -Append -Encoding ascii "
+        "$env:LOCALAPPDATA\\CrashDumps\\FO4Remix_exitcodes.log\"",
+        GetCurrentProcessId(), GetCurrentProcessId());
+
+    STARTUPINFOA si = {};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    PROCESS_INFORMATION pi = {};
+    if (CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE,
+                       CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        _MESSAGE("FO4RemixPlugin: [CrashDiag] exit-code watchdog spawned "
+                 "(FO4Remix_exitcodes.log)");
+    } else {
+        _MESSAGE("FO4RemixPlugin: [CrashDiag] watchdog spawn failed (err=%lu)",
+                 GetLastError());
+    }
+}
+
 void Install() {
     AddVectoredExceptionHandler(1 /* first */, VectoredBreadcrumb);
 
@@ -105,12 +168,16 @@ void Install() {
     if (init != MH_OK && init != MH_ERROR_ALREADY_INITIALIZED) {
         _MESSAGE("FO4RemixPlugin: [CrashDiag] MinHook init failed (%d); "
                  "exit hooks unavailable", (int)init);
+        SpawnExitCodeWatchdog();
         return;
     }
 
     HMODULE k32 = GetModuleHandleA("kernel32.dll");
     void* pExit = k32 ? (void*)GetProcAddress(k32, "ExitProcess") : nullptr;
     void* pTerm = k32 ? (void*)GetProcAddress(k32, "TerminateProcess") : nullptr;
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    void* pRtlExit = ntdll ? (void*)GetProcAddress(ntdll, "RtlExitUserProcess") : nullptr;
+    void* pNtTerm  = ntdll ? (void*)GetProcAddress(ntdll, "NtTerminateProcess") : nullptr;
 
     bool exitHooked = pExit &&
         MH_CreateHook(pExit, &hkExitProcess,
@@ -120,9 +187,21 @@ void Install() {
         MH_CreateHook(pTerm, &hkTerminateProcess,
                       reinterpret_cast<void**>(&g_origTerminateProcess)) == MH_OK &&
         MH_EnableHook(pTerm) == MH_OK;
+    bool rtlHooked = pRtlExit &&
+        MH_CreateHook(pRtlExit, &hkRtlExitUserProcess,
+                      reinterpret_cast<void**>(&g_origRtlExitUserProcess)) == MH_OK &&
+        MH_EnableHook(pRtlExit) == MH_OK;
+    bool ntTermHooked = pNtTerm &&
+        MH_CreateHook(pNtTerm, &hkNtTerminateProcess,
+                      reinterpret_cast<void**>(&g_origNtTerminateProcess)) == MH_OK &&
+        MH_EnableHook(pNtTerm) == MH_OK;
 
     _MESSAGE("FO4RemixPlugin: [CrashDiag] installed (VEH=1 ExitProcess=%d "
-             "TerminateProcess=%d)", exitHooked ? 1 : 0, termHooked ? 1 : 0);
+             "TerminateProcess=%d RtlExitUserProcess=%d NtTerminateProcess=%d)",
+             exitHooked ? 1 : 0, termHooked ? 1 : 0,
+             rtlHooked ? 1 : 0, ntTermHooked ? 1 : 0);
+
+    SpawnExitCodeWatchdog();
 }
 
 }  // namespace CrashDiag
