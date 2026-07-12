@@ -186,6 +186,21 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             const EXCEPTION_RECORD& rec = ev.u.Exception.ExceptionRecord;
             const DWORD code = rec.ExceptionCode;
             const bool firstChance = ev.u.Exception.dwFirstChance != 0;
+            // Debugger-protocol pseudo-exceptions MUST be swallowed with
+            // DBG_CONTINUE the way real debuggers do -- the raisers rely on
+            // an attached debugger consuming them. Passing them through as
+            // unhandled killed the game 3s after attach on the first field
+            // run (exit 0x406D1388: a thread-naming exception raised for
+            // OUR benefit). Breakpoints cover the attach handshake INT3.
+            if (code == 0x406D1388UL ||   // MS_VC_EXCEPTION (SetThreadName)
+                code == 0x80000003UL ||   // STATUS_BREAKPOINT (attach INT3)
+                code == 0x4000001FUL ||   // STATUS_WX86_BREAKPOINT
+                code == 0x80000004UL ||   // STATUS_SINGLE_STEP
+                code == 0x40010006UL ||   // DBG_PRINTEXCEPTION_C
+                code == 0x40010007UL) {   // DBG_PRINTEXCEPTION_WIDE_C
+                continueStatus = DBG_CONTINUE;
+                break;
+            }
             // Pass ordinary exceptions to the game's own handlers (the
             // plugin's guarded stale-pointer AVs arrive here first-chance
             // constantly; they are handled in-process by design).
