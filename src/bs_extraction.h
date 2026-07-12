@@ -32,6 +32,21 @@ struct ExtractedMesh {
     float emissiveColorG = 0.0f;        // Emissive color G
     float emissiveColorB = 0.0f;        // Emissive color B
     float emissiveIntensity = 0.0f;     // fEmitColorScale from BSLightingShaderProperty
+
+    // The COLOR0 stream is authored as an albedo/opacity multiplier for this
+    // shader permutation. False for meshes whose vertex colors are inactive
+    // masks and for grayscale-to-palette materials (where color.r selects a
+    // LUT row instead). SubmitDrawable uses this to select VertexColor0 in
+    // the Remix fixed-function texture-stage state.
+    bool useVertexColors = false;
+
+    // Vertex alpha is a separate shader permutation in FO4. In particular,
+    // tree-animation materials store wind weight in COLOR0.a, so treating
+    // every active color stream as opacity can erase trunks and branches.
+    // The resolver enables this only for the authored vertex-alpha path and
+    // suppresses it for tree animation.
+    bool useVertexAlpha = false;
+
     bool alphaTestEnabled = false;  // true if NiAlphaProperty has alpha test
     int alphaTestType = 7;          // Remix/VkCompareOp value (7 = Always = no test)
     uint8_t alphaTestRef = 128;     // Alpha reference value (0-255)

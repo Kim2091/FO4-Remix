@@ -230,16 +230,18 @@ static uint64_t RetryDelayFrames(uint32_t attempts) {
     return delay < kMaxRetryDelayFrames ? delay : kMaxRetryDelayFrames;
 }
 
-// SEH wrapper for the resolver call. C++ destructors cannot live in a
-// __try scope (MSVC C2712), so we isolate the call in a non-throwing helper
-// with C-style locals only. Returns 0 on normal completion (resolver
-// returned, success or not), 1 if SEH was caught (access violation etc).
-// On SEH catch, *outExceptionCode receives GetExceptionCode().
-static int CallResolverGuarded(SemanticCapture::DrawableState* state,
-                               uint64_t key,
-                               ID3D11Device* device,
-                               unsigned long* outExceptionCode) {
-    __try {
+// Resolver exception fence. A C++ exception is implemented as SEH on MSVC;
+// letting the outer __except catch 0xE06D7363 bypasses /EHsc unwinding and can
+// strand mutex lock_guards owned by the resolver. Catch C++ exceptions in an
+// ordinary C++ frame first, then use the tiny outer SEH frame only for true
+// access violations and similar faults.
+static constexpr unsigned long kMsvcCppExceptionCode = 0xE06D7363UL;
+
+static int CallResolverCxxGuarded(SemanticCapture::DrawableState* state,
+                                  uint64_t key,
+                                  ID3D11Device* device,
+                                  unsigned long* outExceptionCode) {
+    try {
         switch (state->resolverKind) {
             case SemanticCapture::ResolverKind::Lighting:
                 Resolvers::Lighting::TryResolveStatic(*state, key, device);
@@ -249,6 +251,33 @@ static int CallResolverGuarded(SemanticCapture::DrawableState* state,
                 break;
         }
         return 0;
+    } catch (const std::exception& e) {
+        static std::atomic<int> sCxxLogs{0};
+        const int n = sCxxLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            _MESSAGE("FO4RemixPlugin: [Resolver] C++ exception #%d key=0x%llX what=%s",
+                     n, (unsigned long long)key, e.what());
+        }
+        *outExceptionCode = kMsvcCppExceptionCode;
+        return 2;
+    } catch (...) {
+        static std::atomic<int> sCxxLogs{0};
+        const int n = sCxxLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            _MESSAGE("FO4RemixPlugin: [Resolver] unknown C++ exception #%d key=0x%llX",
+                     n, (unsigned long long)key);
+        }
+        *outExceptionCode = kMsvcCppExceptionCode;
+        return 2;
+    }
+}
+
+static int CallResolverGuarded(SemanticCapture::DrawableState* state,
+                               uint64_t key,
+                               ID3D11Device* device,
+                               unsigned long* outExceptionCode) {
+    __try {
+        return CallResolverCxxGuarded(state, key, device, outExceptionCode);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         *outExceptionCode = GetExceptionCode();
         return 1;
@@ -259,11 +288,31 @@ static int CallResolverGuarded(SemanticCapture::DrawableState* state,
 // std::lock_guard, so we cannot put __try inside it (C2712). Instead the
 // caller wraps the entire call. Returns 0 on normal completion, 1 if SEH
 // was caught with *outExceptionCode filled.
+static int CallReleaseDrawableCxxGuarded(uint64_t meshHash,
+                                         unsigned long* outExceptionCode) {
+    try {
+        RemixRenderer::ReleaseDrawable(meshHash);
+        return 0;
+    } catch (const std::exception& e) {
+        static std::atomic<int> sCxxLogs{0};
+        const int n = sCxxLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] C++ exception #%d "
+                     "hash=0x%llX what=%s", n,
+                     (unsigned long long)meshHash, e.what());
+        }
+        *outExceptionCode = kMsvcCppExceptionCode;
+        return 2;
+    } catch (...) {
+        *outExceptionCode = kMsvcCppExceptionCode;
+        return 2;
+    }
+}
+
 static int CallReleaseDrawableGuarded(uint64_t meshHash,
                                       unsigned long* outExceptionCode) {
     __try {
-        RemixRenderer::ReleaseDrawable(meshHash);
-        return 0;
+        return CallReleaseDrawableCxxGuarded(meshHash, outExceptionCode);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         *outExceptionCode = GetExceptionCode();
         return 1;

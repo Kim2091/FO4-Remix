@@ -523,6 +523,7 @@ static bool PeekBytesGuarded(const void* src, void* dst, size_t bytes) {
 static bool BuildMeshFromChunks(BSTriShape* tri,
                                 const DrawCapture::ChunkDraw* chunks, int nChunks,
                                 uint64_t hash,
+                                bool useVertexColors,
                                 const std::vector<std::array<float, 20>>& recs,
                                 const std::vector<remixapi_HardcodedVertex>& srcVerts,
                                 std::vector<remixapi_HardcodedVertex>& outVerts,
@@ -616,7 +617,9 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
         }
         if (!inside) { ++dBound; continue; }
         if (!anchored) { ++dRec; continue; }
-        // append: positions float3@0, UV half2@16, normal biased-ubyte@20
+        // append: positions float3@0, UV half2@16, normal biased-ubyte@20,
+        // packed color@28. Keep color neutral when the shader doesn't consume
+        // it (or uses color.r as a grayscale-palette selector).
         const uint32_t vbase = (uint32_t)outVerts.size();
         outVerts.resize(vbase + nVerts);
         for (uint32_t v = 0; v < nVerts; ++v) {
@@ -640,7 +643,11 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
             hv.normal[0] = nx;
             hv.normal[1] = ny;
             hv.normal[2] = nz;
-            hv.color = 0xFFFFFFFF;
+            if (useVertexColors) {
+                std::memcpy(&hv.color, p + 28, 4);
+            } else {
+                hv.color = 0xFFFFFFFF;
+            }
         }
         // same per-triangle 1<->2 winding flip the parser applies
         const size_t ibase = outIndices.size();
@@ -1440,6 +1447,14 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     // ---- Build mesh ---- (declared at function scope above; filled here)
     mesh.hash = hash;
+    mesh.useVertexColors = applyVertexColors &&
+                           (parsed.vertexDesc & BSGeometry::kFlag_VertexColors) != 0;
+    constexpr uint64_t kFlag_VertexAlpha = 1ULL << 3;
+    constexpr uint64_t kFlag_TreeAnim    = 1ULL << 61;
+    mesh.useVertexAlpha = mesh.useVertexColors &&
+                          (propFlagsEarly & kFlag_VertexAlpha) != 0 &&
+                          (propFlagsEarly & kFlag_TreeAnim) == 0 &&
+                          mat->GetType() != BSLightingShaderMaterialBase::kType_TreeAnim;
     mesh.vertices = std::move(parsed.vertices);
     mesh.indices  = std::move(parsed.indices);
     SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
@@ -2870,6 +2885,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             std::vector<uint32_t> bi;
                             int keptChunks = 0;
                             if (BuildMeshFromChunks(tri, chunks, nChunks, hash,
+                                                    mesh.useVertexColors,
                                                     instRecords, mesh.vertices,
                                                     bv, bi, keptChunks)) {
                                 mesh.vertices = std::move(bv);

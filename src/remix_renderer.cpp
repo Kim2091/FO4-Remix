@@ -119,6 +119,13 @@ static std::atomic<int> g_cxxLogCount_SubmitDrawable{0};
 static std::atomic<int> g_cxxLogCount_DrawInstance{0};
 static constexpr int kCxxLogCap = 16;
 
+// Fallout submits Remix work from two producers: resolver-driven resource
+// creation on the game thread and draw/present work on the dedicated Remix
+// thread. Serialize every API call here so dxvk-remix's command chunk always
+// has one producer, even though the registered D3D9 device was created without
+// D3DCREATE_MULTITHREADED. Recursive for callers that already own the lock.
+static std::recursive_mutex g_remixApiMutex;
+
 // ---------------------------------------------------------------------------
 // SEH wrapper for api->DrawInstance. The OnFrame draw loop iterates
 // g_drawables under g_renderStateMutex (lock_guard's destructor would
@@ -156,16 +163,24 @@ static int CallDrawInstanceCxxGuarded(remixapi_Interface* api,
     }
 }
 
-static int CallDrawInstanceGuarded(remixapi_Interface* api,
-                                   const remixapi_InstanceInfo* instance,
-                                   remixapi_ErrorCode* outErr,
-                                   unsigned long* outExceptionCode) {
+static int CallDrawInstanceSehGuarded(remixapi_Interface* api,
+                                      const remixapi_InstanceInfo* instance,
+                                      remixapi_ErrorCode* outErr,
+                                      unsigned long* outExceptionCode) {
     __try {
         return CallDrawInstanceCxxGuarded(api, instance, outErr);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         *outExceptionCode = GetExceptionCode();
         return 1;
     }
+}
+
+static int CallDrawInstanceGuarded(remixapi_Interface* api,
+                                   const remixapi_InstanceInfo* instance,
+                                   remixapi_ErrorCode* outErr,
+                                   unsigned long* outExceptionCode) {
+    std::lock_guard<std::recursive_mutex> apiLock(g_remixApiMutex);
+    return CallDrawInstanceSehGuarded(api, instance, outErr, outExceptionCode);
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +220,7 @@ static int RemixCallCxxGuarded(const char* site, F& fn) {
 }
 
 template <typename F>
-static int RemixCallGuarded(const char* site, F&& fn) {
+static int RemixCallSehGuarded(const char* site, F& fn) {
     __try {
         return RemixCallCxxGuarded(site, fn);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -216,6 +231,12 @@ static int RemixCallGuarded(const char* site, F&& fn) {
         }
         return 1;
     }
+}
+
+template <typename F>
+static int RemixCallGuarded(const char* site, F&& fn) {
+    std::lock_guard<std::recursive_mutex> apiLock(g_remixApiMutex);
+    return RemixCallSehGuarded(site, fn);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,6 +322,13 @@ namespace {
         uint32_t                     alphaTestType        = 7;  // VK_COMPARE_OP_ALWAYS
         uint8_t                      alphaTestRef         = 128;
 
+        // Whether COLOR0 participates in the fixed-function texture stage.
+        // The mesh always carries a HardcodedVertex::color field, but inactive
+        // streams are neutral white and must not make unrelated shader masks
+        // participate in albedo/opacity.
+        bool                         useVertexColors      = false;
+        bool                         useVertexAlpha       = false;
+
         // Decal tag (2026-05-01). Copied from ExtractedMesh at submit time.
         // OnFrame ORs REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC into the
         // categoryFlags so dxvk-remix applies decal depth-offset Z-fight
@@ -342,15 +370,6 @@ namespace {
     };
     std::unordered_map<MeshCacheKey, MeshRef, MeshCacheKeyHash> g_meshCache;
 
-    // Serializes SetConfigVariable writes (game thread) against OnFrame draw
-    // submissions (Remix thread). Other Remix API mutations elsewhere in this
-    // file rely on g_renderStateMutex and Remix's internal sync, NOT on this
-    // mutex. Recursive so a path that already holds it can re-acquire safely.
-    // NOTE: distinct from g_renderStateMutex below — that one guards
-    // g_drawables/g_meshCache/g_materialCache/g_textureHandles. They protect
-    // different invariants and are taken in order: g_remixApiMutex first.
-    std::recursive_mutex g_remixApiMutex;
-
     // Protects g_drawables, g_meshCache, g_materialCache, and g_textureHandles.
     // Submission (SubmitDrawable / ReleaseDrawable) runs on the game thread
     // via SemanticCapture::Tick from hkPresent; drawing (OnFrame) and sweeps
@@ -362,8 +381,7 @@ namespace {
     // Pending config writes queued by game-thread callers (QueueConfigVariable)
     // and drained at the top of OnFrame on the Remix thread. Last write per key
     // wins. Guarded by its own lightweight mutex -- held only for the map
-    // operation on either side, never across a Remix API call, so the game
-    // thread can never block behind OnFrame's frame-long g_remixApiMutex hold.
+    // operation on either side, never across a Remix API call.
     std::mutex g_configQueueMutex;
     std::unordered_map<std::string, std::string> g_pendingConfigVars;
     // Per-key failure dedup for the drain site: first failure logs, then silent.
@@ -743,6 +761,9 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         const ExtractedMesh& mesh,
         const std::vector<ExtractedTexture>& newTextures) {
 
+    // API calls below use RemixCallGuarded, which serializes command emission
+    // without holding the API lock while this function owns renderer state.
+    // That avoids inverting SemanticCapture's drawable lock against OnFrame.
     std::lock_guard<std::mutex> lock(g_renderStateMutex);
 
     // C++ exception fence: dxvk-remix API calls (CreateTexture/CreateMaterial/
@@ -829,11 +850,15 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
         remixapi_TextureHandle texHandle = nullptr;
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeTextureCreate);
-        remixapi_ErrorCode status = api->CreateTexture(&texInfo, &texHandle);
+        remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        const int createGuard = RemixCallGuarded("CreateTexture(submit)", [&] {
+            status = api->CreateTexture(&texInfo, &texHandle);
+        });
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterTextureCreate);
-        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !texHandle) {
-            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to upload texture 0x%llX (error %d)",
-                     (unsigned long long)tex.hash, (int)status);
+        if (createGuard != 0 || status != REMIXAPI_ERROR_CODE_SUCCESS || !texHandle) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to upload texture 0x%llX "
+                     "(guard %d, error %d)",
+                     (unsigned long long)tex.hash, createGuard, (int)status);
             continue;
         }
 
@@ -958,6 +983,11 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         h ^= (uint64_t)(mesh.alphaTestEnabled ? 1 : 0) * 0xE6546B64ULL;
         h ^= (uint64_t)mesh.alphaTestType * 0x85EBCA77ULL;
         h ^= (uint64_t)mesh.alphaTestRef  * 0xC2B2AE3DULL;
+        // OnFrame reads this instance-side texture-stage mode from the first
+        // bucket member, so include it in the material/mesh identity just like
+        // two-sided and alpha state to keep buckets homogeneous.
+        h ^= (uint64_t)(mesh.useVertexColors ? 1 : 0) * 0xA24BAED4963EE407ULL;
+        h ^= (uint64_t)(mesh.useVertexAlpha ? 1 : 0) * 0x9E6C63D0676A9A99ULL;
         // Fold water tag + transmittance into the cache key so opaque and
         // translucent variants of the same texture set never share a Remix
         // material handle (the underlying pNext extension struct differs).
@@ -1096,11 +1126,15 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
             remixapi_MaterialHandle newHandle = nullptr;
             Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeMaterialCreate);
-            remixapi_ErrorCode matStatus = api->CreateMaterial(&matInfo, &newHandle);
+            remixapi_ErrorCode matStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+            const int createGuard = RemixCallGuarded("CreateMaterial(submit)", [&] {
+                matStatus = api->CreateMaterial(&matInfo, &newHandle);
+            });
             Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterMaterialCreate);
-            if (matStatus != REMIXAPI_ERROR_CODE_SUCCESS || !newHandle) {
-                _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create material 0x%llX (error %d)",
-                         (unsigned long long)matHash, (int)matStatus);
+            if (createGuard != 0 || matStatus != REMIXAPI_ERROR_CODE_SUCCESS || !newHandle) {
+                _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create material 0x%llX "
+                         "(guard %d, error %d)",
+                         (unsigned long long)matHash, createGuard, (int)matStatus);
                 DecrementTextureRefs(inst.textureHashes);
                 return SubmitStatus::kFailed;
             }
@@ -1170,12 +1204,17 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         meshInfo.surfaces_count  = 1;
 
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeMeshCreate);
-        remixapi_ErrorCode meshStatus = api->CreateMesh(&meshInfo, &meshHandle);
+        remixapi_ErrorCode meshStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        const int createGuard = RemixCallGuarded("CreateMesh(submit)", [&] {
+            meshStatus = api->CreateMesh(&meshInfo, &meshHandle);
+        });
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterMeshCreate);
-        if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
-            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create mesh content=0x%llX mat=0x%llX (error %d)",
+        if (createGuard != 0 || meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create mesh content=0x%llX "
+                     "mat=0x%llX (guard %d, error %d)",
                      (unsigned long long)meshKey.contentHash,
-                     (unsigned long long)meshKey.materialHash, (int)meshStatus);
+                     (unsigned long long)meshKey.materialHash,
+                     createGuard, (int)meshStatus);
             DecrementTextureRefs(inst.textureHashes);
             DecrementMaterialRef(matHash);
             return SubmitStatus::kFailed;
@@ -1212,6 +1251,8 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.alphaTestEnabled     = mesh.alphaTestEnabled;
     inst.alphaTestType        = mesh.alphaTestType;
     inst.alphaTestRef         = mesh.alphaTestRef;
+    inst.useVertexColors      = mesh.useVertexColors;
+    inst.useVertexAlpha       = mesh.useVertexAlpha;
 
     // Decal tag for the OnFrame DECAL_STATIC categoryFlag.
     inst.isDecal              = mesh.isDecal;
@@ -1320,20 +1361,18 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     static SemanticCapture::PerfCounters s_lastGameCounters = {};
     const PerfClock::time_point tEnter = PerfClock::now();
 
-    // Serializes Remix API option-registry writes (game thread, via
-    // SetConfigVariable) against draw submissions on this thread. Held for
-    // the function's full duration. Lock order: g_remixApiMutex ->
-    // g_drawableMutex (SnapshotActiveDrawables) -> g_renderStateMutex
-    // (bucket build). Never acquire in reverse.
-    std::lock_guard<std::recursive_mutex> lock(g_remixApiMutex);
-    const PerfClock::time_point tLocked = PerfClock::now();
+    // API serialization is per call. Do not hold it across the semantic and
+    // renderer-state snapshots below: SubmitDrawable runs while the game
+    // thread owns SemanticCapture's drawable mutex, so a frame-wide API lock
+    // would create the opposite lock order and deadlock.
+    const PerfClock::time_point tLocked = tEnter;
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
     // Destroy handles parked by game-thread release paths. This is the one
     // point where a destroy provably cannot overlap a frame in flight: the
-    // previous Present has returned (same thread), no draw of the new frame
-    // has been recorded yet, and g_remixApiMutex is held.
+    // previous Present has returned (same thread) and no draw of the new frame
+    // has been recorded yet. Each destroy call takes the API serializer.
     // g_renderStateMutex is held ACROSS the destroy calls, not just a swap:
     // handles are hash-valued, so a game-thread SubmitDrawable re-creating
     // identical content between a swap-out and the destroy would produce
@@ -1379,8 +1418,14 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             pending.swap(g_pendingConfigVars);
         }
         for (const auto& [key, value] : pending) {
-            const bool ok = api->SetConfigVariable &&
-                api->SetConfigVariable(key.c_str(), value.c_str()) == REMIXAPI_ERROR_CODE_SUCCESS;
+            remixapi_ErrorCode configErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+            const int guardRc = api->SetConfigVariable
+                ? RemixCallGuarded("SetConfigVariable(queue)", [&] {
+                    configErr = api->SetConfigVariable(key.c_str(), value.c_str());
+                  })
+                : 1;
+            const bool ok = guardRc == 0 &&
+                configErr == REMIXAPI_ERROR_CODE_SUCCESS;
             if (!ok) {
                 std::lock_guard<std::mutex> qlock(g_configQueueMutex);
                 if (g_configFailedKeys.insert(key).second) {
@@ -1657,16 +1702,16 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             remixapi_InstanceInfoBlendEXT          blendExt = {};
             remixapi_InstanceInfoBoneTransformsEXT bonesExt = {};
 
-            // Per-instance blend ext (2026-05-01). Built when the bucket's
-            // drawables need per-instance alpha state. The material was built
-            // in SubmitDrawable with useDrawCallAlphaState=1 in this case, so
-            // Remix consumes this struct as the source of BOTH alpha test and
-            // alpha blend (material-level alpha fields are ignored). All
-            // bucket members share blend state because the material cache key
-            // folds in src/dstColorBlendFactor + alpha-test fields, so reading
-            // from members[0] is correct for the whole bucket.
+            // Per-instance blend/texture-stage ext (2026-05-01). Alpha-blended
+            // materials need it as their alpha-state source. Shader-flagged
+            // COLOR0 meshes also need it even when opaque/alpha-tested: this
+            // is the only API path that selects VertexColor0 as a texture-stage
+            // argument, so merely uploading HardcodedVertex::color is not
+            // enough. The cache key folds every field read from members[0],
+            // keeping all bucket members homogeneous.
             const bool needBlendExt = !bucket.members.empty() &&
-                                       bucket.members[0]->alphaBlendEnabled;
+                (bucket.members[0]->alphaBlendEnabled ||
+                 bucket.members[0]->useVertexColors);
             if (needBlendExt) {
                 const DrawableInstance* m = bucket.members[0];
                 blendExt.sType                      = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BLEND_EXT;
@@ -1674,7 +1719,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 blendExt.alphaTestEnabled           = m->alphaTestEnabled ? 1 : 0;
                 blendExt.alphaTestReferenceValue    = m->alphaTestRef;
                 blendExt.alphaTestCompareOp         = m->alphaTestType;
-                blendExt.alphaBlendEnabled          = 1;
+                blendExt.alphaBlendEnabled          = m->alphaBlendEnabled ? 1 : 0;
                 blendExt.srcColorBlendFactor        = m->srcColorBlendFactor;
                 blendExt.dstColorBlendFactor        = m->dstColorBlendFactor;
                 blendExt.colorBlendOp               = 0;   // VK_BLEND_OP_ADD
@@ -1688,11 +1733,14 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 // i.e. plain textured passthrough that respects the diffuse
                 // texture's alpha channel for the alpha-blend equation.
                 blendExt.textureColorArg1Source     = 1;   // RtTextureArgSource::Texture
-                blendExt.textureColorArg2Source     = 0;   // RtTextureArgSource::None
+                blendExt.textureColorArg2Source     = m->useVertexColors
+                    ? 2 : 0;                              // VertexColor0 / None
                 blendExt.textureColorOperation      = 3;   // DxvkRtTextureOperation::Modulate
                 blendExt.textureAlphaArg1Source     = 1;   // RtTextureArgSource::Texture
-                blendExt.textureAlphaArg2Source     = 0;   // RtTextureArgSource::None
-                blendExt.textureAlphaOperation      = 1;   // DxvkRtTextureOperation::SelectArg1
+                blendExt.textureAlphaArg2Source     = m->useVertexAlpha
+                    ? 2 : 0;                              // VertexColor0 / None
+                blendExt.textureAlphaOperation      = m->useVertexAlpha
+                    ? 3 : 1;                              // Modulate / SelectArg1
                 blendExt.tFactor                    = 0xFFFFFFFFu;
                 blendExt.isTextureFactorBlend       = 0;
                 blendExt.srcAlphaBlendFactor        = m->srcColorBlendFactor;
@@ -2173,8 +2221,11 @@ bool RemixRenderer::SetConfigVariable(const char* key, const char* value) {
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api || !api->SetConfigVariable) return false;
 
-    std::lock_guard<std::recursive_mutex> lock(g_remixApiMutex);
-    return api->SetConfigVariable(key, value) == REMIXAPI_ERROR_CODE_SUCCESS;
+    remixapi_ErrorCode err = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+    const int guardRc = RemixCallGuarded("SetConfigVariable", [&] {
+        err = api->SetConfigVariable(key, value);
+    });
+    return guardRc == 0 && err == REMIXAPI_ERROR_CODE_SUCCESS;
 }
 
 void RemixRenderer::QueueConfigVariable(const char* key, const char* value) {
