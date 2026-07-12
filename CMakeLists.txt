@@ -134,6 +134,10 @@ target_link_options(FO4RemixPlugin PRIVATE
     "$<$<CONFIG:Release>:/MAP>"
 )
 
+# External exit-code watchdog (see src/watchdog_main.cpp + crash_diag.cpp).
+# Installed next to the plugin DLL; spawned at plugin load with the game PID.
+add_executable(FO4RemixWatchdog WIN32 src/watchdog_main.cpp)
+
 # Output name without lib prefix
 set_target_properties(FO4RemixPlugin PROPERTIES
     PREFIX ""

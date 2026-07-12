@@ -134,20 +134,28 @@ static LONG NTAPI hkNtTerminateProcess(HANDLE process, NTSTATUS status) {
 // process is too dead to run a single in-process instruction.
 // ---------------------------------------------------------------------------
 static void SpawnExitCodeWatchdog() {
-    char cmd[1024];
-    sprintf_s(cmd,
-        "powershell.exe -NoProfile -WindowStyle Hidden -Command "
-        "\"$p=[Diagnostics.Process]::GetProcessById(%lu);"
-        "$p.WaitForExit();"
-        "('{0:o} pid=%lu exit=0x{1:X8}' -f (Get-Date),$p.ExitCode) | "
-        "Out-File -Append -Encoding ascii "
-        "$env:LOCALAPPDATA\\CrashDumps\\FO4Remix_exitcodes.log\"",
-        GetCurrentProcessId(), GetCurrentProcessId());
+    // FO4RemixWatchdog.exe lives next to this DLL (installed together). The
+    // first incarnation was an inline PowerShell one-liner, but .NET's
+    // Process.ExitCode is unreliable for processes it didn't start (came
+    // back empty on the first real crash); the exe uses GetExitCodeProcess.
+    char dllPath[MAX_PATH] = {};
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)&SpawnExitCodeWatchdog, &self) ||
+        !GetModuleFileNameA(self, dllPath, MAX_PATH)) {
+        _MESSAGE("FO4RemixPlugin: [CrashDiag] watchdog: DLL path resolution failed");
+        return;
+    }
+    char* slash = strrchr(dllPath, '\\');
+    if (slash) *(slash + 1) = '\0';
+
+    char cmd[MAX_PATH * 2];
+    sprintf_s(cmd, "\"%sFO4RemixWatchdog.exe\" %lu",
+              dllPath, GetCurrentProcessId());
 
     STARTUPINFOA si = {};
     si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
     PROCESS_INFORMATION pi = {};
     if (CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE,
                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
@@ -156,8 +164,8 @@ static void SpawnExitCodeWatchdog() {
         _MESSAGE("FO4RemixPlugin: [CrashDiag] exit-code watchdog spawned "
                  "(FO4Remix_exitcodes.log)");
     } else {
-        _MESSAGE("FO4RemixPlugin: [CrashDiag] watchdog spawn failed (err=%lu)",
-                 GetLastError());
+        _MESSAGE("FO4RemixPlugin: [CrashDiag] watchdog spawn failed (err=%lu cmd=%s)",
+                 GetLastError(), cmd);
     }
 }
 
