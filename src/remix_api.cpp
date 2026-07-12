@@ -80,9 +80,16 @@ bool RemixAPI::Initialize(HWND gameWindow, uint32_t width, uint32_t height) {
             pp.Windowed = TRUE;
             pp.PresentationInterval = D3DPRESENT_INTERVAL_IMMEDIATE;
 
+            // D3DCREATE_MULTITHREADED is LOAD-BEARING (2026-07-12): dxvk's
+            // D3D9DeviceLock -- the lock remixapi_Present holds across its
+            // flush and fork_hooks::createTexture takes around its EmitCs --
+            // compiles to a NO-OP without this flag. With it absent, a
+            // game-thread create could interleave with the Remix thread's
+            // Present flush mid CS-chunk swap (m_csChunk momentarily null:
+            // the AV at dxvk_cs.h:171 that killed four sessions tonight).
             HRESULT hr = g_d3d9->CreateDeviceEx(
                 D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, g_remixWindow,
-                D3DCREATE_HARDWARE_VERTEXPROCESSING,
+                D3DCREATE_HARDWARE_VERTEXPROCESSING | D3DCREATE_MULTITHREADED,
                 &pp, nullptr, &g_d3d9Device);
 
             if (SUCCEEDED(hr) && g_d3d9Device) {

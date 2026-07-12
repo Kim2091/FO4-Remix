@@ -1287,10 +1287,27 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         meshInfo.surfaces_values = &surface;
         meshInfo.surfaces_count  = 1;
 
+        // CreateMeshBatched, NOT CreateMesh (2026-07-12, the four-crash
+        // night's root fix). The synchronous CreateMesh EmitCs's onto the
+        // device's CS chunk from THIS (game) thread under only the API
+        // bridge's s_mutex, while the Remix thread's Present flushes that
+        // same chunk under only the device lock -- two different locks, no
+        // exclusion, and the chunk pointer is momentarily null mid-swap
+        // inside the flush (dump-proven: AV in DxvkCsChunk::push,
+        // dxvk_cs.h:171, this=null, caller rtx_remix_api.cpp:1142).
+        // CreateMeshBatched copies the surfaces into runtime-owned storage
+        // and queues them under s_mutex; the render thread materializes
+        // pending creates at its next DrawInstance/Present, so the game
+        // thread never touches the CS chunk at all. Handle semantics are
+        // identical (caller hash cast). Fallback kept for older runtimes.
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeMeshCreate);
         remixapi_ErrorCode meshStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
-        const int meshGuard = RemixCallGuarded("CreateMesh(submit)", [&] {
-            meshStatus = api->CreateMesh(&meshInfo, &meshHandle);
+        const bool haveBatched = api->CreateMeshBatched != nullptr;
+        const int meshGuard = RemixCallGuarded(
+            haveBatched ? "CreateMeshBatched(submit)" : "CreateMesh(submit)", [&] {
+            meshStatus = haveBatched
+                ? api->CreateMeshBatched(&meshInfo, &meshHandle)
+                : api->CreateMesh(&meshInfo, &meshHandle);
         });
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterMeshCreate);
         if (meshGuard != 0 || meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
