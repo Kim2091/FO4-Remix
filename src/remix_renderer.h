@@ -126,6 +126,12 @@ namespace RemixRenderer {
     void QueueBoneTransforms(
         std::unordered_map<uint64_t, std::vector<remixapi_Transform>>&& bones);
 
+    // Write a diagnostic minidump (all current thread stacks) to
+    // %LOCALAPPDATA%\CrashDumps\FO4Remix_<tag>_<pid>.dmp. Used by the
+    // std::terminate handler installed at plugin load; safe to call from
+    // any thread.
+    void WriteDiagDump(const char* tag);
+
     // True if a Remix-side texture handle currently exists for `hash`.
     // Used by the extraction cache to decide whether a cache hit must
     // re-supply pixel data so SubmitDrawable can recreate a handle that was

@@ -11,6 +11,7 @@
 
 #include <cstring>
 #include <atomic>
+#include <exception>  // std::set_terminate (uncaught-exception breadcrumb)
 
 static PluginHandle g_pluginHandle = kPluginHandle_Invalid;
 static F4SEMessagingInterface* g_messaging = nullptr;
@@ -109,6 +110,21 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se) {
 
     LoadConfig();
     StartupDiag::DumpEnvironment();
+
+    // Uncaught-C++-exception breadcrumb (2026-07-12). WER events from the
+    // 0xc0000409 fast-fail class resolve to abort() in THIS module's static
+    // CRT (linker map): some thread's uncaught exception reached
+    // std::terminate, and the default handler dies without saying which
+    // thread or what it was unwinding. abort() runs through this module's
+    // CRT precisely because the throw traversed our EH frames, so OUR
+    // set_terminate handler is the one invoked: log the thread, write an
+    // all-thread-stacks dump, then die as before.
+    std::set_terminate([]() {
+        _MESSAGE("FO4RemixPlugin: [Terminate] uncaught C++ exception on "
+                 "thread %lu -- writing diagnostic dump", GetCurrentThreadId());
+        RemixRenderer::WriteDiagDump("terminate");
+        std::abort();
+    });
 
     // Phase 1A: install BSLightingShaderProperty event-capture hook if
     // [SemanticCapture] Enabled=1. No-op when disabled (default).

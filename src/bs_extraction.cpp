@@ -1802,7 +1802,36 @@ static void TextureConversionWorkerMain()
             job = std::move(g_texConvJobs.front());
             g_texConvJobs.pop_front();
         }
-        ExtractedTexture packed = ConvertReadbackMips(job);
+        // Exception fence (2026-07-12): this is the most allocation-heavy
+        // code the plugin owns (mip-chain vectors, BC7 RGBA expansion,
+        // palette remaps) and it used to run BARE on the worker -- one
+        // bad_alloc/length_error escaped the thread proc, hit
+        // std::terminate, and fast-failed the whole process (WER 0xc0000409
+        // at abort in this DLL). A failed decode now just drops the
+        // texture: an empty result routes through the existing
+        // conversion-dropped path (negative cache) downstream.
+        ExtractedTexture packed;
+        try {
+            packed = ConvertReadbackMips(job);
+        } catch (const std::exception& e) {
+            static std::atomic<int> sConvCatch{0};
+            const int n = sConvCatch.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [TexConvert] worker C++ exception #%d "
+                         "hash=0x%016llX what=%s -- texture dropped",
+                         n, (unsigned long long)job.hash, e.what());
+            }
+            packed = {};
+        } catch (...) {
+            static std::atomic<int> sConvCatchU{0};
+            const int n = sConvCatchU.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [TexConvert] worker unknown C++ exception "
+                         "#%d hash=0x%016llX -- texture dropped",
+                         n, (unsigned long long)job.hash);
+            }
+            packed = {};
+        }
         {
             std::lock_guard<std::mutex> lk(g_texConvMutex);
             g_texConvDone[job.hash] = { std::move(packed),

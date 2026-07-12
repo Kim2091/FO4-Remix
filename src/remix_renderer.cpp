@@ -280,6 +280,31 @@ static int RemixCallCxxGuarded(const char* site, F& fn) {
     }
 }
 
+// Diagnostic dump with the CURRENT context (no exception pointers): all
+// thread stacks as they are right now. Used by the std::terminate handler --
+// abort() fast-fails through THIS module's static CRT, so our handler is the
+// one that runs, and the dump names the thread whose uncaught exception is
+// killing the process (the WER event only says "abort, this DLL").
+void RemixRenderer::WriteDiagDump(const char* tag) {
+    char dir[MAX_PATH] = {};
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) return;
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\CrashDumps\\FO4Remix_%s_%lu.dmp",
+              dir, tag, GetCurrentProcessId());
+    HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    const BOOL ok = MiniDumpWriteDump(
+        GetCurrentProcess(), GetCurrentProcessId(), file,
+        (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo |
+                        MiniDumpWithUnloadedModules),
+        nullptr, nullptr, nullptr);
+    FlushFileBuffers(file);
+    CloseHandle(file);
+    _MESSAGE("FO4RemixPlugin: [%s] dump %s: %s (thread=%lu)",
+             tag, ok ? "written" : "FAILED", path, GetCurrentThreadId());
+}
+
 template <typename F>
 static int RemixCallGuarded(const char* site, F&& fn) {
     __try {

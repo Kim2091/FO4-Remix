@@ -127,6 +127,9 @@ target_link_options(FO4RemixPlugin PRIVATE
     "$<$<CONFIG:Release>:/DEBUG>"
     "$<$<CONFIG:Release>:/OPT:REF>"
     "$<$<CONFIG:Release>:/OPT:ICF>"
+    # Linker map: WER fault offsets (module+0xNNNNN in Event Viewer) resolve
+    # to functions without debugger tooling on the box.
+    "$<$<CONFIG:Release>:/MAP>"
 )
 
 # Output name without lib prefix
