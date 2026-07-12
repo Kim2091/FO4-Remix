@@ -827,13 +827,30 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         texInfo.data      = tex.pixels.data();
         texInfo.dataSize  = tex.pixels.size();
 
+        // RemixCallGuarded is LOAD-BEARING on every create in this function,
+        // not just log hygiene: SubmitDrawable holds g_renderStateMutex, and
+        // an AV inside the runtime that escapes to the resolver's outer SEH
+        // frame skips this scope's lock_guard destructor (/EHsc runs no
+        // destructors on hardware-exception unwinds) -- the mutex is then
+        // stranded owned-by-game-thread, every later lock throws
+        // system_error("resource deadlock would occur"), and the Remix
+        // thread blocks forever (the 2026-07-11 wedge; same signature as
+        // 07-10's "9000 exception storm"). Catching AT the call means no
+        // unwind ever crosses the lock scope; the create becomes a normal
+        // failure. dxvk-remix logged nothing at the observed CreateMesh AV,
+        // so [RemixGuard] site lines are also the only breadcrumb for
+        // root-causing the underlying runtime fault.
         remixapi_TextureHandle texHandle = nullptr;
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeTextureCreate);
-        remixapi_ErrorCode status = api->CreateTexture(&texInfo, &texHandle);
+        remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        const int texGuard = RemixCallGuarded("CreateTexture(submit)", [&] {
+            status = api->CreateTexture(&texInfo, &texHandle);
+        });
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterTextureCreate);
-        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !texHandle) {
-            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to upload texture 0x%llX (error %d)",
-                     (unsigned long long)tex.hash, (int)status);
+        if (texGuard != 0 || status != REMIXAPI_ERROR_CODE_SUCCESS || !texHandle) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to upload texture 0x%llX "
+                     "(guard %d, error %d)",
+                     (unsigned long long)tex.hash, texGuard, (int)status);
             continue;
         }
 
@@ -1096,11 +1113,15 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
             remixapi_MaterialHandle newHandle = nullptr;
             Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeMaterialCreate);
-            remixapi_ErrorCode matStatus = api->CreateMaterial(&matInfo, &newHandle);
+            remixapi_ErrorCode matStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+            const int matGuard = RemixCallGuarded("CreateMaterial(submit)", [&] {
+                matStatus = api->CreateMaterial(&matInfo, &newHandle);
+            });
             Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterMaterialCreate);
-            if (matStatus != REMIXAPI_ERROR_CODE_SUCCESS || !newHandle) {
-                _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create material 0x%llX (error %d)",
-                         (unsigned long long)matHash, (int)matStatus);
+            if (matGuard != 0 || matStatus != REMIXAPI_ERROR_CODE_SUCCESS || !newHandle) {
+                _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create material 0x%llX "
+                         "(guard %d, error %d)",
+                         (unsigned long long)matHash, matGuard, (int)matStatus);
                 DecrementTextureRefs(inst.textureHashes);
                 return SubmitStatus::kFailed;
             }
@@ -1170,12 +1191,17 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         meshInfo.surfaces_count  = 1;
 
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeMeshCreate);
-        remixapi_ErrorCode meshStatus = api->CreateMesh(&meshInfo, &meshHandle);
+        remixapi_ErrorCode meshStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        const int meshGuard = RemixCallGuarded("CreateMesh(submit)", [&] {
+            meshStatus = api->CreateMesh(&meshInfo, &meshHandle);
+        });
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterMeshCreate);
-        if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
-            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create mesh content=0x%llX mat=0x%llX (error %d)",
+        if (meshGuard != 0 || meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create mesh content=0x%llX "
+                     "mat=0x%llX (guard %d, error %d)",
                      (unsigned long long)meshKey.contentHash,
-                     (unsigned long long)meshKey.materialHash, (int)meshStatus);
+                     (unsigned long long)meshKey.materialHash,
+                     meshGuard, (int)meshStatus);
             DecrementTextureRefs(inst.textureHashes);
             DecrementMaterialRef(matHash);
             return SubmitStatus::kFailed;
