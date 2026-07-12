@@ -17,6 +17,7 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -94,6 +95,20 @@ static uint64_t ContentHashOf(const ExtractedMesh& m) {
     return h;
 }
 
+// Remix API handles in this fork are the caller-provided 64-bit hash value,
+// and CreateMesh registrations are immutable while that handle is live.  The
+// material therefore has to participate in the API-visible hash just as it
+// participates in MeshCacheKey: otherwise two material variants of identical
+// geometry alias one runtime mesh, which remains bound to whichever material
+// registered first.  FNV the material hash into the geometry hash to keep the
+// result stable across runs while giving every cache key its own handle.
+static uint64_t RuntimeMeshHashOf(const MeshCacheKey& key) {
+    uint64_t h = HashBytes(&key.materialHash, sizeof(key.materialHash), key.contentHash);
+    // A null hash is rejected as an invalid Remix handle.  This branch is
+    // astronomically unlikely, but keep the API contract deterministic.
+    return h != 0 ? h : 0xD6E8FEB86659FD93ULL;
+}
+
 // ---------------------------------------------------------------------------
 // First-N-catches-per-callsite logger for C++ exceptions out of dxvk-remix
 // API calls. We saw 3277 caught C++ exceptions out of SubmitDrawable in the
@@ -101,9 +116,6 @@ static uint64_t ContentHashOf(const ExtractedMesh& m) {
 // call site is enough to spot patterns and learn what's actually being thrown.
 // ---------------------------------------------------------------------------
 static std::atomic<int> g_cxxLogCount_SubmitDrawable{0};
-static std::atomic<int> g_cxxLogCount_ReleaseDrawableMesh{0};
-static std::atomic<int> g_cxxLogCount_ReleaseDrawableMaterial{0};
-static std::atomic<int> g_cxxLogCount_ReleaseDrawableTexture{0};
 static std::atomic<int> g_cxxLogCount_DrawInstance{0};
 static constexpr int kCxxLogCap = 16;
 
@@ -232,13 +244,6 @@ struct MaterialRef {
 };
 static std::unordered_map<uint64_t, MaterialRef> g_materialCache;
 
-// Per-hash Remix InstanceInfoBlendEXT, populated at SubmitDrawable time for
-// meshes that have any alpha state (test or blend). OnFrame's DrawInstance
-// loop chains the stored struct onto instance.pNext so Remix honors per-
-// instance alpha state. Keyed by the mesh's `hash` field (NOT material hash)
-// -- per-instance, not per-material.
-static std::unordered_map<uint64_t, remixapi_InstanceInfoBlendEXT> g_geometryAlphaState;
-
 // ---------------------------------------------------------------------------
 // Phase 1B: flat per-drawable map, keyed by PassKey/drawable hash.
 //
@@ -326,7 +331,8 @@ namespace {
 
     // Mesh-handle cache keyed by (contentHash, materialHash). Refcounted; a
     // SubmitDrawable that finds a matching key reuses the existing handle and
-    // bumps refCount, ReleaseDrawable drops it, on zero we DestroyMesh + erase.
+    // bumps refCount, ReleaseDrawable drops it, on zero we erase + park the
+    // handle in g_pendingDestroys for the Remix thread to destroy.
     // When g_config.gpuInstancingEnabled is false the cache key has the
     // drawable hash in `contentHash`, so each drawable lands in its own bucket
     // and no sharing happens -- preserves pre-instancing behavior for rollback.
@@ -381,6 +387,63 @@ namespace {
     // Remix thread and chains the bones ext on each skinned draw.
     std::mutex g_boneQueueMutex;
     std::unordered_map<uint64_t, std::vector<remixapi_Transform>> g_boneQueue;
+
+    // Deferred handle destruction (2026-07-10). Game-thread release paths
+    // (ReleaseDrawable / DecrementMeshCacheRef, driven by the Tick TTL sweep,
+    // the PreLoadGame release wave, and merge upgrades) must never call
+    // DestroyMesh/DestroyMaterial/DestroyTexture inline: the runtime
+    // serializes each API call internally, but a destroy that lands between
+    // OnFrame's DrawInstance records and the Present that consumes them
+    // erases a handle the in-flight frame still references -- the runtime's
+    // Present-side .at() then throws std::out_of_range on the Remix thread
+    // (the 0xc0000409 CTD that 3e763bd's RemixCallGuarded only papers over).
+    // Instead the handle is parked here (its cache entry is erased
+    // immediately, so plugin bookkeeping is unchanged) and OnFrame destroys
+    // it at the top of the NEXT frame -- on the Remix thread, after the
+    // previous Present returned and before any new draw is recorded -- so a
+    // destroy can never overlap a frame in flight.
+    // Guarded by g_renderStateMutex (every producer already holds it).
+    // g_hasPendingDestroys lets OnFrame skip the mutex in the common empty
+    // steady state -- the lock is exactly the one a game-thread release
+    // wave holds throughout a cell unload, so an unconditional per-frame
+    // acquisition would block the Remix thread during teardown storms for
+    // zero pending work.
+    struct PendingDestroys {
+        std::vector<remixapi_MeshHandle>     meshes;
+        std::vector<remixapi_MaterialHandle> materials;
+        std::vector<remixapi_TextureHandle>  textures;
+    };
+    PendingDestroys g_pendingDestroys;
+    std::atomic<bool> g_hasPendingDestroys{false};
+}
+
+// Pull a handle back out of the park list. Handles are HASH-VALUED in this
+// fork (rtx_remix_api.cpp reinterpret_casts info->hash into the handle, and
+// the runtime IGNORES repeated registrations of a live handle), so re-
+// creating content identical to something released-but-not-yet-drained
+// yields the SAME handle value -- if the parked destroy then ran, it would
+// unregister the live re-created resource (flicker/vanish on exactly the
+// churn paths the deferral serves: TTL eviction, merge/texture upgrades).
+// Called from SubmitDrawable's create sites under g_renderStateMutex.
+template <typename H>
+static void CancelParkedHandle(std::vector<H>& parked, H h) {
+    parked.erase(std::remove(parked.begin(), parked.end(), h), parked.end());
+}
+
+// Destroy a batch of parked handles on the Remix thread. Shared by the
+// OnFrame top-of-frame drain and Shutdown so both stay guarded -- a parked
+// handle is precisely the class most likely to throw out of the runtime
+// (see the 0xE06D7363 note above DecrementTextureRefs).
+static void DestroyParkedHandles(remixapi_Interface* api, PendingDestroys& doomed) {
+    for (remixapi_MeshHandle h : doomed.meshes) {
+        if (h) RemixCallGuarded("DestroyMesh(deferred)", [&] { api->DestroyMesh(h); });
+    }
+    for (remixapi_MaterialHandle h : doomed.materials) {
+        if (h) RemixCallGuarded("DestroyMaterial(deferred)", [&] { api->DestroyMaterial(h); });
+    }
+    for (remixapi_TextureHandle h : doomed.textures) {
+        if (h) RemixCallGuarded("DestroyTexture(deferred)", [&] { api->DestroyTexture(h); });
+    }
 }
 
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
@@ -488,9 +551,13 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
         const bool stale = (it->second.refCount == 0) && (age > ttlFrames);
         if (stale) {
             if (it->second.handle) {
-                remixapi_MaterialHandle h = it->second.handle;
-                RemixCallGuarded("DestroyMaterial(sweep)",
-                                 [&] { api->DestroyMaterial(h); });
+                // Sweeps run after this frame's DrawInstance calls.  Destroying
+                // inline here lets the runtime free a bindless slot before
+                // Present consumes preserved instances, and its generation bump
+                // is then swallowed by onFrameEnd.  Park it for the guarded
+                // top-of-frame drain, matching ReleaseDrawable.
+                g_pendingDestroys.materials.push_back(it->second.handle);
+                g_hasPendingDestroys.store(true, std::memory_order_release);
             }
             it = g_materialCache.erase(it);
             ++result.staleMaterialCount;
@@ -527,7 +594,8 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
 //   (2) Budget pass -- if currentMaterialTex is over budgetBytes, add the
 //       oldest non-stale textures (with min-age guardrail and per-sweep
 //       cap) to the eviction set.
-// Then defensive orphan-handle destruction (refCount == 0 guard).
+// Then defensive orphan-handle parking (refCount == 0 guard); the next
+// top-of-frame destroy drain performs the API release safely.
 // ---------------------------------------------------------------------------
 RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
         uint64_t currentFrameIndex,
@@ -592,9 +660,13 @@ RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
             auto texIt = g_textureHandles.find(texHash);
             if (texIt != g_textureHandles.end() && texIt->second.refCount == 0) {
                 if (texIt->second.handle) {
-                    remixapi_TextureHandle h = texIt->second.handle;
-                    RemixCallGuarded("DestroyTexture(sweep)",
-                                     [&] { api->DestroyTexture(h); });
+                    // Do not release texture-table slots after draws have been
+                    // recorded.  The top-of-frame drain runs before any new
+                    // DrawInstance, so the runtime generation mismatch forces a
+                    // safe one-frame retranslation before preserved state can
+                    // sample the freed/recycled slot.
+                    g_pendingDestroys.textures.push_back(texIt->second.handle);
+                    g_hasPendingDestroys.store(true, std::memory_order_release);
                 }
                 g_textureHandles.erase(texIt);
                 ++result.orphanTexturesDestroyed;
@@ -636,9 +708,10 @@ static void DecrementMaterialRef(uint64_t matHash) {
     }
 }
 
-// Drop a refCount on a g_meshCache entry. On zero we DestroyMesh and erase.
-// Same per-call try/catch idiom as the texture/material destroy paths so a
-// throw out of dxvk-remix is logged once and does not corrupt our state.
+// Drop a refCount on a g_meshCache entry. On zero we erase the entry and park
+// the handle for deferred destruction on the Remix thread (see
+// g_pendingDestroys) -- this runs on the game thread, where an inline
+// DestroyMesh can invalidate a handle the frame in flight still references.
 // Caller must hold g_renderStateMutex.
 static void DecrementMeshCacheRef(const MeshCacheKey& key) {
     auto it = g_meshCache.find(key);
@@ -646,24 +719,20 @@ static void DecrementMeshCacheRef(const MeshCacheKey& key) {
     if (it->second.refCount > 0) --it->second.refCount;
     if (it->second.refCount != 0) return;
 
-    remixapi_Interface* api = RemixAPI::GetInterface();
-    if (api && it->second.handle) {
-        try {
-            api->DestroyMesh(it->second.handle);
-        } catch (const std::exception& e) {
-            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
-            if (n < kCxxLogCap) {
-                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh (cache) C++ exception #%d content=0x%llX mat=0x%llX what=%s",
-                         n, (unsigned long long)key.contentHash,
-                         (unsigned long long)key.materialHash, e.what());
+    if (it->second.handle) {
+        // RuntimeMeshHashOf normally makes handles unique per full cache key.
+        // Keep a defensive alias check for the vanishingly unlikely 64-bit hash
+        // collision: destroying one collision peer must not unregister another.
+        bool aliased = false;
+        for (const auto& [k, m] : g_meshCache) {
+            if (&m != &it->second && m.handle == it->second.handle) {
+                aliased = true;
+                break;
             }
-        } catch (...) {
-            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
-            if (n < kCxxLogCap) {
-                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh (cache) unknown C++ exception #%d content=0x%llX mat=0x%llX",
-                         n, (unsigned long long)key.contentHash,
-                         (unsigned long long)key.materialHash);
-            }
+        }
+        if (!aliased) {
+            g_pendingDestroys.meshes.push_back(it->second.handle);
+            g_hasPendingDestroys.store(true, std::memory_order_release);
         }
     }
     g_meshCache.erase(it);
@@ -768,6 +837,10 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
             continue;
         }
 
+        // Hash-valued handle: if this same texture was released but its
+        // deferred destroy hasn't drained yet, that parked destroy would
+        // unregister the handle we just (re-)created -- pull it back out.
+        CancelParkedHandle(g_pendingDestroys.textures, texHandle);
         g_textureHandles[tex.hash] = { texHandle, 1, Diagnostics::CurrentFrameIndex() };
         inst.textureHashes.insert(tex.hash);
     }
@@ -1032,6 +1105,9 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
                 return SubmitStatus::kFailed;
             }
 
+            // Hash-valued handle: cancel any not-yet-drained deferred
+            // destroy of this same material (see CancelParkedHandle).
+            CancelParkedHandle(g_pendingDestroys.materials, newHandle);
             g_materialCache[matHash] = { newHandle, 1, Diagnostics::CurrentFrameIndex() };
             matHandle = newHandle;
         }
@@ -1060,9 +1136,11 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         cacheIt->second.refCount++;
         meshHandle = cacheIt->second.handle;
     } else {
-        // Cache miss -- create a new Remix mesh handle. Use the content hash
-        // as the Remix-side mesh hash so USD replacement matching is stable
-        // across game runs (instead of the per-drawable PassKey, which isn't).
+        // Cache miss -- create a new Remix mesh handle. The runtime stores the
+        // surface material on this immutable, hash-valued handle, so hash the
+        // complete (geometry, material) key rather than geometry alone. The
+        // derived value is deterministic, so each full key keeps a stable
+        // runtime identity instead of aliasing whichever variant arrived first.
         remixapi_MeshInfoSurfaceTriangles surface = {};
         surface.vertices_values = mesh.vertices.data();
         surface.vertices_count  = (uint32_t)mesh.vertices.size();
@@ -1087,7 +1165,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
         remixapi_MeshInfo meshInfo = {};
         meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-        meshInfo.hash = meshKey.contentHash;
+        meshInfo.hash = RuntimeMeshHashOf(meshKey);
         meshInfo.surfaces_values = &surface;
         meshInfo.surfaces_count  = 1;
 
@@ -1103,6 +1181,9 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
             return SubmitStatus::kFailed;
         }
 
+        // Hash-valued handle: cancel any not-yet-drained deferred destroy
+        // of this same content (see CancelParkedHandle).
+        CancelParkedHandle(g_pendingDestroys.meshes, meshHandle);
         g_meshCache[meshKey] = { meshHandle, 1 };
     }
 
@@ -1178,32 +1259,20 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
         inst.meshHandle = nullptr;
     }
 
-    // Decrement material refcount; on zero, destroy the material handle.
-    // This is INDEPENDENT of the texture decrement below — material and texture
-    // lifecycles are tracked separately so shared resources are freed correctly.
-    // Per-call C++ catch around DestroyMaterial: refcount mutation + erase
-    // run regardless so we don't leak the cache entry when the API throws.
+    // Decrement material refcount; on zero, erase the entry and park the
+    // handle for deferred destruction (see g_pendingDestroys -- this is the
+    // game thread; an inline DestroyMaterial can invalidate a handle the
+    // frame in flight still references). This is INDEPENDENT of the texture
+    // decrement below — material and texture lifecycles are tracked
+    // separately so shared resources are freed correctly.
     if (inst.materialHash != 0) {
         auto matIt = g_materialCache.find(inst.materialHash);
         if (matIt != g_materialCache.end()) {
             if (matIt->second.refCount > 0) matIt->second.refCount--;
             if (matIt->second.refCount == 0) {
-                if (matIt->second.handle && api) {
-                    try {
-                        api->DestroyMaterial(matIt->second.handle);
-                    } catch (const std::exception& e) {
-                        int n = g_cxxLogCount_ReleaseDrawableMaterial.fetch_add(1, std::memory_order_relaxed);
-                        if (n < kCxxLogCap) {
-                            _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMaterial C++ exception #%d matHash=0x%llX what=%s",
-                                     n, (unsigned long long)inst.materialHash, e.what());
-                        }
-                    } catch (...) {
-                        int n = g_cxxLogCount_ReleaseDrawableMaterial.fetch_add(1, std::memory_order_relaxed);
-                        if (n < kCxxLogCap) {
-                            _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMaterial unknown C++ exception #%d matHash=0x%llX",
-                                     n, (unsigned long long)inst.materialHash);
-                        }
-                    }
+                if (matIt->second.handle) {
+                    g_pendingDestroys.materials.push_back(matIt->second.handle);
+                    g_hasPendingDestroys.store(true, std::memory_order_release);
                 }
                 g_materialCache.erase(matIt);
             }
@@ -1217,33 +1286,16 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
     // alive (shared by another drawable). Nesting this inside the
     // refCount==0 block would leak one refcount per release that doesn't
     // destroy the material.
-    // Per-call C++ catch around DestroyTexture: refcount mutation + erase
-    // run regardless so we don't leak cache entries when the API throws.
-    if (api) {
-        for (uint64_t texHash : inst.textureHashes) {
-            auto texIt = g_textureHandles.find(texHash);
-            if (texIt != g_textureHandles.end()) {
-                if (texIt->second.refCount > 0) texIt->second.refCount--;
-                if (texIt->second.refCount == 0) {
-                    if (texIt->second.handle) {
-                        try {
-                            api->DestroyTexture(texIt->second.handle);
-                        } catch (const std::exception& e) {
-                            int n = g_cxxLogCount_ReleaseDrawableTexture.fetch_add(1, std::memory_order_relaxed);
-                            if (n < kCxxLogCap) {
-                                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyTexture C++ exception #%d texHash=0x%llX what=%s",
-                                         n, (unsigned long long)texHash, e.what());
-                            }
-                        } catch (...) {
-                            int n = g_cxxLogCount_ReleaseDrawableTexture.fetch_add(1, std::memory_order_relaxed);
-                            if (n < kCxxLogCap) {
-                                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyTexture unknown C++ exception #%d texHash=0x%llX",
-                                         n, (unsigned long long)texHash);
-                            }
-                        }
-                    }
-                    g_textureHandles.erase(texIt);
+    for (uint64_t texHash : inst.textureHashes) {
+        auto texIt = g_textureHandles.find(texHash);
+        if (texIt != g_textureHandles.end()) {
+            if (texIt->second.refCount > 0) texIt->second.refCount--;
+            if (texIt->second.refCount == 0) {
+                if (texIt->second.handle) {
+                    g_pendingDestroys.textures.push_back(texIt->second.handle);
+                    g_hasPendingDestroys.store(true, std::memory_order_release);
                 }
+                g_textureHandles.erase(texIt);
             }
         }
     }
@@ -1277,6 +1329,44 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     const PerfClock::time_point tLocked = PerfClock::now();
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
+
+    // Destroy handles parked by game-thread release paths. This is the one
+    // point where a destroy provably cannot overlap a frame in flight: the
+    // previous Present has returned (same thread), no draw of the new frame
+    // has been recorded yet, and g_remixApiMutex is held.
+    // g_renderStateMutex is held ACROSS the destroy calls, not just a swap:
+    // handles are hash-valued, so a game-thread SubmitDrawable re-creating
+    // identical content between a swap-out and the destroy would produce
+    // the same handle value and the destroy would unregister the live
+    // resource. Under the mutex, SubmitDrawable either runs first (its
+    // CancelParkedHandle pulls the handle back out) or after the destroys
+    // (its create re-registers cleanly). The runtime's Destroy* only queues
+    // a CS command under its own lock -- no GPU wait -- so the hold is
+    // short, and it matches the old inline-destroy locking exactly.
+    //
+    // Drained on a CADENCE, not every frame (2026-07-10): each DestroyTexture
+    // bumps the runtime's texture-cache generation (the preserve-path fix for
+    // the stale-albedo-slot corruption), which sends the NEXT frame's draws
+    // down the dynamic path. A steady destroy trickle (TextureUpgradeOnApproach
+    // while moving) would keep the ~93-95% preserve win suppressed every
+    // frame; batching destroys to every kDestroyDrainPeriodFrames confines the
+    // re-translation cost to one frame per period. Longer parking is free --
+    // the handles are already erased from the plugin caches -- and it widens
+    // the CancelParkedHandle rescue window (re-created content avoids its
+    // destroy+re-upload entirely).
+    constexpr uint64_t kDestroyDrainPeriodFrames = 30;
+    static uint64_t s_lastDrainFrame = 0;
+    const uint64_t drainNow = Diagnostics::CurrentFrameIndex();
+    if (g_hasPendingDestroys.load(std::memory_order_acquire) &&
+        drainNow - s_lastDrainFrame >= kDestroyDrainPeriodFrames) {
+        g_hasPendingDestroys.store(false, std::memory_order_release);
+        s_lastDrainFrame = drainNow;
+        std::lock_guard<std::mutex> rsLock(g_renderStateMutex);
+        DestroyParkedHandles(api, g_pendingDestroys);
+        g_pendingDestroys.meshes.clear();
+        g_pendingDestroys.materials.clear();
+        g_pendingDestroys.textures.clear();
+    }
 
     // Apply config writes queued by game-thread callers (weather bridge et
     // al). Swap the map out under the queue mutex so the Remix API calls run
@@ -1962,9 +2052,9 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // LRU sweeps. Run every cullingTextureLRUSweepPeriod frames.
     //
     //   (1) Material sweep -- the LEVER: materials hold Rc<DxvkImageView>
-    //       refs to textures, so cascade-evicting stale materials is what
-    //       actually drops texture VRAM for shared sets. Gated by budget;
-    //       below budget, no eviction (TTL-only mode skips this gate).
+    //       refs to textures, so parking stale materials for the next guarded
+    //       destroy drain is what drops texture VRAM for shared sets. Gated by
+    //       budget; below budget, no eviction (TTL-only mode skips this gate).
     //
     //   (2) Texture sweep -- the BACKSTOP: catches textures whose cache
     //       entry survives their material. Cheap; runs on the same cadence.
@@ -1995,14 +2085,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                          matResult.cellsEvicted);
             }
 
-            // Re-query VRAM after the material sweep so the texture sweep's
-            // budget gate sees the freed bytes.
-            if (g_config.cullingTextureBudgetMiB > 0) {
-                VramStats vramStatsAfter{};
-                if (RemixRenderer::GetVramStats(&vramStatsAfter)) {
-                    currentMaterialTexBytes = vramStatsAfter.usedMaterialTextureBytes;
-                }
-            }
+            // Material victims are only parked here; their runtime references
+            // are released by a later top-of-frame drain. Keep the pre-sweep
+            // VRAM reading for the texture budget pass instead of pretending
+            // the queued releases have already reclaimed memory.
 
             if (g_config.cullingTextureLRUGraceFrames > 0) {
                 auto texResult = RemixRenderer::SweepStaleTextures(
@@ -2010,7 +2096,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     g_config.cullingTextureLRUGraceFrames,
                     budgetBytes,
                     currentMaterialTexBytes);
-                _MESSAGE("FO4RemixPlugin: [LRU] Texture sweep: %u/%u stale, %u cells evicted, %u budget, %u orphans",
+                _MESSAGE("FO4RemixPlugin: [LRU] Texture sweep: %u/%u stale, %u cells evicted, %u budget, %u orphans parked",
                          texResult.staleTextureCount,
                          texResult.textureHandleCount,
                          texResult.cellsEvicted,
@@ -2040,6 +2126,16 @@ void RemixRenderer::Shutdown() {
     // so we don't DestroyMesh here -- the cache loop below does that once per
     // unique handle.
     g_drawables.clear();
+
+    // Handles parked for deferred destruction were already erased from the
+    // caches, so the loops below won't see them -- destroy them here (same
+    // guarded helper as the OnFrame drain: a parked handle is the class most
+    // likely to throw, and an unguarded throw here would crash on exit).
+    if (api) {
+        DestroyParkedHandles(api, g_pendingDestroys);
+    }
+    g_pendingDestroys = {};
+    g_hasPendingDestroys.store(false, std::memory_order_release);
 
     // Destroy all cached meshes, materials, and textures.
     if (api) {
