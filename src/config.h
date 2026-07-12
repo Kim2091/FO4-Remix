@@ -285,6 +285,20 @@ struct PluginConfig {
     // deployment). 0 = unbounded (legacy).
     uint32_t cpuTextureCacheMiB;
 
+    // Suppress the game's own raster draws at the D3D11 hook layer
+    // (raster_suppress.h has the full design). The engine keeps running its
+    // complete CPU render loop -- GetRenderPasses detours, DrawCapture
+    // chunk observation, texture streaming, and readbacks all still work --
+    // but scene draw calls are not forwarded to the driver: game-side
+    // textures become WDDM-demotable instead of pinning VRAM against the
+    // path tracer (the modded-texture budget fight), and the raster GPU
+    // cost disappears. Draws to the detected UI render target and draws
+    // inside occlusion-query scopes still execute. Wants
+    // [Overlay] HudOverlayEnabled=1: with raster suppressed, the Remix
+    // overlay is the only readable UI. The game window intentionally shows
+    // stale/black frames while this is on. Default 0.
+    bool suppressGameRaster;
+
     // Per-Tick wall-clock budget (milliseconds) for the semantic-capture
     // resolve loop (2026-07-09 hitching fix). Tick runs on the game render
     // thread inside hkPresent; a cell attach makes hundreds of drawables

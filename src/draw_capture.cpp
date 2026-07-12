@@ -1,4 +1,5 @@
 #include "draw_capture.h"
+#include "raster_suppress.h"
 
 #include <d3d11.h>
 #include <MinHook.h>
@@ -14,16 +15,29 @@ typedef void (STDMETHODCALLTYPE* PFN_DrawIndexedInstanced)(
     ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
 typedef void (STDMETHODCALLTYPE* PFN_DrawIndexed)(
     ID3D11DeviceContext*, UINT, UINT, INT);
+typedef void (STDMETHODCALLTYPE* PFN_Draw)(
+    ID3D11DeviceContext*, UINT, UINT);
 typedef void (STDMETHODCALLTYPE* PFN_DrawInstanced)(
     ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
 typedef void (STDMETHODCALLTYPE* PFN_DrawIndexedInstancedIndirect)(
     ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+typedef void (STDMETHODCALLTYPE* PFN_DrawInstancedIndirect)(
+    ID3D11DeviceContext*, ID3D11Buffer*, UINT);
+typedef void (STDMETHODCALLTYPE* PFN_DrawAuto)(
+    ID3D11DeviceContext*);
+typedef void (STDMETHODCALLTYPE* PFN_AsyncOp)(
+    ID3D11DeviceContext*, ID3D11Asynchronous*);
 typedef void (STDMETHODCALLTYPE* PFN_SetShaderResources)(
     ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
 static PFN_DrawIndexedInstanced g_original = nullptr;
 static PFN_DrawIndexed g_originalDX = nullptr;
+static PFN_Draw g_originalDraw = nullptr;
 static PFN_DrawInstanced g_originalDI = nullptr;
 static PFN_DrawIndexedInstancedIndirect g_originalDIII = nullptr;
+static PFN_DrawInstancedIndirect g_originalDII2 = nullptr;
+static PFN_DrawAuto g_originalDA = nullptr;
+static PFN_AsyncOp g_originalBegin = nullptr;
+static PFN_AsyncOp g_originalEnd = nullptr;
 static PFN_SetShaderResources g_originalVSSet = nullptr;
 static PFN_SetShaderResources g_originalPSSet = nullptr;
 static PFN_SetShaderResources g_originalCSSet = nullptr;
@@ -268,6 +282,7 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
     // permanent overhead with background upgrade-hunt watches, so the
     // dead path is gone: this hook is one atomic add + a capped
     // diagnostic check per draw.
+    if (RasterSuppress::ShouldSuppress()) return;
     g_original(ctx, idxCount, instCount, startIdx, baseVtx, startInst);
 }
 
@@ -330,6 +345,9 @@ static void STDMETHODCALLTYPE hkDrawIndexed(
             if (vb) vb->Release();
         }
     }
+    // Suppression AFTER observation: the chunk capture above needs only the
+    // engine's CALL with its bound state, never the GPU execution.
+    if (RasterSuppress::ShouldSuppress()) return;
     g_originalDX(ctx, idxCount, startIdx, baseVtx);
 }
 
@@ -340,6 +358,7 @@ static void STDMETHODCALLTYPE hkDrawInstanced(
     if (g_activeCount.load(std::memory_order_relaxed) > 0) {
         g_diCalls.fetch_add(1, std::memory_order_relaxed);
     }
+    if (RasterSuppress::ShouldSuppress()) return;
     g_originalDI(ctx, vtxCount, instCount, startVtx, startInst);
 }
 
@@ -349,7 +368,51 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstancedIndirect(
     if (g_activeCount.load(std::memory_order_relaxed) > 0) {
         g_diiiCalls.fetch_add(1, std::memory_order_relaxed);
     }
+    if (RasterSuppress::ShouldSuppress()) return;
     g_originalDIII(ctx, args, offset);
+}
+
+// The remaining draw entry points carry no capture semantics; they are
+// hooked only so raster suppression covers every way the engine can put
+// scene work on the GPU. Compute (Dispatch*) is deliberately NOT hooked:
+// nothing VRAM-heavy lives there and suppressing it risks breaking
+// engine-internal readbacks for zero budget win.
+static void STDMETHODCALLTYPE hkDraw(
+    ID3D11DeviceContext* ctx, UINT vtxCount, UINT startVtx)
+{
+    if (RasterSuppress::ShouldSuppress()) return;
+    g_originalDraw(ctx, vtxCount, startVtx);
+}
+
+static void STDMETHODCALLTYPE hkDrawInstancedIndirect(
+    ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT offset)
+{
+    if (RasterSuppress::ShouldSuppress()) return;
+    g_originalDII2(ctx, args, offset);
+}
+
+static void STDMETHODCALLTYPE hkDrawAuto(ID3D11DeviceContext* ctx)
+{
+    if (RasterSuppress::ShouldSuppress()) return;
+    g_originalDA(ctx);
+}
+
+// Begin/End feed RasterSuppress's occlusion-query scope tracking: draws
+// between Begin and End of an occlusion query execute even under
+// suppression, so any engine visibility feedback keeps getting real sample
+// counts instead of reading everything as occluded.
+static void STDMETHODCALLTYPE hkBegin(ID3D11DeviceContext* ctx,
+                                      ID3D11Asynchronous* async)
+{
+    RasterSuppress::NotifyQueryBegin(async);
+    g_originalBegin(ctx, async);
+}
+
+static void STDMETHODCALLTYPE hkEnd(ID3D11DeviceContext* ctx,
+                                    ID3D11Asynchronous* async)
+{
+    g_originalEnd(ctx, async);
+    RasterSuppress::NotifyQueryEnd(async);
 }
 
 // Shared body for the Set*ShaderResources hooks: answer, cheaply and
@@ -471,6 +534,11 @@ void InstallHook(ID3D11DeviceContext* ctx) {
     void* targetDX = vtbl[12];    // DrawIndexed (the actual merge draw path)
     void* targetDI = vtbl[21];    // DrawInstanced (counter only)
     void* targetDIII = vtbl[39];  // DrawIndexedInstancedIndirect (counter only)
+    void* targetDraw = vtbl[13];  // Draw (raster suppression only)
+    void* targetDA = vtbl[38];    // DrawAuto (raster suppression only)
+    void* targetDII2 = vtbl[40];  // DrawInstancedIndirect (raster suppression only)
+    void* targetBegin = vtbl[27]; // Begin (occlusion-query scope tracking)
+    void* targetEnd = vtbl[28];   // End (occlusion-query scope tracking)
     void* targetPSSet = vtbl[8];  // PSSetShaderResources (bind diag)
     void* targetVSSet = vtbl[25]; // VSSetShaderResources (bind diag)
     void* targetCSSet = vtbl[67]; // CSSetShaderResources (bind diag)
@@ -494,6 +562,26 @@ void InstallHook(ID3D11DeviceContext* ctx) {
     if (MH_CreateHook(targetDIII, &hkDrawIndexedInstancedIndirect,
                       reinterpret_cast<void**>(&g_originalDIII)) == MH_OK) {
         MH_EnableHook(targetDIII);
+    }
+    if (MH_CreateHook(targetDraw, &hkDraw,
+                      reinterpret_cast<void**>(&g_originalDraw)) == MH_OK) {
+        MH_EnableHook(targetDraw);
+    }
+    if (MH_CreateHook(targetDA, &hkDrawAuto,
+                      reinterpret_cast<void**>(&g_originalDA)) == MH_OK) {
+        MH_EnableHook(targetDA);
+    }
+    if (MH_CreateHook(targetDII2, &hkDrawInstancedIndirect,
+                      reinterpret_cast<void**>(&g_originalDII2)) == MH_OK) {
+        MH_EnableHook(targetDII2);
+    }
+    if (MH_CreateHook(targetBegin, &hkBegin,
+                      reinterpret_cast<void**>(&g_originalBegin)) == MH_OK) {
+        MH_EnableHook(targetBegin);
+    }
+    if (MH_CreateHook(targetEnd, &hkEnd,
+                      reinterpret_cast<void**>(&g_originalEnd)) == MH_OK) {
+        MH_EnableHook(targetEnd);
     }
     if (MH_CreateHook(targetVSSet, &hkVSSetShaderResources,
                       reinterpret_cast<void**>(&g_originalVSSet)) == MH_OK) {

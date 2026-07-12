@@ -1883,6 +1883,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                  (unsigned long long)dTicks);
         s_accLockWaitNs = s_accSnapNs = s_accBucketNs = 0;
         s_accDrawNs = s_accPresentNs = s_accTotalNs = 0;
+
+        // Remix-side VRAM on the same cadence: pairs with present_hook's
+        // process-wide [VRAM] line to split "the path tracer's budget" from
+        // "what the game's raster path pins" during the SuppressGameRaster
+        // A/B runs.
+        VramStats vram{};
+        if (GetVramStats(&vram)) {
+            _MESSAGE("FO4RemixPlugin: [VRAM] remix allocated=%llu MiB used=%llu MiB "
+                     "materialTex=%llu MiB buffers=%llu MiB accel=%llu MiB",
+                     (unsigned long long)(vram.totalAllocatedBytes >> 20),
+                     (unsigned long long)(vram.totalUsedBytes >> 20),
+                     (unsigned long long)(vram.usedMaterialTextureBytes >> 20),
+                     (unsigned long long)(vram.usedBufferBytes >> 20),
+                     (unsigned long long)(vram.usedAccelerationStructureBytes >> 20));
+        }
     }
 
     if (!hasAnyMeshes && g_fallbackMesh) {

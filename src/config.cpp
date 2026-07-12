@@ -178,11 +178,18 @@ void LoadConfig() {
     if (g_config.decodeWorkerPercent > 100) g_config.decodeWorkerPercent = 100;
     g_config.decodeWorkerMax = GetIniUInt("Performance", "DecodeWorkerMax", 4, dllPath);
     g_config.cpuTextureCacheMiB = GetIniUInt("Performance", "CpuTextureCacheMiB", 1024, dllPath);
-    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d BatchedMirrorBase=%d RemixMaxFPS=%u MaxPendingTextureReadbacks=%u ResolveBudgetMs=%.1f DecodeWorkerPercent=%u DecodeWorkerMax=%u CpuTextureCacheMiB=%u",
+    g_config.suppressGameRaster = GetIniBool("Performance", "SuppressGameRaster", false, dllPath);
+    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d BatchedMirrorBase=%d RemixMaxFPS=%u MaxPendingTextureReadbacks=%u ResolveBudgetMs=%.1f DecodeWorkerPercent=%u DecodeWorkerMax=%u CpuTextureCacheMiB=%u SuppressGameRaster=%d",
              g_config.gpuInstancingEnabled, g_config.batchedMirrorBase,
              g_config.remixMaxFPS, g_config.maxPendingTextureReadbacks,
              g_config.resolveBudgetMs, g_config.decodeWorkerPercent,
-             g_config.decodeWorkerMax, g_config.cpuTextureCacheMiB);
+             g_config.decodeWorkerMax, g_config.cpuTextureCacheMiB,
+             g_config.suppressGameRaster);
+    if (g_config.suppressGameRaster && !g_config.hudOverlayEnabled) {
+        _MESSAGE("FO4RemixPlugin: WARNING - SuppressGameRaster=1 with "
+                 "HudOverlayEnabled=0: the game window will stop updating and "
+                 "no UI will be visible anywhere. Enable the HUD overlay.");
+    }
 
     // [Precombines]
     g_config.mergeInstanceExpansion = GetIniBool("Precombines", "MergeInstanceExpansion", true, dllPath);

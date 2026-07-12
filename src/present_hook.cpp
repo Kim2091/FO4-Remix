@@ -1,6 +1,7 @@
 #include "present_hook.h"
 #include "config.h"
 #include "draw_capture.h"
+#include "raster_suppress.h"
 #include "fo4_diagnostics.h"
 #include "remix_api.h"
 #include "remix_renderer.h"
@@ -10,6 +11,7 @@
 
 #include <d3d11.h>
 #include <dxgi.h>
+#include <dxgi1_4.h>   // IDXGIAdapter3::QueryVideoMemoryInfo ([VRAM] log)
 #include <MinHook.h>
 #include <thread>
 #include <atomic>
@@ -146,6 +148,10 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRTVs,
     ID3D11DepthStencilView* pDSV)
 {
+    // Raster suppression tracks whether the UI RT is the CURRENT color
+    // target. The UI is always sole-bound (the detection below depends on
+    // it), so any other bind -- MRT, depth-only, none -- flips this false.
+    bool uiBoundNow = false;
     if (numViews == 1 && ppRTVs && ppRTVs[0]) {
         ID3D11Resource* resource = nullptr;
         ppRTVs[0]->GetResource(&resource);
@@ -162,6 +168,7 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
                             g_ui.clearedThisFrame = true;
                         }
                         g_ui.drawnThisFrame = true;
+                        uiBoundNow = true;
                     }
                 } else {
                     // Check if this sole-bound RT is a ClearRTV candidate
@@ -172,9 +179,11 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
                                 g_ui.renderTarget = tex;
                                 g_ui.renderTarget->AddRef();
                                 _MESSAGE("FO4RemixPlugin: UI RT detected (cleared + sole-bound): tex=%p", tex);
+                                RasterSuppress::NotifyUiRT(g_ui.renderTarget);
                             }
                             g_ui.clearedThisFrame = true;
                             g_ui.drawnThisFrame = true;
+                            uiBoundNow = true;
                             break;
                         }
                     }
@@ -184,6 +193,7 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
             resource->Release();
         }
     }
+    RasterSuppress::NotifyUiTargetBound(uiBoundNow);
     g_originalOMSetRTs(context, numViews, ppRTVs, pDSV);
 }
 
@@ -366,11 +376,12 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     }
 
     // Hook OMSetRenderTargets + ClearRenderTargetView on first opportunity.
-    // Only when the HUD overlay is enabled: these hooks exist solely to find
-    // the UI render target for overlay capture, and hkOMSetRenderTargets runs
-    // on every game render-target bind — pure overhead when the capture below
-    // is gated off anyway.
-    if (!g_ui.contextHooked && g_config.hudOverlayEnabled) {
+    // Only when a consumer exists: the HUD overlay needs them to find the UI
+    // render target for capture, and raster suppression needs the same
+    // detection (plus per-bind tracking) to keep UI draws executing. With
+    // neither feature on, hkOMSetRenderTargets on every bind is pure overhead.
+    if (!g_ui.contextHooked &&
+        (g_config.hudOverlayEnabled || g_config.suppressGameRaster)) {
         ID3D11Device* hookDevice = nullptr;
         swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&hookDevice);
         if (hookDevice) {
@@ -408,8 +419,11 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     // Merge-instanced draw capture: hook DrawIndexedInstanced so the static
     // resolver can reuse the engine's own per-sub-model draw parameters for
     // BSMergeInstancedTriShape partitioning (see draw_capture.h). Idle cost
-    // once hooked is one relaxed atomic load per draw call.
-    if (g_config.mergeInstanceExpansion && g_config.mergeInstanceDrawCapture) {
+    // once hooked is one relaxed atomic load per draw call. Raster
+    // suppression rides the same context hooks (its gates live inside the
+    // draw detours), so it also forces the install.
+    if ((g_config.mergeInstanceExpansion && g_config.mergeInstanceDrawCapture) ||
+        g_config.suppressGameRaster) {
         if (!DrawCapture::Hooked()) {
             ID3D11Device* dcDev = nullptr;
             swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&dcDev);
@@ -576,6 +590,58 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                 lights.insert(lights.end(), cellLights.begin(), cellLights.end());
             }
             RemixRenderer::QueueLights(std::move(lights));
+        }
+    }
+
+    // [VRAM] telemetry every ~300 game frames: process-wide adapter usage
+    // (DXGI -- covers the game's D3D11 AND dxvk-remix's Vulkan, same process)
+    // plus the raster-suppression counters. This is the A/B instrument for
+    // the modded-texture budget fight: with SuppressGameRaster on, "used"
+    // should fall well below "budget" as WDDM demotes unreferenced game
+    // textures; suppressed/fwd counters prove the kill switch is live.
+    {
+        static uint32_t s_vramLogCounter = 0;
+        static IDXGIAdapter3* s_adapter3 = nullptr;
+        static bool s_adapterTried = false;
+        if (++s_vramLogCounter >= 300) {
+            s_vramLogCounter = 0;
+            if (!s_adapterTried) {
+                s_adapterTried = true;
+                ID3D11Device* dev = nullptr;
+                swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&dev);
+                if (dev) {
+                    IDXGIDevice* dxgiDev = nullptr;
+                    if (SUCCEEDED(dev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev))) {
+                        IDXGIAdapter* adapter = nullptr;
+                        if (SUCCEEDED(dxgiDev->GetAdapter(&adapter))) {
+                            adapter->QueryInterface(__uuidof(IDXGIAdapter3), (void**)&s_adapter3);
+                            adapter->Release();
+                        }
+                        dxgiDev->Release();
+                    }
+                    dev->Release();
+                }
+                if (!s_adapter3) {
+                    _MESSAGE("FO4RemixPlugin: [VRAM] IDXGIAdapter3 unavailable; no budget telemetry");
+                }
+            }
+            if (s_adapter3) {
+                DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
+                if (SUCCEEDED(s_adapter3->QueryVideoMemoryInfo(
+                        0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) {
+                    uint64_t suppressed = 0, fwdUi = 0, fwdQuery = 0;
+                    RasterSuppress::ConsumeStats(&suppressed, &fwdUi, &fwdQuery);
+                    _MESSAGE("FO4RemixPlugin: [VRAM] process local used=%llu MiB "
+                             "budget=%llu MiB | raster suppress=%d drawsSuppressed=%llu "
+                             "fwdUI=%llu fwdQuery=%llu (since last)",
+                             (unsigned long long)(local.CurrentUsage >> 20),
+                             (unsigned long long)(local.Budget >> 20),
+                             g_config.suppressGameRaster ? 1 : 0,
+                             (unsigned long long)suppressed,
+                             (unsigned long long)fwdUi,
+                             (unsigned long long)fwdQuery);
+                }
+            }
         }
     }
 
