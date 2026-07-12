@@ -297,6 +297,19 @@ struct PluginConfig {
     // the upgrade-poll compare (see CapDim in bs_extraction.cpp).
     uint32_t maxTextureDimension;
 
+    // Destroy parked Remix handles only during load screens (PreLoadGame
+    // drain request) and on shutdown, instead of every 30 frames
+    // ([Performance] DeferHandleDestroyToLoad, default 1). Mitigation for
+    // the AV-inside-api->CreateMesh session killer (2026-07-10/11): both
+    // incidents featured TexUpgrade churn with interleaved mid-gameplay
+    // destroys, and a create-vs-CS-side-destruction race inside the runtime
+    // is the live suspect. Parking is free plugin-side (handles are already
+    // erased from the caches; CancelParkedHandle rescues re-created content
+    // for as long as it stays parked); the VRAM held by parked handles is
+    // reported as parked= on the [VRAM] line, with an 8192-handle emergency
+    // drain valve. 0 = 30-frame cadence (A/B).
+    bool deferHandleDestroyToLoad;
+
     // Suppress the game's own raster draws at the D3D11 hook layer
     // (raster_suppress.h has the full design). The engine keeps running its
     // complete CPU render loop -- GetRenderPasses detours, DrawCapture

@@ -67,6 +67,10 @@ void OnF4SEMessage(F4SEMessagingInterface::Message* msg) {
         // served across a reload slices the wrong pool region (run-3's
         // progressive corruption per save reload). Drop every watch.
         DrawCapture::ResetAll();
+        // The release wave above parked a pile of Remix handles; the load
+        // screen is the safe window to actually destroy them (see
+        // DeferHandleDestroyToLoad).
+        RemixRenderer::RequestDestroyDrain();
         break;
     case F4SEMessagingInterface::kMessage_PostLoadGame:
         // data is a bool: true = load succeeded, false = load failed/aborted.

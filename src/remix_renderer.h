@@ -84,6 +84,14 @@ namespace RemixRenderer {
     // thread's frame in flight still references. Idempotent on missing hash.
     void ReleaseDrawable(uint64_t hash);
 
+    // Ask the next OnFrame to destroy every parked handle. Called from the
+    // PreLoadGame message: under [Performance] DeferHandleDestroyToLoad the
+    // load screen is the ONLY time parked destroys run (the runtime is
+    // quiescent there; mid-gameplay destroys are the live suspect for the
+    // AV-inside-CreateMesh session killer). Thread-safe, callable from the
+    // game thread.
+    void RequestDestroyDrain();
+
     // Forward a key/value to Remix's runtime config registry. Takes the
     // recursive Remix-API mutex so concurrent OnFrame draw submissions
     // don't race against the option write. Returns true on success;

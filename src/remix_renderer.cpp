@@ -23,6 +23,8 @@
 #include <string>
 #include <d3d11.h>
 #include <excpt.h>  // EXCEPTION_EXECUTE_HANDLER for SEH wrappers below
+#include <DbgHelp.h>  // MiniDumpWriteDump (guard-filter faulting-context dumps)
+#pragma comment(lib, "dbghelp.lib")
 
 // ---------------------------------------------------------------------------
 // DXGI -> remixapi_Format mapping
@@ -156,13 +158,15 @@ static int CallDrawInstanceCxxGuarded(remixapi_Interface* api,
     }
 }
 
+static LONG WriteGuardDumpFilter(EXCEPTION_POINTERS* xp);  // defined below
+
 static int CallDrawInstanceGuarded(remixapi_Interface* api,
                                    const remixapi_InstanceInfo* instance,
                                    remixapi_ErrorCode* outErr,
                                    unsigned long* outExceptionCode) {
     __try {
         return CallDrawInstanceCxxGuarded(api, instance, outErr);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (WriteGuardDumpFilter(GetExceptionInformation())) {
         *outExceptionCode = GetExceptionCode();
         return 1;
     }
@@ -182,6 +186,58 @@ static int CallDrawInstanceGuarded(remixapi_Interface* api,
 // Returns 0 = clean, 1 = SEH caught, 2 = C++ exception caught.
 static std::atomic<int> g_remixGuardLogCount{0};
 static constexpr int kRemixGuardLogCap = 32;
+
+// ---------------------------------------------------------------------------
+// Minidump at the SEH filter (2026-07-12). The CreateMesh AV that kills
+// sessions happens INSIDE dxvk-remix (d3d9.dll) and leaves no trace: dxvk's
+// log is clean, and WER records nothing because the process dies moments
+// later on a DIFFERENT thread (the runtime's internals are left half-mutated
+// by the unwound-through fault). The only place the true faulting stack
+// exists is right here, in the filter, with the original context -- so write
+// the dump now. Capped at 2 per session; C++ exceptions (0xE06D7363) are
+// excluded (they carry no faulting context worth a dump and would burn the
+// budget on out_of_range noise).
+// ---------------------------------------------------------------------------
+static std::atomic<int> g_guardDumpCount{0};
+
+static LONG WriteGuardDumpFilter(EXCEPTION_POINTERS* xp) {
+    if (!xp || !xp->ExceptionRecord ||
+        xp->ExceptionRecord->ExceptionCode == 0xE06D7363UL) {
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    const int n = g_guardDumpCount.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 2) return EXCEPTION_EXECUTE_HANDLER;
+
+    char dir[MAX_PATH] = {};
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) {
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\CrashDumps\\FO4RemixGuard_%lu_%d.dmp",
+              dir, GetCurrentProcessId(), n);
+
+    HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei = {};
+        mei.ThreadId          = GetCurrentThreadId();
+        mei.ExceptionPointers = xp;
+        mei.ClientPointers    = FALSE;
+        const BOOL ok = MiniDumpWriteDump(
+            GetCurrentProcess(), GetCurrentProcessId(), file,
+            (MINIDUMP_TYPE)(MiniDumpWithDataSegs | MiniDumpWithThreadInfo |
+                            MiniDumpWithIndirectlyReferencedMemory |
+                            MiniDumpWithUnloadedModules),
+            &mei, nullptr, nullptr);
+        CloseHandle(file);
+        _MESSAGE("FO4RemixPlugin: [RemixGuard] wrote %s dump to %s "
+                 "(code=0x%08lX addr=%p)",
+                 ok ? "faulting-context" : "FAILED",
+                 path, xp->ExceptionRecord->ExceptionCode,
+                 xp->ExceptionRecord->ExceptionAddress);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
 
 template <typename F>
 static int RemixCallCxxGuarded(const char* site, F& fn) {
@@ -208,7 +264,7 @@ template <typename F>
 static int RemixCallGuarded(const char* site, F&& fn) {
     __try {
         return RemixCallCxxGuarded(site, fn);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (WriteGuardDumpFilter(GetExceptionInformation())) {
         int n = g_remixGuardLogCount.fetch_add(1, std::memory_order_relaxed);
         if (n < kRemixGuardLogCap) {
             _MESSAGE("FO4RemixPlugin: [RemixGuard] %s SEH exception #%d code=0x%08lX",
@@ -415,6 +471,25 @@ namespace {
     };
     PendingDestroys g_pendingDestroys;
     std::atomic<bool> g_hasPendingDestroys{false};
+    // Parked-handle count mirror (updated under g_renderStateMutex at every
+    // park/cancel/drain; atomic so the drain gate and the [VRAM] log can
+    // read it without the lock).
+    std::atomic<size_t> g_pendingDestroyCount{0};
+    // Load-screen drain request ([Performance] DeferHandleDestroyToLoad):
+    // set from the PreLoadGame message, consumed by the next OnFrame.
+    std::atomic<bool> g_destroyDrainRequested{false};
+}
+
+void RemixRenderer::RequestDestroyDrain() {
+    g_destroyDrainRequested.store(true, std::memory_order_release);
+}
+
+// Park a handle for deferred destruction. Caller holds g_renderStateMutex.
+template <typename H>
+static void ParkForDestroy(std::vector<H>& parked, H h) {
+    parked.push_back(h);
+    g_pendingDestroyCount.fetch_add(1, std::memory_order_relaxed);
+    g_hasPendingDestroys.store(true, std::memory_order_release);
 }
 
 // Pull a handle back out of the park list. Handles are HASH-VALUED in this
@@ -427,7 +502,12 @@ namespace {
 // Called from SubmitDrawable's create sites under g_renderStateMutex.
 template <typename H>
 static void CancelParkedHandle(std::vector<H>& parked, H h) {
+    const size_t before = parked.size();
     parked.erase(std::remove(parked.begin(), parked.end(), h), parked.end());
+    const size_t removed = before - parked.size();
+    if (removed) {
+        g_pendingDestroyCount.fetch_sub(removed, std::memory_order_relaxed);
+    }
 }
 
 // Destroy a batch of parked handles on the Remix thread. Shared by the
@@ -556,8 +636,7 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
                 // Present consumes preserved instances, and its generation bump
                 // is then swallowed by onFrameEnd.  Park it for the guarded
                 // top-of-frame drain, matching ReleaseDrawable.
-                g_pendingDestroys.materials.push_back(it->second.handle);
-                g_hasPendingDestroys.store(true, std::memory_order_release);
+                ParkForDestroy(g_pendingDestroys.materials, it->second.handle);
             }
             it = g_materialCache.erase(it);
             ++result.staleMaterialCount;
@@ -665,8 +744,7 @@ RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
                     // DrawInstance, so the runtime generation mismatch forces a
                     // safe one-frame retranslation before preserved state can
                     // sample the freed/recycled slot.
-                    g_pendingDestroys.textures.push_back(texIt->second.handle);
-                    g_hasPendingDestroys.store(true, std::memory_order_release);
+                    ParkForDestroy(g_pendingDestroys.textures, texIt->second.handle);
                 }
                 g_textureHandles.erase(texIt);
                 ++result.orphanTexturesDestroyed;
@@ -731,8 +809,7 @@ static void DecrementMeshCacheRef(const MeshCacheKey& key) {
             }
         }
         if (!aliased) {
-            g_pendingDestroys.meshes.push_back(it->second.handle);
-            g_hasPendingDestroys.store(true, std::memory_order_release);
+            ParkForDestroy(g_pendingDestroys.meshes, it->second.handle);
         }
     }
     g_meshCache.erase(it);
@@ -1297,8 +1374,7 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
             if (matIt->second.refCount > 0) matIt->second.refCount--;
             if (matIt->second.refCount == 0) {
                 if (matIt->second.handle) {
-                    g_pendingDestroys.materials.push_back(matIt->second.handle);
-                    g_hasPendingDestroys.store(true, std::memory_order_release);
+                    ParkForDestroy(g_pendingDestroys.materials, matIt->second.handle);
                 }
                 g_materialCache.erase(matIt);
             }
@@ -1318,8 +1394,7 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
             if (texIt->second.refCount > 0) texIt->second.refCount--;
             if (texIt->second.refCount == 0) {
                 if (texIt->second.handle) {
-                    g_pendingDestroys.textures.push_back(texIt->second.handle);
-                    g_hasPendingDestroys.store(true, std::memory_order_release);
+                    ParkForDestroy(g_pendingDestroys.textures, texIt->second.handle);
                 }
                 g_textureHandles.erase(texIt);
             }
@@ -1380,18 +1455,47 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // the handles are already erased from the plugin caches -- and it widens
     // the CancelParkedHandle rescue window (re-created content avoids its
     // destroy+re-upload entirely).
+    // Drain policy (2026-07-12): with [Performance] DeferHandleDestroyToLoad
+    // (default), parked handles are destroyed ONLY during load screens
+    // (PreLoadGame requests a drain; the runtime is quiescent then) plus an
+    // emergency valve, instead of the 30-frame cadence. Motivation: both
+    // sessions that died on an AV inside api->CreateMesh (07-10, 07-11)
+    // featured TexUpgrade churn with interleaved destroys -- a create-vs-
+    // CS-side-destruction race inside the runtime is the live suspect, and
+    // parking longer is free (handles are already erased from the plugin
+    // caches; CancelParkedHandle rescues re-creates for as long as they stay
+    // parked). VRAM held by parked handles is monitored via parked= on the
+    // [VRAM] line. Set the key to 0 to restore the 30-frame cadence for A/B.
     constexpr uint64_t kDestroyDrainPeriodFrames = 30;
+    constexpr size_t   kEmergencyDrainParked = 8192;
     static uint64_t s_lastDrainFrame = 0;
     const uint64_t drainNow = Diagnostics::CurrentFrameIndex();
-    if (g_hasPendingDestroys.load(std::memory_order_acquire) &&
-        drainNow - s_lastDrainFrame >= kDestroyDrainPeriodFrames) {
-        g_hasPendingDestroys.store(false, std::memory_order_release);
-        s_lastDrainFrame = drainNow;
-        std::lock_guard<std::mutex> rsLock(g_renderStateMutex);
-        DestroyParkedHandles(api, g_pendingDestroys);
-        g_pendingDestroys.meshes.clear();
-        g_pendingDestroys.materials.clear();
-        g_pendingDestroys.textures.clear();
+    if (g_hasPendingDestroys.load(std::memory_order_acquire)) {
+        bool wantDrain;
+        if (g_config.deferHandleDestroyToLoad) {
+            wantDrain = g_destroyDrainRequested.exchange(
+                false, std::memory_order_acq_rel);
+            if (!wantDrain &&
+                g_pendingDestroyCount.load(std::memory_order_relaxed) >=
+                    kEmergencyDrainParked) {
+                _MESSAGE("FO4RemixPlugin: [DeferredDestroy] emergency drain: "
+                         "%zu handles parked",
+                         g_pendingDestroyCount.load(std::memory_order_relaxed));
+                wantDrain = true;
+            }
+        } else {
+            wantDrain = drainNow - s_lastDrainFrame >= kDestroyDrainPeriodFrames;
+        }
+        if (wantDrain) {
+            g_hasPendingDestroys.store(false, std::memory_order_release);
+            s_lastDrainFrame = drainNow;
+            std::lock_guard<std::mutex> rsLock(g_renderStateMutex);
+            DestroyParkedHandles(api, g_pendingDestroys);
+            g_pendingDestroyCount.store(0, std::memory_order_relaxed);
+            g_pendingDestroys.meshes.clear();
+            g_pendingDestroys.materials.clear();
+            g_pendingDestroys.textures.clear();
+        }
     }
 
     // Apply config writes queued by game-thread callers (weather bridge et
@@ -1917,12 +2021,13 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         VramStats vram{};
         if (GetVramStats(&vram)) {
             _MESSAGE("FO4RemixPlugin: [VRAM] remix allocated=%llu MiB used=%llu MiB "
-                     "materialTex=%llu MiB buffers=%llu MiB accel=%llu MiB",
+                     "materialTex=%llu MiB buffers=%llu MiB accel=%llu MiB parked=%zu",
                      (unsigned long long)(vram.totalAllocatedBytes >> 20),
                      (unsigned long long)(vram.totalUsedBytes >> 20),
                      (unsigned long long)(vram.usedMaterialTextureBytes >> 20),
                      (unsigned long long)(vram.usedBufferBytes >> 20),
-                     (unsigned long long)(vram.usedAccelerationStructureBytes >> 20));
+                     (unsigned long long)(vram.usedAccelerationStructureBytes >> 20),
+                     g_pendingDestroyCount.load(std::memory_order_relaxed));
         }
     }
 
