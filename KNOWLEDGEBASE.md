@@ -109,6 +109,38 @@ Mutexes:
 | `g_remixApiMutex` (`remix_renderer.cpp:254`) | `std::recursive_mutex` | Remix thread only | Remix-API option-registry writes vs. `OnFrame` draw submissions. NEVER acquire from the game thread: OnFrame holds it for the whole frame (incl. the multi-ms Present) and re-acquires immediately, so an unfair-lock waiter starves for seconds (the 2026-07-02 "freezes until alt-tab" bug) |
 | `g_configQueueMutex` (`remix_renderer.cpp`) | `std::mutex` | shared | `g_pendingConfigVars` + `g_configFailedKeys`; held only for map ops, never across a Remix API call. Game-thread config writes go through `QueueConfigVariable`; OnFrame drains |
 
+Deferred handle destruction (2026-07-10): game-thread release paths
+(`ReleaseDrawable` / `DecrementMeshCacheRef`) never call
+`DestroyMesh/DestroyMaterial/DestroyTexture` inline — a destroy landing
+between OnFrame's `DrawInstance` records and the `Present` that consumes
+them invalidates a handle the in-flight frame still references (the
+runtime's Present-side `.at()` throws `std::out_of_range`, the 0xc0000409
+CTD class). Handles are parked in `g_pendingDestroys` (guarded by
+`g_renderStateMutex`, gated by the `g_hasPendingDestroys` atomic) and
+destroyed at the top of the next `OnFrame` on the Remix thread. Creates on
+the game thread are safe: every remixapi entry point locks the runtime's
+internal `s_mutex`.
+
+CRITICAL invariant: remixapi handles are HASH-VALUED in this fork
+(`rtx_remix_api.cpp` reinterpret_casts `info->hash` into the handle and the
+runtime IGNORES repeated registrations of a live handle). Consequences the
+code depends on: (1) `SubmitDrawable` must `CancelParkedHandle` on every
+create so a re-created identical resource isn't killed by its predecessor's
+still-parked destroy; (2) the OnFrame drain holds `g_renderStateMutex`
+ACROSS the destroy calls so a concurrent re-create can't interleave; (3)
+the API-visible mesh hash derives from the complete `(contentHash,
+materialHash)` key (`RuntimeMeshHashOf`) — geometry alone would alias
+material variants of identical geometry to whichever surface registered
+first. `DecrementMeshCacheRef` keeps a defensive alias scan for the
+residual 64-bit hash-collision case.
+
+The destroy drain runs every 30 frames (`kDestroyDrainPeriodFrames`), not
+per frame: each `DestroyTexture` bumps the runtime's texture-cache
+generation (the local dxvk-remix preserve-path fix), so a steady destroy
+trickle would suppress the ~93-95% preserve win every frame. Longer parking
+is free — parked handles are already erased from the plugin caches — and it
+widens the `CancelParkedHandle` rescue window.
+
 Lock-order rules (documented in `remix_renderer.cpp:253-263` and
 `remix_renderer.cpp:993-995`):
 
@@ -550,7 +582,6 @@ from FO4 is outstanding.
 | Logging | `LogTextures` | bool | 0 | log every extracted texture | `bs_extraction.cpp:858` (`ExtractMaterialTexture`) |
 | Logging | `LogLights` | bool | 0 | log extracted light info | (light extraction currently retired) |
 | Logging | `LogBoneDiag` | bool | 0 (INI ships 1) | one-shot bone-matrix dump | (plumbed; skinning not in current scope) |
-| Limits | `MaxExtent` | float | 10000 | reject shapes with local extent above this | (plumbed; resolvers use a hard 1e6 guard, this knob is unused at present) |
 | Lights | `Enabled` | bool | 1 | master toggle for extracted lights | (plumbed) |
 | Lights | `Intensity` | float | 1.0 | radiance multiplier | (plumbed) |
 | Lights | `RadiusMultiplier` | float | 1.0 | sphere-light radius multiplier | (plumbed) |
@@ -570,6 +601,12 @@ from FO4 is outstanding.
 | Overlay | `HudOverlayEnabled` | bool | 0 (code) / 1 (shipped ini) | submit the captured DX11 UI render target via `api->DrawScreenOverlay`. Requires a runtime with the rtx_fork_overlay.cpp layout fix (dxvk-remix 8990aed); the shipped ini enables it as of 2026-07-03 | `remix_renderer.cpp:1273` |
 | Overlay | `RestoreLegacyInput` | bool | 1 | issue `RIDEV_REMOVE` for keyboard so the game still receives `WM_KEYDOWN` after Remix's overlay-thread `RIDEV_NOLEGACY` registration | `remix_api.cpp:162` |
 | Performance | `GpuInstancing` | bool | 1 | share Remix mesh handles across drawables with byte-identical geometry+material and batch via `InstanceInfoGpuInstancingEXT` | `remix_renderer.cpp:820` |
+| Performance | `CpuTextureCacheMiB` | uint32 | 1024 | byte budget for the CPU-side decoded-texture cache in bs_extraction (LRU eviction past it; 0 = unbounded legacy) | `bs_extraction.cpp` (`TextureCacheEnforceBudget`) |
+| Precombines | `MergeTwoSided` | bool | 1 | render merge-expanded precombines double-sided (vanilla-faithful). 0 = single-sided experiment: re-enables the per-instance mirrored-record winding flip; potential path-tracing perf win if content winding holds up post-b112e08 | `lighting_static.cpp` (merge submit) |
+
+`[Limits] MaxExtent` was retired 2026-07-10: documented but never consumed
+(resolvers use a hard 1e6 NaN backstop), and wiring the shipped 10000 in
+would have started rejecting huge-local-extent LOD chunks.
 
 ## Known limitations
 
