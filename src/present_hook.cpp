@@ -81,11 +81,34 @@ static struct UIDetectionState {
     std::atomic<bool>        drawnThisFrame { false };
     bool                     contextHooked = false;
 
+    // STICKY bound state (2026-07-11 save-picker freeze fix). drawnThisFrame
+    // only fires on OMSetRenderTargets EVENTS; in pure-UI modes (main-menu
+    // popups) the engine can leave the UI RT bound across many frames with
+    // no rebind, so event-only tracking read as "not drawn" and the capture
+    // below froze on the last frame before the popup. Set on a matching
+    // bind, cleared on any other bind. Same-render-thread ordering.
+    std::atomic<bool>        currentlyBound { false };
+
+    // Liveness stamp (present index of the last matching bind/clear) driving
+    // the stale-lock auto-unlock: if the engine switches or recreates its
+    // interface RT (load transitions), a permanent lock would freeze the
+    // overlay forever AND -- under raster suppression -- swallow every draw
+    // to the NEW UI RT. After kUiStaleUnlockFrames without activity the lock
+    // drops, suppression goes dormant (RasterSuppress::NotifyUiRT(null)),
+    // and detection re-runs to find the current RT.
+    std::atomic<uint64_t>    lastActivityPresent { 0 };
+
     static constexpr int     kMaxClearCandidates = 8;
     ID3D11Texture2D*         clearCandidates[kMaxClearCandidates] = {};
     int                      clearCandidateCount = 0;
     int                      presentCallCount = 0;
 } g_ui;
+
+// Present-call index for the UI liveness stamps above (game render thread).
+static std::atomic<uint64_t> g_presentIndex{0};
+// ~5s at 60fps. Loading screens keep their tips/spinner UI on the same RT,
+// so a live RT never goes quiet this long; a switched/dead RT does.
+static constexpr uint64_t kUiStaleUnlockFrames = 300;
 
 
 static void PumpMessages() {
@@ -112,6 +135,9 @@ static void STDMETHODCALLTYPE hkClearRenderTargetView(
                 if (g_ui.locked) {
                     if (tex == g_ui.renderTarget) {
                         g_ui.clearedThisFrame = true;
+                        g_ui.lastActivityPresent.store(
+                            g_presentIndex.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
                     }
                 } else {
                     // Detection phase: add matching textures to per-frame candidate list
@@ -168,6 +194,9 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
                             g_ui.clearedThisFrame = true;
                         }
                         g_ui.drawnThisFrame = true;
+                        g_ui.lastActivityPresent.store(
+                            g_presentIndex.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
                         uiBoundNow = true;
                     }
                 } else {
@@ -183,6 +212,9 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
                             }
                             g_ui.clearedThisFrame = true;
                             g_ui.drawnThisFrame = true;
+                            g_ui.lastActivityPresent.store(
+                                g_presentIndex.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
                             uiBoundNow = true;
                             break;
                         }
@@ -193,6 +225,7 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
             resource->Release();
         }
     }
+    g_ui.currentlyBound.store(uiBoundNow, std::memory_order_relaxed);
     RasterSuppress::NotifyUiTargetBound(uiBoundNow);
     g_originalOMSetRTs(context, numViews, ppRTVs, pDSV);
 }
@@ -316,6 +349,8 @@ static void RemixThreadFunc() {
 
 static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
     const uint64_t frameIndex = Diagnostics::Tick();
+    const uint64_t presentIdx =
+        g_presentIndex.fetch_add(1, std::memory_order_relaxed) + 1;
     if (Diagnostics::ShouldEmitPeriodic(frameIndex)) {
         const auto gs = Diagnostics::SnapshotGameState();
         Diagnostics::EmitPeriodic(frameIndex, gs);
@@ -440,13 +475,45 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         DrawCapture::OnPresent();
     }
 
+    // Stale-lock auto-unlock (2026-07-11 save-picker freeze). If the engine
+    // switches or recreates its interface RT (load transitions do), the
+    // locked pointer goes quiet: no matching binds, no matching clears. A
+    // permanent lock then freezes the overlay on its last captured frame
+    // forever -- and under raster suppression ALSO swallows every draw to
+    // the new UI RT, so the real UI never even rasterizes. Drop the lock,
+    // put suppression dormant (all draws forward while unlocked), and let
+    // the detection phase re-run; it re-locks within a few frames of the
+    // new RT's clear+sole-bind pattern.
+    if (g_ui.locked &&
+        presentIdx - g_ui.lastActivityPresent.load(std::memory_order_relaxed) >
+            kUiStaleUnlockFrames) {
+        _MESSAGE("FO4RemixPlugin: [UIRT] locked RT %p quiet for %llu presents -- "
+                 "unlocking, re-detecting (suppression dormant meanwhile)",
+                 g_ui.renderTarget,
+                 (unsigned long long)kUiStaleUnlockFrames);
+        RasterSuppress::NotifyUiRT(nullptr);
+        RasterSuppress::NotifyUiTargetBound(false);
+        if (g_ui.renderTarget) g_ui.renderTarget->Release();
+        g_ui.renderTarget = nullptr;
+        g_ui.locked = false;
+        g_ui.currentlyBound.store(false, std::memory_order_relaxed);
+        g_ui.clearCandidateCount = 0;   // stale pointers must not false-match
+        g_ui.clearedThisFrame = false;
+        g_ui.drawnThisFrame = false;
+        g_ui.lastActivityPresent.store(presentIdx, std::memory_order_relaxed);
+    }
+
     // Capture UI render target for screen overlay (isolated UI without 3D scene).
-    // Require BOTH flags: ClearRTV (RT was zeroed) AND OMSetRTs (RT was drawn to).
-    // If only drawn without a clear, the RT has accumulated stale content from
-    // prior frames — skip the copy to avoid ghosting/trailing artifacts.
+    // Require the RT to be zeroed this frame (ClearRTV or our force-clear --
+    // stale accumulated content would ghost) AND either a bind EVENT
+    // (drawnThisFrame) or a STICKY bind (currentlyBound): pure-UI modes such
+    // as main-menu popups leave the UI RT bound across frames with no
+    // OMSetRenderTargets traffic, and requiring a per-frame bind event froze
+    // the capture on the popup's first frame.
     bool uiCleared = g_ui.clearedThisFrame.exchange(false);
     bool uiDrawn = g_ui.drawnThisFrame.exchange(false);
-    bool uiActiveThisFrame = uiCleared && uiDrawn;
+    bool uiActiveThisFrame =
+        uiCleared && (uiDrawn || g_ui.currentlyBound.load(std::memory_order_relaxed));
 
     // Gate on hudOverlayEnabled: without it this block ran the full capture
     // every frame — CopyResource + Map(READ) on a just-copied staging texture
