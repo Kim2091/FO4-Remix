@@ -285,6 +285,18 @@ struct PluginConfig {
     // deployment). 0 = unbounded (legacy).
     uint32_t cpuTextureCacheMiB;
 
+    // Longest texture edge this plugin will extract and upload to Remix
+    // ([Materials] MaxTextureDimension, default 2048, 0 = uncapped). Larger
+    // resident textures upload from the first mip at or under the cap --
+    // the engine's own chain provides it, no resampling. Exists for texture
+    // mods: 4K packs resident at load put ~4x the bytes in the Remix
+    // material-texture pool (11.4 GiB observed, paging the process out of
+    // the adapter budget), plus 4x the readback/decode/CPU-cache cost.
+    // Vanilla content tops out at 2048, so the default only affects mods.
+    // Applied consistently to the resolution hash fold, the readback, and
+    // the upgrade-poll compare (see CapDim in bs_extraction.cpp).
+    uint32_t maxTextureDimension;
+
     // Suppress the game's own raster draws at the D3D11 hook layer
     // (raster_suppress.h has the full design). The engine keeps running its
     // complete CPU render loop -- GetRenderPasses detours, DrawCapture

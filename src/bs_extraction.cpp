@@ -94,6 +94,17 @@ static constexpr uintptr_t OFF_GRID_CELL_ARRAY   = 0x18;  // TESObjectCELL** (fl
 
 
 // Packed unsigned byte -> [-1, 1]
+// Upload-resolution cap ([Materials] MaxTextureDimension). Applied at every
+// point that reads a resident texture dimension -- the resolution hash fold,
+// the readback mip selection, and GetMaterialDiffuseResidentWidth (which
+// feeds both the upgrade poll and the submitted-width record) -- so all of
+// them agree on the capped value and upgrade polling converges instead of
+// endlessly re-extracting identical capped pixels from a larger resident.
+static uint32_t CapDim(uint32_t v) {
+    const uint32_t cap = g_config.maxTextureDimension;
+    return (cap > 0 && v > cap) ? cap : v;
+}
+
 static float UnpackByte(uint8_t b) {
     return (b / 255.0f) * 2.0f - 1.0f;
 }
@@ -443,8 +454,29 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
         uint32_t blockSize = 0;
         const bool isBC = IsBlockCompressed(desc.Format, blockSize);
 
+        // Upload-resolution cap: skip the leading mips that exceed
+        // [Materials] MaxTextureDimension. With 4K texture mods resident at
+        // load, full-chain uploads put ~4x the intended bytes in the Remix
+        // material-texture pool (2026-07-11: materialTex hit 11.4 GiB and
+        // paged the whole process out of the adapter budget). The engine's
+        // own chain already contains the smaller mips -- no resampling, the
+        // readback simply starts lower. Also 4x less readback bandwidth,
+        // decode work, and CPU cache per capped texture.
+        uint32_t firstMip = 0;
+        if (g_config.maxTextureDimension > 0) {
+            while (firstMip + 1 < srcMipCount) {
+                uint32_t w = desc.Width  >> firstMip; if (w == 0) w = 1;
+                uint32_t h = desc.Height >> firstMip; if (h == 0) h = 1;
+                if (w <= g_config.maxTextureDimension &&
+                    h <= g_config.maxTextureDimension) break;
+                ++firstMip;
+            }
+        }
+        uint32_t topW = desc.Width  >> firstMip; if (topW == 0) topW = 1;
+        uint32_t topH = desc.Height >> firstMip; if (topH == 0) topH = 1;
+
         uint32_t usableMips = 0;
-        for (uint32_t i = 0; i < srcMipCount; i++) {
+        for (uint32_t i = firstMip; i < srcMipCount; i++) {
             uint32_t mipW = desc.Width  >> i; if (mipW == 0) mipW = 1;
             uint32_t mipH = desc.Height >> i; if (mipH == 0) mipH = 1;
             if (isBC && (mipW < 4 || mipH < 4)) break;
@@ -453,8 +485,8 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
         if (usableMips == 0) return ReadbackStatus::Failed;
 
         D3D11_TEXTURE2D_DESC stagingDesc = {};
-        stagingDesc.Width              = desc.Width;
-        stagingDesc.Height             = desc.Height;
+        stagingDesc.Width              = topW;
+        stagingDesc.Height             = topH;
         stagingDesc.MipLevels          = usableMips;
         stagingDesc.ArraySize          = 1;
         stagingDesc.Format             = desc.Format;
@@ -474,16 +506,18 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
 
         // Queue all copies; the D3D11 runtime holds a reference on both
         // resources until the commands execute, so the engine freeing the
-        // source texture later is safe.
+        // source texture later is safe. Source mips are offset by firstMip
+        // when the resolution cap dropped the top of the chain.
         for (uint32_t i = 0; i < usableMips; i++) {
-            ctx->CopySubresourceRegion(staging.Get(), i, 0, 0, 0, tex2D, i, nullptr);
+            ctx->CopySubresourceRegion(staging.Get(), i, 0, 0, 0, tex2D,
+                                       firstMip + i, nullptr);
         }
 
         PendingReadback pr;
         pr.staging        = staging;
         pr.format         = desc.Format;
-        pr.width          = desc.Width;
-        pr.height         = desc.Height;
+        pr.width          = topW;
+        pr.height         = topH;
         pr.mipCount       = usableMips;
         pr.lastTouchFrame = nowFrame;
         g_pendingReadbacks.emplace(cacheKey, std::move(pr));
@@ -1392,6 +1426,8 @@ int BsExtraction::SampleLookupColor(NiTexture* lut, ID3D11Device* device,
 // have been freed (cell detach) between polls. No C++ objects with destructors
 // in this frame so __try is legal; ID3D11Texture2D is released by hand.
 // ---------------------------------------------------------------------------
+// NOTE: returns the EFFECTIVE (MaxTextureDimension-capped) resident width --
+// the resolution this plugin would actually extract and upload at.
 uint32_t BsExtraction::GetMaterialDiffuseResidentWidth(void* material) {
     if (!material) return 0;
     uint32_t width = 0;
@@ -1416,7 +1452,7 @@ uint32_t BsExtraction::GetMaterialDiffuseResidentWidth(void* material) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         width = 0;
     }
-    return width;
+    return CapDim(width);
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,8 +1978,12 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                 __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t2d))) && t2d) {
             D3D11_TEXTURE2D_DESC rd; t2d->GetDesc(&rd);
             t2d->Release();
+            // Fold the CAPPED dims: two resident sizes that clamp to the
+            // same upload resolution must share one cache key, or the same
+            // capped pixels would upload twice under different hashes.
             if (rd.Width) hash = FnvHashCombine(
-                hash, 0xA00000000ULL | ((uint64_t)rd.Width << 16) | (rd.Height & 0xFFFFu));
+                hash, 0xA00000000ULL | ((uint64_t)CapDim(rd.Width) << 16) |
+                      (CapDim(rd.Height) & 0xFFFFu));
         }
     }
 
