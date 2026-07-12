@@ -2,6 +2,7 @@
 #include "f4se/PluginAPI.h"
 
 #include "config.h"
+#include "crash_diag.h"
 #include "draw_capture.h"
 #include "present_hook.h"
 #include "remix_api.h"
@@ -125,6 +126,12 @@ __declspec(dllexport) bool F4SEPlugin_Load(const F4SEInterface* f4se) {
         RemixRenderer::WriteDiagDump("terminate");
         std::abort();
     });
+
+    // Breadcrumbs for the deaths that leave NOTHING (no WER, no terminate,
+    // log just stops): stack overflow / heap corruption via a vectored
+    // handler, and deliberate ExitProcess/TerminateProcess calls with the
+    // caller identified. See crash_diag.h for the full ladder.
+    CrashDiag::Install();
 
     // Phase 1A: install BSLightingShaderProperty event-capture hook if
     // [SemanticCapture] Enabled=1. No-op when disabled (default).

@@ -63,6 +63,8 @@ add_library(FO4RemixPlugin SHARED
     src/main.cpp
     src/config.h
     src/config.cpp
+    src/crash_diag.h
+    src/crash_diag.cpp
     src/present_hook.h
     src/present_hook.cpp
     src/remix_api.h
