@@ -208,6 +208,27 @@ static LONG WriteGuardDumpFilter(EXCEPTION_POINTERS* xp) {
     const int n = g_guardDumpCount.fetch_add(1, std::memory_order_relaxed);
     if (n >= 2) return EXCEPTION_EXECUTE_HANDLER;
 
+    // Log the faulting site FIRST -- module-relative, so the crash location
+    // is recoverable from the log alone. Field lesson (2026-07-12 second
+    // crash): the first dump attempt died mid-MiniDumpWriteDump (0-byte
+    // file, no log line) because the heavyweight dump type gave the other
+    // poisoned runtime threads ~seconds to kill the process. The log write
+    // and a stacks-only dump fit inside the window.
+    void* addr = xp->ExceptionRecord->ExceptionAddress;
+    char modName[MAX_PATH] = "?";
+    uintptr_t modOff = 0;
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &mod) && mod) {
+        GetModuleFileNameA(mod, modName, sizeof(modName));
+        modOff = (uintptr_t)addr - (uintptr_t)mod;
+    }
+    _MESSAGE("FO4RemixPlugin: [RemixGuard] SEH fault code=0x%08lX addr=%p "
+             "module=%s +0x%llX -- writing dump",
+             xp->ExceptionRecord->ExceptionCode, addr, modName,
+             (unsigned long long)modOff);
+
     char dir[MAX_PATH] = {};
     if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) {
         return EXCEPTION_EXECUTE_HANDLER;
@@ -223,18 +244,17 @@ static LONG WriteGuardDumpFilter(EXCEPTION_POINTERS* xp) {
         mei.ThreadId          = GetCurrentThreadId();
         mei.ExceptionPointers = xp;
         mei.ClientPointers    = FALSE;
+        // Stacks + modules only: a few MB written in tens of ms. The fat
+        // IndirectlyReferencedMemory dump never completed (above).
         const BOOL ok = MiniDumpWriteDump(
             GetCurrentProcess(), GetCurrentProcessId(), file,
-            (MINIDUMP_TYPE)(MiniDumpWithDataSegs | MiniDumpWithThreadInfo |
-                            MiniDumpWithIndirectlyReferencedMemory |
+            (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo |
                             MiniDumpWithUnloadedModules),
             &mei, nullptr, nullptr);
+        FlushFileBuffers(file);
         CloseHandle(file);
-        _MESSAGE("FO4RemixPlugin: [RemixGuard] wrote %s dump to %s "
-                 "(code=0x%08lX addr=%p)",
-                 ok ? "faulting-context" : "FAILED",
-                 path, xp->ExceptionRecord->ExceptionCode,
-                 xp->ExceptionRecord->ExceptionAddress);
+        _MESSAGE("FO4RemixPlugin: [RemixGuard] dump %s: %s",
+                 ok ? "written" : "FAILED", path);
     }
     return EXCEPTION_EXECUTE_HANDLER;
 }
