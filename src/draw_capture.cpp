@@ -39,6 +39,17 @@ constexpr int      kVsSrvSlots       = 16;     // scan t0..t15 for the record SR
 // watches now continue hunting in the background via EnsureWatch
 // (upgradeHunt), so the foreground deadline can be short.
 constexpr uint64_t kDeadlineMs       = 4000;
+// Orphaned-hunt reap threshold. Upgrade-hunt watches are kept alive by
+// ~1 Hz EnsureWatch polls from the resolver. Drop() and this reap cover
+// DIFFERENT orphan sources and are not interchangeable: Drop() frees the
+// watch when its drawable is TTL-evicted (the poller provably disappears);
+// the reap is the ONLY mechanism that frees a hunt MarkConsumed re-armed
+// while the drawable is still alive but the resolver stopped polling
+// (mergeCaptureUpgradePending cleared after a successful upgrade). Either
+// kind of stranded kActive hunt pins a slot AND keeps g_activeCount>0,
+// which keeps the CheckBind scan running on every Set*ShaderResources call
+// in the game for the rest of the session.
+constexpr uint64_t kHuntOrphanMs     = 15000;
 
 // How the engine actually renders BSMergeInstancedTriShape (established by
 // the 2026-07-03 diagnostic runs): the shape's own record SRV (wrapper q1
@@ -54,21 +65,26 @@ constexpr uint64_t kDeadlineMs       = 4000;
 // draws (e.g. an 11k-tri mesh against a 7-record shape) to the watch.
 // Instead: the VSSetShaderResources hook tracks WHICH watch's SRV is
 // currently at t8 (ordered, same-thread bind events), and hkDrawIndexed
-// counts a draw for that watch ONLY if its IndexCount equals one of the
-// shape's known per-LOD triangle counts (+0x1A0 table) times 3. Each
-// unique surviving index range is a sub-model (offset into a shared IB;
-// the consumer normalizes by the smallest start), and its per-frame
-// repeat count is that sub-model's instance count times the number of
-// render passes, which the consumer divides out.
+// records the chunk draws issued while that ownership holds. NOTE
+// (2026-07-10): the per-LOD IndexCount filter (expectedIdx = segTris*3)
+// belonged to the REMOVED SegDraw sampling path -- run-6 chunk draws are
+// ~2k-tri slices of the pre-baked expanded mesh whose sizes have nothing
+// to do with the +0x1A0 table, so expectedIdx is diagnostic-only now.
+// The defenses that remain live: the exact s8==srv re-read per draw, the
+// desc-verify below, and the resolver's record-anchored chunk validation
+// (every chunk vertex within source-extent of a record translation).
 // Safety: every pointer match desc-verifies (structured, stride 80,
 // ByteWidth == recordCount*80) -- recycled pointers produced false
 // captures in run 2 and cannot pass that check.
 static std::atomic<uint64_t> g_diiCalls{0};
 static std::atomic<uint64_t> g_diCalls{0};
 static std::atomic<uint64_t> g_diiiCalls{0};
-static std::atomic<uint64_t> g_stride80Hits{0};
 static std::atomic<uint64_t> g_bindHits{0};
 static std::atomic<int>      g_bindLogs{0};
+// Session log budgets (also reset by ResetAll so post-reload behavior stays
+// diagnosable instead of going silent after the first burst).
+static std::atomic<int>      g_watchLogs{0};
+static std::atomic<int>      g_expireLogs{0};
 
 struct Watch {
     enum State { kFree, kActive, kDone, kExpired };
@@ -83,7 +99,10 @@ struct Watch {
     uint32_t rearms = 0;         // invalid-frame retries granted so far
     bool     upgradeHunt = false;  // background watch for a fallen-back
                                    // drawable: exempt from kDeadlineMs
+    uint64_t lastPollTick = 0;   // last Query/EnsureWatch/MarkConsumed touch;
+                                 // hunts unpolled past kHuntOrphanMs are reaped
     uint32_t expectedIdx[4] = {};  // segTris[s]*3 for nonzero, sane slots
+                                   // (diagnostic-only in the chunk era)
     int      nExpected = 0;
     // Upgrade bookkeeping: cdone[] ACCUMULATES across frames (the engine
     // draws only the pieces visible in a given frame, so any one frame is
@@ -232,7 +251,11 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
     ID3D11DeviceContext* ctx, UINT idxCount, UINT instCount,
     UINT startIdx, INT baseVtx, UINT startInst)
 {
-    g_diiCalls.fetch_add(1, std::memory_order_relaxed);
+    // Counter feeds the capped expire diagnostic only; skip the atomic RMW
+    // on every one of the game's draws when nothing is being watched.
+    if (g_activeCount.load(std::memory_order_relaxed) > 0) {
+        g_diiCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     LogWindowDraw(ctx, "DII", idxCount, startIdx, baseVtx, instCount);
     // SegDraw sampling REMOVED (2026-07-04). Run-4 ground truth: with 15
     // watches active for a full 17s window (9.3M DII calls, record SRVs
@@ -287,9 +310,13 @@ static void STDMETHODCALLTYPE hkDrawIndexed(
                         RollChunks(*w);
                         w->ccurFrame = f;
                     }
+                    // Same dedup key as RollChunks (ib, offset, count) so two
+                    // index buffers sharing an offset+count within one frame
+                    // don't drop each other.
                     bool dup = false;
                     for (int k = 0; k < w->ccurCount && !dup; ++k) {
-                        dup = w->ccur[k].ibOffset == ibOff &&
+                        dup = w->ccur[k].ib == (void*)ib &&
+                              w->ccur[k].ibOffset == ibOff &&
                               w->ccur[k].idxCount == idxCount;
                     }
                     if (!dup && w->ccurCount < Watch::kMaxChunks) {
@@ -310,14 +337,18 @@ static void STDMETHODCALLTYPE hkDrawInstanced(
     ID3D11DeviceContext* ctx, UINT vtxCount, UINT instCount,
     UINT startVtx, UINT startInst)
 {
-    g_diCalls.fetch_add(1, std::memory_order_relaxed);
+    if (g_activeCount.load(std::memory_order_relaxed) > 0) {
+        g_diCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     g_originalDI(ctx, vtxCount, instCount, startVtx, startInst);
 }
 
 static void STDMETHODCALLTYPE hkDrawIndexedInstancedIndirect(
     ID3D11DeviceContext* ctx, ID3D11Buffer* args, UINT offset)
 {
-    g_diiiCalls.fetch_add(1, std::memory_order_relaxed);
+    if (g_activeCount.load(std::memory_order_relaxed) > 0) {
+        g_diiiCalls.fetch_add(1, std::memory_order_relaxed);
+    }
     g_originalDIII(ctx, args, offset);
 }
 
@@ -483,7 +514,26 @@ bool Hooked() {
 }
 
 void OnPresent() {
-    g_frame.fetch_add(1, std::memory_order_relaxed);
+    const uint32_t f = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Reap orphaned upgrade hunts every ~5s: a hunt nobody polls anymore
+    // (see kHuntOrphanMs) is expired so its slot recycles and, once none
+    // are left, g_activeCount hits 0 and the CheckBind scan goes cold.
+    // Expiry keeps the accumulated cdone[] union, so a poller that comes
+    // back (EnsureWatch) revives it with coverage intact.
+    if ((f % 300u) == 0 && g_activeCount.load(std::memory_order_relaxed) > 0) {
+        const uint64_t now = GetTickCount64();
+        std::lock_guard<std::mutex> g(g_lock);
+        for (Watch& c : g_watches) {
+            if (c.state == Watch::kActive && c.upgradeHunt &&
+                now - c.lastPollTick > kHuntOrphanMs) {
+                c.state = Watch::kExpired;
+                g_activeCount.fetch_sub(1, std::memory_order_relaxed);
+                if (g_boundT8.load(std::memory_order_relaxed) == &c) {
+                    g_boundT8.store(nullptr, std::memory_order_relaxed);
+                }
+            }
+        }
+    }
 }
 
 QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
@@ -495,10 +545,14 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
     for (Watch& c : g_watches) {
         if (c.state != Watch::kFree && c.key == key) { w = &c; break; }
     }
+    if (w) w->lastPollTick = now;
     if (w && w->state == Watch::kExpired) {
         // A NEW resolve cycle for a shape whose earlier watch timed out.
-        // Give it a fresh window instead of failing forever.
+        // Give it a fresh window instead of failing forever. This is a
+        // foreground resolve now, so it re-earns kDeadlineMs expiry --
+        // don't let a stale upgradeHunt flag from a prior life exempt it.
         w->state = Watch::kActive;
+        w->upgradeHunt = false;
         w->registeredTick = now;
         w->registeredFrame = g_frame.load(std::memory_order_relaxed);
         g_activeCount.fetch_add(1, std::memory_order_relaxed);
@@ -514,12 +568,13 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
                 victim = &c;
             }
         }
-        if (!victim) return kUnavailable;  // all 16 slots actively watching
+        if (!victim) return kUnavailable;  // all 32 slots actively watching
         *victim = Watch{};
         victim->state = Watch::kActive;
         victim->buffer = buffer;
         victim->srv = srv;
         victim->key = key;
+        victim->lastPollTick = now;
         victim->expectedBytes = recordCount * 80u;
         for (int s = 0; s < 4; ++s) {
             // garbage slot-3 values (floats/717-style) stay under this
@@ -532,8 +587,7 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
         victim->registeredTick = now;
         victim->registeredFrame = g_frame.load(std::memory_order_relaxed);
         g_activeCount.fetch_add(1, std::memory_order_relaxed);
-        static std::atomic<int> sWatchLogs{0};
-        const int wl = sWatchLogs.fetch_add(1, std::memory_order_relaxed);
+        const int wl = g_watchLogs.fetch_add(1, std::memory_order_relaxed);
         if (wl < 24) {
             _MESSAGE("FO4RemixPlugin: [DrawCap] watch #%d key=0x%llX buf=%p srv=%p "
                      "rc=%u expIdx=[%u,%u,%u,%u]",
@@ -559,18 +613,16 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
         } else if (!w->upgradeHunt && now - w->registeredTick > kDeadlineMs) {
             w->state = Watch::kExpired;
             g_activeCount.fetch_sub(1, std::memory_order_relaxed);
-            static std::atomic<int> sExpireLogs{0};
-            const int el = sExpireLogs.fetch_add(1, std::memory_order_relaxed);
+            const int el = g_expireLogs.fetch_add(1, std::memory_order_relaxed);
             if (el < 24) {
                 _MESSAGE("FO4RemixPlugin: [DrawCap] expire #%d key=0x%llX "
                          "framesWatched=%u binds=%u dii=%llu di=%llu diii=%llu "
-                         "stride80=%llu bindHits=%llu",
+                         "bindHits=%llu",
                          el, (unsigned long long)key,
                          f - w->registeredFrame, w->bindCount,
                          (unsigned long long)g_diiCalls.load(std::memory_order_relaxed),
                          (unsigned long long)g_diCalls.load(std::memory_order_relaxed),
                          (unsigned long long)g_diiiCalls.load(std::memory_order_relaxed),
-                         (unsigned long long)g_stride80Hits.load(std::memory_order_relaxed),
                          (unsigned long long)g_bindHits.load(std::memory_order_relaxed));
             }
             return kUnavailable;
@@ -619,6 +671,7 @@ bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
     std::lock_guard<std::mutex> g(g_lock);
     for (Watch& c : g_watches) {
         if (c.state == Watch::kFree || c.key != key) continue;
+        c.lastPollTick = now;
         if (c.upgradesServed >= kMaxUpgradesPerShape) {
             // Enough resubmissions for this shape; stop hunting and free
             // the slot for others (entry lingers as evictable).
@@ -676,6 +729,7 @@ bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
     victim->buffer = buffer;
     victim->srv = srv;
     victim->key = key;
+    victim->lastPollTick = now;
     victim->expectedBytes = recordCount * 80u;
     for (int s = 0; s < 4; ++s) {
         if (segTris[s] && segTris[s] < 0x400000u) {
@@ -696,6 +750,7 @@ void MarkConsumed(uint64_t key) {
         // same union and shouldn't count against the shape.
         if (c.cdoneCount > c.consumedChunks) ++c.upgradesServed;
         c.consumedChunks = c.cdoneCount;
+        c.lastPollTick = GetTickCount64();
         if (c.state != Watch::kActive) {
             c.state = Watch::kActive;
             c.upgradeHunt = true;
@@ -707,6 +762,21 @@ void MarkConsumed(uint64_t key) {
     }
 }
 
+void Drop(uint64_t key) {
+    std::lock_guard<std::mutex> g(g_lock);
+    for (Watch& c : g_watches) {
+        if (c.state == Watch::kFree || c.key != key) continue;
+        if (c.state == Watch::kActive) {
+            g_activeCount.fetch_sub(1, std::memory_order_relaxed);
+        }
+        if (g_boundT8.load(std::memory_order_relaxed) == &c) {
+            g_boundT8.store(nullptr, std::memory_order_relaxed);
+        }
+        c = Watch{};
+        return;
+    }
+}
+
 void ResetAll() {
     std::lock_guard<std::mutex> g(g_lock);
     g_boundT8.store(nullptr, std::memory_order_relaxed);
@@ -714,6 +784,14 @@ void ResetAll() {
         c = Watch{};
     }
     g_activeCount.store(0, std::memory_order_relaxed);
+    // Re-arm the session log budgets so the world we're loading into is
+    // as diagnosable as the first one was.
+    g_watchLogs.store(0, std::memory_order_relaxed);
+    g_expireLogs.store(0, std::memory_order_relaxed);
+    g_bindLogs.store(0, std::memory_order_relaxed);
+    g_winCount.store(0, std::memory_order_relaxed);
+    g_winRemaining.store(0, std::memory_order_relaxed);
+    g_lastWinKey.store(0, std::memory_order_relaxed);
     _MESSAGE("FO4RemixPlugin: [DrawCap] ResetAll (reload): watches purged");
 }
 

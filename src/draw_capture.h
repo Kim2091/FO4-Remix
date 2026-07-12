@@ -51,10 +51,11 @@ enum QueryResult {
 // recycled pointers produced false captures in run 2).
 // `key` identifies the shape across calls (mesh hash). `segTris` is the
 // shape's +0x1A0 per-LOD triangle table (4 dwords, zeros/garbage in
-// unused slots): only DrawIndexed calls whose IndexCount equals one of
-// the nonzero entries times 3 can belong to the shape -- the filter that
-// keeps sticky t8 bindings from attributing unrelated scene draws
-// (run 4's noise captures) to the watch.
+// unused slots). NOTE: since the run-6 baked-chunk model the table is
+// recorded for diagnostics only -- chunk draws are ~2k-tri slices of the
+// expanded mesh whose sizes are unrelated to segTris*3; attribution
+// safety comes from the per-draw s8==srv re-read, the stride-80
+// desc-verify, and the resolver's record-anchored chunk validation.
 QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
                   const uint32_t segTris[4], std::vector<SegDraw>& out);
 
@@ -83,6 +84,15 @@ bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
 // again on GROWTH, and put the watch back to hunting so the union keeps
 // merging new chunk draws as more of the cluster becomes visible.
 void MarkConsumed(uint64_t key);
+
+// Free this key's watch slot immediately (any state). Called when the
+// owning drawable is evicted (TTL sweep) so cell churn can't strand
+// upgrade-hunt watches that nobody will poll again -- a stranded kActive
+// hunt pins one of the kMaxWatches slots AND keeps the bind-scan hot path
+// enabled for the whole session. Orphans that slip through anyway (e.g.
+// MarkConsumed re-armed a hunt whose resolver stopped polling) are reaped
+// by OnPresent after kHuntOrphanMs without a poll.
+void Drop(uint64_t key);
 
 // Drop every watch (and the t8 ownership pointer). Called on PreLoadGame:
 // captured IB/VB offsets point into the engine's shared geometry pools,

@@ -864,8 +864,13 @@ void SemanticCapture::Tick(ID3D11Device* device) {
 
         // Phase A: collect due keys. Cheap predicates only -- the lock is
         // held for a linear map scan (sub-ms), not the resolve work.
-        std::vector<PassKey> dueNew;    // unsubmitted, inside window, retry-due
-        std::vector<PassKey> duePolls;  // submitted, upgrade-poll slot hit
+        // static + clear(): Tick is single-threaded on the game thread, so
+        // reusing capacity avoids two heap allocations per Tick during
+        // streaming.
+        static std::vector<PassKey> dueNew;    // unsubmitted, inside window, retry-due
+        static std::vector<PassKey> duePolls;  // submitted, upgrade-poll slot hit
+        dueNew.clear();
+        duePolls.clear();
         {
             std::lock_guard<std::mutex> lock(g_drawableMutex);
             for (auto& [key, state] : g_drawableMap) {
@@ -1164,7 +1169,13 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     // (engineCulled stays false); the OnFrame skip is dormant until the
     // signal is identified. Reads SEH-guarded (stale pointers between free
     // and TTL eviction).
-    {
+    // Gated on Diagnostics.Enabled AND its own log budget: the walk (mutex
+    // hold + name substring scans + guarded peeks, every Tick) exists only
+    // to produce these capped log lines, so once the budget is spent -- or
+    // diagnostics are off -- skip it entirely.
+    constexpr int kCullLogCap = 80;
+    static std::atomic<int> sCullLogs{0};
+    if (g_config.diagEnabled && sCullLogs.load(std::memory_order_relaxed) < kCullLogCap) {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         // Change-detection state local to this diagnostic (hash -> last
         // {flags, ageStale}); avoids touching DrawableState::lastFlags, which
@@ -1193,8 +1204,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             const bool changed = fIt == s_lastVisFlags.end() || fIt->second != fl ||
                                  sIt == s_wasStale.end() || sIt->second != stale;
             if (changed) {
-                static std::atomic<int> sCullLogs{0};
-                if (sCullLogs.fetch_add(1, std::memory_order_relaxed) < 80) {
+                if (sCullLogs.fetch_add(1, std::memory_order_relaxed) < kCullLogCap) {
                     _MESSAGE("FO4RemixPlugin: [HeadDiag] skinvis \"%s\" hash=%016llX "
                              "flags=%016llX age=%llu",
                              nm ? nm : "", (unsigned long long)key,
@@ -1259,6 +1269,11 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 }
                 g_lodChunkKeys.erase(it->first);
                 g_skinnedKeys.erase(it->first);
+                // Free any DrawCapture watch keyed to this drawable: after
+                // this erase nothing will ever poll it again, and a stranded
+                // upgrade-hunt watch would pin a slot + keep the bind scan
+                // hot for the rest of the session (cell-churn staleness).
+                DrawCapture::Drop(it->first);
                 it = g_drawableMap.erase(it);
                 ++evicted;
             } else {
@@ -1290,16 +1305,19 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // geometry pointer. >0 means the same BSGeometry is being submitted
         // under multiple PassKeys (different property/material variants),
         // which would render N times -- a candidate cause for the "two
-        // versions of the same object" overlap symptom.
-        std::unordered_set<void*> distinct;
-        distinct.reserve(g_drawableMap.size());
-        for (const auto& [k, st] : g_drawableMap) {
-            if (st.geometry) {
-                distinct.insert(st.geometry);
-                ++entriesWithGeo;
+        // versions of the same object" overlap symptom. Diagnostic-only
+        // (feeds the log line below), so skipped when diagnostics are off.
+        if (g_config.diagEnabled) {
+            std::unordered_set<void*> distinct;
+            distinct.reserve(g_drawableMap.size());
+            for (const auto& [k, st] : g_drawableMap) {
+                if (st.geometry) {
+                    distinct.insert(st.geometry);
+                    ++entriesWithGeo;
+                }
             }
+            distinctGeoPtrs = distinct.size();
         }
-        distinctGeoPtrs = distinct.size();
     }
 
     const size_t geoDups = (entriesWithGeo > distinctGeoPtrs)

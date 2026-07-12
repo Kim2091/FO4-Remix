@@ -160,6 +160,13 @@ namespace SemanticCapture {
         uint32_t mergeWatchRecordCount      = 0;
         uint32_t mergeWatchSegTris[4]       = {};
 
+        // Cached merge-instanced classification (-1 unknown, 0 plain,
+        // 1 BSMergeInstancedTriShape). The RTTI leaf-class walk + strstr
+        // the lighting resolver used to run on EVERY attempt of EVERY
+        // non-skinned drawable is paid once per drawable now -- a live
+        // shape's leaf class can't change.
+        int8_t   mergeLeafKind              = -1;
+
         // Resolve deferrals spent waiting on the t7 table wrapper's
         // pending-upload counter (lighting resolver, take 13.1). Bounded:
         // the +0x44 counter was decompiler-proven only for the bake-path

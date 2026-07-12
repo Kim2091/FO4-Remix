@@ -20,13 +20,13 @@ struct ExtractedTexture {
 };
 
 struct ExtractedMesh {
-    uint64_t hash;
+    uint64_t hash = 0;
     std::vector<remixapi_HardcodedVertex> vertices;
     std::vector<uint32_t> indices;
-    float worldTransform[3][4]; // row-major 3x4 for remixapi_Transform
-    uint64_t diffuseTextureHash;    // 0 = no texture
-    uint64_t normalTextureHash;     // 0 = no texture
-    uint64_t roughnessTextureHash;  // 0 = no texture (FO4 smoothness/spec mask)
+    float worldTransform[3][4] = {}; // row-major 3x4 for remixapi_Transform
+    uint64_t diffuseTextureHash = 0;    // 0 = no texture
+    uint64_t normalTextureHash = 0;     // 0 = no texture
+    uint64_t roughnessTextureHash = 0;  // 0 = no texture (FO4 smoothness/spec mask)
     uint64_t emissiveTextureHash = 0;   // 0 = no glow map (from BSLightingShaderMaterialGlowmap)
     float emissiveColorR = 0.0f;        // Emissive color R from BSLightingShaderProperty (0-1)
     float emissiveColorG = 0.0f;        // Emissive color G

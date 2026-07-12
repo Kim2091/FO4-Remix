@@ -23,6 +23,20 @@ std::atomic<uint64_t> g_cumLightsExtracted{0};
 constexpr uint64_t kFrameLogWarmupCount = 10;
 constexpr uint64_t kFrameLogInterval    = 300;
 
+// Per-event cell lines are the classic churn-spam source (fast travel /
+// boundary walking attach+detach storms, each line an fflush on the game
+// thread). Counters always accumulate -- EmitPeriodic reports them every
+// 300 frames -- but the per-event line is gated on Diagnostics.Enabled and
+// budgeted: the first kCellLogBudget events log verbatim, then 1 in
+// kCellLogSample so a long session stays sampled rather than silent.
+constexpr uint64_t kCellLogBudget = 50;
+constexpr uint64_t kCellLogSample = 32;
+inline bool CellEventShouldLog(uint64_t eventOrdinal) {
+    return g_config.diagEnabled &&
+           (eventOrdinal <= kCellLogBudget ||
+            (eventOrdinal % kCellLogSample) == 0);
+}
+
 }  // namespace
 
 namespace Diagnostics {
@@ -43,18 +57,36 @@ bool ShouldEmitPeriodic(uint64_t frameIndex) {
 
 void OnCellLoaded(uint32_t cellID, size_t meshes, size_t skinned,
                   size_t textures, size_t lights) {
-    g_cumCellsLoaded.fetch_add(1, std::memory_order_relaxed);
+    const uint64_t n = g_cumCellsLoaded.fetch_add(1, std::memory_order_relaxed) + 1;
     g_cumMeshesExtracted.fetch_add(meshes, std::memory_order_relaxed);
     g_cumSkinnedMeshes.fetch_add(skinned, std::memory_order_relaxed);
     g_cumTexturesExtracted.fetch_add(textures, std::memory_order_relaxed);
     g_cumLightsExtracted.fetch_add(lights, std::memory_order_relaxed);
-    _MESSAGE("FO4RemixPlugin: [Diag] CellLoaded id=0x%08X meshes=%zu skinned=%zu textures=%zu lights=%zu",
-             cellID, meshes, skinned, textures, lights);
+    if (CellEventShouldLog(n)) {
+        _MESSAGE("FO4RemixPlugin: [Diag] CellLoaded #%llu id=0x%08X meshes=%zu skinned=%zu textures=%zu lights=%zu",
+                 (unsigned long long)n, cellID, meshes, skinned, textures, lights);
+    }
 }
 
 void OnCellUnloaded(uint32_t cellID) {
-    g_cumCellsUnloaded.fetch_add(1, std::memory_order_relaxed);
-    _MESSAGE("FO4RemixPlugin: [Diag] CellUnloaded id=0x%08X", cellID);
+    const uint64_t n = g_cumCellsUnloaded.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (CellEventShouldLog(n)) {
+        _MESSAGE("FO4RemixPlugin: [Diag] CellUnloaded #%llu id=0x%08X",
+                 (unsigned long long)n, cellID);
+    }
+}
+
+// SEH-guarded read of the cell identity fields: the player-cell pointer can
+// be non-null yet mid-teardown during load/unload transitions, and this is
+// a diagnostics path -- never worth an AV on the game thread.
+static bool ReadCellIdentity(uintptr_t cellPtr, uint32_t* formID, uint32_t* flags) {
+    __try {
+        *formID = *reinterpret_cast<const uint32_t*>(cellPtr + 0x14);  // TESForm::formID
+        *flags  = *reinterpret_cast<const uint32_t*>(cellPtr + 0x40);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
 }
 
 GameStateSnapshot SnapshotGameState() {
@@ -62,9 +94,10 @@ GameStateSnapshot SnapshotGameState() {
 
     // Cell identity — formID and interior flag.
     uintptr_t cellPtr = BsExtraction::GetPlayerCellPtr();
-    if (cellPtr) {
-        ctx.cellFormID  = *reinterpret_cast<const uint32_t*>(cellPtr + 0x14);  // TESForm::formID
-        ctx.cellInterior = (*reinterpret_cast<const uint32_t*>(cellPtr + 0x40)) & 1;  // flags bit 0
+    uint32_t formID = 0, cellFlags = 0;
+    if (cellPtr && ReadCellIdentity(cellPtr, &formID, &cellFlags)) {
+        ctx.cellFormID   = formID;
+        ctx.cellInterior = cellFlags & 1;  // flags bit 0
     }
 
     // Player world position (TESObjectREFR::pos at +0xD0).

@@ -485,21 +485,9 @@ static bool PeekBytesGuarded(const void* src, void* dst, size_t bytes) {
     }
 }
 
-// Enough of IEEE half for diagnostics (denorms flushed to zero).
-static float HalfToFloat(uint16_t h) {
-    const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
-    uint32_t f;
-    if (e == 0) {
-        f = s << 31;
-    } else if (e == 31) {
-        f = (s << 31) | 0x7F800000u;
-    } else {
-        f = (s << 31) | ((e + 112u) << 23) | (m << 13);
-    }
-    float out;
-    std::memcpy(&out, &f, 4);
-    return out;
-}
+// Half-float decode comes from config.h's shared HalfToFloat (a local copy
+// here used to shadow it with divergent denormal handling -- a silent trap
+// for anyone fixing the shared one; removed 2026-07-10).
 
 // ---- Take 11 (scene-graph baked-chunk walk) REMOVED (2026-07-04) ----
 // Live re-verification (frida, same save/binary) disproved every premise:
@@ -1149,8 +1137,11 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     const bool isSkinned = (tri->vertexDesc & BSGeometry::kFlag_Skinned) != 0;
 
     // [HeadDiag]: identity line fires once per hash (dedup on content), then
-    // each gate below reports the first time this shape fails it.
-    const bool headDiag = HeadDiagMatch(tri, state);
+    // each gate below reports the first time this shape fails it. Gated on
+    // Diagnostics.Enabled -- the match itself is up to 3x8 case-insensitive
+    // substring scans per drawable per attempt, pure scaffolding from the
+    // (resolved) missing-FaceGen-heads investigation.
+    const bool headDiag = g_config.diagEnabled && HeadDiagMatch(tri, state);
     if (headDiag) {
         char leaf[64] = "?";
         SemanticCapture::GetLeafClassName(tri, leaf, sizeof(leaf));
@@ -1303,8 +1294,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             const int st = BsExtraction::SampleLookupColor(
                 mat->spLookupTexture, device, /*u=*/0.75f, v, pal);
             if (st == 1) {
-                cached->mesh = std::move(mesh);
-                state.resolveCache = std::move(cacheHolder);
+                // Same attempt cap as stashPhase1Cache: without it a LUT
+                // that never reads back keeps a full vertex copy pinned in
+                // the cache for this drawable indefinitely.
+                if (state.resolveAttempts <= kResolveCacheMaxAttempts) {
+                    cached->mesh = std::move(mesh);
+                    state.resolveCache = std::move(cacheHolder);
+                }
                 if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending (cached)");
                 return false;
             }
@@ -1684,7 +1680,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     }
 
     // ---- [WindDiag] inside-out investigation (2026-07-08) ----
-    LogWindingDiag(tri, mesh, parsed, mat, propFlagsEarly, state);
+    // Gated on Diagnostics.Enabled: the parity pass inside walks every
+    // triangle of the first N shapes, all during the heaviest cell load
+    // (and the inside-out root cause was found -- b112e08).
+    if (g_config.diagEnabled) {
+        LogWindingDiag(tri, mesh, parsed, mat, propFlagsEarly, state);
+    }
 
     // ---- Skin / hair tint (2026-07-08 broken-NPC-colors fix) ----
     // FO4 authors unpigmented/grayscale diffuse maps for tinted body parts and
@@ -1901,7 +1902,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     {
         const uint64_t d = parsed.vertexDesc;
         const bool hasColorStream = (d & (1ULL << 49)) != 0;
-        if (hasColorStream && parsed.vbData && parsed.vertexSize > 0) {
+        if (g_config.diagEnabled &&
+            hasColorStream && parsed.vbData && parsed.vertexSize > 0) {
             const uint32_t szV = (uint32_t)((d >> 4) & 0xF);
             const uint32_t shift = parsed.isDynamic ? 0u : szV;
             const uint32_t oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
@@ -2175,10 +2177,17 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     uint32_t t7GS = 0;
     bool t7Valid = false;
     if (g_config.mergeInstanceExpansion && g_config.gpuInstancingEnabled) {
-        char instLeaf[64] = "";
-        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
-                                          instLeaf, sizeof(instLeaf));
-        if (std::strstr(instLeaf, "MergeInstanced") != nullptr) {
+        // Classify once per drawable (state.mergeLeafKind caches the RTTI
+        // walk + substring scan; retrying drawables used to re-pay it every
+        // attempt).
+        if (state.mergeLeafKind < 0) {
+            char instLeaf[64] = "";
+            SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
+                                              instLeaf, sizeof(instLeaf));
+            state.mergeLeafKind =
+                (std::strstr(instLeaf, "MergeInstanced") != nullptr) ? 1 : 0;
+        }
+        if (state.mergeLeafKind == 1) {
             const bool got = ReadMergeInstanceRecords(tri, instRecords,
                                                       &instBufPtr, &instSrvPtr);
             if (got) {
@@ -2587,7 +2596,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             // or wild UVs -> (b).
             {
                 static std::atomic<int> sVtxLogs{0};
-                const int vn = sVtxLogs.fetch_add(1, std::memory_order_relaxed);
+                const int vn = g_config.diagEnabled
+                    ? sVtxLogs.fetch_add(1, std::memory_order_relaxed) : 150;
                 if (vn < 150 && !mesh.vertices.empty()) {
                     uint32_t rMin = 255, rMax = 0;
                     uint64_t rSum = 0, gSum = 0, bSum = 0, aSum = 0;
@@ -3070,7 +3080,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // on backface culling for these). Until the [MergeWind] stats below
         // justify a per-triangle normal-matched re-flip, double-sided is
         // the vanilla-faithful choice; scope is merge shapes only.
-        mesh.isTwoSided = true;
+        // [Performance] MergeTwoSided=0 is the single-sided experiment: the
+        // 2026-07-07 inside-out evidence predated the b112e08 batched-base
+        // mirror fix, which may have been the real culprit -- single-sided
+        // merges (with the per-instance det flip below re-enabled) would be
+        // a real path-tracing perf win if the content winding holds up.
+        mesh.isTwoSided = g_config.mergeTwoSided;
         // [MergeWind] winding-vs-normals stats: fraction of sampled
         // triangles whose geometric normal (current winding) OPPOSES the
         // authored vertex normals. ~0 or ~1 per shape = consistent content
@@ -3078,7 +3093,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // mid-range = mixed within one mesh.
         {
             static std::atomic<int> sWindLogs{0};
-            if (sWindLogs.load(std::memory_order_relaxed) < 40 &&
+            if (g_config.diagEnabled &&
+                sWindLogs.load(std::memory_order_relaxed) < 40 &&
                 !mesh.indices.empty()) {
                 const size_t nTri = mesh.indices.size() / 3;
                 const size_t step = nTri > 200 ? nTri / 200 : 1;
@@ -3173,17 +3189,24 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 // triangles re-flipped or its single-sided faces cull
                 // inward (Vault 111 walls). Toggle in place; the content
                 // hash covers indices, so flipped instances get their own
-                // mesh/BLAS bucket.
-                const float detC =
-                    comp[0] * (comp[5] * comp[10] - comp[6] * comp[9]) -
-                    comp[1] * (comp[4] * comp[10] - comp[6] * comp[8]) +
-                    comp[2] * (comp[4] * comp[9]  - comp[5] * comp[8]);
-                const bool needFlip = detC < 0.0f;
-                if (needFlip != meshWindingFlipped) {
-                    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
-                        std::swap(mesh.indices[t + 1], mesh.indices[t + 2]);
+                // mesh/BLAS bucket. SKIPPED while the merge renders two-
+                // sided (2026-07-10): under double-sided rendering the flip
+                // is visually a no-op, but it still burned O(indices) swaps
+                // per det-sign change and split otherwise-identical
+                // instances into two BLAS/instancing buckets -- defeating
+                // the sharing the merge path exists to provide.
+                if (!mesh.isTwoSided) {
+                    const float detC =
+                        comp[0] * (comp[5] * comp[10] - comp[6] * comp[9]) -
+                        comp[1] * (comp[4] * comp[10] - comp[6] * comp[8]) +
+                        comp[2] * (comp[4] * comp[9]  - comp[5] * comp[8]);
+                    const bool needFlip = detC < 0.0f;
+                    if (needFlip != meshWindingFlipped) {
+                        for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+                            std::swap(mesh.indices[t + 1], mesh.indices[t + 2]);
+                        }
+                        meshWindingFlipped = needFlip;
                     }
-                    meshWindingFlipped = needFlip;
                 }
                 // Raw buffer instead of `NiTransform xf;`: f4se_minimal
                 // declares but does not define NiPoint3's default ctor, so
@@ -3246,97 +3269,107 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // For 1B, ReleaseDrawable looks up by `hash` and finds the materialHash
     // via g_drawables, so leaving state.materialHash at 0 is fine -- the
     // refcount cleanup goes through g_drawables anyway.
-    // LOD-overlap diagnostic (2026-04-28): include geometry name, the
-    // static IsMeshLOD bit (from initialFlags captured on first-seen),
-    // the live flag word at submit time, technique flag from the hook
-    // arg, world position, and the parent NiNode chain (2 levels up,
-    // captured in the detour). Parent reads are guarded by null checks;
-    // the resolver is wrapped in SEH at the caller, so a stale parent
-    // pointer that survived freshness gating gets caught upstream.
-    const char* meshName = obj->m_name.c_str();
-    const bool  isLOD = ((state.initialFlags >> 12) & 1ULL) != 0;
+    // Per-submission diagnostic, gated on [Logging] LogShapeInfo (2026-07-10;
+    // it was unconditional -- the one hot-path log with no throttle. A cell
+    // attach resolves hundreds of statics in one burst on the game thread,
+    // each paying an RTTI walk + raw engine reads + a ~30-arg _MESSAGE, all
+    // competing with the resolve time budget).
+    if (g_config.logShapeInfo) {
+        // LOD-overlap diagnostic (2026-04-28): include geometry name, the
+        // static IsMeshLOD bit (from initialFlags captured on first-seen),
+        // the live flag word at submit time, technique flag from the hook
+        // arg, world position, and the parent NiNode chain (2 levels up,
+        // captured in the detour). Parent reads are guarded by null checks;
+        // the resolver is wrapped in SEH at the caller, so a stale parent
+        // pointer that survived freshness gating gets caught upstream.
+        const char* meshName = obj->m_name.c_str();
+        const bool  isLOD = ((state.initialFlags >> 12) & 1ULL) != 0;
 
-    const char* p1Name = "";
-    uint64_t    p1Flags = 0;
-    const char* p2Name = "";
-    uint64_t    p2Flags = 0;
-    if (state.parent1) {
-        auto* pn = static_cast<NiAVObject*>(state.parent1);
-        const char* n = pn->m_name.c_str();
-        p1Name = n ? n : "";
-        p1Flags = pn->flags;
-    }
-    if (state.parent2) {
-        auto* pn = static_cast<NiAVObject*>(state.parent2);
-        const char* n = pn->m_name.c_str();
-        p2Name = n ? n : "";
-        p2Flags = pn->flags;
-    }
+        const char* p1Name = "";
+        uint64_t    p1Flags = 0;
+        const char* p2Name = "";
+        uint64_t    p2Flags = 0;
+        if (state.parent1) {
+            auto* pn = static_cast<NiAVObject*>(state.parent1);
+            const char* n = pn->m_name.c_str();
+            p1Name = n ? n : "";
+            p1Flags = pn->flags;
+        }
+        if (state.parent2) {
+            auto* pn = static_cast<NiAVObject*>(state.parent2);
+            const char* n = pn->m_name.c_str();
+            p2Name = n ? n : "";
+            p2Flags = pn->flags;
+        }
 
-    // Alpha-test diagnostic (2026-04-29): emit material type, BSShaderProperty
-    // shader-flags, and the contents of geo->effectState (the NiAlphaProperty
-    // slot at offset 0x130 on BSGeometry per f4se BSGeometry.h). For foliage
-    // drawables that render as solid alpha cards, we want to know which
-    // alpha-test signal source the engine is using -- NiAlphaProperty (geo
-    // level), BSLightingShaderProperty::flags (shader level), or BSLighting-
-    // ShaderMaterialBase fields (material level, requires GetType discriminator).
-    const uint32_t matType = mat ? mat->GetType() : 0xFFFFFFFFu;
-    uint64_t       propFlags = 0;
-    if (state.property) {
-        propFlags = *reinterpret_cast<uint64_t*>(
-            reinterpret_cast<uintptr_t>(state.property) + 0x30);
-    }
-    void*    effectState     = *reinterpret_cast<void**>(
-        reinterpret_cast<uintptr_t>(tri) + 0x130);
-    uint16_t alphaFlags      = 0;
-    uint8_t  alphaThreshold  = 0;
-    if (effectState) {
-        alphaFlags     = *reinterpret_cast<uint16_t*>(
-            reinterpret_cast<uintptr_t>(effectState) + 0x28);
-        alphaThreshold = *reinterpret_cast<uint8_t*>(
-            reinterpret_cast<uintptr_t>(effectState) + 0x2A);
-    }
+        // Alpha-test diagnostic (2026-04-29): emit material type,
+        // BSShaderProperty shader-flags, and the contents of geo->effectState
+        // (the NiAlphaProperty slot at offset 0x130 on BSGeometry per f4se
+        // BSGeometry.h). For foliage drawables that render as solid alpha
+        // cards, we want to know which alpha-test signal source the engine is
+        // using -- NiAlphaProperty (geo level), BSLightingShaderProperty::
+        // flags (shader level), or BSLightingShaderMaterialBase fields
+        // (material level, requires GetType discriminator).
+        const uint32_t matType = mat ? mat->GetType() : 0xFFFFFFFFu;
+        uint64_t       propFlags = 0;
+        if (state.property) {
+            propFlags = *reinterpret_cast<uint64_t*>(
+                reinterpret_cast<uintptr_t>(state.property) + 0x30);
+        }
+        void*    effectState     = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(tri) + 0x130);
+        uint16_t alphaFlags      = 0;
+        uint8_t  alphaThreshold  = 0;
+        if (effectState) {
+            alphaFlags     = *reinterpret_cast<uint16_t*>(
+                reinterpret_cast<uintptr_t>(effectState) + 0x28);
+            alphaThreshold = *reinterpret_cast<uint8_t*>(
+                reinterpret_cast<uintptr_t>(effectState) + 0x2A);
+        }
 
-    // Rotation+scale dump (PROBE 2026-05-03): roads/statics rendering flat
-    // when bUsePreCombines=0; need to see whether m_worldTransform.rot
-    // arrives as identity (rotation lost upstream) or with the slope intact
-    // (then BuildRemixTransform / Remix submission is the leak).
-    const auto& rot = tri->m_worldTransform.rot;
-    const float scale = tri->m_worldTransform.scale;
-    // Leaf RTTI class name (PROBE 2026-05-03): identify whether road/static
-    // sub-meshes are plain BSTriShape vs BSMergeInstancedTriShape vs another
-    // subclass with per-instance transform attributes we don't handle.
-    char leafClass[64] = "";
-    SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
-                                      leafClass, sizeof(leafClass));
-    _MESSAGE("FO4RemixPlugin: [Resolver] submitted hash=0x%llX name=\"%s\" "
-             "leafClass=\"%s\" "
-             "isLOD=%d isDecal=%d flags=0x%016llX tech=0x%08X pos=(%.1f,%.1f,%.1f) "
-             "p1=\"%s\"(0x%016llX) p2=\"%s\"(0x%016llX) "
-             "matType=%u propFlags=0x%016llX effectState=%p "
-             "alphaFlags=0x%04X alphaThreshold=%u alphaTestEnabled=%d "
-             "alphaBlendEnabled=%d srcFactor=%u dstFactor=%u "
-             "rot=[%.3f,%.3f,%.3f|%.3f,%.3f,%.3f|%.3f,%.3f,%.3f] scale=%.3f",
-             (unsigned long long)hash,
-             meshName ? meshName : "(null)",
-             leafClass[0] ? leafClass : "(unknown)",
-             isLOD ? 1 : 0,
-             mesh.isDecal ? 1 : 0,
-             (unsigned long long)state.lastFlags,
-             state.lastTechniqueFlags,
-             tri->m_worldTransform.pos.x,
-             tri->m_worldTransform.pos.y,
-             tri->m_worldTransform.pos.z,
-             p1Name, (unsigned long long)p1Flags,
-             p2Name, (unsigned long long)p2Flags,
-             matType, (unsigned long long)propFlags, effectState,
-             alphaFlags, alphaThreshold, mesh.alphaTestEnabled ? 1 : 0,
-             mesh.alphaBlendEnabled ? 1 : 0,
-             mesh.srcColorBlendFactor, mesh.dstColorBlendFactor,
-             rot.data[0][0], rot.data[0][1], rot.data[0][2],
-             rot.data[1][0], rot.data[1][1], rot.data[1][2],
-             rot.data[2][0], rot.data[2][1], rot.data[2][2],
-             scale);
+        // Rotation+scale dump (PROBE 2026-05-03): roads/statics rendering
+        // flat when bUsePreCombines=0; need to see whether
+        // m_worldTransform.rot arrives as identity (rotation lost upstream)
+        // or with the slope intact (then BuildRemixTransform / Remix
+        // submission is the leak).
+        const auto& rot = tri->m_worldTransform.rot;
+        const float scale = tri->m_worldTransform.scale;
+        // Leaf RTTI class name (PROBE 2026-05-03): identify whether
+        // road/static sub-meshes are plain BSTriShape vs
+        // BSMergeInstancedTriShape vs another subclass with per-instance
+        // transform attributes we don't handle.
+        char leafClass[64] = "";
+        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
+                                          leafClass, sizeof(leafClass));
+        _MESSAGE("FO4RemixPlugin: [Resolver] submitted hash=0x%llX name=\"%s\" "
+                 "leafClass=\"%s\" "
+                 "isLOD=%d isDecal=%d flags=0x%016llX tech=0x%08X pos=(%.1f,%.1f,%.1f) "
+                 "p1=\"%s\"(0x%016llX) p2=\"%s\"(0x%016llX) "
+                 "matType=%u propFlags=0x%016llX effectState=%p "
+                 "alphaFlags=0x%04X alphaThreshold=%u alphaTestEnabled=%d "
+                 "alphaBlendEnabled=%d srcFactor=%u dstFactor=%u "
+                 "rot=[%.3f,%.3f,%.3f|%.3f,%.3f,%.3f|%.3f,%.3f,%.3f] scale=%.3f",
+                 (unsigned long long)hash,
+                 meshName ? meshName : "(null)",
+                 leafClass[0] ? leafClass : "(unknown)",
+                 isLOD ? 1 : 0,
+                 mesh.isDecal ? 1 : 0,
+                 (unsigned long long)state.lastFlags,
+                 state.lastTechniqueFlags,
+                 tri->m_worldTransform.pos.x,
+                 tri->m_worldTransform.pos.y,
+                 tri->m_worldTransform.pos.z,
+                 p1Name, (unsigned long long)p1Flags,
+                 p2Name, (unsigned long long)p2Flags,
+                 matType, (unsigned long long)propFlags, effectState,
+                 alphaFlags, alphaThreshold, mesh.alphaTestEnabled ? 1 : 0,
+                 mesh.alphaBlendEnabled ? 1 : 0,
+                 mesh.srcColorBlendFactor, mesh.dstColorBlendFactor,
+                 rot.data[0][0], rot.data[0][1], rot.data[0][2],
+                 rot.data[1][0], rot.data[1][1], rot.data[1][2],
+                 rot.data[2][0], rot.data[2][1], rot.data[2][2],
+                 scale);
+    }
     for (const auto& t : newTextures) {
         state.textureHashes.insert(t.hash);
     }
