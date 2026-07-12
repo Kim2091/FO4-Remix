@@ -351,6 +351,9 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     const uint64_t frameIndex = Diagnostics::Tick();
     const uint64_t presentIdx =
         g_presentIndex.fetch_add(1, std::memory_order_relaxed) + 1;
+    // Frame boundary for raster suppression's UI-phase tracking: the phase
+    // resets here unless the UI RT is still bound (sticky pure-UI menus).
+    RasterSuppress::NotifyFrameEnd();
     if (Diagnostics::ShouldEmitPeriodic(frameIndex)) {
         const auto gs = Diagnostics::SnapshotGameState();
         Diagnostics::EmitPeriodic(frameIndex, gs);

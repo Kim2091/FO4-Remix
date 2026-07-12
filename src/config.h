@@ -292,11 +292,13 @@ struct PluginConfig {
     // but scene draw calls are not forwarded to the driver: game-side
     // textures become WDDM-demotable instead of pinning VRAM against the
     // path tracer (the modded-texture budget fight), and the raster GPU
-    // cost disappears. Draws to the detected UI render target and draws
-    // inside occlusion-query scopes still execute. Wants
-    // [Overlay] HudOverlayEnabled=1: with raster suppressed, the Remix
-    // overlay is the only readable UI. The game window intentionally shows
-    // stale/black frames while this is on. Default 0.
+    // cost disappears. Still executed: the frame's UI PHASE (first UI-RT
+    // bind through end of frame -- Scaleform glyph atlases, filters, and
+    // the backbuffer composite live in intermediate targets, so the whole
+    // tail forwards; scene/shadow/post passes run before it and stay
+    // suppressed) and draws inside occlusion-query scopes. Wants
+    // [Overlay] HudOverlayEnabled=1. The game window shows live UI over a
+    // stale scene while this is on. Default 0.
     bool suppressGameRaster;
 
     // Per-Tick wall-clock budget (milliseconds) for the semantic-capture

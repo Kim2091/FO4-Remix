@@ -47,7 +47,22 @@ void NotifyUiRT(ID3D11Texture2D* tex);
 // present_hook's OMSetRenderTargets hook reports, on every bind, whether the
 // UI RT is the current color target. Single-render-thread ordering is
 // assumed, same as DrawCapture's bind tracking.
+//
+// The first uiBound=true of a frame also opens the frame's UI PHASE: from
+// that point until the frame ends, EVERY draw is forwarded. Scaleform
+// rasterizes glyphs, filters, and modal elements through intermediate
+// render targets that are not the final UI RT (first field test: the
+// main-menu save-picker never appeared because its new glyphs/elements
+// were suppressed); the engine renders the scene strictly before the UI,
+// so phase-forwarding executes all of that UI plumbing -- plus the final
+// backbuffer composite, which keeps the game window's UI live -- while
+// scene passes, shadows, and post (all pre-UI) stay suppressed.
 void NotifyUiTargetBound(bool uiBound);
+
+// present_hook calls this once per Present (frame boundary). The UI phase
+// carries over into the next frame while the UI RT is STILL bound (pure-UI
+// menus never rebind); otherwise it resets until the next UI bind.
+void NotifyFrameEnd();
 
 // draw_capture's Begin/End hooks report occlusion-query scopes. Cheap: the
 // query-type inspection only runs when suppression is enabled.

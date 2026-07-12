@@ -10,6 +10,11 @@ namespace RasterSuppress {
 // tracking already relies on); atomics make the reads safe from anywhere.
 static std::atomic<ID3D11Texture2D*> g_uiRT{nullptr};
 static std::atomic<bool>             g_uiBound{false};
+// Frame's UI phase: set on the first UI-RT bind, cleared at Present unless
+// the UI RT is still bound (sticky pure-UI menus). While true, everything
+// forwards -- the engine's UI plumbing (glyph atlases, Scaleform filters,
+// composite) runs through targets that are not the UI RT itself.
+static std::atomic<bool>             g_uiPhase{false};
 static std::atomic<int>              g_occlusionDepth{0};
 
 static std::atomic<uint64_t> g_suppressed{0};
@@ -22,6 +27,17 @@ void NotifyUiRT(ID3D11Texture2D* tex) {
 
 void NotifyUiTargetBound(bool uiBound) {
     g_uiBound.store(uiBound, std::memory_order_relaxed);
+    if (uiBound) {
+        g_uiPhase.store(true, std::memory_order_relaxed);
+    }
+}
+
+void NotifyFrameEnd() {
+    // Carry the phase across the boundary while the UI RT stays bound:
+    // static popups/menus can go many frames without a single rebind, and
+    // their glyph/filter updates must keep forwarding.
+    g_uiPhase.store(g_uiBound.load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
 }
 
 // Only occlusion queries open a forward-scope: their results are derived
@@ -67,7 +83,9 @@ bool ShouldSuppress() {
     // leave the player with no readable UI anywhere during boot, and the
     // detection itself needs a few drawn+cleared frames to lock.
     if (!g_uiRT.load(std::memory_order_acquire)) return false;
-    if (g_uiBound.load(std::memory_order_relaxed)) {
+    // uiPhase subsumes uiBound (a UI bind opens the phase); checking the
+    // phase alone keeps the per-draw fast path to two relaxed loads.
+    if (g_uiPhase.load(std::memory_order_relaxed)) {
         g_forwardedUi.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
