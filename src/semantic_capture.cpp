@@ -1440,8 +1440,8 @@ void SemanticCapture::ClearDrawableMap() {
     const size_t totalCount = g_drawableMap.size();
     size_t submittedCount = 0;
 
-    // Release Remix-side handles for every submitted entry first. ~NiPointer
-    // below will only release engine refs; it doesn't know about g_drawables
+    // Release Remix-side handles for every submitted entry first -- the map
+    // clear below only drops our records; it doesn't know about g_drawables
     // / g_meshCache / g_materialCache / g_textureHandles.
     for (auto& [key, state] : g_drawableMap) {
         if (state.submittedToRemix && state.meshHash != 0) {
@@ -1470,6 +1470,11 @@ void SemanticCapture::ClearDrawableMap() {
     g_dirtyPoses.clear();
     g_lodChunkKeys.clear();
     g_skinnedKeys.clear();
+
+    // Async merge-readback slices are keyed by buffer identity; the
+    // destination world recycles those addresses, so stale entries could
+    // serve old-world bytes to a new-world bake.
+    Resolvers::ResetSliceCache();
 
     _MESSAGE("FO4RemixPlugin: [Reload] cleared %zu drawables (%zu submitted) on PreLoadGame",
              totalCount, submittedCount);

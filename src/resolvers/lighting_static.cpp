@@ -146,31 +146,160 @@ static int QiGuarded(void* obj, const GUID* iid, void** out) {
     }
 }
 
+// ---- Async buffer-slice readback (2026-07-13 pop-in fix) ----
+// The old synchronous version Map(READ)-blocked on a just-issued staging
+// copy, forcing a full GPU pipeline sync on the game thread PER slice --
+// log-measured 9-45ms per merge-instanced resolve (t7 read + record read +
+// up to 2 syncs per captured chunk), which blew the 3ms resolve budget with
+// attempted=1 and set the ~1-drawable-per-tick drain rate behind "a 360 in
+// Sanctuary takes a minute to finish loading" (the same stalls were the
+// streaming hitches). Two-phase instead: the first request issues the
+// staging copy and reports pending; later attempts poll with
+// D3D11_MAP_FLAG_DO_NOT_WAIT. Callers defer the whole resolve exactly like
+// a not-yet-decoded texture and re-enter on the retry tick.
+//
+// Ready slices KEEP their bytes cached (not consumed on read): one chunk
+// bake walks many chunks across attempts, and the IB slices must survive
+// while the VB slices they gate are still in flight. Keyed by (identity
+// pointer, offset, bytes); a recycled buffer address with identical
+// offset+size could serve stale-world bytes, so entries are TTL'd short,
+// the whole cache drops on world swap (ResetTransientCaches), and -- same
+// as the sync path -- the bake-time bound/record-anchor gates catch what
+// slips through. Single-threaded: only the resolver (game thread) touches
+// this.
+enum class SliceStatus { kReady, kPending, kFailed };
+
+struct PendingSlice {
+    ID3D11Buffer*        staging = nullptr;  // non-null while the copy is in flight
+    std::vector<uint8_t> data;               // filled once the Map lands
+    uint32_t             bytes = 0;
+    uint64_t             lastTouchMs = 0;
+};
+static std::unordered_map<uint64_t, PendingSlice> g_sliceCache;
+static size_t   g_sliceCacheBytes = 0;
+static uint64_t g_sliceLastSweepMs = 0;
+constexpr uint64_t kSliceTTLMs       = 5000;      // consumers finish in ~2-3 ticks
+constexpr size_t   kSliceCacheMaxBytes = 64u << 20;
+
+static uint64_t SliceKey(const void* identity, uint32_t srcOff, uint32_t bytes) {
+    uint64_t h = 0xCBF29CE484222325ULL ^ reinterpret_cast<uintptr_t>(identity);
+    h *= 0x100000001B3ULL;
+    h ^= srcOff;
+    h *= 0x100000001B3ULL;
+    h ^= bytes;
+    h *= 0x100000001B3ULL;
+    return h;
+}
+
+static void EraseSlice(std::unordered_map<uint64_t, PendingSlice>::iterator it) {
+    if (it->second.staging) it->second.staging->Release();
+    g_sliceCacheBytes -= (std::min)((size_t)it->second.bytes, g_sliceCacheBytes);
+    g_sliceCache.erase(it);
+}
+
+static void SweepSliceCache(uint64_t nowMs) {
+    if (nowMs - g_sliceLastSweepMs < 1000 &&
+        g_sliceCacheBytes <= kSliceCacheMaxBytes) {
+        return;
+    }
+    g_sliceLastSweepMs = nowMs;
+    for (auto it = g_sliceCache.begin(); it != g_sliceCache.end();) {
+        if (nowMs - it->second.lastTouchMs > kSliceTTLMs) {
+            auto victim = it++;
+            EraseSlice(victim);
+        } else {
+            ++it;
+        }
+    }
+    // Byte-cap backstop: evict least-recently-touched until under budget.
+    // Entries touched within the last 100ms belong to the attempt in
+    // progress -- evicting those would make the retry reissue them and
+    // thrash; leave them for the TTL instead.
+    while (g_sliceCacheBytes > kSliceCacheMaxBytes && !g_sliceCache.empty()) {
+        auto oldest = g_sliceCache.end();
+        for (auto it = g_sliceCache.begin(); it != g_sliceCache.end(); ++it) {
+            if (nowMs - it->second.lastTouchMs < 100) continue;
+            if (oldest == g_sliceCache.end() ||
+                it->second.lastTouchMs < oldest->second.lastTouchMs) {
+                oldest = it;
+            }
+        }
+        if (oldest == g_sliceCache.end()) break;
+        EraseSlice(oldest);
+    }
+}
+
 // Copy `bytes` at `srcOff` of a buffer through a staging buffer created on
 // the buffer's OWN device (which may differ from the resolver's device).
-// Blocking Map -- acceptable because it runs at most once per merge-
-// instanced shape at resolve time (the result is baked into the submitted
-// drawables); the texture readback in bs_extraction does the same on this
-// thread.
-static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t bytes,
-                                    std::vector<uint8_t>& out) {
-    // Range-check against the LIVE buffer first: an out-of-range
-    // CopySubresourceRegion is silently dropped by the D3D11 runtime (void
-    // return, no-op in release), but the Map below still succeeds -- the
-    // never-written staging memory (typically all zeros) would then be
-    // returned as "successful" readback data. Chunk offsets are snapshotted
-    // identities; a pool buffer reallocated smaller at the same address
-    // passes the pointer/QI checks and lands here out of range.
+// `identity` is the stable cache identity for this source (the DrawCapture
+// identity pointer for chunk buffers; the live buffer pointer elsewhere).
+// kReady fills `out`; kPending means poll again next tick; kFailed means
+// the slice can't be read (out of range, create/copy/map failure).
+static SliceStatus ReadbackBufferSliceAsync(ID3D11Buffer* buf, const void* identity,
+                                            uint32_t srcOff, uint32_t bytes,
+                                            std::vector<uint8_t>& out) {
+    const uint64_t nowMs = GetTickCount64();
+    SweepSliceCache(nowMs);
+    const uint64_t key = SliceKey(identity, srcOff, bytes);
+    auto it = g_sliceCache.find(key);
+    if (it != g_sliceCache.end() && it->second.bytes != bytes) {
+        // 64-bit key collision or aliased identity: drop and reissue.
+        EraseSlice(it);
+        it = g_sliceCache.end();
+    }
+    if (it != g_sliceCache.end()) {
+        PendingSlice& s = it->second;
+        s.lastTouchMs = nowMs;
+        if (!s.staging) {
+            out = s.data;   // stays cached for other consumers of this bake
+            return SliceStatus::kReady;
+        }
+        // Poll the in-flight copy without stalling the pipeline.
+        SliceStatus status = SliceStatus::kFailed;
+        ID3D11Device* dev = nullptr;
+        s.staging->GetDevice(&dev);
+        if (dev) {
+            ID3D11DeviceContext* ctx = nullptr;
+            dev->GetImmediateContext(&ctx);
+            if (ctx) {
+                D3D11_MAPPED_SUBRESOURCE ms = {};
+                const HRESULT hr = ctx->Map(s.staging, 0, D3D11_MAP_READ,
+                                            D3D11_MAP_FLAG_DO_NOT_WAIT, &ms);
+                if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+                    status = SliceStatus::kPending;
+                } else if (SUCCEEDED(hr)) {
+                    s.data.assign(static_cast<const uint8_t*>(ms.pData),
+                                  static_cast<const uint8_t*>(ms.pData) + bytes);
+                    ctx->Unmap(s.staging, 0);
+                    s.staging->Release();
+                    s.staging = nullptr;
+                    out = s.data;
+                    status = SliceStatus::kReady;
+                }
+                ctx->Release();
+            }
+            dev->Release();
+        }
+        if (status == SliceStatus::kFailed) EraseSlice(it);
+        return status;
+    }
+    // New request: range-check against the LIVE buffer first. An
+    // out-of-range CopySubresourceRegion is silently dropped by the D3D11
+    // runtime (void return, no-op in release) but the Map still succeeds --
+    // never-written staging memory (typically zeros) would come back as
+    // "successful" readback data. Chunk offsets are snapshotted identities;
+    // a pool buffer reallocated smaller at the same address passes the
+    // pointer/QI checks and lands here out of range.
     D3D11_BUFFER_DESC srcDesc = {};
     buf->GetDesc(&srcDesc);
     if (bytes == 0 || srcOff > srcDesc.ByteWidth ||
         bytes > srcDesc.ByteWidth - srcOff) {
-        return 0;
+        return SliceStatus::kFailed;
     }
     ID3D11Device* dev = nullptr;
     buf->GetDevice(&dev);
-    if (!dev) return 0;
-    uint32_t got = 0;
+    if (!dev) return SliceStatus::kFailed;
+    SliceStatus status = SliceStatus::kFailed;
     D3D11_BUFFER_DESC sd = {};
     sd.ByteWidth      = bytes;
     sd.Usage          = D3D11_USAGE_STAGING;
@@ -182,19 +311,27 @@ static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t
         if (ctx) {
             D3D11_BOX box = { srcOff, 0, 0, srcOff + bytes, 1, 1 };
             ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, buf, 0, &box);
-            D3D11_MAPPED_SUBRESOURCE ms = {};
-            if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &ms))) {
-                out.resize(bytes);
-                std::memcpy(out.data(), ms.pData, bytes);
-                ctx->Unmap(staging, 0);
-                got = bytes;
-            }
+            PendingSlice s;
+            s.staging = staging;   // ownership moves to the cache
+            s.bytes = bytes;
+            s.lastTouchMs = nowMs;
+            g_sliceCache.emplace(key, std::move(s));
+            g_sliceCacheBytes += bytes;
+            staging = nullptr;
+            status = SliceStatus::kPending;
             ctx->Release();
         }
-        staging->Release();
     }
+    if (staging) staging->Release();
     dev->Release();
-    return got;
+    return status;
+}
+
+void ResetSliceCache() {
+    for (auto it = g_sliceCache.begin(); it != g_sliceCache.end();) {
+        auto victim = it++;
+        EraseSlice(victim);
+    }
 }
 
 static bool HeapLikePtr(uint64_t q);
@@ -533,7 +670,9 @@ static bool PeekBytesGuarded(const void* src, void* dst, size_t bytes) {
 // every sampled position inside the shape's world bound (leaf rotations
 // are identity on every sampled merged shape, so the local-space bound is
 // just the world bound recentered on the leaf position).
-static bool BuildMeshFromChunks(BSTriShape* tri,
+enum class BakeStatus { kOk, kPending, kFailed };
+
+static BakeStatus BuildMeshFromChunks(BSTriShape* tri,
                                 const DrawCapture::ChunkDraw* chunks, int nChunks,
                                 uint64_t hash,
                                 const std::vector<std::array<float, 20>>& recs,
@@ -578,6 +717,19 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
     }
     int dFmt = 0, dIb = 0, dWin = 0, dVb = 0, dBound = 0, dRec = 0;
 
+    // ---- Gather pass: request/poll every chunk's slices (async). ----
+    // All copies for all chunks get ISSUED on the first attempt (they fly in
+    // parallel); nothing is appended until every non-dropped chunk has both
+    // slices in hand, so a pending return leaves no partial output and the
+    // retry rebuilds from the still-cached slices.
+    struct ChunkSlices {
+        std::vector<uint8_t> ib;
+        std::vector<uint8_t> vb;
+        uint32_t             mn = 0;
+        bool                 usable = false;
+    };
+    std::vector<ChunkSlices> gathered((size_t)nChunks);
+    bool anyPending = false;
     for (int c = 0; c < nChunks; ++c) {
         const DrawCapture::ChunkDraw& ch = chunks[c];
         if (ch.ibFormat != 57 /*R16_UINT*/ || ch.vbStride != 32 ||
@@ -587,12 +739,13 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
         }
         ID3D11Buffer* ibb = SafeBufferFromIdentity(ch.ib);
         if (!ibb) { ++dIb; continue; }
-        std::vector<uint8_t> ibBytes;
-        const bool ibOk = ReadbackBufferSlice(ibb, ch.ibOffset, ch.idxCount * 2,
-                                              ibBytes) == ch.idxCount * 2;
+        ChunkSlices& cs = gathered[(size_t)c];
+        const SliceStatus ibSt = ReadbackBufferSliceAsync(
+            ibb, ch.ib, ch.ibOffset, ch.idxCount * 2, cs.ib);
         ibb->Release();
-        if (!ibOk) { ++dIb; continue; }
-        const uint16_t* idx = reinterpret_cast<const uint16_t*>(ibBytes.data());
+        if (ibSt == SliceStatus::kPending) { anyPending = true; continue; }
+        if (ibSt != SliceStatus::kReady) { ++dIb; continue; }
+        const uint16_t* idx = reinterpret_cast<const uint16_t*>(cs.ib.data());
         uint16_t mn = 0xFFFF, mx = 0;
         for (uint32_t i = 0; i < ch.idxCount; ++i) {
             if (idx[i] < mn) mn = idx[i];
@@ -602,11 +755,25 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
         if (nVerts > 70000) { ++dWin; continue; }
         ID3D11Buffer* vbb = SafeBufferFromIdentity(ch.vb);
         if (!vbb) { ++dVb; continue; }
-        std::vector<uint8_t> vbytes;
-        const bool vbOk = ReadbackBufferSlice(vbb, ch.vbOffset + (uint32_t)mn * 32u,
-                                              nVerts * 32u, vbytes) == nVerts * 32u;
+        const SliceStatus vbSt = ReadbackBufferSliceAsync(
+            vbb, ch.vb, ch.vbOffset + (uint32_t)mn * 32u, nVerts * 32u, cs.vb);
         vbb->Release();
-        if (!vbOk) { ++dVb; continue; }
+        if (vbSt == SliceStatus::kPending) { anyPending = true; continue; }
+        if (vbSt != SliceStatus::kReady) { ++dVb; continue; }
+        cs.mn = mn;
+        cs.usable = true;
+    }
+    if (anyPending) return BakeStatus::kPending;
+
+    // ---- Build pass: everything readable is in hand. ----
+    for (int c = 0; c < nChunks; ++c) {
+        const DrawCapture::ChunkDraw& ch = chunks[c];
+        const ChunkSlices& cs = gathered[(size_t)c];
+        if (!cs.usable) continue;
+        const uint16_t* idx = reinterpret_cast<const uint16_t*>(cs.ib.data());
+        const uint32_t mn = cs.mn;
+        const uint32_t nVerts = (uint32_t)(cs.vb.size() / 32u);
+        const std::vector<uint8_t>& vbytes = cs.vb;
         // Every vertex must (a) land inside the cluster bound and (b) lie
         // within source-extent of SOME record translation. (a) kills
         // NaN/garbage from repacked pool slices (comparisons with NaN are
@@ -676,7 +843,7 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
                  outIndices.size() / 3, outVerts.size(), rSrc, recs.size(),
                  dFmt, dIb, dWin, dVb, dBound, dRec, cx, cy, cz, rad);
     }
-    return ok;
+    return ok ? BakeStatus::kOk : BakeStatus::kFailed;
 }
 
 static inline int PermXY(int i) { return i == 0 ? 1 : (i == 1 ? 0 : 2); }
@@ -737,10 +904,14 @@ static bool HeapLikePtr(uint64_t q) {
 // pointer IDENTITIES of the instance buffer and its paired SRV (wrapper
 // qwords 0 and 1) for DrawCapture matching -- no references are held.
 // Returns false (out untouched) on ANY validation miss, and the caller
-// falls back to the pre-existing single-draw path.
+// falls back to the pre-existing single-draw path. *outPending is set when
+// the record readback is still in flight (async slice) -- the caller must
+// defer the whole resolve and retry, NOT fall back.
 static bool ReadMergeInstanceRecords(BSTriShape* tri,
                                      std::vector<std::array<float, 20>>& out,
-                                     void** outBufPtr, void** outSrvPtr) {
+                                     void** outBufPtr, void** outSrvPtr,
+                                     bool* outPending) {
+    *outPending = false;
     const auto heapLike = HeapLikePtr;
     // shape+0x170 -> wrapper; wrapper qword 0 -> structured instance buffer.
     uint64_t wrapPtr = 0;
@@ -782,7 +953,10 @@ static bool ReadMergeInstanceRecords(BSTriShape* tri,
         if (count > 4096) break;  // sanity bound; samples were 2..15
 
         std::vector<uint8_t> bytes;
-        if (ReadbackBufferSlice(buf, 0, bd.ByteWidth, bytes) != bd.ByteWidth) break;
+        const SliceStatus st = ReadbackBufferSliceAsync(
+            buf, reinterpret_cast<void*>(bufObj), 0, bd.ByteWidth, bytes);
+        if (st == SliceStatus::kPending) { *outPending = true; break; }
+        if (st != SliceStatus::kReady) break;
 
         std::vector<std::array<float, 20>> recs(count);
         bool valid = true;
@@ -2201,8 +2375,18 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 (std::strstr(instLeaf, "MergeInstanced") != nullptr) ? 1 : 0;
         }
         if (state.mergeLeafKind == 1) {
+            bool recPending = false;
             const bool got = ReadMergeInstanceRecords(tri, instRecords,
-                                                      &instBufPtr, &instSrvPtr);
+                                                      &instBufPtr, &instSrvPtr,
+                                                      &recPending);
+            if (recPending) {
+                // Record readback in flight (async slice): defer the whole
+                // resolve like a not-yet-decoded texture. Falling back here
+                // instead would submit the single-draw path and lose the
+                // instance expansion permanently.
+                stashPhase1Cache();
+                return false;
+            }
             if (got) {
                 uint64_t segQ[2] = {};
                 if (PeekQwordsGuarded(reinterpret_cast<const void*>(
@@ -2406,11 +2590,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             }
                             std::vector<uint8_t> tBytes;
                             const uint32_t want = nGroups * 2;
-                            const bool readOk =
-                                ReadbackBufferSlice(tBuf, tFE * elemSize,
-                                                    want, tBytes) == want;
+                            const SliceStatus tSt = ReadbackBufferSliceAsync(
+                                tBuf, tBuf, tFE * elemSize, want, tBytes);
                             tBuf->Release();
-                            if (!readOk) { rej = "tReadback"; break; }
+                            if (tSt == SliceStatus::kPending) {
+                                t7Defer = true; rej = "tReadPend"; break;
+                            }
+                            if (tSt != SliceStatus::kReady) { rej = "tReadback"; break; }
                             T.resize(nGroups);
                             std::memcpy(T.data(), tBytes.data(), want);
                             haveT = true;
@@ -2462,15 +2648,19 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         t7Valid = true;
                     } while (false);
                     if (t7Defer && state.mergeT7Deferrals < 240) {
-                        // Transient by definition (pending-upload counter);
-                        // retry the whole resolve next tick. No log line:
-                        // deferrals would burn the capped counters and hide
-                        // the real OK/REJECT population. Bounded (~4s of
-                        // ticks) because +0x44 is only proven for the
-                        // bake-path wrapper -- junk that never clears must
-                        // fall through to the capture/fallback chain, not
-                        // hide the shape forever.
+                        // Transient by definition (pending-upload counter or
+                        // an async table readback in flight); retry the
+                        // whole resolve next tick. No log line: deferrals
+                        // would burn the capped counters and hide the real
+                        // OK/REJECT population. Bounded (~4s of ticks)
+                        // because +0x44 is only proven for the bake-path
+                        // wrapper -- junk that never clears must fall
+                        // through to the capture/fallback chain, not hide
+                        // the shape forever. Stash phase-1 so each deferral
+                        // tick skips the re-parse (pre-2026-07-13 this
+                        // burned a full parse per deferred tick).
                         ++state.mergeT7Deferrals;
+                        stashPhase1Cache();
                         return false;
                     }
                     static std::atomic<int> sT7Logs{0};
@@ -2524,6 +2714,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                            (uint32_t)instRecords.size(),
                                            instSegTris, capPeek) ==
                         DrawCapture::kCapturing) {
+                        // Stash phase-1 so the per-tick capture polls skip
+                        // the re-parse (pre-2026-07-13 every kCapturing
+                        // deferral re-paid the full parse).
+                        stashPhase1Cache();
                         return false;
                     }
                 }
@@ -2881,9 +3075,18 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             std::vector<remixapi_HardcodedVertex> bv;
                             std::vector<uint32_t> bi;
                             int keptChunks = 0;
-                            if (BuildMeshFromChunks(tri, chunks, nChunks, hash,
-                                                    instRecords, mesh.vertices,
-                                                    bv, bi, keptChunks)) {
+                            const BakeStatus bs = BuildMeshFromChunks(
+                                tri, chunks, nChunks, hash,
+                                instRecords, mesh.vertices,
+                                bv, bi, keptChunks);
+                            if (bs == BakeStatus::kPending) {
+                                // Slice copies issued/in flight; re-enter
+                                // next tick with the phase-1 cache so the
+                                // retry skips the parse.
+                                stashPhase1Cache();
+                                return false;
+                            }
+                            if (bs == BakeStatus::kOk) {
                                 mesh.vertices = std::move(bv);
                                 mesh.indices = std::move(bi);
                                 instRecords.clear();
@@ -2926,7 +3129,16 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                          "validation -- recapturing",
                                          brn, (unsigned long long)hash, nChunks);
                             }
+                            // Drop the slice cache: the failed bake's bytes
+                            // are cached by identity, and the recaptured
+                            // chunks usually carry the SAME identities -- a
+                            // retry must re-read the live pool (the failure
+                            // may be stale pool content), not be re-fed the
+                            // cached garbage. Other in-flight shapes just
+                            // reissue their copies next tick.
+                            ResetSliceCache();
                             if (DrawCapture::Rearm(hash)) {
+                                stashPhase1Cache();
                                 return false;
                             }
                         }

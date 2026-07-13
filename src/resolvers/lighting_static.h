@@ -60,6 +60,13 @@ namespace Resolvers {
         void SetStep(int s);
     }
 
+    // Drop the async buffer-slice readback cache (staging copies + cached
+    // bytes keyed by buffer identity). MUST run on world swap
+    // (PreLoadGame/NewGame, via SemanticCapture::ClearDrawableMap): the
+    // destination world recycles buffer addresses, and a recycled identity
+    // with matching offset+size would serve stale-world bytes.
+    void ResetSliceCache();
+
     namespace Lighting {
 
     // Try to resolve a captured-but-not-yet-submitted DrawableState into a
