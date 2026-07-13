@@ -28,6 +28,16 @@
 
 static FILE* g_log = nullptr;
 
+// Nothing else guarantees %LOCALAPPDATA%\CrashDumps exists (WER only creates
+// it when LocalDumps has fired): on a fresh install every fopen_s/CreateFileA
+// below failed silently and the watchdog attached, observed, and recorded
+// nothing. Idempotent.
+static void EnsureDumpDir(const char* localAppData) {
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\CrashDumps", localAppData);
+    CreateDirectoryA(path, nullptr);
+}
+
 static void LogLine(const char* fmt, ...) {
     if (!g_log) return;
     SYSTEMTIME st;
@@ -77,6 +87,7 @@ static void WriteExternalDump(HANDLE proc, DWORD pid, DWORD tid,
                               EXCEPTION_RECORD* rec) {
     char dir[MAX_PATH] = {};
     if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) return;
+    EnsureDumpDir(dir);
     char path[MAX_PATH];
     sprintf_s(path, "%s\\CrashDumps\\FO4Remix_extdump_%lu.dmp", dir, pid);
     HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -125,6 +136,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         if (!proc) return 2;
         char dir[MAX_PATH] = {};
         if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) return 3;
+        EnsureDumpDir(dir);
         char path[MAX_PATH];
         sprintf_s(path, "%s\\CrashDumps\\FO4Remix_hang_%lu.dmp", dir, dumpPid);
         HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -146,6 +158,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
 
     char dir[MAX_PATH] = {};
     if (GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) {
+        EnsureDumpDir(dir);
         char path[MAX_PATH];
         sprintf_s(path, "%s\\CrashDumps\\FO4Remix_exitcodes.log", dir);
         fopen_s(&g_log, path, "a");
@@ -191,15 +204,44 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             // an attached debugger consuming them. Passing them through as
             // unhandled killed the game 3s after attach on the first field
             // run (exit 0x406D1388: a thread-naming exception raised for
-            // OUR benefit). Breakpoints cover the attach handshake INT3.
+            // OUR benefit).
             if (code == 0x406D1388UL ||   // MS_VC_EXCEPTION (SetThreadName)
-                code == 0x80000003UL ||   // STATUS_BREAKPOINT (attach INT3)
-                code == 0x4000001FUL ||   // STATUS_WX86_BREAKPOINT
-                code == 0x80000004UL ||   // STATUS_SINGLE_STEP
                 code == 0x40010006UL ||   // DBG_PRINTEXCEPTION_C
                 code == 0x40010007UL) {   // DBG_PRINTEXCEPTION_WIDE_C
                 continueStatus = DBG_CONTINUE;
                 break;
+            }
+            // Breakpoints: only the attach-handshake INT3 (the FIRST one)
+            // is protocol noise. Swallowing every later breakpoint/single-
+            // step forever consumed the plugin's own __debugbreak() asserts
+            // -- execution silently continued PAST failed asserts -- and
+            // bypassed any game/DRM SEH that raises-and-handles int3 (its
+            // handler never ran while the watchdog was attached).
+            // DBG_EXCEPTION_NOT_HANDLED hands them to in-process SEH exactly
+            // as without a debugger; an unhandled one comes back second-
+            // chance and the fatal path below logs and dumps it.
+            if (code == 0x80000003UL ||   // STATUS_BREAKPOINT
+                code == 0x4000001FUL ||   // STATUS_WX86_BREAKPOINT
+                code == 0x80000004UL) {   // STATUS_SINGLE_STEP
+                static bool s_attachBreakSeen = false;
+                if (!s_attachBreakSeen && firstChance &&
+                    code != 0x80000004UL) {
+                    s_attachBreakSeen = true;   // the attach INT3
+                    continueStatus = DBG_CONTINUE;
+                    break;
+                }
+                static int s_bpLogs = 0;
+                if (s_bpLogs < 8) {
+                    ++s_bpLogs;
+                    char site[MAX_PATH + 32];
+                    FormatRemoteAddr(proc, rec.ExceptionAddress, site,
+                                     sizeof(site));
+                    LogLine("pid=%lu post-attach %s-chance code=0x%08lX at %s "
+                            "tid=%lu (passed to in-process SEH)",
+                            pid, firstChance ? "first" : "SECOND", code, site,
+                            (unsigned long)ev.dwThreadId);
+                }
+                // Falls through to the ordinary NOT_HANDLED path below.
             }
             // Pass ordinary exceptions to the game's own handlers (the
             // plugin's guarded stale-pointer AVs arrive here first-chance
@@ -232,6 +274,19 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
             if (proc) CloseHandle(proc);
             if (g_log) fclose(g_log);
             return 0;
+        // The debugger owns these file handles; attaching to a modded FO4
+        // delivers one LOAD_DLL per already-loaded module (hundreds), so
+        // not closing them leaked handles for the whole session.
+        case CREATE_PROCESS_DEBUG_EVENT:
+            if (ev.u.CreateProcessInfo.hFile) {
+                CloseHandle(ev.u.CreateProcessInfo.hFile);
+            }
+            break;
+        case LOAD_DLL_DEBUG_EVENT:
+            if (ev.u.LoadDll.hFile) {
+                CloseHandle(ev.u.LoadDll.hFile);
+            }
+            break;
         default:
             break;
         }

@@ -244,6 +244,12 @@ namespace BsExtraction {
     // Call once at plugin shutdown; safe to call when no worker ever started.
     void StopTextureConversionWorkers();
 
+    // Age-sweep completed async decodes nobody consumed (drawable evicted
+    // mid-decode, resolution fold changed the hash). Called from the Tick
+    // sweep cadence: enqueue-time sweeping alone leaves orphans pinned
+    // (~22 MiB each, outside every budget) once a streaming burst ends.
+    void SweepTextureQueues();
+
     // Diagnostic (2026-07-06 black-merge investigation): content statistics
     // of a cached extracted texture. Returns false on cache miss. meanRGBA is
     // computed from a stride sample of mip 0 when the cached format is

@@ -159,6 +159,12 @@ namespace SemanticCapture {
         void*    mergeWatchSrv              = nullptr;
         uint32_t mergeWatchRecordCount      = 0;
         uint32_t mergeWatchSegTris[4]       = {};
+        // Release->re-resolve cycles spent on capture upgrades (successful
+        // bakes AND failed ones). Durable superset of DrawCapture's
+        // per-watch budgets, which are lost whenever the watch slot is
+        // recycled under pressure: without this cap a shape whose bakes
+        // never validate churns handle destroy/create + flicker forever.
+        uint32_t mergeUpgradeReleases       = 0;
 
         // Cached merge-instanced classification (-1 unknown, 0 plain,
         // 1 BSMergeInstancedTriShape). The RTTI leaf-class walk + strstr

@@ -1502,6 +1502,39 @@ static std::unordered_set<uint64_t>     g_texConvInflight;  // queued or convert
 static std::vector<std::thread>         g_texConvWorkers;
 static bool                             g_texConvStop = false;  // guarded by g_texConvMutex
 
+// Raw-mip bytes currently parked in g_texConvJobs (guarded by g_texConvMutex).
+// MaxPendingTextureReadbacks caps only CONCURRENT readbacks; slots turn over
+// every few ticks while the below-normal-priority workers starve exactly when
+// the game saturates all cores (streaming bursts), so without a bound the
+// conveyor's output -- hundreds of unique textures x several MiB of raw
+// chains -- accumulated outside every budget. Past the cap, jobs are dropped
+// and the caller's retry re-runs the readback later (bounded by the readback
+// cap), so the queue self-heals once the workers catch up.
+static size_t           g_texConvJobsBytes = 0;
+static constexpr size_t kMaxTexConvJobsBytes = 256ull << 20;  // 256 MiB
+
+static size_t TexConvJobBytes(const TextureConversionJob& job) {
+    size_t n = 0;
+    for (const auto& mip : job.mips) n += mip.pixels.size();
+    return n;
+}
+
+// Age-sweep completed decodes nobody consumed (drawable evicted mid-decode,
+// or the resolution fold changed the hash mid-flight). Each orphan pins a
+// fully decoded packed mip chain (~22 MiB at the 2048 cap) OUTSIDE every
+// budget (CpuTextureCacheMiB never sees it). Caller holds g_texConvMutex.
+static void SweepTexConvDoneLocked() {
+    if (g_texConvDone.empty()) return;
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    for (auto it = g_texConvDone.begin(); it != g_texConvDone.end();) {
+        if (now - it->second.doneFrame > 600) {
+            it = g_texConvDone.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 // The conversion tail moved out of ExtractMaterialTexture: pure function of
 // the job, runs on a worker thread. Returns the packed mip chain; empty
 // pixels signal "drop" (exactly the cases that returned 0 inline before).
@@ -1801,6 +1834,9 @@ static void TextureConversionWorkerMain()
             if (g_texConvStop) return;   // queued jobs dropped on shutdown, by design
             job = std::move(g_texConvJobs.front());
             g_texConvJobs.pop_front();
+            const size_t jobBytes = TexConvJobBytes(job);
+            g_texConvJobsBytes = g_texConvJobsBytes > jobBytes
+                ? g_texConvJobsBytes - jobBytes : 0;
         }
         // Exception fence (2026-07-12): this is the most allocation-heavy
         // code the plugin owns (mip-chain vectors, BC7 RGBA expansion,
@@ -1846,21 +1882,30 @@ static void EnqueueTextureConversion(TextureConversionJob&& job)
     std::lock_guard<std::mutex> lk(g_texConvMutex);
     if (g_texConvStop) return;
 
-    // Orphan sweep: a completed result whose caller stopped retrying (drawable
-    // evicted mid-flight, or the resident-resolution fold changed the hash)
-    // would pin its pixel buffer forever. Only walks once the map has grown
-    // past what a healthy pipeline keeps in flight.
-    if (g_texConvDone.size() > 64) {
-        const uint64_t now = Diagnostics::CurrentFrameIndex();
-        for (auto it = g_texConvDone.begin(); it != g_texConvDone.end();) {
-            if (now - it->second.doneFrame > 600) {
-                it = g_texConvDone.erase(it);
-            } else {
-                ++it;
-            }
+    // Orphan sweep (unconditional -- the old size()>64 gate meant up to 64
+    // orphans, ~1.4 GiB worst case, survived indefinitely once a streaming
+    // burst ended, and even past 64 only a fresh enqueue could reap them).
+    // The Tick sweep cadence also calls this via SweepTextureQueues.
+    SweepTexConvDoneLocked();
+
+    // Queue byte bound (see g_texConvJobsBytes): drop rather than park
+    // unbounded raw chains; the caller keeps reporting pending and its
+    // retry re-runs the readback once the workers have drained the queue.
+    const size_t jobBytes = TexConvJobBytes(job);
+    if (g_texConvJobsBytes + jobBytes > kMaxTexConvJobsBytes) {
+        static std::atomic<int> sDropLogs{0};
+        const int n = sDropLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            _MESSAGE("FO4RemixPlugin: [TexConvert] queue full (%zu MiB), "
+                     "dropping job #%d hash=0x%016llX (%zu KiB) -- retry "
+                     "re-reads it back",
+                     g_texConvJobsBytes >> 20, n,
+                     (unsigned long long)job.hash, jobBytes >> 10);
         }
+        return;
     }
 
+    g_texConvJobsBytes += jobBytes;
     g_texConvInflight.insert(job.hash);
     g_texConvJobs.push_back(std::move(job));
 
@@ -1910,6 +1955,12 @@ void BsExtraction::StopTextureConversionWorkers()
     }
     g_texConvWorkers.clear();
     _MESSAGE("FO4RemixPlugin: [TexConvert] texture decode workers stopped");
+}
+
+void BsExtraction::SweepTextureQueues()
+{
+    std::lock_guard<std::mutex> lk(g_texConvMutex);
+    SweepTexConvDoneLocked();
 }
 
 // ---------------------------------------------------------------------------

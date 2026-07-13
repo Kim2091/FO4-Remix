@@ -8,11 +8,14 @@
 #include "f4se/NiObjects.h"
 #include "f4se/BSGeometry.h"
 #include "f4se/NiMaterials.h"  // BSWaterShaderMaterial
+#include "f4se/NiProperties.h" // BSShaderProperty (live material re-fetch)
 #include "f4se/PluginAPI.h"  // _MESSAGE
 #include "lighting_static.h"  // for Resolvers::Trace
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 namespace Resolvers {
@@ -50,6 +53,50 @@ bool TryResolve(SemanticCapture::DrawableState& state,
     }
 
     Resolvers::Trace::SetStep(Resolvers::Trace::kCastOK);
+
+    // Re-fetch the water material from the LIVE shader property on every
+    // attempt instead of trusting the detour-captured state.material: the
+    // engine can swap or free a material between the hot-path capture and a
+    // (possibly much later) resolve, and a stale-but-mapped pointer reads as
+    // garbage kDeepColor / a dangling spNormalMap01 with nothing to catch it.
+    // The lighting resolver re-fetches live for exactly this reason
+    // (BsExtraction::GetLightingMaterial). Gate on the RTTI leaf class, not
+    // GetFeature(): feature values are build-dependent, the class name isn't.
+    BSWaterShaderMaterial* waterMat = nullptr;
+    if (NiProperty* prop = tri->shaderProperty) {
+        BSShaderMaterial* liveMat =
+            static_cast<BSShaderProperty*>(prop)->shaderMaterial;
+        if (liveMat) {
+            char leaf[64] = "";
+            SemanticCapture::GetLeafClassName(liveMat, leaf, sizeof(leaf));
+            if (std::strcmp(leaf, "BSWaterShaderMaterial") == 0) {
+                waterMat = static_cast<BSWaterShaderMaterial*>(liveMat);
+            }
+        }
+    }
+    Resolvers::Trace::SetStep(Resolvers::Trace::kMaterialFetched);
+
+    // Ripple normal map, probed BEFORE the geometry parse. The async texture
+    // pipeline returns 0-and-pending on the first attempt(s) for any
+    // not-yet-cached texture, and water's synthetic diffuse always passes
+    // SubmitDrawable's diffuse gate -- so submitting while the normal decode
+    // was still in flight made the submission PERMANENT with
+    // normalTextureHash == 0 (no re-resolve poll exists for water), silently
+    // killing the ripple feature on the common path. Pending -> retry next
+    // tick via the normal backoff; probing here costs no parse. A 0 hash
+    // with pending == false means the slot genuinely has no extractable
+    // texture -- submit flat as before.
+    std::vector<ExtractedTexture> newTextures;
+    uint64_t normalHash = 0;
+    if (waterMat) {
+        bool pendNormal = false;
+        normalHash = BsExtraction::ExtractMaterialTexture(
+            waterMat->spNormalMap01, "water_normal", device, newTextures,
+            TexturePostProcess::Octahedral,
+            /*minRoughness=*/0, /*albedoLumFloor=*/0, /*tintRGB=*/0xFFFFFFu,
+            /*paletteLut=*/nullptr, /*paletteRowV=*/0.0f, &pendNormal);
+        if (pendNormal) return false;
+    }
 
     // Parse vertex / index data (shader-agnostic).
     Resolvers::Trace::SetStep(Resolvers::Trace::kParseStart);
@@ -89,13 +136,13 @@ bool TryResolve(SemanticCapture::DrawableState& state,
 
     Resolvers::Trace::SetStep(Resolvers::Trace::kBuildMeshOK);
 
-    // Pull spNormalMap01 from the water material into the actual normal slot
-    // so the path tracer reads ripple bump as surface perturbation (Fresnel
-    // glints, refraction angle variation) instead of as flat diffuse color.
-    // Hash is content-derived inside ExtractMaterialTexture (deterministic
-    // over the .dds bytes), so it stays stable across game restarts --
-    // toolkit USD replacements keyed by this hash keep working session-to-
-    // session.
+    // spNormalMap01 (probed and extracted above) goes into the actual normal
+    // slot so the path tracer reads ripple bump as surface perturbation
+    // (Fresnel glints, refraction angle variation) instead of as flat
+    // diffuse color. Hash is content-derived inside ExtractMaterialTexture
+    // (deterministic over the .dds bytes), so it stays stable across game
+    // restarts -- toolkit USD replacements keyed by this hash keep working
+    // session-to-session.
     //
     // Post-process: Octahedral. dxvk-remix's translucent and opaque material
     // shaders both unconditionally octahedral-decode normalSample.xy via
@@ -114,16 +161,18 @@ bool TryResolve(SemanticCapture::DrawableState& state,
     // synth keeps that gate passing without leaking color into the water
     // surface. The g_textureHandles cache dedupes the synth across all
     // water drawables, so pushing it every call is essentially free.
-    std::vector<ExtractedTexture> newTextures;
-    auto* waterMat = static_cast<BSWaterShaderMaterial*>(state.material);
     if (waterMat) {
-        mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
-            waterMat->spNormalMap01, "water_normal", device, newTextures,
-            TexturePostProcess::Octahedral);
+        mesh.normalTextureHash = normalHash;
         mesh.isWater             = true;
-        mesh.waterTransmittanceR = waterMat->kDeepColor.r;
-        mesh.waterTransmittanceG = waterMat->kDeepColor.g;
-        mesh.waterTransmittanceB = waterMat->kDeepColor.b;
+        // Clamp: the live re-fetch + RTTI gate make garbage unlikely, but a
+        // mid-frame material swap can still hand us junk floats, and
+        // out-of-range transmittance ships silently wrong water color.
+        auto clamp01 = [](float v) {
+            return std::isfinite(v) ? std::clamp(v, 0.0f, 1.0f) : 0.0f;
+        };
+        mesh.waterTransmittanceR = clamp01(waterMat->kDeepColor.r);
+        mesh.waterTransmittanceG = clamp01(waterMat->kDeepColor.g);
+        mesh.waterTransmittanceB = clamp01(waterMat->kDeepColor.b);
     }
     {
         ExtractedTexture synth;

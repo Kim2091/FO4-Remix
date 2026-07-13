@@ -106,6 +106,14 @@ static struct UIDetectionState {
 
 // Present-call index for the UI liveness stamps above (game render thread).
 static std::atomic<uint64_t> g_presentIndex{0};
+// PreLoadGame reset request (F4SE messaging thread -> render thread).
+// The g_ui fields (renderTarget COM pointer, locked, candidate list) are
+// owned by the render thread: hkClearRenderTargetView / hkOMSetRenderTargets
+// / the capture block all read them with no lock, so the reset must run ON
+// that thread (top of hkPresent), not on the message thread -- a cross-
+// thread Release()+null raced the in-flight frame's GetDesc/CopyResource
+// (use-after-free on every unlucky save load).
+static std::atomic<bool> g_uiResetRequested{false};
 // ~5s at 60fps. Loading screens keep their tips/spinner UI on the same RT,
 // so a live RT never goes quiet this long; a switched/dead RT does.
 static constexpr uint64_t kUiStaleUnlockFrames = 300;
@@ -379,6 +387,27 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     }
 
     g_ui.presentCallCount++;
+
+    // Deferred PreLoadGame reset (see g_uiResetRequested): drop the UI RT
+    // detection state on the thread that owns it. Suppression is re-armed
+    // dormant exactly like the stale-unlock path below -- the old reset
+    // left RasterSuppress pointed at the dead RT, which swallowed every
+    // load-screen UI draw until re-detection happened to match.
+    if (g_uiResetRequested.exchange(false, std::memory_order_acq_rel)) {
+        _MESSAGE("FO4RemixPlugin: [UIRT] reset (save game load): re-detecting");
+        RasterSuppress::NotifyUiRT(nullptr);
+        RasterSuppress::NotifyUiTargetBound(false);
+        if (g_ui.renderTarget) {
+            g_ui.renderTarget->Release();
+            g_ui.renderTarget = nullptr;
+        }
+        g_ui.locked = false;
+        g_ui.currentlyBound.store(false, std::memory_order_relaxed);
+        g_ui.clearCandidateCount = 0;
+        g_ui.clearedThisFrame = false;
+        g_ui.drawnThisFrame = false;
+        g_ui.lastActivityPresent.store(presentIdx, std::memory_order_relaxed);
+    }
 
     // Reset per-frame ClearRTV candidate list for next frame's detection
     g_ui.clearCandidateCount = 0;
@@ -794,17 +823,11 @@ bool PresentHook::Install() {
 }
 
 void PresentHook::ResetExtractionState() {
+    // Called on the F4SE messaging (game) thread. The UI RT detection state
+    // is render-thread-owned; request the reset and let hkPresent perform
+    // it (see g_uiResetRequested).
     _MESSAGE("FO4RemixPlugin: Resetting extraction state (save game load)");
-
-    // Reset UI RT detection — RT resource may change after load
-    if (g_ui.renderTarget) {
-        g_ui.renderTarget->Release();
-        g_ui.renderTarget = nullptr;
-    }
-    g_ui.locked = false;
-    g_ui.clearedThisFrame = false;
-    g_ui.clearCandidateCount = 0;
-    g_ui.drawnThisFrame = false;
+    g_uiResetRequested.store(true, std::memory_order_release);
 }
 
 void PresentHook::Uninstall() {

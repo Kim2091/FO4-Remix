@@ -154,6 +154,19 @@ static int QiGuarded(void* obj, const GUID* iid, void** out) {
 // thread.
 static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t bytes,
                                     std::vector<uint8_t>& out) {
+    // Range-check against the LIVE buffer first: an out-of-range
+    // CopySubresourceRegion is silently dropped by the D3D11 runtime (void
+    // return, no-op in release), but the Map below still succeeds -- the
+    // never-written staging memory (typically all zeros) would then be
+    // returned as "successful" readback data. Chunk offsets are snapshotted
+    // identities; a pool buffer reallocated smaller at the same address
+    // passes the pointer/QI checks and lands here out of range.
+    D3D11_BUFFER_DESC srcDesc = {};
+    buf->GetDesc(&srcDesc);
+    if (bytes == 0 || srcOff > srcDesc.ByteWidth ||
+        bytes > srcDesc.ByteWidth - srcOff) {
+        return 0;
+    }
     ID3D11Device* dev = nullptr;
     buf->GetDevice(&dev);
     if (!dev) return 0;
@@ -2855,7 +2868,6 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                            (uint32_t)instRecords.size(),
                                            instSegTris, cap) ==
                         DrawCapture::kReady) {
-                        const uint32_t rc = (uint32_t)instRecords.size();
                         // ---- Baked-mesh rebuild (take 10) ----
                         // Preferred: replace our parsed source mesh with
                         // the engine's own baked expanded geometry (see
@@ -2894,80 +2906,29 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             }
                         }
                         if (!bakedMesh) {
-                        // Only the DrawIndexed capture is trusted; kind-0
-                        // (DrawIndexedInstanced) entries were only ever
-                        // stray leftover-binding draws.
-                        std::vector<DrawCapture::SegDraw> uniq;
-                        for (const auto& d : cap) {
-                            if (d.kind == 1) uniq.push_back(d);
-                        }
-                        bool ok = !uniq.empty() && uniq.size() <= 8;
-                        uint32_t base = UINT32_MAX;
-                        uint64_t total = 0;
-                        for (const auto& d : uniq) {
-                            if (d.startIndex < base) base = d.startIndex;
-                            total += d.instanceCount;
-                        }
-                        const uint32_t k =
-                            (ok && rc && total % rc == 0) ? (uint32_t)(total / rc) : 0;
-                        ok = ok && k >= 1;
-                        SegDraw capSegs[8];
-                        int nCapSegs = 0;
-                        if (ok) {
-                            std::sort(uniq.begin(), uniq.end(),
-                                      [](const DrawCapture::SegDraw& a,
-                                         const DrawCapture::SegDraw& b) {
-                                          return a.order < b.order;
-                                      });
-                            uint32_t recCursor = 0;
-                            for (const auto& d : uniq) {
-                                const uint32_t rel = d.startIndex - base;
-                                if (d.instanceCount % k != 0 ||
-                                    rel % 3 != 0 || d.indexCount == 0 ||
-                                    d.indexCount % 3 != 0 ||
-                                    (uint64_t)rel + d.indexCount >
-                                        mesh.indices.size()) {
-                                    ok = false;
-                                    break;
-                                }
-                                const uint32_t recCount = d.instanceCount / k;
-                                capSegs[nCapSegs++] = { rel / 3, d.indexCount / 3,
-                                                        recCursor, recCount };
-                                recCursor += recCount;
+                            // Chunk bake failed validation. The SegDraw
+                            // partition rebuild that used to run here was
+                            // dead code: draw-time SegDraw sampling was
+                            // removed 2026-07-04, so Query's out is always
+                            // empty and the path could never validate -- it
+                            // only ever routed into Rearm. Rearm wipes the
+                            // accumulated union (a failed bake means it held
+                            // garbage) and re-arms for a fresh capture, up
+                            // to its budget; past the budget it poisons the
+                            // watch so the fallback below stops the
+                            // release/re-resolve churn.
+                            static std::atomic<int> sBakeRearmLogs{0};
+                            const int brn = sBakeRearmLogs.fetch_add(
+                                1, std::memory_order_relaxed);
+                            if (brn < 24) {
+                                _MESSAGE("FO4RemixPlugin: [MergeBake] REARM #%d "
+                                         "hash=0x%llX chunks=%d failed "
+                                         "validation -- recapturing",
+                                         brn, (unsigned long long)hash, nChunks);
                             }
-                            ok = ok && recCursor == rc;
-                        }
-                        static std::atomic<int> sDrawLogs{0};
-                        const int dn = sDrawLogs.fetch_add(1, std::memory_order_relaxed);
-                        if (dn < 24) {
-                            char list[512];
-                            size_t pos = 0;
-                            list[0] = 0;
-                            for (size_t i = 0; i < cap.size() && i < 10; ++i) {
-                                const auto& d = cap[i];
-                                const int wln = snprintf(list + pos, sizeof(list) - pos,
-                                    "%s[k%u idx %u+%u n%u bv%d]", i ? " " : "",
-                                    d.kind, d.startIndex, d.indexCount,
-                                    d.instanceCount, d.baseVertex);
-                                if (wln <= 0 || (size_t)wln >= sizeof(list) - pos) break;
-                                pos += (size_t)wln;
+                            if (DrawCapture::Rearm(hash)) {
+                                return false;
                             }
-                            _MESSAGE("FO4RemixPlugin: [MergeDraw] #%d hash=0x%llX "
-                                     "raw=%zu uniq=%zu rc=%u meshTris=%u base=%u "
-                                     "passes=%u ok=%d %s",
-                                     dn, (unsigned long long)hash, cap.size(),
-                                     uniq.size(), rc, meshTris, base, k,
-                                     ok ? 1 : 0, list);
-                        }
-                        if (ok) {
-                            for (int c = 0; c < nCapSegs; ++c) {
-                                segs[nSegs++] = capSegs[c];
-                            }
-                        } else if (DrawCapture::Rearm(hash)) {
-                            // Bad frame (partial shadow set, LOD mix):
-                            // capture another one before giving up.
-                            return false;
-                        }
                         }
                     }
                 }

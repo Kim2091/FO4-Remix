@@ -204,6 +204,24 @@ static bool PeekQwordGuarded(uintptr_t src, uint64_t* out) {
     }
 }
 
+// SEH-guarded copy of a NiAVObject's m_name for the skinned-visibility
+// diagnostic: g_skinnedKeys entries survive up to kTTLFrames after the
+// actor's geometry is freed (despawn without a load screen), and the name
+// walk dereferences both the object and its StringCache entry. POD-only
+// locals (SEH + C++ unwinding conflict).
+static bool PeekNameGuarded(void* geometry, char* out, size_t cap) {
+    __try {
+        const char* nm = static_cast<NiAVObject*>(geometry)->m_name.c_str();
+        if (!nm) return false;
+        size_t i = 0;
+        for (; i + 1 < cap && nm[i]; ++i) out[i] = nm[i];
+        out[i] = 0;
+        return true;
+    } __except (1) {
+        return false;
+    }
+}
+
 // -------- Sweep cadence counter (Tick() rate-limits via this) --------
 std::atomic<uint32_t> g_sweepCounter{0};
 
@@ -1088,7 +1106,14 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             // release the fallback and re-resolve: Query finds the
             // completed watch and the exact baked geometry replaces
             // the fallback via the normal resolve path.
+            // Durable churn cap: DrawCapture's per-watch budgets reset when
+            // a watch slot is recycled under pressure, so a shape whose
+            // bakes never validate could release/re-resolve forever. This
+            // counter lives with the drawable and counts EVERY upgrade
+            // release (success or failed bake).
+            constexpr uint32_t kMaxMergeUpgradeReleases = 12;
             if (state.mergeCaptureUpgradePending &&
+                state.mergeUpgradeReleases < kMaxMergeUpgradeReleases &&
                 ((currentFrame ^ key) & 63) == 0 &&
                 DrawCapture::EnsureWatch(state.mergeWatchBuf,
                                          state.mergeWatchSrv, key,
@@ -1111,13 +1136,17 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 state.submittedToRemix = false;
                 state.resolveAttempts = 0;
                 state.nextRetryFrame = 0;
-                // The geometry is provably alive (the engine just drew
-                // it, and this state holds a +1 NiPointer ref); touch
-                // lastSeenFrame so the freshness gate doesn't retire the
-                // re-resolve of a long-ago-attached shape.
+                // The capture landing means the engine drew this cluster
+                // within the hunt window -- but DrawableState holds only
+                // RAW pointers (no NiPointer refs), so the re-resolve must
+                // treat them as potentially stale; the resolver SEH guard
+                // is the only net. Touch lastSeenFrame so the freshness
+                // gate doesn't retire the re-resolve of a long-ago-
+                // attached shape.
                 state.lastSeenFrame = currentFrame;
                 // The resolver re-sets this if it has to fall back again.
                 state.mergeCaptureUpgradePending = false;
+                ++state.mergeUpgradeReleases;
                 static std::atomic<int> sUpgradeLogs{0};
                 const int un = sUpgradeLogs.fetch_add(1, std::memory_order_relaxed);
                 if (un < 40) {
@@ -1237,9 +1266,12 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             if (it == g_drawableMap.end()) continue;
             SemanticCapture::DrawableState& st = it->second;
             if (!st.geometry) continue;
-            const char* nm = static_cast<NiAVObject*>(st.geometry)->m_name.c_str();
-            const bool nameHair = nm && (NameHasCI(nm, "hair") || NameHasCI(nm, "head") ||
-                                         NameHasCI(nm, "hat")  || NameHasCI(nm, "helm"));
+            char nameBuf[96];
+            if (!PeekNameGuarded(st.geometry, nameBuf, sizeof(nameBuf)))
+                continue;  // stale pointer: keep last state
+            const char* nm = nameBuf;
+            const bool nameHair = NameHasCI(nm, "hair") || NameHasCI(nm, "head") ||
+                                  NameHasCI(nm, "hat")  || NameHasCI(nm, "helm");
             if (!nameHair) continue;
             uint64_t fl = 0;
             if (!PeekQwordGuarded(
@@ -1269,6 +1301,10 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     const uint32_t counter = g_sweepCounter.fetch_add(1, std::memory_order_relaxed) + 1;
     if (counter < kSweepPeriodFrames) return;
     g_sweepCounter.store(0, std::memory_order_relaxed);
+
+    // Reap orphaned async texture decodes on the same cadence (enqueue-time
+    // sweeping alone can't run once a streaming burst ends).
+    BsExtraction::SweepTextureQueues();
 
     const uint64_t now = currentFrame;
     uint32_t evicted = 0;
@@ -1427,9 +1463,9 @@ void SemanticCapture::ClearDrawableMap() {
         }
     }
 
-    // ~DrawableState -> ~NiPointer -> DecRef on every entry. For drawables
-    // where the engine's already released its refs (refcount == 1, just us),
-    // the engine destructor runs inline here and frees the BSGeometry.
+    // DrawableState holds RAW engine pointers only (no NiPointer members),
+    // so this clear releases no engine refs -- it just drops our records.
+    // The engine owns the BSGeometry lifetimes outright.
     g_drawableMap.clear();
     g_dirtyPoses.clear();
     g_lodChunkKeys.clear();

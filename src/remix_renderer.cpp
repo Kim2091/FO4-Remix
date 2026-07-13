@@ -289,6 +289,11 @@ void RemixRenderer::WriteDiagDump(const char* tag) {
     char dir[MAX_PATH] = {};
     if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) return;
     char path[MAX_PATH];
+    // Nothing else guarantees this folder exists (WER only creates it if
+    // LocalDumps ran); without it every CreateFileA below fails silently
+    // on a fresh install. Idempotent.
+    sprintf_s(path, "%s\\CrashDumps", dir);
+    CreateDirectoryA(path, nullptr);
     sprintf_s(path, "%s\\CrashDumps\\FO4Remix_%s_%lu.dmp",
               dir, tag, GetCurrentProcessId());
     HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
@@ -1417,12 +1422,17 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
     remixapi_Interface* api = RemixAPI::GetInterface();
 
     // Drop our refCount on the cached mesh handle. DestroyMesh only fires when
-    // the last drawable using this (content, material) bucket releases. The
-    // alias in inst.meshHandle is cleared to avoid any double-touch later.
-    if (inst.meshHandle) {
-        DecrementMeshCacheRef(inst.meshCacheKey);
-        inst.meshHandle = nullptr;
-    }
+    // the last drawable using this (content, material) bucket releases.
+    // Keyed on meshCacheKey, NOT the meshHandle alias: OnFrame's guard paths
+    // null member meshHandles after a caught DrawInstance fault, and gating
+    // this decrement on the alias meant the cache entry's refCount never hit
+    // zero -- the runtime mesh (geometry + BLAS VRAM) leaked for the rest of
+    // the session, one whole working set per exception storm. Every drawable
+    // that reaches g_drawables was inserted with both fields set; a fault-
+    // nulled alias still holds its cache ref. (A default key would simply
+    // miss in g_meshCache.)
+    DecrementMeshCacheRef(inst.meshCacheKey);
+    inst.meshHandle = nullptr;
 
     // Decrement material refcount; on zero, erase the entry and park the
     // handle for deferred destruction (see g_pendingDestroys -- this is the
@@ -1570,10 +1580,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             std::lock_guard<std::mutex> qlock(g_configQueueMutex);
             pending.swap(g_pendingConfigVars);
         }
-        for (const auto& [key, value] : pending) {
-            const bool ok = api->SetConfigVariable &&
-                api->SetConfigVariable(key.c_str(), value.c_str()) == REMIXAPI_ERROR_CODE_SUCCESS;
-            if (!ok) {
+        for (const auto& kv : pending) {
+            const std::string& key = kv.first;
+            const std::string& value = kv.second;
+            // Guarded like every other frame-path call into d3d9.dll: an
+            // SEH fault in the runtime's option-registry write would skip
+            // the thread-level C++ backstop entirely (/EHsc catch(...)
+            // doesn't see hardware exceptions) and kill the process with no
+            // [RemixGuard] breadcrumb.
+            remixapi_ErrorCode cfgErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+            if (api->SetConfigVariable) {
+                RemixCallGuarded("SetConfigVariable", [&] {
+                    cfgErr = api->SetConfigVariable(key.c_str(), value.c_str());
+                });
+            }
+            if (cfgErr != REMIXAPI_ERROR_CODE_SUCCESS) {
                 std::lock_guard<std::mutex> qlock(g_configQueueMutex);
                 if (g_configFailedKeys.insert(key).second) {
                     _MESSAGE("FO4RemixPlugin: [ConfigQueue] SetConfigVariable failed for "

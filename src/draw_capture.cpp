@@ -303,8 +303,12 @@ static void STDMETHODCALLTYPE hkDrawIndexed(
         // Exact state check kills ownership staleness: is OUR SRV
         // literally at t8 for THIS draw? (Run 4/5 lesson: bindings and
         // even bind-tracked ownership go stale across unrelated draws.)
+        // Pre-filter only -- the game thread can recycle this watch slot
+        // to a different key between here and the lock below, so both the
+        // state AND the srv identity are re-verified under the lock.
         ID3D11ShaderResourceView* s8 = nullptr;
         ctx->VSGetShaderResources(8, 1, &s8);
+        const void* s8v = s8;
         const bool ours = (s8 == w->srv);
         if (s8) s8->Release();
         if (ours) {
@@ -319,7 +323,7 @@ static void STDMETHODCALLTYPE hkDrawIndexed(
             ctx->IAGetVertexBuffers(0, 1, &vb, &stride, &vbOff);
             {
                 std::lock_guard<std::mutex> g(g_lock);
-                if (w->state == Watch::kActive) {
+                if (w->state == Watch::kActive && w->srv == s8v) {
                     const uint32_t f = g_frame.load(std::memory_order_relaxed);
                     if (w->ccurFrame != f) {
                         RollChunks(*w);
@@ -624,6 +628,39 @@ void OnPresent() {
     }
 }
 
+// A watch's stored buffer/srv are pointer IDENTITIES snapshotted at
+// registration. If the engine recreates the record buffer/SRV in-session
+// (streaming repack -- no PreLoadGame, so no ResetAll), the old identity
+// never binds again: the hunt pins its slot (and keeps CheckBind hot)
+// forever, and a kDone union slices a dead pool region at bake time.
+// Callers pass the LIVE identity on every poll; on mismatch adopt it and
+// drop the captures taken against the dead binding (budgets survive --
+// only the capture data is invalid). Caller holds g_lock.
+static void RefreshIdentityLocked(Watch& c, void* buffer, void* srv,
+                                  uint32_t recordCount, uint64_t now) {
+    if ((!srv || c.srv == srv) && (!buffer || c.buffer == buffer)) return;
+    c.buffer = buffer;
+    c.srv = srv;
+    c.expectedBytes = recordCount * 80u;
+    c.curCount = 0;
+    c.doneCount = 0;
+    c.ccurCount = 0;
+    c.cdoneCount = 0;
+    c.consumedChunks = 0;
+    if (g_boundT8.load(std::memory_order_relaxed) == &c) {
+        g_boundT8.store(nullptr, std::memory_order_relaxed);
+    }
+    // A kDone watch whose captures were just dropped has nothing left to
+    // serve; put it back to capturing against the new identity.
+    if (c.state == Watch::kDone) {
+        c.state = Watch::kActive;
+        c.upgradeHunt = true;
+        c.registeredTick = now;
+        c.registeredFrame = g_frame.load(std::memory_order_relaxed);
+        g_activeCount.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
                   const uint32_t segTris[4], std::vector<SegDraw>& out) {
     if (!Hooked()) return kUnavailable;
@@ -633,14 +670,23 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
     for (Watch& c : g_watches) {
         if (c.state != Watch::kFree && c.key == key) { w = &c; break; }
     }
-    if (w) w->lastPollTick = now;
+    if (w) {
+        w->lastPollTick = now;
+        RefreshIdentityLocked(*w, buffer, srv, recordCount, now);
+    }
     if (w && w->state == Watch::kExpired) {
         // A NEW resolve cycle for a shape whose earlier watch timed out.
         // Give it a fresh window instead of failing forever. This is a
         // foreground resolve now, so it re-earns kDeadlineMs expiry --
         // don't let a stale upgradeHunt flag from a prior life exempt it.
+        // Fresh cycle, fresh budgets: this is the one legitimate way a
+        // Rearm-poisoned key earns another chance (it never happens inside
+        // the upgrade-churn cycle -- EnsureWatch refuses poisoned keys, so
+        // no re-resolve and therefore no Query is triggered by the hunt).
         w->state = Watch::kActive;
         w->upgradeHunt = false;
+        w->rearms = 0;
+        w->upgradesServed = 0;
         w->registeredTick = now;
         w->registeredFrame = g_frame.load(std::memory_order_relaxed);
         g_activeCount.fetch_add(1, std::memory_order_relaxed);
@@ -657,6 +703,9 @@ QueryResult Query(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
             }
         }
         if (!victim) return kUnavailable;  // all 32 slots actively watching
+        if (g_boundT8.load(std::memory_order_relaxed) == victim) {
+            g_boundT8.store(nullptr, std::memory_order_relaxed);
+        }
         *victim = Watch{};
         victim->state = Watch::kActive;
         victim->buffer = buffer;
@@ -731,10 +780,20 @@ bool Rearm(uint64_t key) {
     for (Watch& c : g_watches) {
         if (c.state != Watch::kDone || c.key != key) continue;
         if (c.rearms >= kMaxRearms) {
-            // Budget spent on frames that never validated: free the slot so
-            // a later EnsureWatch can start a fresh hunt (with a fresh
-            // budget) instead of pinning stale done[] data forever.
-            c = Watch{};
+            // Budget spent on captures that never validated. POISON the
+            // watch instead of freeing the slot: a freed slot forgets the
+            // key, so the resolver's next EnsureWatch registered a fresh
+            // watch with fresh budgets and the release/re-resolve churn
+            // restarted from zero, forever (handle destroy/create spam +
+            // visible flicker). upgradesServed at the cap makes EnsureWatch
+            // refuse this key for the rest of the session (or ResetAll /
+            // slot recycling under pressure); a genuinely NEW resolve cycle
+            // via Query still revives it with fresh budgets.
+            c.state = Watch::kExpired;
+            c.upgradesServed = 0xFFFFFFFFu;
+            if (g_boundT8.load(std::memory_order_relaxed) == &c) {
+                g_boundT8.store(nullptr, std::memory_order_relaxed);
+            }
             return false;
         }
         ++c.rearms;
@@ -744,7 +803,12 @@ bool Rearm(uint64_t key) {
         c.curCount = 0;
         c.doneCount = 0;
         c.ccurCount = 0;
+        // Wiping the union is the stale-capture self-heal (a failed bake
+        // means it held garbage), and the consumption baseline must reset
+        // with it: a fresh union compared against the old baseline could
+        // never signal growth, so the retried bake would never fire.
         c.cdoneCount = 0;
+        c.consumedChunks = 0;
         g_activeCount.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
@@ -760,6 +824,7 @@ bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
     for (Watch& c : g_watches) {
         if (c.state == Watch::kFree || c.key != key) continue;
         c.lastPollTick = now;
+        RefreshIdentityLocked(c, buffer, srv, recordCount, now);
         if (c.upgradesServed >= kMaxUpgradesPerShape) {
             // Enough resubmissions for this shape; stop hunting and free
             // the slot for others (entry lingers as evictable).
@@ -811,6 +876,9 @@ bool EnsureWatch(void* buffer, void* srv, uint64_t key, uint32_t recordCount,
         }
     }
     if (!victim) return false;
+    if (g_boundT8.load(std::memory_order_relaxed) == victim) {
+        g_boundT8.store(nullptr, std::memory_order_relaxed);
+    }
     *victim = Watch{};
     victim->state = Watch::kActive;
     victim->upgradeHunt = true;
