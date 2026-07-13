@@ -49,6 +49,15 @@ namespace Resolvers {
             kLODSkipped                  = 23,  // dropped: NiAVObject::kFlagIsMeshLOD set
             kTopFadeNodeSkipped          = 24,  // dropped: parent1 is kFlagTopFadeNode (LOD-fade group)
             kWorldLODChunkSkipped        = 25,  // dropped: parent chain identifies WRLD LOD chunk
+
+            // Deferred on ASYNC work in flight (texture decode, slice
+            // readback, draw capture): completion is expected, so Tick's
+            // retry bookkeeping polls fast (2 frames) instead of climbing
+            // the exponential backoff. Every pending source has its own
+            // bound (readback/decode TTLs, t7 deferral cap, capture
+            // deadline, rearm budget) that re-classes a stuck wait into a
+            // normal gate, resuming the backoff.
+            kPendingDefer                = 26,
         };
 
         int LastStep();

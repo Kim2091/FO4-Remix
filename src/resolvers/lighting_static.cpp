@@ -1013,6 +1013,7 @@ namespace ResolverTrace {
             case Trace::kLODSkipped:                  return "lod_skipped";
             case Trace::kTopFadeNodeSkipped:          return "topfadenode_skipped";
             case Trace::kWorldLODChunkSkipped:        return "world_lod_chunk_skipped";
+            case Trace::kPendingDefer:                return "pending_defer";
             default: return "unknown";
         }
     }
@@ -1489,6 +1490,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     state.resolveCache = std::move(cacheHolder);
                 }
                 if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending (cached)");
+                ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                std::memory_order_relaxed);
                 return false;
             }
             if (st == 0) {
@@ -2052,6 +2055,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     state.resolveCache = std::move(rc);
                 }
                 if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending");
+                ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                std::memory_order_relaxed);
                 return false;
             }
             if (st == 0) {
@@ -2268,6 +2273,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         pendDiffuse ? 1 : 0, pendNormal ? 1 : 0,
                         pendRough ? 1 : 0, pendEmissive ? 1 : 0);
         }
+        ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                        std::memory_order_relaxed);
         return false;
     }
 
@@ -2385,6 +2392,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 // instead would submit the single-draw path and lose the
                 // instance expansion permanently.
                 stashPhase1Cache();
+                ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                std::memory_order_relaxed);
                 return false;
             }
             if (got) {
@@ -2661,6 +2670,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         // burned a full parse per deferred tick).
                         ++state.mergeT7Deferrals;
                         stashPhase1Cache();
+                        ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                        std::memory_order_relaxed);
                         return false;
                     }
                     static std::atomic<int> sT7Logs{0};
@@ -2718,6 +2729,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         // the re-parse (pre-2026-07-13 every kCapturing
                         // deferral re-paid the full parse).
                         stashPhase1Cache();
+                        ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                        std::memory_order_relaxed);
                         return false;
                     }
                 }
@@ -3084,6 +3097,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                 // next tick with the phase-1 cache so the
                                 // retry skips the parse.
                                 stashPhase1Cache();
+                                ResolverTrace::g_lastStep.store(
+                                    Trace::kPendingDefer,
+                                    std::memory_order_relaxed);
                                 return false;
                             }
                             if (bs == BakeStatus::kOk) {
@@ -3139,6 +3155,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             ResetSliceCache();
                             if (DrawCapture::Rearm(hash)) {
                                 stashPhase1Cache();
+                                ResolverTrace::g_lastStep.store(
+                                    Trace::kPendingDefer,
+                                    std::memory_order_relaxed);
                                 return false;
                             }
                         }

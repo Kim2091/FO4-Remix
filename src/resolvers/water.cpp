@@ -95,7 +95,11 @@ bool TryResolve(SemanticCapture::DrawableState& state,
             TexturePostProcess::Octahedral,
             /*minRoughness=*/0, /*albedoLumFloor=*/0, /*tintRGB=*/0xFFFFFFu,
             /*paletteLut=*/nullptr, /*paletteRowV=*/0.0f, &pendNormal);
-        if (pendNormal) return false;
+        if (pendNormal) {
+            // Async decode in flight: fast-retry class (see kPendingDefer).
+            Resolvers::Trace::SetStep(Resolvers::Trace::kPendingDefer);
+            return false;
+        }
     }
 
     // Parse vertex / index data (shader-agnostic).

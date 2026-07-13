@@ -922,7 +922,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // (The 2026-07-01 COUNT cap of 4 starved streaming because it also
         // counted near-free Pending polls; a TIME budget lets dozens of
         // cheap polls through and only defers the expensive decodes.)
-        const double budgetMs = (double)g_config.resolveBudgetMs;
+        double budgetMs = (double)g_config.resolveBudgetMs;
         const auto tResolve0 = std::chrono::steady_clock::now();
         auto resolveElapsedMs = [&tResolve0]() {
             return std::chrono::duration<double, std::milli>(
@@ -978,6 +978,18 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 if (currentFrame < state.nextRetryFrame) continue;
                 dueNew.push_back(key);
             }
+        }
+
+        // Burst budget (2026-07-13): with the merge readbacks and texture
+        // decodes async, a typical attempt costs ~0.1ms and the fixed
+        // budget became the throughput ceiling exactly when a deep backlog
+        // is waiting (fresh cell attach, a 360 look-around). Triple the
+        // budget while the backlog is deep -- a few extra ms of frame time
+        // during bursts (still far under the 20-45ms the old blocking
+        // readbacks cost per tick) in exchange for draining ~3x faster.
+        // Back to the ini value the moment the queue shrinks.
+        if (budgetMs > 0.0 && dueNew.size() > 150) {
+            budgetMs *= 3.0;
         }
 
         // Gates + resolver call + retry bookkeeping for one entry. Caller
@@ -1048,9 +1060,23 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 state.lastFailedResolverStep =
                     Resolvers::Trace::LastStep();
                 if (!crashed) {
-                    state.resolveAttempts++;
-                    state.nextRetryFrame =
-                        currentFrame + RetryDelayFrames(state.resolveAttempts);
+                    if (state.lastFailedResolverStep ==
+                        Resolvers::Trace::kPendingDefer) {
+                        // Async work in flight (texture decode, slice
+                        // readback, draw capture) -- completion is
+                        // expected, so poll fast and do NOT climb the
+                        // exponential backoff. Pre-2026-07-13 a decoded
+                        // texture could sit for up to 512 frames waiting
+                        // for its drawable's next backoff slot: the
+                        // "takes forever to FINISH loading" tail. Attempt
+                        // count is left alone so the phase-1 cache stays
+                        // alive across the whole wait.
+                        state.nextRetryFrame = currentFrame + 2;
+                    } else {
+                        state.resolveAttempts++;
+                        state.nextRetryFrame =
+                            currentFrame + RetryDelayFrames(state.resolveAttempts);
+                    }
                 }
             } else {
                 // Side indexes over submitted entries only -- unsubmitted
