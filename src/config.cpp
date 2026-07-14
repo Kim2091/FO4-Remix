@@ -151,7 +151,11 @@ void LoadConfig() {
     g_config.roughnessMapFloor      = GetIniFloatClamped("Materials", "RoughnessMapFloor",   0.15f, 0.0f, 1.0f, dllPath);
     g_config.textureUpgradeOnApproach = GetIniBool("Materials", "TextureUpgradeOnApproach", false, dllPath);
     g_config.maxTextureDimension = GetIniUInt("Materials", "MaxTextureDimension", 2048, dllPath);
-    _MESSAGE("FO4RemixPlugin: Materials - MaxTextureDimension=%u", g_config.maxTextureDimension);
+    g_config.diskTextureCache    = GetIniBool("Materials", "DiskTextureCache", true, dllPath);
+    g_config.diskTextureCacheGiB = GetIniUInt("Materials", "DiskTextureCacheGiB", 8, dllPath);
+    _MESSAGE("FO4RemixPlugin: Materials - MaxTextureDimension=%u DiskTextureCache=%d (cap %u GiB)",
+             g_config.maxTextureDimension, g_config.diskTextureCache ? 1 : 0,
+             g_config.diskTextureCacheGiB);
     _MESSAGE("FO4RemixPlugin: Materials - MetalConversionEnabled=%d MetalMetallicEnabled=%d MetalRoughnessEnabled=%d MetalMetallic=%.2f MetalAlbedoLumFloor=%.2f MetalMinRoughness=%.2f RoughnessMapsEnabled=%d RoughnessMapFloor=%.2f TextureUpgradeOnApproach=%d",
              g_config.metalConversionEnabled, g_config.metalMetallicEnabled,
              g_config.metalRoughnessEnabled, g_config.metalMetallic,

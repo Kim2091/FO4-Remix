@@ -1487,6 +1487,12 @@ struct TextureConversionJob {
     bool     palTableValid  = false;
     bool     isDiffuseSlot  = false;      // debug-dump routing only
     std::string texName;                  // logging only
+    // Persistent disk cache (see the block comment above DiskCacheDir).
+    // diskLoadKey != 0: this job LOADS the converted chain from disk
+    // instead of converting (mips empty). diskWriteKey != 0: write the
+    // converted result to disk after a successful convert.
+    uint64_t diskLoadKey  = 0;
+    uint64_t diskWriteKey = 0;
 };
 
 struct CompletedTextureConversion {
@@ -1517,6 +1523,180 @@ static size_t TexConvJobBytes(const TextureConversionJob& job) {
     size_t n = 0;
     for (const auto& mip : job.mips) n += mip.pixels.size();
     return n;
+}
+
+// ---- Persistent disk cache of converted chains (2026-07-13) ----
+// The convert stage (BC decode + octahedral/invert/tint/palette bakes)
+// costs ~11ms per chain across ~2k unique chains in a fresh area -- the
+// pop-in floor once everything upstream went async. The output is
+// deterministic for a given content hash (name + resident-resolution fold
+// + variant params), so persist it: the first session converts and writes,
+// every later one streams the converted bytes back on the same worker
+// threads. The file key folds the SOURCE resource's desc on top of the
+// content hash, which catches texture-pack swaps that change dims, format
+// or mip count; a repaint with identical name AND desc is NOT caught --
+// documented with the [Materials] DiskTextureCache ini key (clear
+// %LOCALAPPDATA%\FO4Remix\texcache after swapping texture mods).
+// Threading: probe runs on the game thread; load/store/sweep run on the
+// decode workers. Directory init is call_once-guarded.
+struct DiskCacheHeader {
+    uint32_t magic;        // 'FRT1'
+    uint32_t version;
+    uint64_t key;
+    uint64_t hash;
+    uint32_t width;
+    uint32_t height;
+    uint32_t mipLevels;
+    uint32_t dxgiFormat;
+    uint64_t pixelBytes;
+};
+constexpr uint32_t kDiskCacheMagic   = 0x31545246u;  // 'FRT1'
+constexpr uint32_t kDiskCacheVersion = 1;            // bump on pipeline changes
+
+static std::once_flag g_diskCacheDirOnce;
+static char g_diskCacheDir[MAX_PATH] = {};
+static bool g_diskCacheDirOk = false;
+// Keys stat'ed and found absent this session (game thread only): the
+// resolver re-probes pending textures every 2 frames, and one stat per
+// probe per texture adds up during bursts.
+static std::unordered_set<uint64_t> g_diskProbeMissing;
+
+static const char* DiskCacheDir() {
+    std::call_once(g_diskCacheDirOnce, [] {
+        char base[MAX_PATH] = {};
+        if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof(base))) return;
+        char path[MAX_PATH];
+        sprintf_s(path, "%s\\FO4Remix", base);
+        CreateDirectoryA(path, nullptr);
+        sprintf_s(g_diskCacheDir, "%s\\FO4Remix\\texcache", base);
+        CreateDirectoryA(g_diskCacheDir, nullptr);
+        g_diskCacheDirOk =
+            GetFileAttributesA(g_diskCacheDir) != INVALID_FILE_ATTRIBUTES;
+        _MESSAGE("FO4RemixPlugin: [TexCache] disk cache %s at %s (cap %u GiB)",
+                 g_diskCacheDirOk ? "ready" : "UNAVAILABLE",
+                 g_diskCacheDir, g_config.diskTextureCacheGiB);
+    });
+    return g_diskCacheDirOk ? g_diskCacheDir : nullptr;
+}
+
+static bool DiskCachePath(uint64_t key, char out[MAX_PATH]) {
+    const char* dir = DiskCacheDir();
+    if (!dir) return false;
+    sprintf_s(out, MAX_PATH, "%s\\%016llX.tex", dir, (unsigned long long)key);
+    return true;
+}
+
+static uint64_t DiskCacheKeyFold(uint64_t hash, const D3D11_TEXTURE2D_DESC& sd) {
+    uint64_t k = FnvHashCombine(hash, 0xD15C0000u | kDiskCacheVersion);
+    k = FnvHashCombine(k, ((uint64_t)sd.Format << 48) |
+                          ((uint64_t)sd.MipLevels << 40) |
+                          ((uint64_t)sd.Width << 20) | sd.Height);
+    return k;
+}
+
+static bool DiskCacheLoad(uint64_t key, uint64_t expectHash, ExtractedTexture& out) {
+    char path[MAX_PATH];
+    if (!DiskCachePath(key, path)) return false;
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    bool ok = false;
+    DiskCacheHeader h = {};
+    DWORD got = 0;
+    LARGE_INTEGER fileSize = {};
+    if (GetFileSizeEx(f, &fileSize) &&
+        ReadFile(f, &h, sizeof(h), &got, nullptr) && got == sizeof(h) &&
+        h.magic == kDiskCacheMagic && h.version == kDiskCacheVersion &&
+        h.key == key && h.hash == expectHash &&
+        h.pixelBytes > 0 && h.pixelBytes < (512ull << 20) &&
+        (uint64_t)fileSize.QuadPart == sizeof(h) + h.pixelBytes &&
+        h.width > 0 && h.width <= 16384 && h.height > 0 && h.height <= 16384) {
+        out.hash       = h.hash;
+        out.width      = h.width;
+        out.height     = h.height;
+        out.mipLevels  = h.mipLevels;
+        out.dxgiFormat = (DXGI_FORMAT)h.dxgiFormat;
+        out.pixels.resize((size_t)h.pixelBytes);
+        DWORD pgot = 0;
+        ok = ReadFile(f, out.pixels.data(), (DWORD)h.pixelBytes, &pgot, nullptr) &&
+             pgot == (DWORD)h.pixelBytes;
+    }
+    CloseHandle(f);
+    if (!ok) out = {};
+    return ok;
+}
+
+static void DiskCacheStore(uint64_t key, const ExtractedTexture& packed) {
+    char path[MAX_PATH];
+    if (!DiskCachePath(key, path)) return;
+    char tmp[MAX_PATH];
+    sprintf_s(tmp, "%s.tmp", path);
+    HANDLE f = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DiskCacheHeader h = {};
+    h.magic      = kDiskCacheMagic;
+    h.version    = kDiskCacheVersion;
+    h.key        = key;
+    h.hash       = packed.hash;
+    h.width      = packed.width;
+    h.height     = packed.height;
+    h.mipLevels  = packed.mipLevels;
+    h.dxgiFormat = (uint32_t)packed.dxgiFormat;
+    h.pixelBytes = packed.pixels.size();
+    DWORD wrote = 0;
+    const bool ok =
+        WriteFile(f, &h, sizeof(h), &wrote, nullptr) && wrote == sizeof(h) &&
+        WriteFile(f, packed.pixels.data(), (DWORD)packed.pixels.size(),
+                  &wrote, nullptr) && wrote == (DWORD)packed.pixels.size();
+    CloseHandle(f);
+    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileA(tmp);
+    }
+}
+
+// Size-cap sweep, once per session on a worker thread: delete oldest files
+// (by last write) until the folder is back under 90% of the cap.
+static void DiskCacheSweep() {
+    const char* dir = DiskCacheDir();
+    if (!dir) return;
+    struct Ent { std::string path; uint64_t size; FILETIME wt; };
+    std::vector<Ent> ents;
+    uint64_t total = 0;
+    char pat[MAX_PATH];
+    sprintf_s(pat, "%s\\*.tex", dir);
+    WIN32_FIND_DATAA fd = {};
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        Ent e;
+        e.path = std::string(dir) + "\\" + fd.cFileName;
+        e.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        e.wt   = fd.ftLastWriteTime;
+        total += e.size;
+        ents.push_back(std::move(e));
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    const uint64_t capBytes =
+        (uint64_t)(std::max)(1u, g_config.diskTextureCacheGiB) << 30;
+    if (total <= capBytes) return;
+    std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) {
+        return CompareFileTime(&a.wt, &b.wt) < 0;
+    });
+    const uint64_t target = capBytes / 10 * 9;
+    size_t deleted = 0;
+    for (const Ent& e : ents) {
+        if (total <= target) break;
+        if (DeleteFileA(e.path.c_str())) {
+            total -= e.size;
+            ++deleted;
+        }
+    }
+    _MESSAGE("FO4RemixPlugin: [TexCache] size sweep: deleted %zu oldest files, "
+             "now %llu MiB (cap %u GiB)",
+             deleted, (unsigned long long)(total >> 20),
+             g_config.diskTextureCacheGiB);
 }
 
 // Age-sweep completed decodes nobody consumed (drawable evicted mid-decode,
@@ -1826,6 +2006,11 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
 
 static void TextureConversionWorkerMain()
 {
+    // One-time disk-cache size sweep, off the game thread.
+    if (g_config.diskTextureCache) {
+        static std::once_flag s_diskSweepOnce;
+        std::call_once(s_diskSweepOnce, [] { DiskCacheSweep(); });
+    }
     for (;;) {
         TextureConversionJob job;
         {
@@ -1837,6 +2022,38 @@ static void TextureConversionWorkerMain()
             const size_t jobBytes = TexConvJobBytes(job);
             g_texConvJobsBytes = g_texConvJobsBytes > jobBytes
                 ? g_texConvJobsBytes - jobBytes : 0;
+        }
+        // Disk-cache load job: no convert, just stream the chain back.
+        if (job.diskLoadKey != 0) {
+            ExtractedTexture packed;
+            if (DiskCacheLoad(job.diskLoadKey, job.hash, packed)) {
+                static std::atomic<int> sHitLogs{0};
+                const int n = sHitLogs.fetch_add(1, std::memory_order_relaxed);
+                if (n < 8) {
+                    _MESSAGE("FO4RemixPlugin: [TexCache] disk hit #%d "
+                             "hash=0x%016llX %ux%u mips=%u (%zu KiB)",
+                             n, (unsigned long long)job.hash,
+                             packed.width, packed.height, packed.mipLevels,
+                             packed.pixels.size() >> 10);
+                }
+                std::lock_guard<std::mutex> lk(g_texConvMutex);
+                g_texConvDone[job.hash] = { std::move(packed),
+                                            Diagnostics::CurrentFrameIndex() };
+                g_texConvInflight.erase(job.hash);
+            } else {
+                // Corrupt/stale file: delete it and post NOTHING -- an empty
+                // done entry would negative-cache the hash. With the file
+                // gone the resolver's next probe misses and takes the normal
+                // readback + convert path.
+                char path[MAX_PATH];
+                if (DiskCachePath(job.diskLoadKey, path)) DeleteFileA(path);
+                _MESSAGE("FO4RemixPlugin: [TexCache] BAD cache file for "
+                         "hash=0x%016llX -- deleted, re-converting",
+                         (unsigned long long)job.hash);
+                std::lock_guard<std::mutex> lk(g_texConvMutex);
+                g_texConvInflight.erase(job.hash);
+            }
+            continue;
         }
         // Exception fence (2026-07-12): this is the most allocation-heavy
         // code the plugin owns (mip-chain vectors, BC7 RGBA expansion,
@@ -1867,6 +2084,13 @@ static void TextureConversionWorkerMain()
                          n, (unsigned long long)job.hash);
             }
             packed = {};
+        }
+        // Persist the converted chain so later sessions skip the readback +
+        // convert entirely (see DiskCacheDir). Written before publishing so
+        // a consumer evicting the CPU-cache copy can't race the write.
+        if (job.diskWriteKey != 0 && g_config.diskTextureCache &&
+            !packed.pixels.empty()) {
+            DiskCacheStore(job.diskWriteKey, packed);
         }
         {
             std::lock_guard<std::mutex> lk(g_texConvMutex);
@@ -2167,6 +2391,33 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                                           reinterpret_cast<void**>(&tex2D));
     if (FAILED(hr) || !tex2D) return 0;
 
+    // Persistent disk cache probe: a prior session already converted this
+    // exact chain -- stream it back on a worker instead of paying readback
+    // + convert. Probed at most once per hash per session
+    // (g_diskProbeMissing suppresses the per-retry stat; the resolver polls
+    // pending textures every 2 frames).
+    D3D11_TEXTURE2D_DESC srcDescForCache = {};
+    tex2D->GetDesc(&srcDescForCache);
+    uint64_t diskKey = 0;
+    if (g_config.diskTextureCache) {
+        diskKey = DiskCacheKeyFold(hash, srcDescForCache);
+        if (!g_diskProbeMissing.count(hash)) {
+            char cachePath[MAX_PATH];
+            if (DiskCachePath(diskKey, cachePath) &&
+                GetFileAttributesA(cachePath) != INVALID_FILE_ATTRIBUTES) {
+                TextureConversionJob loadJob;
+                loadJob.hash        = hash;
+                loadJob.diskLoadKey = diskKey;
+                loadJob.texName     = texName ? texName : "";
+                EnqueueTextureConversion(std::move(loadJob));
+                tex2D->Release();
+                if (outPending) *outPending = true;
+                return 0;
+            }
+            g_diskProbeMissing.insert(hash);
+        }
+    }
+
     // Read every mip from the source D3D texture. Each entry is a single-mip
     // ExtractedTexture so we can reuse the existing per-mip decompression and
     // post-process functions unchanged. They get concatenated into a packed
@@ -2199,6 +2450,7 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     job.tintRGB        = tintRGB;
     job.isDiffuseSlot  = slotName && std::strcmp(slotName, "diffuse") == 0;
     job.texName        = texName ? texName : "";
+    job.diskWriteKey   = diskKey;  // 0 when the disk cache is off
 
     // Runtime gamma of the source resource, captured before any decompression
     // (DecompressBC drops the _SRGB tag). Drives the palette remap's U decode:

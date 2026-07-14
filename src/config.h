@@ -297,6 +297,23 @@ struct PluginConfig {
     // the upgrade-poll compare (see CapDim in bs_extraction.cpp).
     uint32_t maxTextureDimension;
 
+    // Persistent disk cache of CONVERTED texture chains ([Materials]
+    // DiskTextureCache, default 1). The convert stage (BC decode +
+    // octahedral/invert/tint/palette bakes) costs ~11ms per chain across
+    // ~2k unique chains in a fresh area -- the pop-in floor once the rest
+    // of the pipeline went async. The output is deterministic per content
+    // hash, so it is written once to %LOCALAPPDATA%\FO4Remix\texcache and
+    // later sessions stream the converted bytes from disk instead.
+    // LIMITATION: the key folds the texture NAME + the source resource's
+    // desc, not the pixel content -- a texture-pack swap that keeps
+    // identical names, dims, format and mip counts serves stale pixels.
+    // Clear the folder (or disable this key) after swapping texture mods.
+    bool     diskTextureCache;
+    // Folder size cap in GiB ([Materials] DiskTextureCacheGiB, default 8).
+    // Checked once per session on a worker thread; oldest files (by last
+    // write) are deleted until the folder is back under 90% of the cap.
+    uint32_t diskTextureCacheGiB;
+
     // Destroy parked Remix handles only during load screens (PreLoadGame
     // drain request) and on shutdown, instead of every 30 frames
     // ([Performance] DeferHandleDestroyToLoad, default 1). Mitigation for
