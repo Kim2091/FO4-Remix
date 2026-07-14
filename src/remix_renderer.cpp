@@ -1,5 +1,6 @@
 #include "remix_renderer.h"
 #include "config.h"
+#include "crash_diag.h"
 #include "remix_api.h"
 #include "fo4_diagnostics.h"
 #include "semantic_capture.h"
@@ -270,12 +271,14 @@ static int RemixCallCxxGuarded(const char* site, F& fn) {
             _MESSAGE("FO4RemixPlugin: [RemixGuard] %s C++ exception #%d what=%s",
                      site, n, e.what());
         }
+        CrashDiag::LogLastCxxThrow(site);
         return 2;
     } catch (...) {
         int n = g_remixGuardLogCount.fetch_add(1, std::memory_order_relaxed);
         if (n < kRemixGuardLogCap) {
             _MESSAGE("FO4RemixPlugin: [RemixGuard] %s unknown C++ exception #%d", site, n);
         }
+        CrashDiag::LogLastCxxThrow(site);
         return 2;
     }
 }

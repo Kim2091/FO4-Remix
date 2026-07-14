@@ -29,4 +29,12 @@ namespace CrashDiag {
 // it already being initialized).
 void Install();
 
+// Log the backtrace of the most recent C++ throw on THIS thread (stashed
+// first-chance by the VEH, where the throw stack is still intact -- by the
+// time a catch block runs, the unwinder has already destroyed it). Call from
+// a catch block right after logging what(); no-op if nothing new was thrown
+// on this thread since the last call. Session-capped per site class so a
+// throw storm can't flood the log.
+void LogLastCxxThrow(const char* site);
+
 }  // namespace CrashDiag

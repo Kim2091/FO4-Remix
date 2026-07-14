@@ -33,6 +33,54 @@ static void FormatCaller(void* retAddr, char* out, size_t outSize) {
 }
 
 // ---------------------------------------------------------------------------
+// C++-throw backtrace stash (2026-07-14, the Present "invalid vector
+// subscript" wedge). The RemixGuard catch blocks log what() but by then the
+// throw stack is gone -- the unwinder tore it down reaching the catch. The
+// VEH below runs FIRST-CHANCE, on the throwing thread, with the throw stack
+// intact: stash the raw frames per-thread here, and let the catch site
+// decide whether they're worth a log line (LogLastCxxThrow). Capture is a
+// single RtlCaptureStackBackTrace -- cheap enough to run unconditionally on
+// every 0xE06D7363, including historic SubmitDrawable throw storms.
+// ---------------------------------------------------------------------------
+struct CxxThrowStash {
+    void*    frames[28];
+    USHORT   count;
+    unsigned seq;        // bumped per capture
+    unsigned loggedSeq;  // last seq consumed by LogLastCxxThrow
+};
+static thread_local CxxThrowStash t_cxxThrow = {};
+
+void LogLastCxxThrow(const char* site) {
+    CxxThrowStash& st = t_cxxThrow;
+    if (st.seq == 0 || st.seq == st.loggedSeq) return;
+    st.loggedSeq = st.seq;
+
+    // Present throws are the wedge signature we're hunting; everything else
+    // shares a smaller budget so a Create/Draw throw storm can't eat the log.
+    static std::atomic<int> sPresentLogged{0};
+    static std::atomic<int> sOtherLogged{0};
+    const bool isPresent = site && strcmp(site, "Present") == 0;
+    std::atomic<int>& bucket = isPresent ? sPresentLogged : sOtherLogged;
+    if (bucket.fetch_add(1, std::memory_order_relaxed) >= (isPresent ? 6 : 3)) {
+        return;
+    }
+
+    // One frame per segment, module-basename+offset; two log lines max so a
+    // deep stack doesn't overflow the formatter.
+    char line[1600];
+    int  pos = 0;
+    pos += sprintf_s(line + pos, sizeof(line) - pos,
+                     "FO4RemixPlugin: [CrashDiag] throw@%s backtrace:", site);
+    const int n = (int)st.count;
+    for (int i = 0; i < n && pos < (int)sizeof(line) - 96; ++i) {
+        char frame[MAX_PATH + 32];
+        FormatCaller(st.frames[i], frame, sizeof(frame));
+        pos += sprintf_s(line + pos, sizeof(line) - pos, " %s;", frame);
+    }
+    _MESSAGE("%s", line);
+}
+
+// ---------------------------------------------------------------------------
 // Vectored exception handler: first-chance, add-only (cannot be displaced by
 // later SetUnhandledExceptionFilter calls). Logs ONLY the silent-killer
 // codes; routine first-chance AVs (the resolver's guarded stale-pointer
@@ -41,6 +89,14 @@ static void FormatCaller(void* retAddr, char* out, size_t outSize) {
 static LONG CALLBACK VectoredBreadcrumb(EXCEPTION_POINTERS* xp) {
     const DWORD code = xp && xp->ExceptionRecord
         ? xp->ExceptionRecord->ExceptionCode : 0;
+    if (code == 0xE06D7363UL /* MSVC C++ exception */) {
+        // Stash only -- never log here. skip=0 keeps the dispatcher frames;
+        // they anchor the read and cost nothing offline.
+        t_cxxThrow.count = RtlCaptureStackBackTrace(
+            0, ARRAYSIZE(t_cxxThrow.frames), t_cxxThrow.frames, nullptr);
+        ++t_cxxThrow.seq;
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
     if (code == 0xC00000FDUL /* STATUS_STACK_OVERFLOW */ ||
         code == 0xC0000374UL /* STATUS_HEAP_CORRUPTION */) {
         static std::atomic<int> sOnce{0};
