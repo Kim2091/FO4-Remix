@@ -16,12 +16,14 @@
 #include "f4se/NiObjects.h"  // NiAVObject (skinned-visibility name read)
 #include "MinHook.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -936,8 +938,14 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // streaming.
         static std::vector<PassKey> dueNew;    // unsubmitted, inside window, retry-due
         static std::vector<PassKey> duePolls;  // submitted, upgrade-poll slot hit
+        // (rank, key) staging for the nearest-in-view-first sort below.
+        static std::vector<std::pair<float, PassKey>> dueRanked;
         dueNew.clear();
         duePolls.clear();
+        dueRanked.clear();
+        // Camera snapshot for the priority ranking (engine reads on the same
+        // thread hkPresent already calls Camera::Get from).
+        const CameraState resolveCam = Camera::Get();
         {
             std::lock_guard<std::mutex> lock(g_drawableMutex);
             for (auto& [key, state] : g_drawableMap) {
@@ -976,9 +984,41 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 // Backoff gate: a prior failure scheduled this entry's next
                 // attempt; skip until due. See DrawableState::resolveAttempts.
                 if (currentFrame < state.nextRetryFrame) continue;
-                dueNew.push_back(key);
+                // Rank for the nearest-in-view-first sort below: behind-the-
+                // camera geometry pays a large offset so the visible field
+                // always submits first; distance orders within each class;
+                // unknown transforms sort to the very back.
+                float rank = 1.0e18f;
+                if (resolveCam.valid && state.liveTransformValid) {
+                    const float dx =
+                        state.liveWorldTransform[0][3] - resolveCam.position[0];
+                    const float dy =
+                        state.liveWorldTransform[1][3] - resolveCam.position[1];
+                    const float dz =
+                        state.liveWorldTransform[2][3] - resolveCam.position[2];
+                    const float facing = dx * resolveCam.forward[0] +
+                                         dy * resolveCam.forward[1] +
+                                         dz * resolveCam.forward[2];
+                    rank = dx * dx + dy * dy + dz * dz +
+                           (facing < 0.0f ? 1.0e12f : 0.0f);
+                }
+                dueRanked.push_back({ rank, key });
             }
         }
+
+        // Nearest-in-view-first (2026-07-13). dueNew used to be map
+        // iteration order -- effectively random -- so a streaming burst
+        // filled in geometry BEHIND the player at the same rate as what the
+        // camera was pointed at. The expensive part of the burst (big merge
+        // submits at 10-35ms each) is a fixed total cost either way; paying
+        // it for on-screen objects first changes how "loaded" the scene
+        // FEELS by an order of magnitude.
+        std::sort(dueRanked.begin(), dueRanked.end(),
+                  [](const std::pair<float, PassKey>& a,
+                     const std::pair<float, PassKey>& b) {
+                      return a.first < b.first;
+                  });
+        for (const auto& rk : dueRanked) dueNew.push_back(rk.second);
 
         // Burst budget (2026-07-13): with the merge readbacks and texture
         // decodes async, a typical attempt costs ~0.1ms and the fixed
