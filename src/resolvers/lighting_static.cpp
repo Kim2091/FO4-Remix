@@ -2149,7 +2149,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // ==================================================================
     }
 
-    std::vector<ExtractedTexture> newTextures;
+    TextureSupply newTextures;
     // For alpha-tested or alpha-blended geometry: synthesize alpha from RGB
     // luminance if the diffuse is BC1 (no alpha channel). BGS LOD foliage
     // atlases are stored as BC1; vanilla DX11's rasterizer hides the lack of
@@ -3563,7 +3563,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                  scale);
     }
     for (const auto& t : newTextures) {
-        state.textureHashes.insert(t.hash);
+        state.textureHashes.insert(t->hash);
     }
 
     // Reset trace so we can tell when we're between resolver calls.

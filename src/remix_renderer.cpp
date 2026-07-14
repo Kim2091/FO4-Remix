@@ -871,7 +871,7 @@ static void DecrementMeshCacheRef(const MeshCacheKey& key) {
 RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         uint64_t hash,
         const ExtractedMesh& mesh,
-        const std::vector<ExtractedTexture>& newTextures) {
+        const TextureSupply& newTextures) {
 
     std::lock_guard<std::mutex> lock(g_renderStateMutex);
 
@@ -912,7 +912,10 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
     // ---- Texture upload + cache ----
     // Per-texture upload + cache loop: refCount++ on hit, insert at refCount=1 on miss.
-    for (const auto& tex : newTextures) {
+    // Entries are shared_ptr views of the extraction cache's chains (see
+    // TextureSupply); the only remaining pixel copy is CreateTexture's own.
+    for (const auto& texPtr : newTextures) {
+        const ExtractedTexture& tex = *texPtr;
         // Dupe guard: the extraction cache re-supplies pixels whenever the
         // Remix-side handle is missing, so a drawable that references the
         // same texture in two slots (diffuse reused as glow map) can list

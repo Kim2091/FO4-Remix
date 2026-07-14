@@ -4,6 +4,7 @@
 #include <vector>
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <d3d11.h>
 
@@ -18,6 +19,17 @@ struct ExtractedTexture {
                                   // Format is uniform across all mips (post-decompression
                                   // and post-process this is RGBA8 for BC source textures).
 };
+
+// Texture supply list for SubmitDrawable (2026-07-14). Entries SHARE the CPU
+// pixel cache's chains instead of copying them: a 2048^2 chain is ~22 MiB and
+// the old value-vector paid that memcpy once per supplied slot per submit --
+// the dominant per-submit cost after the parse (10-35ms big-merge submits).
+// shared_ptr rather than a raw borrow because the cache can erase an entry
+// while a supply list is alive in the same tick (superseded-resolution
+// variant eviction fires from a sibling slot's decode landing mid-pass);
+// shared ownership keeps the pixels valid through SubmitDrawable regardless.
+// All producers/consumers are game-thread; refcounting is atomic anyway.
+using TextureSupply = std::vector<std::shared_ptr<const ExtractedTexture>>;
 
 struct ExtractedMesh {
     uint64_t hash = 0;
@@ -351,16 +363,15 @@ namespace BsExtraction {
     //
     // supplyPixels (2026-07-09): false = "probe" mode -- fill hashes, start
     // any not-yet-started readback/decode, consume finished decodes into the
-    // internal cache, but NEVER copy pixel buffers into newTextures. True =
+    // internal cache, but NEVER add pixel buffers to newTextures. True =
     // full behavior (pixels re-supplied whenever the Remix-side handle is
     // missing). The resolver probes all slots first and only runs a
-    // supplying pass on the attempt that actually submits, so each
-    // texture's pixels are copied exactly once instead of on every retry
-    // (~22MB per slot per retry while a sibling slot was still decoding --
-    // the 2026-07-09 "slower pop-in" report).
+    // supplying pass on the attempt that actually submits. Supplied entries
+    // are shared_ptr views of the cache's chains (see TextureSupply) --
+    // supplying costs a refcount, not a ~22MB memcpy.
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,
-                                    std::vector<ExtractedTexture>& newTextures,
+                                    TextureSupply& newTextures,
                                     TexturePostProcess postProcess = TexturePostProcess::None,
                                     uint8_t minRoughness = 0,
                                     uint8_t albedoLumFloor = 0,
@@ -374,7 +385,7 @@ namespace BsExtraction {
     // outPending / supplyPixels forward to the glow-map slot's
     // ExtractMaterialTexture call (see above).
     void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
-                             ID3D11Device* device, std::vector<ExtractedTexture>& newTextures,
+                             ID3D11Device* device, TextureSupply& newTextures,
                              uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity,
                              bool* outPending = nullptr, bool supplyPixels = true);
 

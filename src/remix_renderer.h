@@ -73,7 +73,7 @@ namespace RemixRenderer {
     // (the runtime serializes each API call internally).
     SubmitStatus SubmitDrawable(uint64_t hash,
                                 const ExtractedMesh& mesh,
-                                const std::vector<ExtractedTexture>& newTextures);
+                                const TextureSupply& newTextures);
 
     // Release the drawable identified by hash: drop its mesh-cache refcount,
     // decrement material refcount (cascading texture refcount decrements).

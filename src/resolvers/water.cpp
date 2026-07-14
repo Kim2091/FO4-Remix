@@ -86,7 +86,7 @@ bool TryResolve(SemanticCapture::DrawableState& state,
     // tick via the normal backoff; probing here costs no parse. A 0 hash
     // with pending == false means the slot genuinely has no extractable
     // texture -- submit flat as before.
-    std::vector<ExtractedTexture> newTextures;
+    TextureSupply newTextures;
     uint64_t normalHash = 0;
     if (waterMat) {
         bool pendNormal = false;
@@ -179,13 +179,13 @@ bool TryResolve(SemanticCapture::DrawableState& state,
         mesh.waterTransmittanceB = clamp01(waterMat->kDeepColor.b);
     }
     {
-        ExtractedTexture synth;
-        synth.width      = 1;
-        synth.height     = 1;
-        synth.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-        synth.pixels     = { 64, 96, 160, 255 };  // RGBA(0.25, 0.38, 0.63, 1.0) -- solid blue
-        synth.hash       = kSyntheticDiffuseHash;
-        newTextures.push_back(synth);
+        auto synth = std::make_shared<ExtractedTexture>();
+        synth->width      = 1;
+        synth->height     = 1;
+        synth->dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+        synth->pixels     = { 64, 96, 160, 255 };  // RGBA(0.25, 0.38, 0.63, 1.0) -- solid blue
+        synth->hash       = kSyntheticDiffuseHash;
+        newTextures.push_back(std::move(synth));
         mesh.diffuseTextureHash = kSyntheticDiffuseHash;
     }
 
@@ -214,7 +214,7 @@ bool TryResolve(SemanticCapture::DrawableState& state,
     state.submittedToRemix = true;
     state.meshHash = hash;
     for (const auto& t : newTextures) {
-        state.textureHashes.insert(t.hash);
+        state.textureHashes.insert(t->hash);
     }
 
     _MESSAGE("FO4RemixPlugin: [ResolverWater] submitted hash=0x%llX name=\"%s\" "

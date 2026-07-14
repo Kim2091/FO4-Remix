@@ -117,7 +117,10 @@ static float UnpackByte(uint8_t b) {
 // exists to bound).
 // ---------------------------------------------------------------------------
 struct CachedTexture {
-    ExtractedTexture tex;
+    // Shared with in-flight TextureSupply lists (see bs_extraction.h): the
+    // supply pass hands SubmitDrawable a refcounted view of this chain
+    // instead of a ~22MB copy. Never null for a live entry.
+    std::shared_ptr<const ExtractedTexture> tex;
     uint64_t         touch = 0;       // monotonic use-stamp (LRU order)
     uint64_t         touchFrame = 0;  // frame of last use (cold gating)
 };
@@ -156,18 +159,23 @@ static void TextureCacheErase(uint64_t key)
 {
     auto it = g_textureCache.find(key);
     if (it == g_textureCache.end()) return;
-    g_textureCacheBytes -= it->second.tex.pixels.size();
+    if (it->second.tex) g_textureCacheBytes -= it->second.tex->pixels.size();
     g_textureCache.erase(it);
 }
 
-static void TextureCacheInsert(uint64_t key, ExtractedTexture&& t)
+// Returns the stored shared chain so a supplying caller can alias it into
+// its TextureSupply without another copy. Reference stays valid across other
+// entries' erasure (unordered_map node stability).
+static const std::shared_ptr<const ExtractedTexture>&
+TextureCacheInsert(uint64_t key, ExtractedTexture&& t)
 {
     CachedTexture& slot = g_textureCache[key];
-    g_textureCacheBytes -= slot.tex.pixels.size();  // 0 for a fresh slot
+    if (slot.tex) g_textureCacheBytes -= slot.tex->pixels.size();
     g_textureCacheBytes += t.pixels.size();
-    slot.tex        = std::move(t);
+    slot.tex        = std::make_shared<const ExtractedTexture>(std::move(t));
     slot.touch      = ++g_textureCacheTouchCounter;
     slot.touchFrame = Diagnostics::CurrentFrameIndex();
+    return slot.tex;
 }
 
 // Entries younger than this many frames are HOT and never evicted, no
@@ -2192,7 +2200,7 @@ void BsExtraction::SweepTextureQueues()
 // ---------------------------------------------------------------------------
 uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                        ID3D11Device* device,
-                                       std::vector<ExtractedTexture>& newTextures,
+                                       TextureSupply& newTextures,
                                        TexturePostProcess postProcess,
                                        uint8_t minRoughness,
                                        uint8_t albedoLumFloor,
@@ -2301,7 +2309,8 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // gate fails silently and the drawable can NEVER submit again (the
     // "player's area empty after loading a save" + submitFailed-retry-storm
     // symptom). Re-supply the cached pixels so SubmitDrawable recreates the
-    // handle; the copy only happens in the handle-missing case.
+    // handle; the supply is a shared_ptr alias of the cache entry (refcount,
+    // not a pixel copy), taken only in the handle-missing case.
     if (g_texKnownBad.count(hash)) return 0;  // decode permanently dropped
 
     auto it = g_textureCache.find(hash);
@@ -2371,14 +2380,13 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                 }
             }
 
+            // One shared chain serves both the cache and (when supplying)
+            // the submit list -- the old path deep-copied the ~22MB chain
+            // here so the cache could keep one while the submit list took
+            // the other.
+            const auto& cached = TextureCacheInsert(hash, std::move(packed));
             if (supplyPixels) {
-                ExtractedTexture cached = packed;          // copy stays cached
-                TextureCacheInsert(hash, std::move(cached));
-                newTextures.push_back(std::move(packed));  // moved to submit list
-            } else {
-                // Probe mode: park the decode in the cache without the extra
-                // copy; the supplying pass cache-hits it later.
-                TextureCacheInsert(hash, std::move(packed));
+                newTextures.push_back(cached);
             }
             TextureCacheEnforceBudget();
             return hash;
@@ -2494,7 +2502,7 @@ BSLightingShaderMaterialBase* BsExtraction::GetLightingMaterial(BSTriShape* shap
 
 // Extract emissive data from a shape's shader property and material
 void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
-                                ID3D11Device* device, std::vector<ExtractedTexture>& newTextures,
+                                ID3D11Device* device, TextureSupply& newTextures,
                                 uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity,
                                 bool* outPending, bool supplyPixels)
 {
@@ -3157,8 +3165,8 @@ bool BsExtraction::GetCachedTextureStats(uint64_t hash, uint32_t* outW, uint32_t
                                          uint32_t* outFmt, uint32_t outMeanRGBA[4])
 {
     auto it = g_textureCache.find(hash);
-    if (it == g_textureCache.end()) return false;
-    const ExtractedTexture& tex = it->second.tex;
+    if (it == g_textureCache.end() || !it->second.tex) return false;
+    const ExtractedTexture& tex = *it->second.tex;
     if (outW) *outW = tex.width;
     if (outH) *outH = tex.height;
     if (outFmt) *outFmt = (uint32_t)tex.dxgiFormat;
