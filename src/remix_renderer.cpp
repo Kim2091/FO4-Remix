@@ -1752,14 +1752,30 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     float vmBethA[3][4] = {};
     float vmRemixA[3][4] = {};
     if (vmActive) {
-        // S_rot = (camBoneRot^T / scale) * camRot   (row-vector rows)
+        // Bone->camera convention twist (2026-07-18 verify run): the Camera
+        // bone's basis is right-handed/orthonormal (row0 x row1 == row2,
+        // log-verified) but FACES BACKWARD relative to the cameraNode
+        // convention -- its right and forward rows are the camera's negated,
+        // up shared (a pure 180-degree yaw twist; user-visible as arms
+        // "behind the camera, rotated 180 horizontally", pivoting at eye
+        // height). True synthetic camera pose = Q * boneRot with
+        // Q = diag(-1,-1,+1).
+        float bRot[3][3];
+        for (int r = 0; r < 3; ++r) {
+            const float flip =
+                (g_config.viewModelBoneYawFlip && r < 2) ? -1.0f : 1.0f;
+            for (int c = 0; c < 3; ++c) {
+                bRot[r][c] = vmAnchor.rot[r][c] * flip;
+            }
+        }
+        // S_rot = ((Q*boneRot)^T / scale) * camRot   (row-vector rows)
         float sRot[3][3];
         const float inv = 1.0f / vmAnchor.scale;  // publisher range-guards
         for (int r = 0; r < 3; ++r) {
             for (int c = 0; c < 3; ++c) {
-                sRot[r][c] = (vmAnchor.rot[0][r] * cam.rawRot[0][c] +
-                              vmAnchor.rot[1][r] * cam.rawRot[1][c] +
-                              vmAnchor.rot[2][r] * cam.rawRot[2][c]) * inv;
+                sRot[r][c] = (bRot[0][r] * cam.rawRot[0][c] +
+                              bRot[1][r] * cam.rawRot[1][c] +
+                              bRot[2][r] * cam.rawRot[2][c]) * inv;
             }
         }
         // S_t = camPos - camBonePos * S_rot   (row-vector application)

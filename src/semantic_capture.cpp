@@ -604,16 +604,22 @@ static void ViewModelDiagTick(uint64_t currentFrame) {
              vmActive ? 1 : 0, (void*)g_vmCamBone,
              vmXf.pos[0], vmXf.pos[1], vmXf.pos[2]);
 
-    // Camera-bone rotation dump (every 10th pass): decides whether the bone
-    // carries an identity basis (frame fully camera-locked) or a live
-    // orientation; compare against the [Camera] fwd/up/right lines.
+    // SYNCHRONIZED camera-bone vs cameraNode rotation dump (every 10th
+    // pass): same-frame samples so the constant convention twist between
+    // the two bases can be read directly off one line (async [Camera] lines
+    // made the 2026-07-18 twist derivation needlessly indirect).
     if ((s_passes % 10) == 1) {
-        _MESSAGE("FO4RemixPlugin: [ViewModel]   camBoneRot=[%.3f %.3f %.3f | "
-                 "%.3f %.3f %.3f | %.3f %.3f %.3f] scale=%.3f",
+        const CameraState camNow = Camera::Get();
+        _MESSAGE("FO4RemixPlugin: [ViewModel]   sync boneRot=[%.3f %.3f %.3f | "
+                 "%.3f %.3f %.3f | %.3f %.3f %.3f] s=%.3f "
+                 "camRawRot=[%.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f]",
                  vmXf.rot[0][0], vmXf.rot[0][1], vmXf.rot[0][2],
                  vmXf.rot[1][0], vmXf.rot[1][1], vmXf.rot[1][2],
                  vmXf.rot[2][0], vmXf.rot[2][1], vmXf.rot[2][2],
-                 vmXf.scale);
+                 vmXf.scale,
+                 camNow.rawRot[0][0], camNow.rawRot[0][1], camNow.rawRot[0][2],
+                 camNow.rawRot[1][0], camNow.rawRot[1][1], camNow.rawRot[1][2],
+                 camNow.rawRot[2][0], camNow.rawRot[2][1], camNow.rawRot[2][2]);
     }
 
     const bool dumpDetail =

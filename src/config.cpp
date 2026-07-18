@@ -111,6 +111,7 @@ void LoadConfig() {
     // [Skinning]
     g_config.skinningEnabled = GetIniBool("Skinning", "Enabled", true, dllPath);
     g_config.viewModelEnabled = GetIniBool("ViewModel", "Enabled", true, dllPath);
+    g_config.viewModelBoneYawFlip = GetIniBool("ViewModel", "BoneYawFlip", true, dllPath);
 
     // [Emissive]
     g_config.emissiveGlowMapsEnabled = GetIniBool("Emissive", "GlowMapsEnabled", true, dllPath);
@@ -222,7 +223,8 @@ void LoadConfig() {
              g_config.lightsEnabled, g_config.lightIntensity,
              g_config.lightRadius, g_config.lightColorStrength);
     _MESSAGE("FO4RemixPlugin: Skinning - Enabled=%d", g_config.skinningEnabled);
-    _MESSAGE("FO4RemixPlugin: ViewModel - Enabled=%d", g_config.viewModelEnabled);
+    _MESSAGE("FO4RemixPlugin: ViewModel - Enabled=%d BoneYawFlip=%d",
+             g_config.viewModelEnabled, g_config.viewModelBoneYawFlip);
     _MESSAGE("FO4RemixPlugin: Emissive - GlowMaps=%d EmissiveColor=%d Intensity=%.2f LogEmissive=%d",
              g_config.emissiveGlowMapsEnabled, g_config.emissiveColorEnabled,
              g_config.emissiveIntensity, g_config.logEmissive);
