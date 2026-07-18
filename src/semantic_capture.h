@@ -221,17 +221,27 @@ namespace SemanticCapture {
     void GetLeafClassName(void* obj, char* out, size_t outSize);
 
     // ---- [ViewModel] 1st-person rendering (2026-07-18) ----
-    // The engine keeps the 1P graph in a synthetic origin-local space with
-    // world-aligned axes; the 1P skeleton's "Camera" bone marks where the
-    // render camera sits in that space. Tick tracks the bone; OnFrame adds
-    // delta = realCameraBethPos - camBoneSyntheticPos to every viewmodel
-    // instance/bone translation, gluing the arms to the live camera.
+    // The engine keeps the 1P graph in a synthetic origin-local space that is
+    // ROTATION-LOCKED to the camera (diag-proven: the body root stays fixed
+    // while the player looks around, and wanders with animation while the
+    // "Camera" bone sits frozen at (0,0,120.5) -- static BY CONSTRUCTION
+    // because the frame follows the camera). The camera bone is the
+    // synthetic-space pose the real cameraNode is derived from, so the
+    // synthetic->world map solves exactly:
+    //   cameraNode = camBone * S  =>  S = camBone^-1 * cameraNode
+    // OnFrame composes S onto every viewmodel instance/bone transform.
     //
     // Returns true while the viewmodel should render (1P root present, not
-    // app-culled, camera bone resolved) and fills the bone's synthetic-space
-    // Beth translation. Thread-safe snapshot (written on the game thread in
-    // Tick, read on the Remix thread in OnFrame).
-    bool GetViewModelAnchor(float outCamBoneSynthPos[3]);
+    // app-culled, camera bone resolved + plausible) and fills the bone's
+    // full synthetic-space world transform (Beth row-vector rotation rows +
+    // translation + scale). Thread-safe snapshot (written on the game
+    // thread in Tick, read on the Remix thread in OnFrame).
+    struct ViewModelAnchor {
+        float rot[3][3];  // camera bone rotation rows (Beth, row-vector)
+        float pos[3];     // camera bone translation (Beth)
+        float scale;
+    };
+    bool GetViewModelAnchor(ViewModelAnchor& out);
 
     // Resolver query (game thread): does this geometry descend from
     // PlayerCharacter::firstPersonSkeleton? Guarded parent-chain walk,

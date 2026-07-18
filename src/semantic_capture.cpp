@@ -360,9 +360,18 @@ static void WalkFpSubtree(uintptr_t root, std::vector<VmLeaf>& outLeaves,
 // aim/pitch is baked into the bone poses by the engine's animation).
 std::mutex g_vmAnchorMx;
 struct {
-    bool  active = false;
-    float camBonePos[3] = {};
+    bool active = false;
+    SemanticCapture::ViewModelAnchor xf = {};
 } g_vmAnchor;
+
+// POD mirror of NiTransform for the guarded bulk read (rot NiMatrix43
+// [3][4], pos, scale) -- same layout skinned_meshes.cpp anchors on.
+struct VmPodXf {
+    float rot[3][4];
+    float pos[3];
+    float scale;
+};
+static_assert(sizeof(VmPodXf) == 0x40, "must mirror NiTransform layout");
 static uintptr_t g_vmCachedRoot      = 0;  // fpRoot the cached bone belongs to
 static uintptr_t g_vmCamBone         = 0;  // cached camera bone (NiNode*)
 static uint32_t  g_vmRevalidateTick  = 0;
@@ -418,7 +427,7 @@ static uintptr_t FindFpCameraBone(uintptr_t root) {
 static void UpdateViewModelAnchor() {
     const uintptr_t fpRoot = BsExtraction::GetPlayerFirstPersonRootPtr();
     bool active = false;
-    float pos[3] = {};
+    SemanticCapture::ViewModelAnchor anchor = {};
     if (fpRoot) {
         uint64_t rootFlags = 0;
         const bool flagsOk = PeekQwordGuarded(fpRoot + 0x108, &rootFlags);
@@ -454,9 +463,33 @@ static void UpdateViewModelAnchor() {
                              "(modded skeleton without a Camera node?)");
                 }
             }
+            VmPodXf bone = {};
             if (g_vmCamBone &&
-                PeekBytesGuarded(g_vmCamBone + 0x70 + 0x30, pos, sizeof(pos))) {
-                active = true;
+                PeekBytesGuarded(g_vmCamBone + 0x70, &bone, sizeof(bone))) {
+                // Plausibility gate: a recycled pointer usually fails long
+                // before a garbage matrix reaches the composed transform.
+                bool ok = bone.scale > 1.0e-4f && bone.scale < 1.0e3f;
+                for (int r = 0; ok && r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        if (!(bone.rot[r][c] > -4.0f && bone.rot[r][c] < 4.0f)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!(bone.pos[r] > -1.0e7f && bone.pos[r] < 1.0e7f)) ok = false;
+                }
+                if (ok) {
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 3; ++c) {
+                            anchor.rot[r][c] = bone.rot[r][c];
+                        }
+                        anchor.pos[r] = bone.pos[r];
+                    }
+                    anchor.scale = bone.scale;
+                    active = true;
+                } else {
+                    g_vmCamBone = 0;  // recycled object -> re-search next tick
+                }
             } else {
                 g_vmCamBone = 0;  // stale pointer -> re-search next tick
             }
@@ -464,7 +497,7 @@ static void UpdateViewModelAnchor() {
     }
     std::lock_guard<std::mutex> lk(g_vmAnchorMx);
     g_vmAnchor.active = active;
-    std::memcpy(g_vmAnchor.camBonePos, pos, sizeof(pos));
+    g_vmAnchor.xf = anchor;
 }
 
 static void ViewModelDiagTick(uint64_t currentFrame) {
@@ -511,6 +544,7 @@ static void ViewModelDiagTick(uint64_t currentFrame) {
         bool     submitted = false;
         bool     engineCulled = false;
         bool     isSkinnedActor = false;
+        bool     isViewModel = false;
     };
     std::unordered_map<void*, MapInfo> geomToInfo;
     {
@@ -526,12 +560,13 @@ static void ViewModelDiagTick(uint64_t currentFrame) {
             mi.submitted      = st.submittedToRemix;
             mi.engineCulled   = st.engineCulled;
             mi.isSkinnedActor = st.isSkinnedActor;
+            mi.isViewModel    = st.isViewModel;
             geomToInfo[st.geometry] = mi;
         }
     }
 
     uint32_t inMap = 0, fresh = 0, submitted = 0, culledLeaf = 0,
-             culledPath = 0, withBones = 0;
+             culledPath = 0, withBones = 0, tagged = 0;
     for (const VmLeaf& leaf : leaves) {
         if (leaf.flags & 1ull) ++culledLeaf;
         if (leaf.culledPath) ++culledPath;
@@ -541,31 +576,45 @@ static void ViewModelDiagTick(uint64_t currentFrame) {
         const MapInfo& mi = it->second;
         if (currentFrame - mi.lastSeenFrame <= 2) ++fresh;
         if (mi.submitted) ++submitted;
+        if (mi.isViewModel) ++tagged;
         if (SkinnedMeshes::HasEntry(mi.key)) ++withBones;
     }
 
     float playerPos[3] = {};
     BsExtraction::GetPlayerPosition(playerPos[0], playerPos[1], playerPos[2]);
 
-    bool  vmActive = false;
-    float vmBonePos[3] = {};
+    bool vmActive = false;
+    SemanticCapture::ViewModelAnchor vmXf = {};
     {
         std::lock_guard<std::mutex> lk(g_vmAnchorMx);
         vmActive = g_vmAnchor.active;
-        std::memcpy(vmBonePos, g_vmAnchor.camBonePos, sizeof(vmBonePos));
+        vmXf = g_vmAnchor.xf;
     }
 
     _MESSAGE("FO4RemixPlugin: [ViewModel] pass=%u fpRoot=%p rootCulled=%d "
              "rootPos=(%.0f,%.0f,%.0f) playerPos=(%.0f,%.0f,%.0f) nodes=%u "
-             "tris=%u inMap=%u fresh=%u submitted=%u bones=%u culledLeaf=%u "
-             "culledPath=%u vmActive=%d camBone=%p camBonePos=(%.1f,%.1f,%.1f)",
+             "tris=%u inMap=%u fresh=%u submitted=%u tagged=%u bones=%u "
+             "culledLeaf=%u culledPath=%u vmActive=%d camBone=%p "
+             "camBonePos=(%.1f,%.1f,%.1f)",
              s_passes, (void*)fpRoot, (int)(rootFlags & 1ull),
              rootPos[0], rootPos[1], rootPos[2],
              playerPos[0], playerPos[1], playerPos[2],
-             nodes, (uint32_t)leaves.size(), inMap, fresh, submitted,
+             nodes, (uint32_t)leaves.size(), inMap, fresh, submitted, tagged,
              withBones, culledLeaf, culledPath,
              vmActive ? 1 : 0, (void*)g_vmCamBone,
-             vmBonePos[0], vmBonePos[1], vmBonePos[2]);
+             vmXf.pos[0], vmXf.pos[1], vmXf.pos[2]);
+
+    // Camera-bone rotation dump (every 10th pass): decides whether the bone
+    // carries an identity basis (frame fully camera-locked) or a live
+    // orientation; compare against the [Camera] fwd/up/right lines.
+    if ((s_passes % 10) == 1) {
+        _MESSAGE("FO4RemixPlugin: [ViewModel]   camBoneRot=[%.3f %.3f %.3f | "
+                 "%.3f %.3f %.3f | %.3f %.3f %.3f] scale=%.3f",
+                 vmXf.rot[0][0], vmXf.rot[0][1], vmXf.rot[0][2],
+                 vmXf.rot[1][0], vmXf.rot[1][1], vmXf.rot[1][2],
+                 vmXf.rot[2][0], vmXf.rot[2][1], vmXf.rot[2][2],
+                 vmXf.scale);
+    }
 
     const bool dumpDetail =
         (uint32_t)leaves.size() != s_lastLeafCount || (s_passes % 10) == 1;
@@ -588,12 +637,13 @@ static void ViewModelDiagTick(uint64_t currentFrame) {
         const MapInfo& mi = it->second;
         _MESSAGE("FO4RemixPlugin: [ViewModel]   geom=%p \"%s\" cls=%s "
                  "culled=%d path=%d skin=%d pos=(%.1f,%.1f,%.1f) "
-                 "MAP{fires=%u age=%llu sub=%d gate=%s engCull=%d "
+                 "MAP{vm=%d fires=%u age=%llu sub=%d gate=%s engCull=%d "
                  "skinActor=%d bones=%d}",
                  leaf.geom, leaf.name, leaf.cls,
                  (int)(leaf.flags & 1ull), leaf.culledPath ? 1 : 0,
                  leaf.hasSkin ? 1 : 0,
                  leaf.pos[0], leaf.pos[1], leaf.pos[2],
+                 mi.isViewModel ? 1 : 0,
                  mi.fireCount,
                  (unsigned long long)(currentFrame - mi.lastSeenFrame),
                  mi.submitted ? 1 : 0,
@@ -819,12 +869,9 @@ void SemanticCapture::GetLeafClassName(void* obj, char* out, size_t outSize) {
     GetLeafClassNameGuarded(obj, g_moduleBase, out, outSize);
 }
 
-bool SemanticCapture::GetViewModelAnchor(float outCamBoneSynthPos[3]) {
+bool SemanticCapture::GetViewModelAnchor(ViewModelAnchor& out) {
     std::lock_guard<std::mutex> lk(g_vmAnchorMx);
-    if (outCamBoneSynthPos) {
-        std::memcpy(outCamBoneSynthPos, g_vmAnchor.camBonePos,
-                    sizeof(g_vmAnchor.camBonePos));
-    }
+    out = g_vmAnchor.xf;
     return g_vmAnchor.active;
 }
 
@@ -833,7 +880,7 @@ bool SemanticCapture::IsViewModelGeometry(void* geometry) {
     const uintptr_t fpRoot = BsExtraction::GetPlayerFirstPersonRootPtr();
     if (!fpRoot) return false;
     uintptr_t obj = reinterpret_cast<uintptr_t>(geometry);
-    for (int i = 0; i < 16 && obj; ++i) {
+    for (int i = 0; i < 64 && obj; ++i) {
         if (obj == fpRoot) return true;
         uintptr_t parent = 0;
         if (!PeekBytesGuarded(obj + 0x28, &parent, sizeof(parent))) return false;

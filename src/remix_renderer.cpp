@@ -1732,32 +1732,63 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     SemanticCapture::SnapshotSkinnedCulled(skinnedCulled);
 
     // [ViewModel] synthetic-space -> render-world mapping (2026-07-18).
-    // 1st-person geometry is authored in an origin-local space whose
-    // "Camera" bone marks the eye; adding (realCamera - camBone) to every
-    // viewmodel translation glues the arms/weapon to the live camera. The
-    // Beth-axis delta feeds skinned BONE translations (their instance base
-    // is the bare mirror P and bones stay in Beth space); the X/Y-swapped
-    // delta feeds rigid instance transforms (already Remix-form). vmActive
-    // false = the engine has the 1P root app-culled (3rd person, menus):
-    // viewmodel draws are skipped but keep their handles warm. The bone
-    // anchor is Tick's snapshot (same hkPresent as this cam on the game
-    // thread), so camera translation cancels exactly; only the sway
-    // animation can skew by a frame (sub-centimeter).
-    float vmCamBone[3] = {};
+    // 1st-person geometry is authored in a synthetic space that is
+    // ROTATION-LOCKED to the camera; its "Camera" bone is the pose the real
+    // cameraNode is derived from, so the map solves exactly (Beth
+    // row-vector affine):
+    //   cameraNode = camBone * S
+    //   =>  S_rot = camBoneRot^T/scale * camRot,  S_t = camPos - camBonePos*S_rot
+    // Composed here into two 3x4 affine composers applied at draw time:
+    //   vmBethA  = [S_rot^T | S_t]          for skinned BONE transforms
+    //              (Beth column-form; their instance base is the bare
+    //              mirror P applied on top)
+    //   vmRemixA = [P*S_rot^T*P | P*S_t]    for rigid instance transforms
+    //              (already Remix-form, P = the Beth->Remix X/Y swap)
+    // vmActive false = the engine has the 1P root app-culled (3rd person,
+    // menus): viewmodel draws are skipped but keep their handles warm.
+    SemanticCapture::ViewModelAnchor vmAnchor = {};
     const bool vmActive =
-        SemanticCapture::GetViewModelAnchor(vmCamBone) && cam.valid;
-    float vmDeltaBeth[3] = {};
-    float vmDeltaRemix[3] = {};
+        SemanticCapture::GetViewModelAnchor(vmAnchor) && cam.valid;
+    float vmBethA[3][4] = {};
+    float vmRemixA[3][4] = {};
     if (vmActive) {
-        const float camBeth[3] = {
-            cam.position[1], cam.position[0], cam.position[2] };
-        for (int i = 0; i < 3; ++i) {
-            vmDeltaBeth[i] = camBeth[i] - vmCamBone[i];
+        // S_rot = (camBoneRot^T / scale) * camRot   (row-vector rows)
+        float sRot[3][3];
+        const float inv = 1.0f / vmAnchor.scale;  // publisher range-guards
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                sRot[r][c] = (vmAnchor.rot[0][r] * cam.rawRot[0][c] +
+                              vmAnchor.rot[1][r] * cam.rawRot[1][c] +
+                              vmAnchor.rot[2][r] * cam.rawRot[2][c]) * inv;
+            }
         }
-        vmDeltaRemix[0] = vmDeltaBeth[1];
-        vmDeltaRemix[1] = vmDeltaBeth[0];
-        vmDeltaRemix[2] = vmDeltaBeth[2];
+        // S_t = camPos - camBonePos * S_rot   (row-vector application)
+        float sT[3];
+        for (int c = 0; c < 3; ++c) {
+            sT[c] = cam.rawPos[c] - (vmAnchor.pos[0] * sRot[0][c] +
+                                     vmAnchor.pos[1] * sRot[1][c] +
+                                     vmAnchor.pos[2] * sRot[2][c]);
+        }
+        static const int perm[3] = { 1, 0, 2 };
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                vmBethA[r][c]  = sRot[c][r];
+                vmRemixA[r][c] = sRot[perm[c]][perm[r]];
+            }
+            vmBethA[r][3]  = sT[r];
+            vmRemixA[r][3] = sT[perm[r]];
+        }
     }
+    // out = A o B for 3x4 affines in column-vector semantics.
+    auto vmCompose = [](const float A[3][4], const float B[3][4],
+                        float out[3][4]) {
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                out[r][c] = A[r][0] * B[0][c] + A[r][1] * B[1][c] +
+                            A[r][2] * B[2][c] + (c == 3 ? A[r][3] : 0.0f);
+            }
+        }
+    };
 
     const PerfClock::time_point tSnap1 = PerfClock::now();
     PerfClock::duration dBucket{}, dDraw{};
@@ -1775,6 +1806,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t skippedChunkPlayerInside = 0;
     size_t skippedChunkStale = 0;
     size_t skippedViewModel = 0;
+    size_t vmDrawn = 0;
     {
         std::lock_guard<std::mutex> lock(g_renderStateMutex);
         const PerfClock::time_point tBucket0 = PerfClock::now();
@@ -1810,6 +1842,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // 1P graph (vmActive); skip otherwise but keep handles warm --
             // they return the moment the player re-enters 1st person.
             if (inst.isViewModel && !vmActive) { ++skippedViewModel; continue; }
+            if (inst.isViewModel) ++vmDrawn;
             // (Engine-active filter removed 2026-07-02 -- with the window at
             // TTL it never skipped anything; skippedInactive stays in the
             // status log as a tombstone and always reads 0.)
@@ -1996,14 +2029,17 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                         instance.transform.matrix[r][c] = member->worldTransform[r][c];
                     }
                 }
-                // Rigid viewmodel part: re-anchor the synthetic-space
-                // transform to the live camera (Remix-form translation; see
-                // the vmDeltaRemix derivation above). Applied to the LOCAL
-                // copy only -- inst.worldTransform stays the raw synthetic
-                // value the capture hook maintains.
+                // Rigid viewmodel part: compose the synthetic->world map
+                // onto the synthetic transform (Remix-form composer).
+                // Applied to the LOCAL copy only -- inst.worldTransform
+                // stays the raw synthetic value the capture hook maintains.
                 if (member->isViewModel && !member->isSkinned) {
+                    float adj[3][4];
+                    vmCompose(vmRemixA, member->worldTransform, adj);
                     for (int r = 0; r < 3; ++r) {
-                        instance.transform.matrix[r][3] += vmDeltaRemix[r];
+                        for (int c = 0; c < 4; ++c) {
+                            instance.transform.matrix[r][c] = adj[r][c];
+                        }
                     }
                 }
                 // pNext: blendExt directly, or nullptr if not needed.
@@ -2018,17 +2054,17 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     bonesExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
                     bonesExt.pNext = instance.pNext;
                     if (member->isViewModel) {
-                        // Skinned viewmodel (arms/1P body): the delta rides
-                        // the BONE translations in Beth axes (the instance
-                        // base is the bare mirror P, applied on top). Copied
-                        // to a scratch set per draw so the raw bones in
-                        // boneTransforms are never double-adjusted on frames
-                        // without a fresh bone queue.
-                        vmBoneScratch = member->boneTransforms;
-                        for (auto& bt : vmBoneScratch) {
-                            for (int r = 0; r < 3; ++r) {
-                                bt.matrix[r][3] += vmDeltaBeth[r];
-                            }
+                        // Skinned viewmodel (arms/1P body): compose the map
+                        // onto the BONE transforms in Beth column-form (the
+                        // instance base is the bare mirror P, applied on
+                        // top). Copied to a scratch set per draw so the raw
+                        // bones in boneTransforms are never double-adjusted
+                        // on frames without a fresh bone queue.
+                        vmBoneScratch.resize(member->boneTransforms.size());
+                        for (size_t b = 0; b < member->boneTransforms.size(); ++b) {
+                            vmCompose(vmBethA,
+                                      member->boneTransforms[b].matrix,
+                                      vmBoneScratch[b].matrix);
                         }
                         bonesExt.boneTransforms_values = vmBoneScratch.data();
                         bonesExt.boneTransforms_count  = (uint32_t)vmBoneScratch.size();
@@ -2072,18 +2108,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 const bool mirrorBase = g_config.batchedMirrorBase;
                 bucket.transforms.reserve(bucket.members.size());
                 for (const DrawableInstance* member : bucket.members) {
+                    // Rigid viewmodel part sharing a mesh handle (e.g.
+                    // duplicated Pip-Boy sub-meshes): compose the map first,
+                    // then apply the mirror-base row swap to the adjusted
+                    // matrix so the base P recovers the true placement.
+                    float adj[3][4];
+                    const float (*src)[4] = member->worldTransform;
+                    if (member->isViewModel) {
+                        vmCompose(vmRemixA, member->worldTransform, adj);
+                        src = adj;
+                    }
                     remixapi_Transform xform = {};
                     for (int r = 0; r < 3; ++r) {
                         const int srcRow = mirrorBase ? (r == 0 ? 1 : (r == 1 ? 0 : 2)) : r;
                         for (int c = 0; c < 4; ++c) {
-                            xform.matrix[r][c] = member->worldTransform[srcRow][c];
-                        }
-                        // Rigid viewmodel part sharing a mesh handle (e.g.
-                        // duplicated Pip-Boy sub-meshes): same re-anchor as
-                        // the single-member path, indexed by srcRow so the
-                        // mirror-base row swap composes correctly.
-                        if (member->isViewModel) {
-                            xform.matrix[r][3] += vmDeltaRemix[srcRow];
+                            xform.matrix[r][c] = src[srcRow][c];
                         }
                     }
                     bucket.transforms.push_back(xform);
@@ -2170,10 +2209,12 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                                                  &activeStats, nullptr);
         _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu "
                  "skippedChunkPlayerInside=%zu skippedChunkStale=%zu chunks=%zu "
+                 "vmDrawn=%zu skippedVM=%zu "
                  "active=%u isLod=%u fadedIn=%u notVisible=%u lodFadingOut=%u forcedFadeOut=%u "
                  "player=(%.0f,%.0f,%.0f)",
                  drawableCount, bucketCount, batchedBucketCount, skippedInactive,
                  skippedChunkPlayerInside, skippedChunkStale, lodChunkAges.size(),
+                 vmDrawn, skippedViewModel,
                  activeStats.total, activeStats.isLod, activeStats.fadedIn,
                  activeStats.notVisible, activeStats.lodFadingOut, activeStats.forcedFadeOut,
                  cam.playerWorldPos[0], cam.playerWorldPos[1], cam.playerWorldPos[2]);

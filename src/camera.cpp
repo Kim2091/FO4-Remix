@@ -176,6 +176,16 @@ CameraState Camera::Get() {
     state.up[1]      = xform.rot.data[2][0];
     state.up[2]      = xform.rot.data[2][2];
 
+    // Raw Beth-space transform for the viewmodel mapping (no swap).
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            state.rawRot[r][c] = xform.rot.data[r][c];
+        }
+    }
+    state.rawPos[0] = xform.pos.x;
+    state.rawPos[1] = xform.pos.y;
+    state.rawPos[2] = xform.pos.z;
+
     // FOV source ladder (see the NiCamera comment block above):
     //   1. Live NiCamera view frustum -- exact vertical FOV + aspect + near/
     //      far, tracks ADS zoom and FOV mods per frame.
