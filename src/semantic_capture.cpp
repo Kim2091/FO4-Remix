@@ -250,6 +250,230 @@ static uint64_t RetryDelayFrames(uint32_t attempts) {
     return delay < kMaxRetryDelayFrames ? delay : kMaxRetryDelayFrames;
 }
 
+// -------- [ViewModel] first-person pipeline diagnostic (2026-07-18) --------
+// User report: 1st-person arms/weapon are COMPLETELY INVISIBLE in the Remix
+// window, yet the log proves the capture pipeline sees *1stPerson shapes at
+// least once (skin registrations at load). This walks the player's
+// 1st-person scene graph (PlayerCharacter::firstPersonSkeleton) once every
+// ~2s on the game thread and cross-references every BSTriShape leaf against
+// g_drawableMap, answering per shape: does the hook still fire for it
+// (lastSeen age), did it resolve+submit, is it engine-app-culled (leaf flag
+// or anywhere on the ancestor path), does it have live bones queued, and
+// where is it in Beth world space relative to the player. One summary line
+// per pass; leaf detail dumped on the first populated pass, then whenever
+// the leaf count changes (weapon draw/holster) and every 10th pass.
+
+// SEH-guarded bulk read (engine pointers can be mid-teardown). POD-only.
+static bool PeekBytesGuarded(uintptr_t src, void* dst, size_t n) {
+    __try {
+        memcpy(dst, reinterpret_cast<const void*>(src), n);
+        return true;
+    } __except (1) {
+        return false;
+    }
+}
+
+struct VmLeaf {
+    void*    geom       = nullptr;
+    uint64_t flags      = 0;      // NiAVObject flags qword; bit0 = app-culled
+    float    pos[3]     = {};     // m_worldTransform.pos (Beth coords)
+    bool     culledPath = false;  // any ANCESTOR carried the app-culled bit
+    bool     hasSkin    = false;  // +0x140 skinInstance non-null
+    char     cls[48]    = {};
+    char     name[64]   = {};
+};
+
+// Breadth-first walk of the 1P subtree. Ordinary C++ (vectors fine) -- every
+// engine deref goes through the guarded peeks above, and class/name reads go
+// through the already-guarded RTTI/name helpers.
+static void WalkFpSubtree(uintptr_t root, std::vector<VmLeaf>& outLeaves,
+                          uint32_t& outNodes) {
+    struct QEntry { uintptr_t obj; bool culledPath; };
+    constexpr size_t   kMaxNodes    = 1024;
+    constexpr uint32_t kMaxChildren = 4096;
+    std::vector<QEntry> queue;
+    queue.reserve(64);
+    queue.push_back({root, false});
+    size_t head = 0;
+    outNodes = 0;
+    while (head < queue.size() && outNodes < kMaxNodes) {
+        const QEntry qe = queue[head++];
+        if (!qe.obj) continue;
+        ++outNodes;
+
+        uint64_t flags = 0;
+        PeekQwordGuarded(qe.obj + 0x108, &flags);
+        const bool culledHere = (flags & 1ull) != 0;
+
+        char cls[48] = {};
+        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(qe.obj),
+                                          cls, sizeof(cls));
+
+        if (std::strstr(cls, "TriShape")) {
+            VmLeaf leaf;
+            leaf.geom       = reinterpret_cast<void*>(qe.obj);
+            leaf.flags      = flags;
+            leaf.culledPath = qe.culledPath;
+            std::memcpy(leaf.cls, cls, sizeof(leaf.cls));
+            // NiTransform at +0x70: NiMatrix43 (0x30) then NiPoint3 pos.
+            PeekBytesGuarded(qe.obj + 0x70 + 0x30, leaf.pos, sizeof(leaf.pos));
+            uintptr_t skin = 0;
+            PeekBytesGuarded(qe.obj + 0x140, &skin, sizeof(skin));
+            leaf.hasSkin = skin != 0;
+            PeekNameGuarded(leaf.geom, leaf.name, sizeof(leaf.name));
+            outLeaves.push_back(leaf);
+            continue;  // BSTriShape has no children worth walking
+        }
+
+        // Recurse into anything node-like (NiNode/BSFadeNode/
+        // BSFlattenedBoneTree/...). NiNode::m_children NiTArray at +0x120:
+        // m_data +0x128, m_emptyRunStart +0x132 (sparse -- skip nulls).
+        if (std::strstr(cls, "Node") || std::strstr(cls, "Tree")) {
+            uintptr_t data = 0;
+            uint16_t emptyRunStart = 0;
+            if (PeekBytesGuarded(qe.obj + 0x128, &data, sizeof(data)) && data &&
+                PeekBytesGuarded(qe.obj + 0x132, &emptyRunStart,
+                                 sizeof(emptyRunStart)) &&
+                emptyRunStart <= kMaxChildren) {
+                for (uint16_t i = 0; i < emptyRunStart; ++i) {
+                    uintptr_t child = 0;
+                    if (PeekBytesGuarded(data + (uintptr_t)i * 8, &child,
+                                         sizeof(child)) && child) {
+                        queue.push_back({child, qe.culledPath || culledHere});
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void ViewModelDiagTick(uint64_t currentFrame) {
+    constexpr uint32_t kPeriodTicks   = 120;  // ~2s
+    constexpr uint32_t kMaxPasses     = 90;
+    constexpr uint32_t kMaxDetailLines = 240;
+    static uint32_t s_sinceLast   = kPeriodTicks;  // first eligible tick logs
+    static uint32_t s_passes      = 0;
+    static uint32_t s_detailLines = 0;
+    static uint32_t s_lastLeafCount = UINT32_MAX;
+    static bool     s_noRootLogged  = false;
+
+    if (s_passes >= kMaxPasses) return;
+    if (++s_sinceLast < kPeriodTicks) return;
+    s_sinceLast = 0;
+
+    const uintptr_t fpRoot = BsExtraction::GetPlayerFirstPersonRootPtr();
+    if (!fpRoot) {
+        if (!s_noRootLogged) {
+            s_noRootLogged = true;
+            _MESSAGE("FO4RemixPlugin: [ViewModel] firstPersonSkeleton unavailable "
+                     "(main menu?) -- will keep polling silently");
+        }
+        return;
+    }
+    ++s_passes;
+
+    uint64_t rootFlags = 0;
+    PeekQwordGuarded(fpRoot + 0x108, &rootFlags);
+    float rootPos[3] = {};
+    PeekBytesGuarded(fpRoot + 0x70 + 0x30, rootPos, sizeof(rootPos));
+
+    static std::vector<VmLeaf> leaves;
+    leaves.clear();
+    uint32_t nodes = 0;
+    WalkFpSubtree(fpRoot, leaves, nodes);
+
+    // Cross-reference against the capture map by geometry pointer.
+    struct MapInfo {
+        uint64_t key = 0;
+        uint32_t fireCount = 0;
+        uint64_t lastSeenFrame = 0;
+        int      lastGate = 0;
+        bool     submitted = false;
+        bool     engineCulled = false;
+        bool     isSkinnedActor = false;
+    };
+    std::unordered_map<void*, MapInfo> geomToInfo;
+    {
+        std::lock_guard<std::mutex> lock(g_drawableMutex);
+        geomToInfo.reserve(g_drawableMap.size());
+        for (const auto& [key, st] : g_drawableMap) {
+            if (!st.geometry) continue;
+            MapInfo mi;
+            mi.key            = key;
+            mi.fireCount      = st.fireCount;
+            mi.lastSeenFrame  = st.lastSeenFrame;
+            mi.lastGate       = st.lastFailedResolverStep;
+            mi.submitted      = st.submittedToRemix;
+            mi.engineCulled   = st.engineCulled;
+            mi.isSkinnedActor = st.isSkinnedActor;
+            geomToInfo[st.geometry] = mi;
+        }
+    }
+
+    uint32_t inMap = 0, fresh = 0, submitted = 0, culledLeaf = 0,
+             culledPath = 0, withBones = 0;
+    for (const VmLeaf& leaf : leaves) {
+        if (leaf.flags & 1ull) ++culledLeaf;
+        if (leaf.culledPath) ++culledPath;
+        auto it = geomToInfo.find(leaf.geom);
+        if (it == geomToInfo.end()) continue;
+        ++inMap;
+        const MapInfo& mi = it->second;
+        if (currentFrame - mi.lastSeenFrame <= 2) ++fresh;
+        if (mi.submitted) ++submitted;
+        if (SkinnedMeshes::HasEntry(mi.key)) ++withBones;
+    }
+
+    float playerPos[3] = {};
+    BsExtraction::GetPlayerPosition(playerPos[0], playerPos[1], playerPos[2]);
+
+    _MESSAGE("FO4RemixPlugin: [ViewModel] pass=%u fpRoot=%p rootCulled=%d "
+             "rootPos=(%.0f,%.0f,%.0f) playerPos=(%.0f,%.0f,%.0f) nodes=%u "
+             "tris=%u inMap=%u fresh=%u submitted=%u bones=%u culledLeaf=%u "
+             "culledPath=%u",
+             s_passes, (void*)fpRoot, (int)(rootFlags & 1ull),
+             rootPos[0], rootPos[1], rootPos[2],
+             playerPos[0], playerPos[1], playerPos[2],
+             nodes, (uint32_t)leaves.size(), inMap, fresh, submitted,
+             withBones, culledLeaf, culledPath);
+
+    const bool dumpDetail =
+        (uint32_t)leaves.size() != s_lastLeafCount || (s_passes % 10) == 1;
+    s_lastLeafCount = (uint32_t)leaves.size();
+    if (!dumpDetail) return;
+    for (const VmLeaf& leaf : leaves) {
+        if (s_detailLines >= kMaxDetailLines) break;
+        ++s_detailLines;
+        auto it = geomToInfo.find(leaf.geom);
+        if (it == geomToInfo.end()) {
+            _MESSAGE("FO4RemixPlugin: [ViewModel]   geom=%p \"%s\" cls=%s "
+                     "culled=%d path=%d skin=%d pos=(%.1f,%.1f,%.1f) "
+                     "NOT-IN-MAP",
+                     leaf.geom, leaf.name, leaf.cls,
+                     (int)(leaf.flags & 1ull), leaf.culledPath ? 1 : 0,
+                     leaf.hasSkin ? 1 : 0,
+                     leaf.pos[0], leaf.pos[1], leaf.pos[2]);
+            continue;
+        }
+        const MapInfo& mi = it->second;
+        _MESSAGE("FO4RemixPlugin: [ViewModel]   geom=%p \"%s\" cls=%s "
+                 "culled=%d path=%d skin=%d pos=(%.1f,%.1f,%.1f) "
+                 "MAP{fires=%u age=%llu sub=%d gate=%s engCull=%d "
+                 "skinActor=%d bones=%d}",
+                 leaf.geom, leaf.name, leaf.cls,
+                 (int)(leaf.flags & 1ull), leaf.culledPath ? 1 : 0,
+                 leaf.hasSkin ? 1 : 0,
+                 leaf.pos[0], leaf.pos[1], leaf.pos[2],
+                 mi.fireCount,
+                 (unsigned long long)(currentFrame - mi.lastSeenFrame),
+                 mi.submitted ? 1 : 0,
+                 Resolvers::Trace::StepName(mi.lastGate),
+                 mi.engineCulled ? 1 : 0,
+                 mi.isSkinnedActor ? 1 : 0,
+                 SkinnedMeshes::HasEntry(mi.key) ? 1 : 0);
+    }
+}
+
 // Resolver exception fence. A C++ exception is implemented as SEH on MSVC;
 // letting the outer __except catch 0xE06D7363 bypasses /EHsc unwinding and can
 // strand mutex lock_guards owned by the resolver. Catch C++ exceptions in an
@@ -890,6 +1114,12 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     // half-freed skeleton can read as plausible garbage).
     if (!loadingGate && g_config.skinningEnabled) {
         SkinnedMeshes::UpdateAndQueue();
+    }
+
+    // [ViewModel] 1st-person pipeline probe (rate-limited + capped inside;
+    // ~2s cadence, one summary line per pass).
+    if (!loadingGate) {
+        ViewModelDiagTick(currentFrame);
     }
 
     // ---- Resolve loop: every call, attempt one resolve per unsubmitted drawable ----

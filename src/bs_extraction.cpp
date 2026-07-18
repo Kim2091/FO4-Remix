@@ -81,6 +81,9 @@ static constexpr uintptr_t OFF_CELL_OBJECT_LIST = 0x70;
 static constexpr uintptr_t OFF_CELL_FLAGS       = 0x40;
 static constexpr uintptr_t OFF_CELL_LAND        = 0x58;  // TESObjectLAND*
 static constexpr uintptr_t OFF_CELL_WORLD_SPACE = 0xC8;
+// PlayerCharacter::firstPersonSkeleton (NiNode*). F4SE GameReferences.h
+// pins the neighbors: playerEquipData 0xB70 / tints 0xD00 STATIC_ASSERTs.
+static constexpr uintptr_t OFF_PLAYER_FP_SKELETON = 0xB78;
 static constexpr uint16_t  CELL_FLAG_IS_INTERIOR = 0x0001;
 static constexpr uintptr_t OFF_LAND_QUADRANTS   = 0x40;  // BSMultiBoundNode*[4]
 static constexpr int       LAND_QUADRANT_COUNT  = 4;
@@ -2956,6 +2959,17 @@ uintptr_t BsExtraction::GetPlayerCellPtr()
     if (!ppPlayer || !*ppPlayer) return 0;
     uintptr_t player = *ppPlayer;
     return *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
+}
+
+// ---------------------------------------------------------------------------
+// Return PlayerCharacter::firstPersonSkeleton (0 if unavailable).
+// ---------------------------------------------------------------------------
+uintptr_t BsExtraction::GetPlayerFirstPersonRootPtr()
+{
+    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
+    if (!ppPlayer || !*ppPlayer) return 0;
+    uintptr_t player = *ppPlayer;
+    return *reinterpret_cast<uintptr_t*>(player + OFF_PLAYER_FP_SKELETON);
 }
 
 // ---------------------------------------------------------------------------

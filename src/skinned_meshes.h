@@ -65,6 +65,10 @@ namespace SkinnedMeshes {
     // Drop a drawable's bone tracking (wired into ReleaseDrawable).
     void OnDrawableReleased(uint64_t drawableHash);
 
+    // [ViewModel] diag probe: does a bone registry entry exist for this
+    // drawable (i.e. is UpdateAndQueue feeding it live bones)?
+    bool HasEntry(uint64_t drawableHash);
+
     // Read live bone transforms for every registered drawable and queue the
     // composed matrix sets to RemixRenderer. Game thread, once per Tick.
     void UpdateAndQueue();

@@ -237,6 +237,12 @@ namespace BsExtraction {
     // Outputs are left unchanged (default 0) when player is unavailable.
     void GetPlayerPosition(float& outX, float& outY, float& outZ);
 
+    // Returns PlayerCharacter::firstPersonSkeleton (+0xB78, STATIC_ASSERT-
+    // anchored by playerEquipData/tints asserts in F4SE GameReferences.h),
+    // or 0 when the player singleton is absent. The root NiNode of the
+    // 1st-person scene graph (arms / weapon / Pip-Boy).
+    uintptr_t GetPlayerFirstPersonRootPtr();
+
     // Lightweight check: player exists, parentCell loaded, cell has objects,
     // and player's 3D root node is present.  Cheap enough to call every frame.
     bool IsPlayerCellReady();

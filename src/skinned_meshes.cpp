@@ -267,6 +267,11 @@ void SkinnedMeshes::OnDrawableReleased(uint64_t drawableHash) {
     g_entries.erase(drawableHash);
 }
 
+bool SkinnedMeshes::HasEntry(uint64_t drawableHash) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    return g_entries.count(drawableHash) != 0;
+}
+
 void SkinnedMeshes::Reset() {
     std::lock_guard<std::mutex> lk(g_mx);
     g_entries.clear();
