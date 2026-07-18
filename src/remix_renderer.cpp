@@ -1731,6 +1731,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         vmInfo.pNext = &vmParams;
         vmInfo.type = REMIXAPI_CAMERA_TYPE_VIEW_MODEL;
         RemixCallGuarded("SetupCamera(viewModel)", [&] { api->SetupCamera(&vmInfo); });
+
+        // Master switch for the runtime's view-model machinery (2026-07-18):
+        // rtx.viewModel.enable defaults FALSE and createViewModelInstances
+        // early-outs without it -- the whole external VM path (the camera
+        // above + the category tag at draw time) shipped silently inert.
+        // Queued once per session; also persisted in the game-dir rtx.conf,
+        // but this survives a runtime-side settings rewrite dropping the
+        // line. Drained later this frame on this thread under the API mutex.
+        if (g_config.viewModelCategoryTag) {
+            static bool s_vmEnableQueued = false;
+            if (!s_vmEnableQueued) {
+                s_vmEnableQueued = true;
+                QueueConfigVariable("rtx.viewModel.enable", "True");
+            }
+        }
     }
 
     bool hasAnyMeshes = false;
