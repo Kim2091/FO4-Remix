@@ -158,6 +158,18 @@ static size_t g_textureCacheBytes = 0;
 // with the cache.
 static std::unordered_set<uint64_t> g_texKnownBad;
 
+// ---- Live render-target textures (2026-07-18 Pip-Boy screen) ----
+// Sources with D3D11_BIND_RENDER_TARGET are engine compositing targets
+// (Scaleform UI on the Pip-Boy screen); their pixels change every frame,
+// so their cache identity folds this generation counter -- bumping it
+// makes the next extraction a cache miss that re-captures live content.
+// Game thread only (resolver + Tick), plain statics suffice.
+static uint32_t g_liveTexGeneration = 1;
+static bool     g_liveRTFlagSticky  = false;
+// baseHash (pre-generation fold) -> last generation's folded hash, for
+// evicting the superseded CPU-cache entry (one live entry per RT).
+static std::unordered_map<uint64_t, uint64_t> g_liveTexLastVariant;
+
 static void TextureCacheErase(uint64_t key)
 {
     auto it = g_textureCache.find(key);
@@ -2302,6 +2314,50 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
         }
     }
 
+    // ---- Live render-target detection (2026-07-18 Pip-Boy screen) ----
+    // A source with BIND_RENDER_TARGET is an engine compositing target whose
+    // pixels change at runtime (the Pip-Boy screen's Scaleform UI). Fold the
+    // live-texture generation into the hash BEFORE the cache check so a
+    // generation bump forces a fresh capture, and fold the surface identity
+    // (dims+format) so distinct unnamed RTs can't collide on a name hash.
+    bool isLiveRT = false;
+    {
+        ID3D11Texture2D* probe2d = nullptr;
+        if (SUCCEEDED(resource->QueryInterface(
+                __uuidof(ID3D11Texture2D),
+                reinterpret_cast<void**>(&probe2d))) && probe2d) {
+            D3D11_TEXTURE2D_DESC pd = {};
+            probe2d->GetDesc(&pd);
+            probe2d->Release();
+            if (pd.BindFlags & D3D11_BIND_RENDER_TARGET) {
+                isLiveRT = true;
+                g_liveRTFlagSticky = true;
+                hash = FnvHashCombine(hash,
+                    ((uint64_t)pd.Format << 40) |
+                    ((uint64_t)pd.Width << 24) | ((uint64_t)pd.Height << 8) | 9u);
+                const uint64_t baseHash = hash;
+                hash = FnvHashCombine(hash,
+                    11ull | ((uint64_t)g_liveTexGeneration << 8));
+                // One live CPU-cache entry per RT: evict the previous
+                // generation the moment a new one is keyed.
+                auto [lit, inserted] =
+                    g_liveTexLastVariant.try_emplace(baseHash, hash);
+                if (!inserted && lit->second != hash) {
+                    TextureCacheErase(lit->second);
+                    lit->second = hash;
+                }
+                static std::atomic<int> sLiveRtLogs{0};
+                if (sLiveRtLogs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    _MESSAGE("FO4RemixPlugin: [LiveTex] render-target source "
+                             "\"%s\" slot=%s %ux%u fmt=%u gen=%u",
+                             texName ? texName : "<unnamed>", slotName,
+                             pd.Width, pd.Height, (unsigned)pd.Format,
+                             g_liveTexGeneration);
+                }
+            }
+        }
+    }
+
     // Check cache first. A hit normally returns just the hash -- the pixels
     // were already handed to SubmitDrawable when the texture was first
     // extracted. But the Remix-side handle can be destroyed while this cache
@@ -2372,7 +2428,7 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
             // ever had resident. Only when the resolution fold is active (hash
             // differs from the pre-fold hash); only supersede strictly-smaller
             // variants.
-            if (hash != preResolutionHash) {
+            if (hash != preResolutionHash && !isLiveRT) {
                 auto [vit, inserted] = g_texResVariantIndex.try_emplace(
                     preResolutionHash, hash, packed.width);
                 if (!inserted && vit->second.first != hash) {
@@ -2410,7 +2466,9 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     D3D11_TEXTURE2D_DESC srcDescForCache = {};
     tex2D->GetDesc(&srcDescForCache);
     uint64_t diskKey = 0;
-    if (g_config.diskTextureCache) {
+    // Live RTs bypass the disk cache entirely: their pixels are per-frame
+    // runtime content, and per-generation keys would flood the folder.
+    if (g_config.diskTextureCache && !isLiveRT) {
         diskKey = DiskCacheKeyFold(hash, srcDescForCache);
         if (!g_diskProbeMissing.count(hash)) {
             char cachePath[MAX_PATH];
@@ -2948,6 +3006,25 @@ void BsExtraction::ExtractAlphaState(BSGeometry* geo, ExtractedMesh& mesh) {
         mesh.srcColorBlendFactor  = vkSrc;
         mesh.dstColorBlendFactor  = vkDst;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Live render-target texture generation (see the isLiveRT block in
+// ExtractMaterialTexture). Game thread only.
+// ---------------------------------------------------------------------------
+void BsExtraction::BumpLiveTextureGeneration()
+{
+    ++g_liveTexGeneration;
+}
+
+void BsExtraction::ResetLiveRTFlag()
+{
+    g_liveRTFlagSticky = false;
+}
+
+bool BsExtraction::LastExtractionSawLiveRT()
+{
+    return g_liveRTFlagSticky;
 }
 
 // ---------------------------------------------------------------------------

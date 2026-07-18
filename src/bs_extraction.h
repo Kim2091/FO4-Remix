@@ -388,6 +388,22 @@ namespace BsExtraction {
     // supplying pass on the attempt that actually submits. Supplied entries
     // are shared_ptr views of the cache's chains (see TextureSupply) --
     // supplying costs a refcount, not a ~22MB memcpy.
+    // ---- Live render-target textures (2026-07-18 Pip-Boy screen) ----
+    // ExtractMaterialTexture detects source resources with
+    // D3D11_BIND_RENDER_TARGET (the engine composites UI/Scaleform content
+    // into them at runtime -- Pip-Boy screen, scope displays) and folds a
+    // global GENERATION counter into their hash, so bumping the generation
+    // makes the next extraction a cache miss that re-captures the live
+    // pixels. RT-backed textures bypass the disk cache and evict their
+    // previous generation from the CPU cache. Game thread only.
+    void BumpLiveTextureGeneration();
+    // Sticky per-resolve flag: set whenever any ExtractMaterialTexture call
+    // since the last Reset detected an RT-backed source. The resolver
+    // resets before its extraction passes and checks after, tagging the
+    // drawable for the Tick's shadow-refresh poll.
+    void ResetLiveRTFlag();
+    bool LastExtractionSawLiveRT();
+
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,
                                     TextureSupply& newTextures,

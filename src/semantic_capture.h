@@ -130,6 +130,19 @@ namespace SemanticCapture {
         // walk only the ~dozens of chunk entries instead of the whole map.
         bool  isLODChunk               = false;
 
+        // ---- Live-RT texture refresh (2026-07-18 Pip-Boy screen) ----
+        // hasLiveTexture: set by the lighting resolver when extraction
+        // detected an RT-backed source texture (engine composites UI into
+        // it at runtime). Tick's poll then runs a SHADOW re-resolve every
+        // [ViewModel] ScreenRefreshFrames while the engine draws the
+        // drawable: the entry STAYS submitted (and rendering) while the new
+        // texture generation extracts asynchronously; when the resolver
+        // finally submits, SubmitDrawable swaps the instance's handles in
+        // place -- no release-first gap, no screen flicker.
+        bool    hasLiveTexture         = false;
+        bool    liveTexRefreshInFlight = false;
+        uint8_t liveTexRefreshAttempts = 0;
+
         // ---- 1st-person viewmodel (2026-07-18) ----
         // Set by the lighting resolver when this geometry descends from
         // PlayerCharacter::firstPersonSkeleton (guarded parent-chain walk).

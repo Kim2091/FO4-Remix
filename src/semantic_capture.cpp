@@ -1462,7 +1462,16 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                          ((currentFrame ^ key) & 63) == 0) ||
                         (g_config.textureUpgradeOnApproach &&
                          state.submittedDiffuseWidth != 0 &&
-                         ((currentFrame ^ key) & 127) == 0)) {
+                         ((currentFrame ^ key) & 127) == 0) ||
+                        // Live-RT texture refresh (Pip-Boy screen): due on
+                        // its period tick, and on EVERY tick while a shadow
+                        // refresh is in flight (the async readback/decode
+                        // needs the polls; each is a cheap pending probe).
+                        (g_config.viewModelScreenRefreshFrames != 0 &&
+                         state.hasLiveTexture &&
+                         (state.liveTexRefreshInFlight ||
+                          (currentFrame %
+                           g_config.viewModelScreenRefreshFrames) == 0))) {
                         duePolls.push_back(key);
                     }
                     continue;
@@ -1647,6 +1656,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         bool   budgetHit = false;
         bool   congestionTripped = false;
         int    upgradesThisTick = 0;  // texture re-capture storm cap
+        bool   liveGenBumped = false; // one generation bump per trigger tick
 
         const bool congestedCooldown = currentFrame < s_congestedUntilFrame;
         if (!congestedCooldown)
@@ -1688,6 +1698,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             if (!state.submittedToRemix) continue;  // released meanwhile
 
             bool doReresolve = false;
+            bool doShadowResolve = false;
 
             // Merge capture upgrade poll (2026-07-04): this merge shape
             // submitted with a fallback partition because the engine
@@ -1804,7 +1815,42 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 }
             }
 
-            if (!doReresolve) continue;
+            // Live-RT texture refresh (2026-07-18 Pip-Boy screen): SHADOW
+            // re-resolve. Unlike the release-first upgrade paths above, the
+            // drawable STAYS submitted and rendering while the new texture
+            // generation runs the async readback+decode pipeline; when the
+            // resolver finally reaches SubmitDrawable, the instance's
+            // handles are replaced in place (no gap = no screen flicker).
+            // One generation bump per trigger tick serves every live-RT
+            // drawable; the in-flight pipeline works against a stable hash
+            // until the next period. Attempts are bounded per cycle -- a
+            // permanently failing capture (format drop) gives up until the
+            // next period tick instead of spinning every tick forever.
+            else if (g_config.viewModelScreenRefreshFrames != 0 &&
+                     state.hasLiveTexture) {
+                constexpr uint8_t kMaxLiveTexAttemptsPerCycle = 64;
+                if (!state.liveTexRefreshInFlight &&
+                    (currentFrame % g_config.viewModelScreenRefreshFrames) == 0 &&
+                    currentFrame - state.lastSeenFrame <= 4) {
+                    // Engine is drawing it (Pip-Boy raised): start a cycle.
+                    if (!liveGenBumped) {
+                        liveGenBumped = true;
+                        BsExtraction::BumpLiveTextureGeneration();
+                    }
+                    state.liveTexRefreshInFlight = true;
+                    state.liveTexRefreshAttempts = 0;
+                }
+                if (state.liveTexRefreshInFlight) {
+                    if (++state.liveTexRefreshAttempts >
+                        kMaxLiveTexAttemptsPerCycle) {
+                        state.liveTexRefreshInFlight = false;
+                    } else {
+                        doShadowResolve = true;
+                    }
+                }
+            }
+
+            if (!doReresolve && !doShadowResolve) continue;
             // Resolve immediately with the upgraded input -- same lock hold
             // as the release above, so the handle gap is one resolve, never
             // a budget-break away.

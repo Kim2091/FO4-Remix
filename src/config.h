@@ -107,6 +107,16 @@ struct PluginConfig {
     // rtx.viewModel.* options). Buckets are split by the flag so a mesh
     // shared between a 1P part and a world object can't be mistagged.
     bool  viewModelCategoryTag;        // default true
+    // Live render-target texture refresh period, in game frames (2026-07-18
+    // Pip-Boy screen). The screen mesh's texture is a render target the
+    // engine composites the Scaleform UI into at runtime; a one-shot capture
+    // shows whatever was in it at resolve time (blank). Drawables whose
+    // extraction detected an RT-backed texture get a SHADOW re-resolve every
+    // this-many frames while the engine is drawing them: a new texture
+    // generation extracts asynchronously while the old instance keeps
+    // rendering, then SubmitDrawable swaps the handles in place (no flicker).
+    // 0 = off (static capture, old behavior).
+    uint32_t viewModelScreenRefreshFrames;  // default 12
 
     // [Emissive]
     bool  emissiveGlowMapsEnabled;  // Extract glow map textures from BSLightingShaderMaterialGlowmap

@@ -581,6 +581,16 @@ namespace {
     // Load-screen drain request ([Performance] DeferHandleDestroyToLoad):
     // set from the PreLoadGame message, consumed by the next OnFrame.
     std::atomic<bool> g_destroyDrainRequested{false};
+
+    // Live-texture refresh churn (2026-07-18 Pip-Boy screen): handles that
+    // turn over every refresh period (~each old screen texture is 2.4MB of
+    // VRAM) would blow far past the deferred-drain valve if parked with the
+    // rest. They get their own park list, drained EVERY frame -- tiny
+    // (<= 3 handles per refresh), and the destroys are the same top-of-
+    // frame Remix-thread timing as the normal drain. Same lock discipline
+    // (writers hold g_renderStateMutex).
+    PendingDestroys   g_eagerPendingDestroys;
+    std::atomic<bool> g_hasEagerDestroys{false};
 }
 
 void RemixRenderer::RequestDestroyDrain() {
@@ -901,8 +911,10 @@ static void DecrementMaterialRef(uint64_t matHash) {
 // the handle for deferred destruction on the Remix thread (see
 // g_pendingDestroys) -- this runs on the game thread, where an inline
 // DestroyMesh can invalidate a handle the frame in flight still references.
+// eagerPark routes the handle to the every-frame drain list instead (live-
+// texture refresh churn; see g_eagerPendingDestroys).
 // Caller must hold g_renderStateMutex.
-static void DecrementMeshCacheRef(const MeshCacheKey& key) {
+static void DecrementMeshCacheRef(const MeshCacheKey& key, bool eagerPark = false) {
     auto it = g_meshCache.find(key);
     if (it == g_meshCache.end()) return;
     if (it->second.refCount > 0) --it->second.refCount;
@@ -920,11 +932,19 @@ static void DecrementMeshCacheRef(const MeshCacheKey& key) {
             }
         }
         if (!aliased) {
-            ParkForDestroy(g_pendingDestroys.meshes, it->second.handle);
+            if (eagerPark) {
+                g_eagerPendingDestroys.meshes.push_back(it->second.handle);
+                g_hasEagerDestroys.store(true, std::memory_order_release);
+            } else {
+                ParkForDestroy(g_pendingDestroys.meshes, it->second.handle);
+            }
         }
     }
     g_meshCache.erase(it);
 }
+
+// Defined below ReleaseDrawable; used by SubmitDrawable's in-place replace.
+static void ReleaseDrawableRefsLocked(uint64_t hash, bool eagerPark);
 
 RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         uint64_t hash,
@@ -1460,6 +1480,20 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.isTwoSided           = mesh.isTwoSided;
     inst.isSkinned            = mesh.hasSkinning;
 
+    // In-place replacement (2026-07-18 live-texture refresh): a shadow
+    // re-resolve re-submits an ALREADY-SUBMITTED hash with fresh handles.
+    // Release the outgoing instance's cache refcounts NOW -- after the new
+    // handles were created above, so shared textures (unchanged normal/
+    // roughness maps) keep refcount >= 1 straight through the swap and are
+    // never destroyed+re-uploaded. The freed per-generation handles (old
+    // screen texture, its material, its mesh) go to the eager park list:
+    // they turn over every refresh period and would blow past the deferred-
+    // drain valve (2.4MB VRAM each) if parked with the rest. Bone tracking
+    // is NOT dropped -- the resolver re-registered it during the shadow
+    // resolve.
+    if (g_drawables.count(hash)) {
+        ReleaseDrawableRefsLocked(hash, /*eagerPark=*/true);
+    }
     g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
     } catch (const std::exception& e) {
@@ -1479,19 +1513,17 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     }
 }
 
-void RemixRenderer::ReleaseDrawable(uint64_t hash) {
-    // Drop bone tracking regardless of drawable presence (registration can
-    // outlive a failed submit).
-    SkinnedMeshes::OnDrawableReleased(hash);
-
-    std::lock_guard<std::mutex> lock(g_renderStateMutex);
-
+// Locked core of ReleaseDrawable: drop the instance's mesh/material/texture
+// cache refcounts (parking zero-refcount handles) and erase it from
+// g_drawables. Caller must hold g_renderStateMutex. eagerPark routes parked
+// handles to the every-frame drain (live-texture refresh; see
+// g_eagerPendingDestroys). Shared by the public ReleaseDrawable and
+// SubmitDrawable's in-place replacement.
+static void ReleaseDrawableRefsLocked(uint64_t hash, bool eagerPark) {
     auto it = g_drawables.find(hash);
     if (it == g_drawables.end()) return;
 
     DrawableInstance& inst = it->second;
-
-    remixapi_Interface* api = RemixAPI::GetInterface();
 
     // Drop our refCount on the cached mesh handle. DestroyMesh only fires when
     // the last drawable using this (content, material) bucket releases.
@@ -1503,7 +1535,7 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
     // that reaches g_drawables was inserted with both fields set; a fault-
     // nulled alias still holds its cache ref. (A default key would simply
     // miss in g_meshCache.)
-    DecrementMeshCacheRef(inst.meshCacheKey);
+    DecrementMeshCacheRef(inst.meshCacheKey, eagerPark);
     inst.meshHandle = nullptr;
 
     // Decrement material refcount; on zero, erase the entry and park the
@@ -1518,7 +1550,12 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
             if (matIt->second.refCount > 0) matIt->second.refCount--;
             if (matIt->second.refCount == 0) {
                 if (matIt->second.handle) {
-                    ParkForDestroy(g_pendingDestroys.materials, matIt->second.handle);
+                    if (eagerPark) {
+                        g_eagerPendingDestroys.materials.push_back(matIt->second.handle);
+                        g_hasEagerDestroys.store(true, std::memory_order_release);
+                    } else {
+                        ParkForDestroy(g_pendingDestroys.materials, matIt->second.handle);
+                    }
                 }
                 g_materialCache.erase(matIt);
             }
@@ -1538,7 +1575,12 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
             if (texIt->second.refCount > 0) texIt->second.refCount--;
             if (texIt->second.refCount == 0) {
                 if (texIt->second.handle) {
-                    ParkForDestroy(g_pendingDestroys.textures, texIt->second.handle);
+                    if (eagerPark) {
+                        g_eagerPendingDestroys.textures.push_back(texIt->second.handle);
+                        g_hasEagerDestroys.store(true, std::memory_order_release);
+                    } else {
+                        ParkForDestroy(g_pendingDestroys.textures, texIt->second.handle);
+                    }
                 }
                 g_textureHandles.erase(texIt);
             }
@@ -1546,6 +1588,15 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
     }
 
     g_drawables.erase(it);
+}
+
+void RemixRenderer::ReleaseDrawable(uint64_t hash) {
+    // Drop bone tracking regardless of drawable presence (registration can
+    // outlive a failed submit).
+    SkinnedMeshes::OnDrawableReleased(hash);
+
+    std::lock_guard<std::mutex> lock(g_renderStateMutex);
+    ReleaseDrawableRefsLocked(hash, /*eagerPark=*/false);
 }
 
 // ---------------------------------------------------------------------------
@@ -1645,6 +1696,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             g_pendingDestroys.materials.clear();
             g_pendingDestroys.textures.clear();
         }
+    }
+
+    // Live-texture refresh churn (Pip-Boy screen): every-frame drain of the
+    // eager park list. Same top-of-frame Remix-thread timing as the normal
+    // drain (previous Present returned, no new draw recorded); the list is
+    // <= a handful of handles per refresh period, and each old screen
+    // texture holds ~2.4MB of VRAM -- deferring them to a load screen would
+    // leak hundreds of MB per minute of Pip-Boy use.
+    if (g_hasEagerDestroys.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> rsLock(g_renderStateMutex);
+        g_hasEagerDestroys.store(false, std::memory_order_release);
+        DestroyParkedHandles(api, g_eagerPendingDestroys);
+        g_eagerPendingDestroys.meshes.clear();
+        g_eagerPendingDestroys.materials.clear();
+        g_eagerPendingDestroys.textures.clear();
     }
 
     // Apply config writes queued by game-thread callers (weather bridge et

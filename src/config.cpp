@@ -122,9 +122,12 @@ void LoadConfig() {
     g_config.viewModelFovOverride =
         GetIniFloatClamped("ViewModel", "FovOverride", 0.0f, 0.0f, 179.0f, dllPath);
     g_config.viewModelCategoryTag = GetIniBool("ViewModel", "CategoryTag", true, dllPath);
-    _MESSAGE("FO4RemixPlugin: ViewModel - SeparateCamera=%d FovOverride=%.1f CategoryTag=%d",
+    g_config.viewModelScreenRefreshFrames =
+        GetIniUInt("ViewModel", "ScreenRefreshFrames", 12, dllPath);
+    _MESSAGE("FO4RemixPlugin: ViewModel - SeparateCamera=%d FovOverride=%.1f CategoryTag=%d "
+             "ScreenRefreshFrames=%u",
              g_config.viewModelSeparateCamera, g_config.viewModelFovOverride,
-             g_config.viewModelCategoryTag);
+             g_config.viewModelCategoryTag, g_config.viewModelScreenRefreshFrames);
 
     // [Emissive]
     g_config.emissiveGlowMapsEnabled = GetIniBool("Emissive", "GlowMapsEnabled", true, dllPath);

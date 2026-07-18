@@ -2232,6 +2232,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // below runs only on the attempt that submits.
     bool pendDiffuse = false, pendNormal = false, pendRough = false,
          pendEmissive = false;
+    // Live-RT detection window: any extraction below that sees an RT-backed
+    // source sets the sticky flag; checked after the supply pass.
+    BsExtraction::ResetLiveRTFlag();
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
         mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
         /*minRoughness=*/0, albedoLumFloor, diffuseTint, paletteLut, paletteRowV,
@@ -2331,6 +2334,24 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     // Textures resolved: the phase-1 cache (if any) is consumed by this
     // attempt; cacheHolder frees it at return.
+
+    // Live-RT texture tag (2026-07-18 Pip-Boy screen): the Tick poll
+    // shadow-refreshes this drawable so the runtime texture tracks the
+    // engine's compositing target instead of freezing the first capture.
+    // (Plain shapes only: a merge-instanced drawable's re-submit path
+    // appends instance extras, which the in-place replace doesn't reconcile
+    // -- and no precombine cluster has an RT-backed texture anyway.)
+    if (BsExtraction::LastExtractionSawLiveRT() && !state.hasLiveTexture &&
+        state.mergeLeafKind != 1) {
+        state.hasLiveTexture = true;
+        static std::atomic<int> sLiveTexTagLogs{0};
+        if (sLiveTexTagLogs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            _MESSAGE("FO4RemixPlugin: [LiveTex] drawable hash=%016llX \"%s\" "
+                     "has a live RT texture -- shadow refresh armed",
+                     (unsigned long long)hash,
+                     tri->m_name.c_str() ? tri->m_name.c_str() : "");
+        }
+    }
 
     ResolverTrace::g_lastStep.store(Trace::kTexturesExtracted, std::memory_order_relaxed);
 
@@ -3462,6 +3483,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
 
     // Update DrawableState to mark submission and track refcount targets.
     state.submittedToRemix = true;
+    // A completed submit finishes any live-texture shadow refresh cycle
+    // (in-place handle swap already happened inside SubmitDrawable).
+    state.liveTexRefreshInFlight = false;
+    state.liveTexRefreshAttempts = 0;
     state.meshHash = hash;
     if (headDiag) {
         HeadDiagLog(hash, "SUBMITTED skinned=%d bones=%u diffuse=%016llX matType=%u",
