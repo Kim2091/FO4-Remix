@@ -70,11 +70,43 @@ struct PluginConfig {
     float lightIntensity;    // Multiplier for light radiance (default 1.0)
     float lightRadius;       // Multiplier for light radius (default 1.0)
     float lightColorStrength;// 0 = white, 1 = full game color (default 1.0)
+    // In-place light updates via remixapi UpdateLightDefinition (2026-07-18,
+    // BetaRT recipe). When a snapshot changes an existing light's derived
+    // params (position from the REFR at poll time, radius/radiance after
+    // config multipliers, spot shaping, near-camera flags), the definition is
+    // updated on the SAME handle+hash so the runtime's persistent RTXDI
+    // reservoirs survive (no re-seed boiling). Runtime without the entry
+    // point (or a failed update) falls back to destroy+recreate. Off = the
+    // legacy behavior: an existing hash keeps its creation-time params until
+    // the light leaves the snapshot entirely.
+    bool  lightsLiveUpdate;  // default true
+    // Lights within this many game units of the camera get
+    // ignoreViewModel + ignoreFirstPersonPlayerShadow so the 1st-person
+    // arms/weapon can't shadow the whole scene from a light at arm's reach
+    // (the classic flashlight-through-viewmodel artifact; BetaRT sets these
+    // on its held-torch light). Re-evaluated on every snapshot diff (~1Hz +
+    // cell changes) via the live-update path. 0 = disabled.
+    float lightsNearCameraIgnoreVMUnits;  // default 150
 
     // [Skinning]
     bool  skinningEnabled;   // Extract and animate skinned meshes (characters, creatures)
     bool  viewModelEnabled;  // Render the 1st-person arms/weapon/Pip-Boy (synthetic-space remap)
     bool  viewModelBoneConventionFix;  // Camera bone is NIF-camera-convention {right,up,back} vs cameraNode {right,fwd,up}
+    // Submit a second SetupCamera of type VIEW_MODEL each frame (2026-07-18,
+    // BetaRT recipe): same pose as the world camera, but with the game's
+    // 1st-person FOV (fDefault1stPersonFOV, horizontal->vertical converted)
+    // and a small near plane. The runtime renders VIEW_MODEL-categorized
+    // geometry with this camera, so the arms/weapon keep their own FOV when
+    // the world FOV changes (ADS zoom, FOV mods) instead of distorting.
+    bool  viewModelSeparateCamera;     // default true
+    // Manual vertical-FOV override for the view-model camera, degrees.
+    // 0 = auto (fDefault1stPersonFOV converted at the live aspect).
+    float viewModelFovOverride;        // default 0
+    // Tag viewmodel draws with REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL so
+    // the runtime applies its view-model handling (separate camera above,
+    // rtx.viewModel.* options). Buckets are split by the flag so a mesh
+    // shared between a 1P part and a world object can't be mistagged.
+    bool  viewModelCategoryTag;        // default true
 
     // [Emissive]
     bool  emissiveGlowMapsEnabled;  // Extract glow map textures from BSLightingShaderMaterialGlowmap
@@ -368,6 +400,26 @@ struct PluginConfig {
     // supply-pass zero-copy (5b5b956) removed the memcpys that had been
     // accidentally rate-limiting exactly this.
     uint32_t maxUploadMiBPerTick;
+
+    // [Window] (2026-07-18, BetaRT overlay-mode port). The plugin runs a
+    // dual-window setup: the game window renders raster (or live UI over a
+    // stale scene with SuppressGameRaster) while the plugin-created Remix
+    // window shows the path-traced output. OverlayMode turns the Remix
+    // window into a borderless, topmost, click-through overlay glued to the
+    // game window's client rect: keys and clicks pass through to the game
+    // window beneath, the game keeps focus, and the two windows read as one.
+    // When the Remix dev menu opens (GetUIState != NONE) the overlay becomes
+    // interactive and takes focus so ImGui gets the mouse; closing the menu
+    // restores click-through and refocuses the game. 0 = legacy free-
+    // floating window.
+    bool windowOverlayMode;      // default true
+    // Virtual-key code that toggles the Remix dev menu via SetUIState
+    // (0 = disabled). Polled with GetAsyncKeyState on the Remix thread, so
+    // it works regardless of which window has focus -- this makes the menu
+    // reachable even with [Overlay] RestoreLegacyInput=1, whose documented
+    // trade-off was losing the runtime's own raw-input hotkeys (Alt+X).
+    // Default 0x77 (VK_F8).
+    uint32_t windowMenuHotkey;
 };
 
 // Global config instance

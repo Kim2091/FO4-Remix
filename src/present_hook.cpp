@@ -8,6 +8,8 @@
 #include "camera.h"
 #include "semantic_capture.h"
 #include "weather_bridge.h"
+#include "window_manager.h"
+#include "fo4_tracy.h"
 
 #include <d3d11.h>
 #include <dxgi.h>
@@ -240,6 +242,7 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
 
 static void RemixThreadFunc() {
     _MESSAGE("FO4RemixPlugin: Remix thread started");
+    FO4_TRACY_SET_THREAD_NAME("RemixThread");
 
     // Prevent Windows from ghosting this thread's window when Present() blocks
     DisableProcessWindowsGhosting();
@@ -254,6 +257,11 @@ static void RemixThreadFunc() {
         _MESSAGE("FO4RemixPlugin: ERROR - Renderer init failed on remix thread");
         return;
     }
+
+    // Window manager: overlay glue + menu interactivity + hotkey. Runs on
+    // this thread (it owns the Remix window and its message pump); installed
+    // after device creation so its subclass wraps the runtime's WndProc.
+    WindowManager::Init(RemixAPI::GetRemixWindow(), g_remix.gameHwnd);
 
     g_remix.ready = true;
 
@@ -330,6 +338,12 @@ static void RemixThreadFunc() {
         // Pump again after rendering
         PumpMessages();
 
+        // Overlay glue + menu interactivity sync + hotkey (cheap: a few
+        // win32 reads per frame; SetWindowPos only when the rect changed).
+        WindowManager::Tick(RemixAPI::GetInterface());
+
+        FO4_TRACY_FRAME_MARK();
+
         // Pace to RemixMaxFPS by sleeping only the UNUSED remainder of the
         // frame budget. The previous flat Sleep(16) added a full budget on
         // top of every frame's render time (16ms render + 16ms sleep = 31fps,
@@ -351,11 +365,13 @@ static void RemixThreadFunc() {
     timeEndPeriod(1);
 
     _MESSAGE("FO4RemixPlugin: Remix thread shutting down");
+    WindowManager::Shutdown();
     RemixRenderer::Shutdown();
     RemixAPI::Shutdown();
 }
 
 static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
+    FO4_TRACY_SCOPE("hkPresent");
     const uint64_t frameIndex = Diagnostics::Tick();
     const uint64_t presentIdx =
         g_presentIndex.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -382,7 +398,10 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     // Frame-number gating is unreliable -- new runtime builds can finish
     // init at very different frame counts.  Idempotent (returns after first
     // successful registration).
-    if (g_remix.ready && g_remix.gameHwnd) {
+    // Paused while the Remix dev menu is open (2026-07-18): the menu owns
+    // input then, and re-claiming raw input mid-menu would stomp whatever
+    // the runtime's input path registered. Resumes the moment it closes.
+    if (g_remix.ready && g_remix.gameHwnd && !WindowManager::IsMenuOpen()) {
         RemixAPI::RebindRawInputToGameWindow(g_remix.gameHwnd);
     }
 
@@ -656,6 +675,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     // texture readbacks. Mirrors Skyrim's EndFrame call site exactly.
     // Internally rate-limits resolve work; resolver cost is bounded per call.
     if (g_remix.ready && g_gameDataReady) {
+        FO4_TRACY_SCOPE("SemanticCapture::Tick");
         ID3D11Device* semanticDevice = nullptr;
         swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&semanticDevice);
         if (semanticDevice) {

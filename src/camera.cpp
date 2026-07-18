@@ -135,6 +135,7 @@ static CameraState MakeFallback() {
     state.right[1] = 0.0f;
     state.right[2] = 0.0f;
     state.fovY = 70.0f;
+    state.fov1stY = 70.0f;
     state.aspectRatio = 16.0f / 9.0f;
     state.nearPlane = 1.0f;
     state.farPlane = 100000.0f;
@@ -208,6 +209,22 @@ CameraState Camera::Get() {
             : hFov;  // legacy passthrough
         state.nearPlane = 5.0f;
         state.farPlane = 100000.0f;
+    }
+
+    // 1st-person FOV for the VIEW_MODEL camera. Same horizontal->vertical
+    // conversion as the world fallback path: fDefault1stPersonFOV is the
+    // game's horizontal convention (default 80). Sanity-gated; falls back
+    // to the world FOV so a bad read can never distort the viewmodel more
+    // than the legacy single-camera behavior did.
+    {
+        state.fov1stY = state.fovY;
+        const float hFov1st = playerCam->fDefault1stPersonFOV;
+        if (hFov1st >= 10.0f && hFov1st <= 170.0f && state.aspectRatio > 0.1f) {
+            const float v = HorizontalToVerticalFov(hFov1st, state.aspectRatio);
+            if (v >= 5.0f && v <= 160.0f) {
+                state.fov1stY = v;
+            }
+        }
     }
 
     // Snapshot player world position (Beth coords, not swapped) for the

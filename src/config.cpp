@@ -107,12 +107,24 @@ void LoadConfig() {
     g_config.lightIntensity    = GetIniFloatClamped("Lights", "Intensity", 1.0f, 0.0f, 1000.0f, dllPath);
     g_config.lightRadius       = GetIniFloatClamped("Lights", "RadiusMultiplier", 1.0f, 0.0f, 1000.0f, dllPath);
     g_config.lightColorStrength = GetIniFloatClamped("Lights", "ColorStrength", 1.0f, 0.0f, 1.0f, dllPath);
+    g_config.lightsLiveUpdate  = GetIniBool("Lights", "LiveUpdate", true, dllPath);
+    g_config.lightsNearCameraIgnoreVMUnits =
+        GetIniFloatClamped("Lights", "NearCameraIgnoreViewModelUnits", 150.0f, 0.0f, 10000.0f, dllPath);
+    _MESSAGE("FO4RemixPlugin: Lights - LiveUpdate=%d NearCameraIgnoreViewModelUnits=%.0f",
+             g_config.lightsLiveUpdate, g_config.lightsNearCameraIgnoreVMUnits);
 
     // [Skinning]
     g_config.skinningEnabled = GetIniBool("Skinning", "Enabled", true, dllPath);
     g_config.viewModelEnabled = GetIniBool("ViewModel", "Enabled", true, dllPath);
     g_config.viewModelBoneConventionFix =
         GetIniBool("ViewModel", "BoneConventionFix", true, dllPath);
+    g_config.viewModelSeparateCamera = GetIniBool("ViewModel", "SeparateCamera", true, dllPath);
+    g_config.viewModelFovOverride =
+        GetIniFloatClamped("ViewModel", "FovOverride", 0.0f, 0.0f, 179.0f, dllPath);
+    g_config.viewModelCategoryTag = GetIniBool("ViewModel", "CategoryTag", true, dllPath);
+    _MESSAGE("FO4RemixPlugin: ViewModel - SeparateCamera=%d FovOverride=%.1f CategoryTag=%d",
+             g_config.viewModelSeparateCamera, g_config.viewModelFovOverride,
+             g_config.viewModelCategoryTag);
 
     // [Emissive]
     g_config.emissiveGlowMapsEnabled = GetIniBool("Emissive", "GlowMapsEnabled", true, dllPath);
@@ -203,6 +215,18 @@ void LoadConfig() {
                  "HudOverlayEnabled=0: the game window will stop updating and "
                  "no UI will be visible anywhere. Enable the HUD overlay.");
     }
+
+    // [Window]
+    g_config.windowOverlayMode = GetIniBool("Window", "OverlayMode", true, dllPath);
+    // MenuHotkey accepts hex ("0x77") or decimal; GetPrivateProfileIntA
+    // parses decimal only, so read the string and strtoul(base 0).
+    {
+        char hk[32] = {};
+        GetPrivateProfileStringA("Window", "MenuHotkey", "0x77", hk, sizeof(hk), dllPath);
+        g_config.windowMenuHotkey = (uint32_t)strtoul(hk, nullptr, 0);
+    }
+    _MESSAGE("FO4RemixPlugin: Window - OverlayMode=%d MenuHotkey=0x%02X",
+             g_config.windowOverlayMode, g_config.windowMenuHotkey);
 
     // [Precombines]
     g_config.mergeInstanceExpansion = GetIniBool("Precombines", "MergeInstanceExpansion", true, dllPath);

@@ -8,6 +8,11 @@ namespace RemixAPI {
     remixapi_Interface* GetInterface();
     bool IsInitialized();
 
+    // The plugin-created output window the runtime presents into (null until
+    // Initialize succeeds). Owned by the Remix thread; WindowManager glues
+    // it over the game window in overlay mode.
+    HWND GetRemixWindow();
+
     // Override Remix's overlay-thread RegisterRawInputDevices(RIDEV_NOLEGACY)
     // for keyboard. Remix's dev-menu window registers raw input with NOLEGACY
     // on its overlay thread, which suppresses WM_KEYDOWN/UP for the entire

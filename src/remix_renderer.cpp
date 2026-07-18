@@ -3,6 +3,7 @@
 #include "crash_diag.h"
 #include "remix_api.h"
 #include "fo4_diagnostics.h"
+#include "fo4_tracy.h"
 #include "semantic_capture.h"
 #include "skinned_meshes.h"
 #include "resolvers/lighting_static.h"  // Trace::SetStep + Trace::Step constants
@@ -262,6 +263,10 @@ static LONG WriteGuardDumpFilter(EXCEPTION_POINTERS* xp) {
 
 template <typename F>
 static int RemixCallCxxGuarded(const char* site, F& fn) {
+    // Tracy zone lives here, not in the SEH wrapper (RAII + __try = C2712).
+    // Dynamic name: one zone per guarded remixapi call site, giving the
+    // per-API-call cost table on the flame graph for free.
+    FO4_TRACY_SCOPE_DYN(site);
     try {
         fn();
         return 0;
@@ -501,7 +506,38 @@ namespace {
     std::mutex g_lightQueueMutex;
     bool g_lightSnapshotPending = false;
     std::vector<ExtractedLight> g_lightSnapshot;
-    std::unordered_map<uint64_t, remixapi_LightHandle> g_lights;  // Remix thread only
+    // Live light records (2026-07-18, BetaRT recipe). Beyond the handle,
+    // each record keeps the DERIVED params last submitted (post config
+    // multipliers, camera-proximity flags resolved) so a snapshot can be
+    // diffed against what the runtime actually has. A changed light is
+    // updated in place via UpdateLightDefinition on the SAME handle+hash --
+    // the runtime's persistent RTXDI reservoirs survive, so no re-seed
+    // boiling -- with destroy+recreate as the fallback when the entry point
+    // is missing or the update fails. Remix thread only.
+    struct LightRecord {
+        remixapi_LightHandle handle = nullptr;
+        float position[3] = {};
+        float radius = 0.0f;
+        float radiance[3] = {};
+        bool  isSpot = false;
+        float spotDirection[3] = {};
+        float spotConeAngle = 0.0f;
+        float spotSoftness = 0.0f;
+        bool  ignoreViewModel = false;  // near-camera flag, re-evaluated per snapshot
+
+        bool SameAs(const LightRecord& o) const {
+            return position[0] == o.position[0] && position[1] == o.position[1]
+                && position[2] == o.position[2] && radius == o.radius
+                && radiance[0] == o.radiance[0] && radiance[1] == o.radiance[1]
+                && radiance[2] == o.radiance[2] && isSpot == o.isSpot
+                && spotDirection[0] == o.spotDirection[0]
+                && spotDirection[1] == o.spotDirection[1]
+                && spotDirection[2] == o.spotDirection[2]
+                && spotConeAngle == o.spotConeAngle && spotSoftness == o.spotSoftness
+                && ignoreViewModel == o.ignoreViewModel;
+        }
+    };
+    std::unordered_map<uint64_t, LightRecord> g_lights;  // Remix thread only
 
     // Skinned bone sync (2026-07-08). The game thread queues composed
     // bind->world matrix sets per skinned drawable (QueueBoneTransforms from
@@ -1517,6 +1553,7 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
 // ---------------------------------------------------------------------------
 void RemixRenderer::OnFrame(const CameraState& cam,
                             const OverlayData& overlay) {
+    FO4_TRACY_SCOPE("OnFrame");
     // Per-phase CPU timing, reported through the every-300-frame status log.
     // ~10 steady_clock reads per frame -- negligible. Static accumulators are
     // safe: OnFrame runs only on the Remix thread.
@@ -1526,6 +1563,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     };
     static uint64_t s_accLockWaitNs = 0, s_accSnapNs = 0, s_accBucketNs = 0,
                     s_accDrawNs = 0, s_accPresentNs = 0, s_accTotalNs = 0;
+    // Window maxima (2026-07-18, BetaRT perf-window pattern): the avg hides
+    // single-frame stalls entirely -- a 300ms lock convoy inside a 300-frame
+    // window moves the average by 1ms. Max columns are what catch them.
+    static uint64_t s_maxLockWaitNs = 0, s_maxPresentNs = 0, s_maxTotalNs = 0;
     static SemanticCapture::PerfCounters s_lastGameCounters = {};
     const PerfClock::time_point tEnter = PerfClock::now();
 
@@ -1670,6 +1711,27 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     camInfo.pNext = &camParams;
     camInfo.type = REMIXAPI_CAMERA_TYPE_WORLD;
     RemixCallGuarded("SetupCamera", [&] { api->SetupCamera(&camInfo); });
+
+    // View-model camera (2026-07-18, BetaRT recipe): same pose, 1st-person
+    // FOV, small near plane. The runtime renders VIEW_MODEL-categorized
+    // instances with this camera, decoupling the arms/weapon from world-FOV
+    // changes (ADS zoom, FOV mods). Submitted every frame like the world
+    // camera; cheap (one struct copy + one guarded call).
+    if (g_config.viewModelEnabled && g_config.viewModelSeparateCamera && cam.valid) {
+        remixapi_CameraInfoParameterizedEXT vmParams = camParams;
+        vmParams.fovYInDegrees = g_config.viewModelFovOverride > 0.0f
+            ? g_config.viewModelFovOverride
+            : (cam.fov1stY > 0.0f ? cam.fov1stY : camParams.fovYInDegrees);
+        vmParams.nearPlane = (std::min)(camParams.nearPlane, 1.0f);
+        if (vmParams.farPlane <= vmParams.nearPlane) {
+            vmParams.farPlane = vmParams.nearPlane + 1024.0f;
+        }
+        remixapi_CameraInfo vmInfo = {};
+        vmInfo.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
+        vmInfo.pNext = &vmParams;
+        vmInfo.type = REMIXAPI_CAMERA_TYPE_VIEW_MODEL;
+        RemixCallGuarded("SetupCamera(viewModel)", [&] { api->SetupCamera(&vmInfo); });
+    }
 
     bool hasAnyMeshes = false;
 
@@ -1849,6 +1911,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t skippedViewModel = 0;
     size_t vmDrawn = 0;
     {
+        // Zone opens BEFORE the lock so lock-wait time shows inside it.
+        FO4_TRACY_SCOPE("OnFrame.bucketsAndDraw");
         std::lock_guard<std::mutex> lock(g_renderStateMutex);
         const PerfClock::time_point tBucket0 = PerfClock::now();
         const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
@@ -1867,8 +1931,28 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             std::vector<DrawableInstance*> members;
             std::vector<remixapi_Transform> transforms;  // built only for batched path
         };
-        std::unordered_map<remixapi_MeshHandle, DrawBucket> buckets;
+        // Bucket key folds the viewmodel flag next to the mesh handle so a
+        // mesh shared between a 1P part and a world placement (same weapon
+        // lying on a table) can't land in one bucket and mistag the world
+        // copy with the VIEW_MODEL category. With CategoryTag off the flag
+        // is constant false and bucketing degenerates to the old
+        // handle-only behavior.
+        struct BucketKey {
+            remixapi_MeshHandle mesh;
+            bool vm;
+            bool operator==(const BucketKey& o) const noexcept {
+                return mesh == o.mesh && vm == o.vm;
+            }
+        };
+        struct BucketKeyHash {
+            size_t operator()(const BucketKey& k) const noexcept {
+                return std::hash<uintptr_t>{}(reinterpret_cast<uintptr_t>(k.mesh))
+                     ^ (k.vm ? 0x9E3779B97F4A7C15ull : 0ull);
+            }
+        };
+        std::unordered_map<BucketKey, DrawBucket, BucketKeyHash> buckets;
         buckets.reserve(g_drawables.size());
+        const bool vmCategoryTag = g_config.viewModelEnabled && g_config.viewModelCategoryTag;
 
         // [HeadDiag] hold accounting (2026-07-08 missing-heads): a skinned
         // drawable that was submitted but whose bone set never queues sits
@@ -1953,7 +2037,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     }
                 }
             }
-            buckets[inst.meshHandle].members.push_back(&inst);
+            buckets[BucketKey{inst.meshHandle, vmCategoryTag && inst.isViewModel}]
+                .members.push_back(&inst);
         }
         bucketCount = buckets.size();
         if (skinnedHeldNoBones > 0 || skinnedHidden > 0) {
@@ -1976,13 +2061,13 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         // draw; reused across buckets, alive through each DrawInstance).
         std::vector<remixapi_Transform> vmBoneScratch;
 
-        for (auto& [meshHandle, bucket] : buckets) {
+        for (auto& [bucketKey, bucket] : buckets) {
             if (bucket.members.empty()) continue;
 
             remixapi_InstanceInfo instance = {};
             instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
             instance.pNext = nullptr;
-            instance.mesh = meshHandle;
+            instance.mesh = bucketKey.mesh;
             // Backface culling (2026-07-02). Previously hardcoded
             // doubleSided=1, which defeated backface culling in ray traversal
             // for the whole scene -- extra hit evaluations on every opaque
@@ -2018,6 +2103,16 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // instead of fighting for the same depth.
             if (!bucket.members.empty() && bucket.members[0]->isDecal) {
                 instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
+            }
+
+            // View-model tag (2026-07-18): routes the draw through the
+            // runtime's view-model path (VIEW_MODEL camera + vm handling).
+            // Requires the fork-added category bit (extern/remix_c.h is
+            // refreshed from the fork at configure time); runtimes without
+            // the mapping ignore unknown bits, so this degrades to the
+            // previous behavior (world camera) rather than breaking.
+            if (bucketKey.vm) {
+                instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL;
             }
 
             remixapi_InstanceInfoGpuInstancingEXT  gpuExt   = {};
@@ -2206,7 +2301,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             if (guardRc == 1) {
                 _MESSAGE("FO4RemixPlugin: [OnFrame] SEH CRASH CAUGHT in DrawInstance "
                          "meshHandle=%p batchSize=%zu exception=0x%08lX -- nulling member meshHandles to skip permanently",
-                         (void*)meshHandle, bucket.members.size(), drawExcCode);
+                         (void*)bucketKey.mesh, bucket.members.size(), drawExcCode);
                 for (DrawableInstance* member : bucket.members) member->meshHandle = nullptr;
                 continue;
             }
@@ -2242,6 +2337,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     s_accSnapNs     += nsSince(tSnap0, tSnap1);
     s_accBucketNs   += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dBucket).count();
     s_accDrawNs     += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dDraw).count();
+    s_maxLockWaitNs  = (std::max)(s_maxLockWaitNs, nsSince(tEnter, tLocked));
 
     // Periodic status log (every ~5 seconds)
     static uint32_t s_frameCounter = 0;
@@ -2279,6 +2375,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         s_lastGameCounters = game;
         _MESSAGE("FO4RemixPlugin: OnFrame perf (avg us/frame over 300) - "
                  "lockWait=%llu snap=%llu bucket=%llu draw=%llu present=%llu total=%llu | "
+                 "max us: lockWait=%llu present=%llu total=%llu | "
                  "game thread: fires/frame=%llu fireUs/frame=%llu tickUs/frame=%llu gameFrames=%llu",
                  (unsigned long long)(s_accLockWaitNs / 300 / 1000),
                  (unsigned long long)(s_accSnapNs     / 300 / 1000),
@@ -2286,12 +2383,16 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                  (unsigned long long)(s_accDrawNs     / 300 / 1000),
                  (unsigned long long)(s_accPresentNs  / 300 / 1000),
                  (unsigned long long)(s_accTotalNs    / 300 / 1000),
+                 (unsigned long long)(s_maxLockWaitNs / 1000),
+                 (unsigned long long)(s_maxPresentNs  / 1000),
+                 (unsigned long long)(s_maxTotalNs    / 1000),
                  (unsigned long long)(dTicks ? dFires  / dTicks        : 0),
                  (unsigned long long)(dTicks ? dFireNs / dTicks / 1000 : 0),
                  (unsigned long long)(dTicks ? dTickNs / dTicks / 1000 : 0),
                  (unsigned long long)dTicks);
         s_accLockWaitNs = s_accSnapNs = s_accBucketNs = 0;
         s_accDrawNs = s_accPresentNs = s_accTotalNs = 0;
+        s_maxLockWaitNs = s_maxPresentNs = s_maxTotalNs = 0;
 
         // Remix-side VRAM on the same cadence: pairs with present_hook's
         // process-wide [VRAM] line to split "the path tracer's budget" from
@@ -2341,6 +2442,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // analytical lights are per-frame submissions like instances.
     // ------------------------------------------------------------------
     {
+        FO4_TRACY_SCOPE("OnFrame.lights");
         bool haveSnapshot = false;
         std::vector<ExtractedLight> snapshot;
         {
@@ -2359,8 +2461,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
             for (auto it = g_lights.begin(); it != g_lights.end();) {
                 if (desired.find(it->first) == desired.end()) {
-                    if (it->second) {
-                        remixapi_LightHandle h = it->second;
+                    if (it->second.handle) {
+                        remixapi_LightHandle h = it->second.handle;
                         RemixCallGuarded("DestroyLight",
                                          [&] { api->DestroyLight(h); });
                     }
@@ -2369,33 +2471,23 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     ++it;
                 }
             }
-            static std::atomic<int> sLightLogs{0};
-            uint32_t created = 0, failed = 0;
-            for (const auto& [lhash, lp] : desired) {
-                if (g_lights.find(lhash) != g_lights.end()) continue;
-                const ExtractedLight& light = *lp;
 
-                remixapi_LightInfoSphereEXT sphere = {};
-                sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-                sphere.position = { light.position[0], light.position[1],
-                                    light.position[2] };
+            // Derive the submitted params for one extracted light: config
+            // multipliers, spot shaping, and the near-camera ignoreViewModel
+            // flag (a light within arm's reach must not let the 1P arms/
+            // weapon shadow the whole scene). Camera position is in the same
+            // swapped space as light.position.
+            const float nearVMUnits = g_config.lightsNearCameraIgnoreVMUnits;
+            const auto deriveRecord = [&](const ExtractedLight& light,
+                                          LightRecord& rec) {
+                rec.position[0] = light.position[0];
+                rec.position[1] = light.position[1];
+                rec.position[2] = light.position[2];
                 // Emitter size, not falloff: FO4's radius is the falloff
                 // range; a small emitter sphere scaled from it keeps shadows
                 // soft in proportion (0.025 = the retired pipeline's tuning).
-                sphere.radius = (std::max)(light.radius * 0.025f *
-                                           g_config.lightRadius, 0.5f);
-                sphere.volumetricRadianceScale = 1.0f;
-                if (light.isSpotLight && light.spotFOV > 0.0f) {
-                    sphere.shaping_hasvalue = true;
-                    sphere.shaping_value.direction = { light.spotDirection[0],
-                                                       light.spotDirection[1],
-                                                       light.spotDirection[2] };
-                    // FO4 FOV is the full cone angle.
-                    sphere.shaping_value.coneAngleDegrees = light.spotFOV * 0.5f;
-                    sphere.shaping_value.coneSoftness = light.spotSoftness;
-                    sphere.shaping_value.focusExponent = 0.0f;
-                }
-
+                rec.radius = (std::max)(light.radius * 0.025f *
+                                        g_config.lightRadius, 0.5f);
                 float r = light.radiance[0], g = light.radiance[1],
                       b = light.radiance[2];
                 const float cs = g_config.lightColorStrength;
@@ -2405,50 +2497,142 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     g = avg + (g - avg) * cs;
                     b = avg + (b - avg) * cs;
                 }
+                rec.radiance[0] = r * g_config.lightIntensity;
+                rec.radiance[1] = g * g_config.lightIntensity;
+                rec.radiance[2] = b * g_config.lightIntensity;
+                rec.isSpot = light.isSpotLight && light.spotFOV > 0.0f;
+                if (rec.isSpot) {
+                    rec.spotDirection[0] = light.spotDirection[0];
+                    rec.spotDirection[1] = light.spotDirection[1];
+                    rec.spotDirection[2] = light.spotDirection[2];
+                    // FO4 FOV is the full cone angle.
+                    rec.spotConeAngle = light.spotFOV * 0.5f;
+                    rec.spotSoftness  = light.spotSoftness;
+                } else {
+                    rec.spotDirection[0] = rec.spotDirection[1] = rec.spotDirection[2] = 0.0f;
+                    rec.spotConeAngle = 0.0f;
+                    rec.spotSoftness  = 0.0f;
+                }
+                rec.ignoreViewModel = false;
+                if (nearVMUnits > 0.0f && cam.valid) {
+                    const float dx = light.position[0] - cam.position[0];
+                    const float dy = light.position[1] - cam.position[1];
+                    const float dz = light.position[2] - cam.position[2];
+                    rec.ignoreViewModel =
+                        (dx * dx + dy * dy + dz * dz) < nearVMUnits * nearVMUnits;
+                }
+            };
 
-                remixapi_LightInfo info = {};
+            // Fill the remixapi structs from a derived record. sphere must
+            // outlive the call (info.pNext chains it).
+            const auto fillInfo = [](uint64_t lhash, const LightRecord& rec,
+                                     remixapi_LightInfo& info,
+                                     remixapi_LightInfoSphereEXT& sphere) {
+                sphere = {};
+                sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+                sphere.position = { rec.position[0], rec.position[1], rec.position[2] };
+                sphere.radius = rec.radius;
+                sphere.volumetricRadianceScale = 1.0f;
+                if (rec.isSpot) {
+                    sphere.shaping_hasvalue = true;
+                    sphere.shaping_value.direction = { rec.spotDirection[0],
+                                                       rec.spotDirection[1],
+                                                       rec.spotDirection[2] };
+                    sphere.shaping_value.coneAngleDegrees = rec.spotConeAngle;
+                    sphere.shaping_value.coneSoftness = rec.spotSoftness;
+                    sphere.shaping_value.focusExponent = 0.0f;
+                }
+                info = {};
                 info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
                 info.pNext = &sphere;
                 info.hash = lhash;
-                info.radiance = { r * g_config.lightIntensity,
-                                  g * g_config.lightIntensity,
-                                  b * g_config.lightIntensity };
+                info.radiance = { rec.radiance[0], rec.radiance[1], rec.radiance[2] };
                 info.isDynamic = false;
-                info.ignoreViewModel = false;
+                info.ignoreViewModel = rec.ignoreViewModel;
+            };
 
+            static std::atomic<int> sLightLogs{0};
+            uint32_t created = 0, failed = 0, updated = 0;
+            const bool canLiveUpdate =
+                g_config.lightsLiveUpdate && api->UpdateLightDefinition != nullptr;
+            for (const auto& [lhash, lp] : desired) {
+                const ExtractedLight& light = *lp;
+
+                LightRecord next = {};
+                deriveRecord(light, next);
+
+                auto existing = g_lights.find(lhash);
+                if (existing != g_lights.end()) {
+                    LightRecord& cur = existing->second;
+                    if (!g_config.lightsLiveUpdate || !cur.handle || next.SameAs(cur)) {
+                        continue;  // unchanged (or legacy mode): keep as-is
+                    }
+                    if (canLiveUpdate) {
+                        // In-place update on the same handle+hash: persistent
+                        // RTXDI reservoirs survive, no boiling.
+                        remixapi_LightInfo info;
+                        remixapi_LightInfoSphereEXT sphere;
+                        fillInfo(lhash, next, info, sphere);
+                        remixapi_ErrorCode updErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+                        remixapi_LightHandle h = cur.handle;
+                        RemixCallGuarded("UpdateLightDefinition",
+                                         [&] { updErr = api->UpdateLightDefinition(h, &info); });
+                        if (updErr == REMIXAPI_ERROR_CODE_SUCCESS) {
+                            next.handle = cur.handle;
+                            cur = next;
+                            ++updated;
+                            continue;
+                        }
+                        // Fall through to destroy+recreate on failure.
+                    }
+                    // No UpdateLightDefinition in this runtime (or it
+                    // failed): recreate. Same hash, so the reservoir cost is
+                    // the pre-2026-07-18 status quo, paid only on change.
+                    remixapi_LightHandle h = cur.handle;
+                    RemixCallGuarded("DestroyLight", [&] { api->DestroyLight(h); });
+                    g_lights.erase(existing);
+                    // continues into the create path below
+                }
+
+                remixapi_LightInfo info;
+                remixapi_LightInfoSphereEXT sphere;
+                fillInfo(lhash, next, info, sphere);
                 remixapi_LightHandle handle = nullptr;
                 remixapi_ErrorCode lightErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
                 RemixCallGuarded("CreateLight",
                                  [&] { lightErr = api->CreateLight(&info, &handle); });
                 if (lightErr == REMIXAPI_ERROR_CODE_SUCCESS && handle) {
-                    g_lights.emplace(lhash, handle);
+                    next.handle = handle;
+                    g_lights[lhash] = next;
                     ++created;
                     const int ln = sLightLogs.fetch_add(1,
                                        std::memory_order_relaxed);
                     if (ln < 12) {
                         _MESSAGE("FO4RemixPlugin: [Lights] #%d hash=0x%llX "
                                  "pos=(%.0f,%.0f,%.0f) radius=%.1f "
-                                 "radiance=(%.1f,%.1f,%.1f) spot=%d",
+                                 "radiance=(%.1f,%.1f,%.1f) spot=%d ignoreVM=%d",
                                  ln, (unsigned long long)lhash,
                                  light.position[0], light.position[1],
                                  light.position[2], sphere.radius,
                                  info.radiance.x, info.radiance.y,
                                  info.radiance.z,
-                                 light.isSpotLight ? 1 : 0);
+                                 light.isSpotLight ? 1 : 0,
+                                 next.ignoreViewModel ? 1 : 0);
                     }
                 } else {
                     ++failed;
                 }
             }
-            if (created || failed) {
+            if (created || failed || updated) {
                 _MESSAGE("FO4RemixPlugin: [Lights] snapshot applied: %zu total, "
-                         "%u created, %u failed, %zu live",
-                         snapshot.size(), created, failed, g_lights.size());
+                         "%u created, %u updated, %u failed, %zu live%s",
+                         snapshot.size(), created, updated, failed, g_lights.size(),
+                         canLiveUpdate ? "" : " (no UpdateLightDefinition; recreate on change)");
             }
         }
-        for (const auto& [lhash, handle] : g_lights) {
-            if (handle) {
-                remixapi_LightHandle h = handle;
+        for (const auto& [lhash, rec] : g_lights) {
+            if (rec.handle) {
+                remixapi_LightHandle h = rec.handle;
                 RemixCallGuarded("DrawLightInstance",
                                  [&] { api->DrawLightInstance(h); });
             }
@@ -2540,6 +2724,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     const PerfClock::time_point tEnd = PerfClock::now();
     s_accPresentNs += nsSince(tPresent0, tEnd);
     s_accTotalNs   += nsSince(tEnter, tEnd);
+    s_maxPresentNs  = (std::max)(s_maxPresentNs, nsSince(tPresent0, tEnd));
+    s_maxTotalNs    = (std::max)(s_maxTotalNs, nsSince(tEnter, tEnd));
 }
 
 void RemixRenderer::Shutdown() {
@@ -2581,8 +2767,8 @@ void RemixRenderer::Shutdown() {
     }
 
     if (api) {
-        for (auto& [hash, handle] : g_lights) {
-            if (handle) api->DestroyLight(handle);
+        for (auto& [hash, rec] : g_lights) {
+            if (rec.handle) api->DestroyLight(rec.handle);
         }
         g_lights.clear();
     }

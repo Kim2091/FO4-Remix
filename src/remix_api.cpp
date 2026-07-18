@@ -161,6 +161,10 @@ remixapi_Interface* RemixAPI::GetInterface() {
     return g_initialized ? &g_remixInterface : nullptr;
 }
 
+HWND RemixAPI::GetRemixWindow() {
+    return g_initialized ? g_remixWindow : nullptr;
+}
+
 bool RemixAPI::IsInitialized() {
     return g_initialized;
 }

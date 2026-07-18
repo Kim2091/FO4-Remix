@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Tracy profiler instrumentation (2026-07-18, BetaRT port). OFF by default:
+# the shipped DLL carries zero instrumentation cost. Enable for perf hunts:
+#   cmake -B build -DFO4REMIX_ENABLE_TRACY=ON
+# then connect the Tracy profiler to port 8086 (BetaRT uses 8087; distinct
+# so both can profile side by side).
+option(FO4REMIX_ENABLE_TRACY "Enable Tracy profiling zones" OFF)
+set(FO4REMIX_TRACY_PORT "8086" CACHE STRING "Tracy data port")
+
 # F4SE SDK paths
 set(F4SE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../f4se-0.7.7")
 
@@ -93,6 +101,8 @@ add_library(FO4RemixPlugin SHARED
     src/resolvers/water.cpp
     src/weather_bridge.h
     src/weather_bridge.cpp
+    src/window_manager.h
+    src/window_manager.cpp
     src/f4se_compat.h
 )
 
@@ -116,6 +126,20 @@ target_link_libraries(FO4RemixPlugin PRIVATE
 target_compile_definitions(FO4RemixPlugin PRIVATE
     RUNTIME_VERSION=RUNTIME_VERSION_1_11_191
 )
+
+if(FO4REMIX_ENABLE_TRACY)
+    # Separate lib: TracyClient.cpp includes winsock2, which conflicts with
+    # the plugin target's force-included f4se_compat.h (Windows.h first).
+    add_library(tracy_client STATIC extern/tracy/public/TracyClient.cpp)
+    target_include_directories(tracy_client PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/extern/tracy/public")
+    target_compile_definitions(tracy_client PUBLIC
+        TRACY_ENABLE
+        TRACY_PORT=${FO4REMIX_TRACY_PORT}
+    )
+    target_link_libraries(FO4RemixPlugin PRIVATE tracy_client)
+    target_compile_definitions(FO4RemixPlugin PRIVATE FO4REMIX_ENABLE_TRACY)
+endif()
 
 # Force-include compatibility header
 target_compile_options(FO4RemixPlugin PRIVATE /FI"f4se_compat.h")
