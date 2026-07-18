@@ -92,6 +92,18 @@ namespace RemixRenderer {
     // game thread.
     void RequestDestroyDrain();
 
+    // Bytes handed to the runtime by SubmitDrawable since the last reset:
+    // CreateTexture pixel chains + CreateMesh vertex/index data. Every one
+    // of those bytes becomes CS-chunk payload the runtime's CS thread has
+    // to drain; the 2026-07-17 hang dump proved what happens when the game
+    // thread outruns that drain during a burst (CS queue backpressure ->
+    // present thread blocks in FlushCsChunk HOLDING the device spinlock ->
+    // game thread spins forever entering its next CreateTexture). The
+    // resolve loop resets this each tick and stops resolving once the
+    // [Performance] MaxUploadMiBPerTick cap is reached.
+    void   ResetUploadBytesTick();
+    size_t UploadBytesTick();
+
     // Forward a key/value to Remix's runtime config registry. Takes the
     // recursive Remix-API mutex so concurrent OnFrame draw submissions
     // don't race against the option write. Returns true on success;

@@ -355,6 +355,17 @@ struct PluginConfig {
     // tick so a single over-budget item can't stall progress. 0 = unbounded
     // (legacy burst behavior).
     float resolveBudgetMs;
+
+    // [Performance] MaxUploadMiBPerTick (default 48, 0 = uncapped). Hard cap
+    // on bytes handed to the runtime per tick (CreateTexture chains +
+    // CreateMesh geometry). Every byte becomes CS-chunk payload; the
+    // 2026-07-17 hang dump proved the failure mode when a burst outruns the
+    // CS thread's drain rate: CS-queue backpressure blocks the present
+    // thread inside FlushCsChunk while it holds the device spinlock, and
+    // the game thread spins unboundedly entering its next create call. The
+    // supply-pass zero-copy (5b5b956) removed the memcpys that had been
+    // accidentally rate-limiting exactly this.
+    uint32_t maxUploadMiBPerTick;
 };
 
 // Global config instance

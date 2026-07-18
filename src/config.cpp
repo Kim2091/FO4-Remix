@@ -184,16 +184,17 @@ void LoadConfig() {
     if (g_config.decodeWorkerPercent > 100) g_config.decodeWorkerPercent = 100;
     g_config.decodeWorkerMax = GetIniUInt("Performance", "DecodeWorkerMax", 4, dllPath);
     g_config.cpuTextureCacheMiB = GetIniUInt("Performance", "CpuTextureCacheMiB", 1024, dllPath);
+    g_config.maxUploadMiBPerTick = GetIniUInt("Performance", "MaxUploadMiBPerTick", 48, dllPath);
     g_config.suppressGameRaster = GetIniBool("Performance", "SuppressGameRaster", false, dllPath);
     g_config.deferHandleDestroyToLoad = GetIniBool("Performance", "DeferHandleDestroyToLoad", true, dllPath);
     _MESSAGE("FO4RemixPlugin: Performance - DeferHandleDestroyToLoad=%d",
              g_config.deferHandleDestroyToLoad);
-    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d BatchedMirrorBase=%d RemixMaxFPS=%u MaxPendingTextureReadbacks=%u ResolveBudgetMs=%.1f DecodeWorkerPercent=%u DecodeWorkerMax=%u CpuTextureCacheMiB=%u SuppressGameRaster=%d",
+    _MESSAGE("FO4RemixPlugin: Performance - GpuInstancing=%d BatchedMirrorBase=%d RemixMaxFPS=%u MaxPendingTextureReadbacks=%u ResolveBudgetMs=%.1f DecodeWorkerPercent=%u DecodeWorkerMax=%u CpuTextureCacheMiB=%u MaxUploadMiBPerTick=%u SuppressGameRaster=%d",
              g_config.gpuInstancingEnabled, g_config.batchedMirrorBase,
              g_config.remixMaxFPS, g_config.maxPendingTextureReadbacks,
              g_config.resolveBudgetMs, g_config.decodeWorkerPercent,
              g_config.decodeWorkerMax, g_config.cpuTextureCacheMiB,
-             g_config.suppressGameRaster);
+             g_config.maxUploadMiBPerTick, g_config.suppressGameRaster);
     if (g_config.suppressGameRaster && !g_config.hudOverlayEnabled) {
         _MESSAGE("FO4RemixPlugin: WARNING - SuppressGameRaster=1 with "
                  "HudOverlayEnabled=0: the game window will stop updating and "

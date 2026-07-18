@@ -468,6 +468,11 @@ namespace {
     // and crash the iterating thread.
     std::mutex g_renderStateMutex;
 
+    // Per-tick runtime-ingest byte counter (see remix_renderer.h). Atomic
+    // only because the accessors are declared thread-safe; in practice
+    // SubmitDrawable and the resolve loop both live on the game thread.
+    std::atomic<size_t> g_uploadBytesTick{0};
+
     // Pending config writes queued by game-thread callers (QueueConfigVariable)
     // and drained at the top of OnFrame on the Remix thread. Last write per key
     // wins. Guarded by its own lightweight mutex -- held only for the map
@@ -535,6 +540,14 @@ namespace {
 
 void RemixRenderer::RequestDestroyDrain() {
     g_destroyDrainRequested.store(true, std::memory_order_release);
+}
+
+void RemixRenderer::ResetUploadBytesTick() {
+    g_uploadBytesTick.store(0, std::memory_order_relaxed);
+}
+
+size_t RemixRenderer::UploadBytesTick() {
+    return g_uploadBytesTick.load(std::memory_order_relaxed);
 }
 
 // Park a handle for deferred destruction. Caller holds g_renderStateMutex.
@@ -993,6 +1006,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         CancelParkedHandle(g_pendingDestroys.textures, texHandle);
         g_textureHandles[tex.hash] = { texHandle, 1, Diagnostics::CurrentFrameIndex() };
         inst.textureHashes.insert(tex.hash);
+        g_uploadBytesTick.fetch_add(tex.pixels.size(), std::memory_order_relaxed);
     }
 
     // ---- Validate texture upload completeness ----
@@ -1361,6 +1375,12 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         // of this same content (see CancelParkedHandle).
         CancelParkedHandle(g_pendingDestroys.meshes, meshHandle);
         g_meshCache[meshKey] = { meshHandle, 1 };
+        g_uploadBytesTick.fetch_add(
+            mesh.vertices.size() * sizeof(remixapi_HardcodedVertex) +
+            mesh.indices.size() * sizeof(uint32_t) +
+            mesh.blendWeights.size() * sizeof(float) +
+            mesh.blendIndices.size() * sizeof(uint32_t),
+            std::memory_order_relaxed);
     }
 
     inst.meshHandle     = meshHandle;

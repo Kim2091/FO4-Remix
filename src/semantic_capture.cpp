@@ -931,6 +931,33 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 std::chrono::steady_clock::now() - tResolve0).count();
         };
 
+        // ---- Runtime-congestion pacing (2026-07-17 hang dump) ----
+        // The runtime's ingest is NOT free-flowing: every CreateTexture /
+        // CreateMesh becomes CS-chunk payload, and when a burst outruns the
+        // CS thread's drain rate the queue's backpressure blocks the Remix
+        // present thread inside FlushCsChunk WHILE IT HOLDS the device
+        // spinlock -- and this thread then spins unboundedly trying to enter
+        // its next create call (dump-proven 3-thread convoy: CS thread
+        // waiting on GPU-side command-list recycling, present thread parked
+        // in FlushCsChunk holding devLock, game thread in
+        // RecursiveSpinlock::lock under SubmitDrawable). Two layers:
+        //   (1) byte cap per tick (MaxUploadMiBPerTick) keeps the CS queue
+        //       shallow so the backpressure stall never forms;
+        //   (2) if a single attempt still stalls (devLock convoy already in
+        //       progress), stop feeding the runtime for a cooldown window
+        //       so the pipeline can drain.
+        // The supply-pass zero-copy (5b5b956) removed ~20ms of memcpy per
+        // supplying attempt that had been rate-limiting exactly this path.
+        static uint64_t s_congestedUntilFrame = 0;
+        const size_t uploadCapBytes = (size_t)g_config.maxUploadMiBPerTick * 1024u * 1024u;
+        RemixRenderer::ResetUploadBytesTick();
+        auto uploadCapHit = [&]() {
+            return uploadCapBytes != 0 &&
+                   RemixRenderer::UploadBytesTick() >= uploadCapBytes;
+        };
+        constexpr double  kCongestedAttemptMs   = 150.0;
+        constexpr uint64_t kCongestionCooldownFrames = 60;
+
         // Phase A: collect due keys. Cheap predicates only -- the lock is
         // held for a linear map scan (sub-ms), not the resolve work.
         // static + clear(): Tick is single-threaded on the game thread, so
@@ -1136,10 +1163,14 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // resolve can't stall the queue forever.
         size_t attempted = 0;
         bool   budgetHit = false;
+        bool   congestionTripped = false;
         int    upgradesThisTick = 0;  // texture re-capture storm cap
 
+        const bool congestedCooldown = currentFrame < s_congestedUntilFrame;
+        if (!congestedCooldown)
         for (const PassKey key : dueNew) {
-            if (budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs) {
+            if ((budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs) ||
+                uploadCapHit()) {
                 budgetHit = true;
                 break;
             }
@@ -1147,12 +1178,24 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             auto it = g_drawableMap.find(key);
             if (it == g_drawableMap.end()) continue;      // evicted meanwhile
             if (it->second.submittedToRemix) continue;    // resolved meanwhile
+            const double tAttempt0 = resolveElapsedMs();
             if (attemptResolve(key, it->second)) ++attempted;
+            if (resolveElapsedMs() - tAttempt0 >= kCongestedAttemptMs) {
+                // One attempt stalled way past any honest CPU cost: it sat
+                // in a runtime lock convoy. Feeding more creates now only
+                // deepens the CS backlog the convoy is waiting out.
+                s_congestedUntilFrame = currentFrame + kCongestionCooldownFrames;
+                congestionTripped = true;
+                budgetHit = true;
+                break;
+            }
         }
 
+        if (!congestedCooldown && !congestionTripped)
         for (const PassKey key : duePolls) {
             if (budgetHit ||
-                (budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs)) {
+                (budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs) ||
+                uploadCapHit()) {
                 budgetHit = true;
                 break;
             }
@@ -1290,14 +1333,29 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // resolve phase ran long or deferred work, so hitching reports can
         // be checked against exactly what this tick did.
         const double spentMs = resolveElapsedMs();
+        if (congestionTripped) {
+            static std::atomic<int> sCongestLogs{0};
+            const int n = sCongestLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 40) {
+                _MESSAGE("FO4RemixPlugin: [ResolveBudget] CONGESTED #%d -- attempt "
+                         "stalled %.0fms+ in the runtime (CS backpressure convoy); "
+                         "pausing resolves for %llu ticks (uploadMiB=%.1f)",
+                         n, kCongestedAttemptMs,
+                         (unsigned long long)kCongestionCooldownFrames,
+                         RemixRenderer::UploadBytesTick() / (1024.0 * 1024.0));
+            }
+        }
         if (budgetHit || spentMs > 8.0) {
             static uint64_t s_lastSpikeLogFrame = 0;
             if (currentFrame - s_lastSpikeLogFrame >= 120) {
                 s_lastSpikeLogFrame = currentFrame;
                 _MESSAGE("FO4RemixPlugin: [ResolveBudget] tick spent %.1fms "
-                         "(budget %.1fms%s) attempted=%zu dueNew=%zu duePolls=%zu",
+                         "(budget %.1fms%s) attempted=%zu dueNew=%zu duePolls=%zu "
+                         "uploadMiB=%.1f%s",
                          spentMs, budgetMs, budgetHit ? ", HIT -- deferring rest" : "",
-                         attempted, dueNew.size(), duePolls.size());
+                         attempted, dueNew.size(), duePolls.size(),
+                         RemixRenderer::UploadBytesTick() / (1024.0 * 1024.0),
+                         congestedCooldown ? " [cooldown]" : "");
             }
         }
     }
