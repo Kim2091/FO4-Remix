@@ -194,6 +194,11 @@ std::unordered_set<PassKey> g_lodChunkKeys;
 // SnapshotSkinnedCulled feeds OnFrame's hidden-geometry skip.
 std::unordered_set<PassKey> g_skinnedKeys;
 
+// Keys of submitted VIEWMODEL drawables (DrawableState::isViewModel); same
+// lifecycle/locking. SnapshotViewModelStale walks it for OnFrame's
+// hidden-1P-object skip (lowered weapon while the Pip-Boy is up, etc.).
+std::unordered_set<PassKey> g_viewModelKeys;
+
 // SEH-guarded qword read for the live NiAVObject flags refresh: geometry
 // pointers can go stale between the engine freeing an actor and the TTL
 // sweep evicting the entry. POD-only locals (SEH + C++ unwinding conflict).
@@ -1590,6 +1595,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 // across retries.
                 if (state.isLODChunk)     g_lodChunkKeys.insert(key);
                 if (state.isSkinnedActor) g_skinnedKeys.insert(key);
+                if (state.isViewModel)    g_viewModelKeys.insert(key);
             }
             return true;
         };
@@ -1917,6 +1923,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 }
                 g_lodChunkKeys.erase(it->first);
                 g_skinnedKeys.erase(it->first);
+                g_viewModelKeys.erase(it->first);
                 // Free any DrawCapture watch keyed to this drawable: after
                 // this erase nothing will ever poll it again, and a stranded
                 // upgrade-hunt watch would pin a slot + keep the bind scan
@@ -2033,6 +2040,7 @@ void SemanticCapture::ClearDrawableMap() {
     g_dirtyPoses.clear();
     g_lodChunkKeys.clear();
     g_skinnedKeys.clear();
+    g_viewModelKeys.clear();
 
     // Async merge-readback slices are keyed by buffer identity; the
     // destination world recycles those addresses, so stale entries could
@@ -2084,6 +2092,19 @@ void SemanticCapture::SnapshotSkinnedCulled(std::unordered_set<uint64_t>& out) {
         auto it = g_drawableMap.find(key);
         if (it == g_drawableMap.end()) continue;
         if (it->second.engineCulled) out.insert(key);
+    }
+}
+
+void SemanticCapture::SnapshotViewModelStale(uint64_t currentFrame,
+                                             uint64_t maxAge,
+                                             std::unordered_set<uint64_t>& out) {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    for (const PassKey key : g_viewModelKeys) {
+        auto it = g_drawableMap.find(key);
+        if (it == g_drawableMap.end()) continue;
+        const uint64_t seen = it->second.lastSeenFrame;
+        const uint64_t age = (currentFrame > seen) ? (currentFrame - seen) : 0;
+        if (age > maxAge) out.insert(key);
     }
 }
 

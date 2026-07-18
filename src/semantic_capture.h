@@ -245,8 +245,17 @@ namespace SemanticCapture {
 
     // Resolver query (game thread): does this geometry descend from
     // PlayerCharacter::firstPersonSkeleton? Guarded parent-chain walk,
-    // <=16 hops; false when the player/skeleton is unavailable.
+    // <=64 hops; false when the player/skeleton is unavailable.
     bool IsViewModelGeometry(void* geometry);
+
+    // Fill `out` with submitted viewmodel drawables whose capture entry has
+    // gone STALE (no GetRenderPasses fire for > maxAge frames). 1P shapes
+    // fire every frame while the engine shows them (log-proven age=1), so a
+    // stale entry is a 1P object the engine hid -- the lowered weapon while
+    // the Pip-Boy is up, holstered gear, swapped scope overlays. OnFrame
+    // skips these draws; they return within a frame of firing again.
+    void SnapshotViewModelStale(uint64_t currentFrame, uint64_t maxAge,
+                                std::unordered_set<uint64_t>& out);
 
     // Install the BSLightingShaderProperty render-pass-equivalent hook
     // (slot 0x2B at Fallout4.exe RVA 0x02172540) and start tracking

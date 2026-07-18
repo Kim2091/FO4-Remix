@@ -1749,6 +1749,23 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     SemanticCapture::ViewModelAnchor vmAnchor = {};
     const bool vmActive =
         SemanticCapture::GetViewModelAnchor(vmAnchor) && cam.valid;
+
+    // [ViewModel] hidden-object filter (2026-07-18 Pip-Boy overlay report):
+    // the engine hides lowered/swapped 1P objects (the weapon while the
+    // Pip-Boy is up, holstered gear, scope overlays) by simply not issuing
+    // render passes for them -- but our submitted instances kept drawing,
+    // stacking the weapon under the raised Pip-Boy. 1P shapes fire EVERY
+    // frame while shown (log-proven age=1), so a viewmodel entry stale for
+    // a few frames is one the engine hid: skip its draw. Gated on
+    // sceneFiring so pause states (which stop ALL fires) don't blank the
+    // arms mid-menu.
+    constexpr uint64_t kViewModelStaleAgeFrames = 4;
+    static std::unordered_set<uint64_t> vmStale;
+    vmStale.clear();
+    if (vmActive && sceneFiring) {
+        SemanticCapture::SnapshotViewModelStale(Diagnostics::CurrentFrameIndex(),
+                                                kViewModelStaleAgeFrames, vmStale);
+    }
     float vmBethA[3][4] = {};
     float vmRemixA[3][4] = {};
     if (vmActive) {
@@ -1866,6 +1883,13 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // 1P graph (vmActive); skip otherwise but keep handles warm --
             // they return the moment the player re-enters 1st person.
             if (inst.isViewModel && !vmActive) { ++skippedViewModel; continue; }
+            // Engine hid this 1P object (stopped firing passes for it):
+            // lowered weapon under the Pip-Boy, holstered gear, swapped
+            // scope parts. Returns within a frame of firing again.
+            if (inst.isViewModel && vmStale.count(drawHash)) {
+                ++skippedViewModel;
+                continue;
+            }
             if (inst.isViewModel) ++vmDrawn;
             // (Engine-active filter removed 2026-07-02 -- with the window at
             // TTL it never skipped anything; skippedInactive stays in the
