@@ -1859,7 +1859,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // briefly skipped by engine culling flickering back is worse than a
     // half-second of lingering body on a camera transition. Same
     // sceneFiring gate so pause states hide nothing.
-    constexpr uint64_t kSkinnedStaleAgeFrames = 8;
+    // 8 -> 4 (2026-07-18): user-verified working but "a bit slow to
+    // despawn" at low fps; matches the viewmodel threshold, which has
+    // shown no false-positive flicker.
+    constexpr uint64_t kSkinnedStaleAgeFrames = 4;
     static std::unordered_set<uint64_t> skinnedStale;
     if (sceneFiring) {
         skinnedStale.clear();

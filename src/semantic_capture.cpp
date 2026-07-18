@@ -505,6 +505,42 @@ static void UpdateViewModelAnchor() {
     g_vmAnchor.xf = anchor;
 }
 
+// [ViewModel] rigid-part pose freshness (2026-07-18 lag report): rigid 1P
+// transforms used to update only at GetRenderPasses fire time -- that is
+// state from the frame being RENDERED, while the camera snapshot hkPresent
+// takes reads the LIVE cameraNode, which the engine's overlapped main-
+// thread update may already have advanced to the next frame. Net effect:
+// the weapon/Pip-Boy (rigid) trailed the camera by up to a frame while the
+// arms (bones read at Tick) did not. Re-read every rigid viewmodel
+// transform HERE, at the same moment the camera and anchor reads happen,
+// so all camera-glued state is sampled together. ~40 guarded reads/tick.
+static void RefreshViewModelRigidPoses() {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    for (const PassKey key : g_viewModelKeys) {
+        auto it = g_drawableMap.find(key);
+        if (it == g_drawableMap.end()) continue;
+        SemanticCapture::DrawableState& st = it->second;
+        if (st.isSkinnedActor || !st.geometry) continue;
+        VmPodXf xf = {};
+        if (!PeekBytesGuarded(reinterpret_cast<uintptr_t>(st.geometry) + 0x70,
+                              &xf, sizeof(xf))) {
+            continue;
+        }
+        float live[3][4];
+        SemanticCapture::BuildRemixTransform(
+            *reinterpret_cast<const NiTransform*>(&xf), live);
+        if (!st.liveTransformValid ||
+            std::memcmp(st.liveWorldTransform, live, sizeof(live)) != 0) {
+            std::memcpy(st.liveWorldTransform, live, sizeof(live));
+            st.liveTransformValid = true;
+            if (!st.poseDirty) {
+                st.poseDirty = true;
+                g_dirtyPoses.push_back(key);
+            }
+        }
+    }
+}
+
 static void ViewModelDiagTick(uint64_t currentFrame) {
     constexpr uint32_t kPeriodTicks   = 120;  // ~2s
     constexpr uint32_t kMaxPasses     = 90;
@@ -1332,6 +1368,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     if (!loadingGate) {
         if (g_config.viewModelEnabled) {
             UpdateViewModelAnchor();
+            RefreshViewModelRigidPoses();
         }
         ViewModelDiagTick(currentFrame);
     }
