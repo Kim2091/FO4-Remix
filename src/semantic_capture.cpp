@@ -347,6 +347,126 @@ static void WalkFpSubtree(uintptr_t root, std::vector<VmLeaf>& outLeaves,
     }
 }
 
+// ---- [ViewModel] anchor tracking (2026-07-18) ----
+// Diag pass 1-40 (this session's log) proved the full 1P pipeline works --
+// capture fires every frame, resolves submit, bones queue -- but the whole
+// graph lives in a synthetic origin-local space (body z~3, Pip-Boy z~89,
+// weapon z~100 while the player stood at (-79683,90060,7827)), so the arms
+// rendered at the map origin. The 1P skeleton's "Camera" bone marks the eye
+// position in that space; Tick tracks it here and OnFrame adds
+// delta = realCameraPos - camBonePos to every viewmodel translation.
+// The mapping is a PURE TRANSLATION: the synthetic space is world-axis-
+// aligned (the weapon sits along the real camera yaw in synthetic coords;
+// aim/pitch is baked into the bone poses by the engine's animation).
+std::mutex g_vmAnchorMx;
+struct {
+    bool  active = false;
+    float camBonePos[3] = {};
+} g_vmAnchor;
+static uintptr_t g_vmCachedRoot      = 0;  // fpRoot the cached bone belongs to
+static uintptr_t g_vmCamBone         = 0;  // cached camera bone (NiNode*)
+static uint32_t  g_vmRevalidateTick  = 0;
+static bool      g_vmNoCamBoneLogged = false;
+
+// BFS the 1P subtree for the camera bone: exact name "Camera" preferred,
+// first name containing "camera" (CI) as fallback. Bounded like the diag
+// walk; every deref guarded.
+static uintptr_t FindFpCameraBone(uintptr_t root) {
+    constexpr size_t   kMaxNodes    = 1024;
+    constexpr uint32_t kMaxChildren = 4096;
+    std::vector<uintptr_t> queue;
+    queue.reserve(64);
+    queue.push_back(root);
+    size_t head = 0, visited = 0;
+    uintptr_t partial = 0;
+    while (head < queue.size() && visited < kMaxNodes) {
+        const uintptr_t obj = queue[head++];
+        if (!obj) continue;
+        ++visited;
+
+        char name[64] = {};
+        if (PeekNameGuarded(reinterpret_cast<void*>(obj), name, sizeof(name)) &&
+            name[0]) {
+            if (_stricmp(name, "Camera") == 0) return obj;
+            if (!partial && NameHasCI(name, "camera")) partial = obj;
+        }
+
+        char cls[48] = {};
+        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(obj),
+                                          cls, sizeof(cls));
+        if (std::strstr(cls, "Node") || std::strstr(cls, "Tree")) {
+            uintptr_t data = 0;
+            uint16_t emptyRunStart = 0;
+            if (PeekBytesGuarded(obj + 0x128, &data, sizeof(data)) && data &&
+                PeekBytesGuarded(obj + 0x132, &emptyRunStart,
+                                 sizeof(emptyRunStart)) &&
+                emptyRunStart <= kMaxChildren) {
+                for (uint16_t i = 0; i < emptyRunStart; ++i) {
+                    uintptr_t child = 0;
+                    if (PeekBytesGuarded(data + (uintptr_t)i * 8, &child,
+                                         sizeof(child)) && child) {
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+    }
+    return partial;
+}
+
+// Once per Tick (game thread): refresh the anchor snapshot OnFrame reads.
+static void UpdateViewModelAnchor() {
+    const uintptr_t fpRoot = BsExtraction::GetPlayerFirstPersonRootPtr();
+    bool active = false;
+    float pos[3] = {};
+    if (fpRoot) {
+        uint64_t rootFlags = 0;
+        const bool flagsOk = PeekQwordGuarded(fpRoot + 0x108, &rootFlags);
+        // Root app-culled = the engine is not showing the 1P graph
+        // (3rd person, furniture, scenes) -> viewmodel hidden.
+        if (flagsOk && (rootFlags & 1ull) == 0) {
+            bool needSearch = g_vmCamBone == 0 || g_vmCachedRoot != fpRoot;
+            // Periodic revalidation: the cached pointer could be recycled
+            // into a different object without the root changing.
+            if (!needSearch && ++g_vmRevalidateTick >= 300) {
+                g_vmRevalidateTick = 0;
+                char nm[64] = {};
+                if (!PeekNameGuarded(reinterpret_cast<void*>(g_vmCamBone),
+                                     nm, sizeof(nm)) ||
+                    !NameHasCI(nm, "camera")) {
+                    needSearch = true;
+                }
+            }
+            if (needSearch) {
+                g_vmCamBone = FindFpCameraBone(fpRoot);
+                g_vmCachedRoot = fpRoot;
+                if (g_vmCamBone) {
+                    char nm[64] = {};
+                    PeekNameGuarded(reinterpret_cast<void*>(g_vmCamBone),
+                                    nm, sizeof(nm));
+                    _MESSAGE("FO4RemixPlugin: [ViewModel] camera bone \"%s\" "
+                             "at %p under fpRoot=%p",
+                             nm, (void*)g_vmCamBone, (void*)fpRoot);
+                } else if (!g_vmNoCamBoneLogged) {
+                    g_vmNoCamBoneLogged = true;
+                    _MESSAGE("FO4RemixPlugin: [ViewModel] no camera bone found "
+                             "in the 1P skeleton -- viewmodel stays hidden "
+                             "(modded skeleton without a Camera node?)");
+                }
+            }
+            if (g_vmCamBone &&
+                PeekBytesGuarded(g_vmCamBone + 0x70 + 0x30, pos, sizeof(pos))) {
+                active = true;
+            } else {
+                g_vmCamBone = 0;  // stale pointer -> re-search next tick
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lk(g_vmAnchorMx);
+    g_vmAnchor.active = active;
+    std::memcpy(g_vmAnchor.camBonePos, pos, sizeof(pos));
+}
+
 static void ViewModelDiagTick(uint64_t currentFrame) {
     constexpr uint32_t kPeriodTicks   = 120;  // ~2s
     constexpr uint32_t kMaxPasses     = 90;
@@ -427,15 +547,25 @@ static void ViewModelDiagTick(uint64_t currentFrame) {
     float playerPos[3] = {};
     BsExtraction::GetPlayerPosition(playerPos[0], playerPos[1], playerPos[2]);
 
+    bool  vmActive = false;
+    float vmBonePos[3] = {};
+    {
+        std::lock_guard<std::mutex> lk(g_vmAnchorMx);
+        vmActive = g_vmAnchor.active;
+        std::memcpy(vmBonePos, g_vmAnchor.camBonePos, sizeof(vmBonePos));
+    }
+
     _MESSAGE("FO4RemixPlugin: [ViewModel] pass=%u fpRoot=%p rootCulled=%d "
              "rootPos=(%.0f,%.0f,%.0f) playerPos=(%.0f,%.0f,%.0f) nodes=%u "
              "tris=%u inMap=%u fresh=%u submitted=%u bones=%u culledLeaf=%u "
-             "culledPath=%u",
+             "culledPath=%u vmActive=%d camBone=%p camBonePos=(%.1f,%.1f,%.1f)",
              s_passes, (void*)fpRoot, (int)(rootFlags & 1ull),
              rootPos[0], rootPos[1], rootPos[2],
              playerPos[0], playerPos[1], playerPos[2],
              nodes, (uint32_t)leaves.size(), inMap, fresh, submitted,
-             withBones, culledLeaf, culledPath);
+             withBones, culledLeaf, culledPath,
+             vmActive ? 1 : 0, (void*)g_vmCamBone,
+             vmBonePos[0], vmBonePos[1], vmBonePos[2]);
 
     const bool dumpDetail =
         (uint32_t)leaves.size() != s_lastLeafCount || (s_passes % 10) == 1;
@@ -687,6 +817,29 @@ void SemanticCapture::GetLeafClassName(void* obj, char* out, size_t outSize) {
     if (outSize == 0 || !out) return;
     out[0] = '\0';
     GetLeafClassNameGuarded(obj, g_moduleBase, out, outSize);
+}
+
+bool SemanticCapture::GetViewModelAnchor(float outCamBoneSynthPos[3]) {
+    std::lock_guard<std::mutex> lk(g_vmAnchorMx);
+    if (outCamBoneSynthPos) {
+        std::memcpy(outCamBoneSynthPos, g_vmAnchor.camBonePos,
+                    sizeof(g_vmAnchor.camBonePos));
+    }
+    return g_vmAnchor.active;
+}
+
+bool SemanticCapture::IsViewModelGeometry(void* geometry) {
+    if (!geometry) return false;
+    const uintptr_t fpRoot = BsExtraction::GetPlayerFirstPersonRootPtr();
+    if (!fpRoot) return false;
+    uintptr_t obj = reinterpret_cast<uintptr_t>(geometry);
+    for (int i = 0; i < 16 && obj; ++i) {
+        if (obj == fpRoot) return true;
+        uintptr_t parent = 0;
+        if (!PeekBytesGuarded(obj + 0x28, &parent, sizeof(parent))) return false;
+        obj = parent;
+    }
+    return false;
 }
 
 namespace { // reopen anonymous namespace
@@ -1116,9 +1269,12 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         SkinnedMeshes::UpdateAndQueue();
     }
 
-    // [ViewModel] 1st-person pipeline probe (rate-limited + capped inside;
-    // ~2s cadence, one summary line per pass).
+    // [ViewModel] anchor refresh (every tick; OnFrame consumes the snapshot)
+    // + pipeline probe (rate-limited + capped inside; ~2s cadence).
     if (!loadingGate) {
+        if (g_config.viewModelEnabled) {
+            UpdateViewModelAnchor();
+        }
         ViewModelDiagTick(currentFrame);
     }
 

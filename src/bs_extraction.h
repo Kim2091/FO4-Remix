@@ -63,6 +63,19 @@ struct ExtractedMesh {
     // depth-offset Z-fight prevention.
     bool isDecal = false;
 
+    // 1st-person viewmodel tag (2026-07-18, set by lighting_static when the
+    // geometry descends from PlayerCharacter::firstPersonSkeleton). The 1P
+    // graph lives in a SYNTHETIC origin-local space (player-at-origin, world-
+    // aligned axes; diag-proven: body z~3, Pip-Boy z~89, weapon z~100 while
+    // the player stood at (-79683,90060,7827)); submitting its transforms
+    // raw renders the arms at the map origin -- the "viewmodels invisible"
+    // bug. OnFrame maps the space into the render world per frame by adding
+    // delta = realCameraPos - camBoneSyntheticPos (SemanticCapture::
+    // GetViewModelAnchor) to the instance transform (rigid parts) or the
+    // bone translations (skinned parts), and hides these instances entirely
+    // while the engine has the 1P root app-culled (3rd person, menus).
+    bool isViewModel = false;
+
     // Two-sided tag (set by lighting_static resolver from BSShaderProperty
     // flag bit 36, kTwoSided per CommonLibF4; sanity-anchored by kOwnEmit=22
     // and kDecal=26 which match our confirmed bits). Drives per-instance

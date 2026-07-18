@@ -1663,6 +1663,20 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         }
     }
 
+    // ---- 1st-person viewmodel tag (2026-07-18) ----
+    // Descendants of PlayerCharacter::firstPersonSkeleton live in the
+    // engine's synthetic origin-local 1P space; OnFrame re-anchors them to
+    // the live camera every frame and hides them while the engine has the
+    // 1P root culled (see ExtractedMesh::isViewModel). Positive result is
+    // cached on the DrawableState -- a live geometry can't migrate between
+    // skeletons (despawn/reload replaces the pointers and the map entry).
+    if (g_config.viewModelEnabled) {
+        if (!state.isViewModel && SemanticCapture::IsViewModelGeometry(tri)) {
+            state.isViewModel = true;
+        }
+        mesh.isViewModel = state.isViewModel;
+    }
+
     // ---- Skinned drawable wiring (2026-07-08) ----
     if (isSkinned) {
         uint32_t boneCount = 0;

@@ -130,6 +130,14 @@ namespace SemanticCapture {
         // walk only the ~dozens of chunk entries instead of the whole map.
         bool  isLODChunk               = false;
 
+        // ---- 1st-person viewmodel (2026-07-18) ----
+        // Set by the lighting resolver when this geometry descends from
+        // PlayerCharacter::firstPersonSkeleton (guarded parent-chain walk).
+        // Mirrored into ExtractedMesh::isViewModel at submit so OnFrame can
+        // apply the synthetic-space -> render-world translation and the
+        // hidden-in-3rd-person skip. See ExtractedMesh::isViewModel.
+        bool  isViewModel              = false;
+
         // ---- Skinned-actor visibility (2026-07-08 hair-through-hats) ----
         // isSkinnedActor: set by the lighting resolver when this drawable
         // submitted as a skinned mesh; Tick maintains g_skinnedKeys from it.
@@ -211,6 +219,24 @@ namespace SemanticCapture {
     // so a stale vtable pointer doesn't crash the caller. Writes "?" on fault
     // or empty/null input. Requires Install() to have run (sets module base).
     void GetLeafClassName(void* obj, char* out, size_t outSize);
+
+    // ---- [ViewModel] 1st-person rendering (2026-07-18) ----
+    // The engine keeps the 1P graph in a synthetic origin-local space with
+    // world-aligned axes; the 1P skeleton's "Camera" bone marks where the
+    // render camera sits in that space. Tick tracks the bone; OnFrame adds
+    // delta = realCameraBethPos - camBoneSyntheticPos to every viewmodel
+    // instance/bone translation, gluing the arms to the live camera.
+    //
+    // Returns true while the viewmodel should render (1P root present, not
+    // app-culled, camera bone resolved) and fills the bone's synthetic-space
+    // Beth translation. Thread-safe snapshot (written on the game thread in
+    // Tick, read on the Remix thread in OnFrame).
+    bool GetViewModelAnchor(float outCamBoneSynthPos[3]);
+
+    // Resolver query (game thread): does this geometry descend from
+    // PlayerCharacter::firstPersonSkeleton? Guarded parent-chain walk,
+    // <=16 hops; false when the player/skeleton is unavailable.
+    bool IsViewModelGeometry(void* geometry);
 
     // Install the BSLightingShaderProperty render-pass-equivalent hook
     // (slot 0x2B at Fallout4.exe RVA 0x02172540) and start tracking

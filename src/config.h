@@ -73,6 +73,7 @@ struct PluginConfig {
 
     // [Skinning]
     bool  skinningEnabled;   // Extract and animate skinned meshes (characters, creatures)
+    bool  viewModelEnabled;  // Render the 1st-person arms/weapon/Pip-Boy (synthetic-space remap)
 
     // [Emissive]
     bool  emissiveGlowMapsEnabled;  // Extract glow map textures from BSLightingShaderMaterialGlowmap
