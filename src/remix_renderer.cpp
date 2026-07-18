@@ -1836,12 +1836,35 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // a few frames is one the engine hid: skip its draw. Gated on
     // sceneFiring so pause states (which stop ALL fires) don't blank the
     // arms mid-menu.
+    // Both stale sets are STICKY while the scene is not firing: pause
+    // states freeze fire ages, and clearing the verdicts there would
+    // resurrect every hidden object (lowered weapon, 3P body) behind the
+    // pause menu. Recomputed fresh on every firing frame.
     constexpr uint64_t kViewModelStaleAgeFrames = 4;
     static std::unordered_set<uint64_t> vmStale;
-    vmStale.clear();
-    if (vmActive && sceneFiring) {
+    if (sceneFiring && vmActive) {
+        vmStale.clear();
         SemanticCapture::SnapshotViewModelStale(Diagnostics::CurrentFrameIndex(),
                                                 kViewModelStaleAgeFrames, vmStale);
+    }
+
+    // Skinned-actor stale-fire filter (2026-07-18, 3P-body-persists report):
+    // actors are animated geometry, so the engine rebuilds their render
+    // passes EVERY frame they are shown -- a skinned drawable that stopped
+    // firing is one the engine hid. The canonical case: zoom to 3rd person
+    // (3P body fires, gets captured + submitted), zoom back in (engine
+    // stops firing it) -- without this filter the 3P body kept drawing in
+    // first person forever. Also covers despawned NPCs and equipment-
+    // suppressed parts. Wider threshold than the viewmodel's: an actor
+    // briefly skipped by engine culling flickering back is worse than a
+    // half-second of lingering body on a camera transition. Same
+    // sceneFiring gate so pause states hide nothing.
+    constexpr uint64_t kSkinnedStaleAgeFrames = 8;
+    static std::unordered_set<uint64_t> skinnedStale;
+    if (sceneFiring) {
+        skinnedStale.clear();
+        SemanticCapture::SnapshotSkinnedStale(Diagnostics::CurrentFrameIndex(),
+                                              kSkinnedStaleAgeFrames, skinnedStale);
     }
     float vmBethA[3][4] = {};
     float vmRemixA[3][4] = {};
@@ -2020,6 +2043,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 // gore parts) -- skip the draw but keep the handle; it
                 // returns the moment the engine unhides it.
                 if (skinnedCulled.count(drawHash)) { ++skinnedHidden; continue; }
+                // Engine stopped issuing passes for this actor geometry
+                // (3P body after a camera transition, despawns) -- same
+                // skip-but-keep-warm treatment.
+                if (skinnedStale.count(drawHash)) { ++skinnedHidden; continue; }
                 // No bone set yet: bind-pose verts are model-space and would
                 // render T-posed at the world origin -- hold the draw until
                 // the first game-thread bone update lands (next Tick).

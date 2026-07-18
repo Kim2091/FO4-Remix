@@ -257,6 +257,17 @@ namespace SemanticCapture {
     void SnapshotViewModelStale(uint64_t currentFrame, uint64_t maxAge,
                                 std::unordered_set<uint64_t>& out);
 
+    // Same stale-fire snapshot over ALL submitted skinned drawables
+    // (g_skinnedKeys). Actors are animated geometry -- the engine rebuilds
+    // their render passes every frame they are shown -- so a skinned entry
+    // that stopped firing is one the engine hid: the player's 3rd-person
+    // body after a 3P->1P camera transition (which used to persist into
+    // first person forever), despawned/unloaded NPCs, equipment-suppressed
+    // parts. OnFrame skips these draws; they return within a frame of
+    // firing again.
+    void SnapshotSkinnedStale(uint64_t currentFrame, uint64_t maxAge,
+                              std::unordered_set<uint64_t>& out);
+
     // Install the BSLightingShaderProperty render-pass-equivalent hook
     // (slot 0x2B at Fallout4.exe RVA 0x02172540) and start tracking
     // captured drawables in the DrawableMap.

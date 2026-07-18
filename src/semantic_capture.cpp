@@ -2108,6 +2108,19 @@ void SemanticCapture::SnapshotViewModelStale(uint64_t currentFrame,
     }
 }
 
+void SemanticCapture::SnapshotSkinnedStale(uint64_t currentFrame,
+                                           uint64_t maxAge,
+                                           std::unordered_set<uint64_t>& out) {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    for (const PassKey key : g_skinnedKeys) {
+        auto it = g_drawableMap.find(key);
+        if (it == g_drawableMap.end()) continue;
+        const uint64_t seen = it->second.lastSeenFrame;
+        const uint64_t age = (currentFrame > seen) ? (currentFrame - seen) : 0;
+        if (age > maxAge) out.insert(key);
+    }
+}
+
 uint64_t SemanticCapture::SnapshotLodChunkAges(uint64_t currentFrame,
                                                std::unordered_map<uint64_t, uint64_t>& out) {
     std::lock_guard<std::mutex> lock(g_drawableMutex);
