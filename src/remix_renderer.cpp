@@ -1752,20 +1752,28 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     float vmBethA[3][4] = {};
     float vmRemixA[3][4] = {};
     if (vmActive) {
-        // Bone->camera convention twist (2026-07-18 verify run): the Camera
-        // bone's basis is right-handed/orthonormal (row0 x row1 == row2,
-        // log-verified) but FACES BACKWARD relative to the cameraNode
-        // convention -- its right and forward rows are the camera's negated,
-        // up shared (a pure 180-degree yaw twist; user-visible as arms
-        // "behind the camera, rotated 180 horizontally", pivoting at eye
-        // height). True synthetic camera pose = Q * boneRot with
-        // Q = diag(-1,-1,+1).
+        // Bone->camera convention twist (SYNC-DUMP PROVEN 2026-07-18: two
+        // exact same-frame samples, menu + gameplay, every element matching
+        // to 3 decimals). The Camera bone uses the NIF camera convention
+        // {row0=right, row1=up, row2=backward}; the cameraNode convention
+        // is {row0=right, row1=forward, row2=up}. Exact mapping:
+        //   right = b0,  forward = -b2,  up = b1
+        // i.e. R_true = Q * boneRot with Q = [[1,0,0],[0,0,-1],[0,1,0]]
+        // (a 90-degree twist about the shared right axis, det +1). With the
+        // true convention the bone pose EQUALS the camera pose in the
+        // observed steady state, so S degenerates to a pure translation --
+        // while the general solve stays exact if the synthetic frame ever
+        // rotates (swim/workshop/scene states).
         float bRot[3][3];
-        for (int r = 0; r < 3; ++r) {
-            const float flip =
-                (g_config.viewModelBoneYawFlip && r < 2) ? -1.0f : 1.0f;
-            for (int c = 0; c < 3; ++c) {
-                bRot[r][c] = vmAnchor.rot[r][c] * flip;
+        for (int c = 0; c < 3; ++c) {
+            if (g_config.viewModelBoneConventionFix) {
+                bRot[0][c] = vmAnchor.rot[0][c];
+                bRot[1][c] = -vmAnchor.rot[2][c];
+                bRot[2][c] = vmAnchor.rot[1][c];
+            } else {
+                bRot[0][c] = vmAnchor.rot[0][c];
+                bRot[1][c] = vmAnchor.rot[1][c];
+                bRot[2][c] = vmAnchor.rot[2][c];
             }
         }
         // S_rot = ((Q*boneRot)^T / scale) * camRot   (row-vector rows)
