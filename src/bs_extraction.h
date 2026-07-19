@@ -403,6 +403,17 @@ namespace BsExtraction {
     // drawable for the Tick's shadow-refresh poll.
     void ResetLiveRTFlag();
     bool LastExtractionSawLiveRT();
+    // Overlay-compositor exclusion: true if this ID3D11Texture2D pointer was
+    // ever seen as an RT-backed MATERIAL source (Pip-Boy screen, terminals).
+    // Such Scaleform targets present on their mesh, so the screen-overlay
+    // composite must skip them or the UI appears full-screen over the world
+    // as well. Identity compare only -- callers pass unowned pointers.
+    // Render/game thread only, like the rest of the live-RT state.
+    bool IsLiveRTScreenSource(void* tex2d);
+    // Dropped on load resets (engine recreates its RTs; a recycled pointer
+    // must not exclude a legit full-screen layer). Re-learns on the next
+    // extraction of each screen material.
+    void ClearLiveRTScreenSources();
 
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,

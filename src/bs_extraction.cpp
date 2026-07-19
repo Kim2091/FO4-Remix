@@ -169,6 +169,14 @@ static bool     g_liveRTFlagSticky  = false;
 // baseHash (pre-generation fold) -> last generation's folded hash, for
 // evicting the superseded CPU-cache entry (one live entry per RT).
 static std::unordered_map<uint64_t, uint64_t> g_liveTexLastVariant;
+// D3D11 texture identities of every RT-backed MATERIAL source seen (Pip-Boy
+// screen, terminal screens, scopes). The screen-overlay compositor excludes
+// these from its full-screen composite: the mesh IS their presentation
+// surface, and compositing the same Scaleform target on screen drew the
+// Pip-Boy UI huge over the world (2026-07-18). Pointer values are identity
+// tokens only -- never dereferenced, no refs held; cleared on load resets
+// so a recycled allocation can't shadow a legit full-screen layer.
+static std::unordered_set<void*> g_liveRTScreenSources;
 
 static void TextureCacheErase(uint64_t key)
 {
@@ -2332,6 +2340,12 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
             if (pd.BindFlags & D3D11_BIND_RENDER_TARGET) {
                 isLiveRT = true;
                 g_liveRTFlagSticky = true;
+                // Registry for the overlay compositor's exclusion check.
+                // Bounded: live RTs are a handful per session; a runaway set
+                // (pointer churn) resets and re-learns from live extractions.
+                if (g_liveRTScreenSources.size() > 32)
+                    g_liveRTScreenSources.clear();
+                g_liveRTScreenSources.insert(probe2d);
                 hash = FnvHashCombine(hash,
                     ((uint64_t)pd.Format << 40) |
                     ((uint64_t)pd.Width << 24) | ((uint64_t)pd.Height << 8) | 9u);
@@ -3025,6 +3039,16 @@ void BsExtraction::ResetLiveRTFlag()
 bool BsExtraction::LastExtractionSawLiveRT()
 {
     return g_liveRTFlagSticky;
+}
+
+bool BsExtraction::IsLiveRTScreenSource(void* tex2d)
+{
+    return g_liveRTScreenSources.count(tex2d) != 0;
+}
+
+void BsExtraction::ClearLiveRTScreenSources()
+{
+    g_liveRTScreenSources.clear();
 }
 
 // ---------------------------------------------------------------------------

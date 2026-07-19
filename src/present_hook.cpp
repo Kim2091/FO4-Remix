@@ -1,4 +1,5 @@
 #include "present_hook.h"
+#include "bs_extraction.h"
 #include "config.h"
 #include "draw_capture.h"
 #include "raster_suppress.h"
@@ -605,6 +606,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         // surfaces; drop the frame layers AND the size-keyed staging pool.
         g_uiLayers.ReleaseFrameLayers();
         g_uiLayers.ReleaseStagings();
+        BsExtraction::ClearLiveRTScreenSources();
         if (g_ui.renderTarget) {
             g_ui.renderTarget->Release();
             g_ui.renderTarget = nullptr;
@@ -772,14 +774,30 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     // Pip-Boy / terminal / load screen). Plain HUD frames -- the vast
     // majority -- keep the legacy single-RT path below and its exact perf
     // profile (no zero-fill + blend + re-un-premultiply passes).
+    // Layers whose texture is an RT-backed MATERIAL source (Pip-Boy screen,
+    // terminal screens) present on their MESH via the live-texture refresh
+    // (0c0c9e7) -- compositing them here too painted the 876x700 Pip-Boy UI
+    // huge and untinted over the world (2026-07-18 verify). Excluded from
+    // the composite, but still recorded/bound-tracked: their Scaleform draws
+    // must keep executing under raster suppression or the mesh capture goes
+    // stale. ScreenRefreshFrames=0 (live screen off) restores compositing so
+    // the UI is never presented nowhere.
+    auto isLiveScreenLayer = [](ID3D11Texture2D* tex) {
+        return g_config.viewModelScreenRefreshFrames != 0 &&
+               BsExtraction::IsLiveRTScreenSource(tex);
+    };
     int otherBoundLayers = 0;
     for (int i = 0; i < g_uiLayers.count; ++i) {
         const auto& L = g_uiLayers.layers[i];
-        if (L.tex && L.bound && L.tex != g_ui.renderTarget) ++otherBoundLayers;
+        if (L.tex && L.bound && L.tex != g_ui.renderTarget &&
+            !isLiveScreenLayer(L.tex)) ++otherBoundLayers;
     }
-    if (g_config.hudOverlayEnabled && g_config.overlayMultiLayer &&
-        g_remix.ready && otherBoundLayers > 0) {
-        // Diag: log the layer set when it changes ([UILayer], capped).
+    // Diag: log the layer set when it changes ([UILayer], capped). Outside
+    // the composite gate on purpose: when every non-interface layer is a
+    // live-screen exclusion (Pip-Boy raised, nothing else) the composite
+    // never engages, and these lines are the only field evidence the
+    // exclusion actually matched (live=1).
+    if (g_config.overlayMultiLayer && g_uiLayers.count > 0) {
         uint64_t sig = 0x9E3779B97F4A7C15ull * (uint64_t)(g_uiLayers.count + 1);
         for (int i = 0; i < g_uiLayers.count; ++i) {
             sig ^= (uint64_t)(uintptr_t)g_uiLayers.layers[i].tex +
@@ -790,11 +808,14 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
             ++g_uiLayers.logCount;
             for (int i = 0; i < g_uiLayers.count; ++i) {
                 const auto& L = g_uiLayers.layers[i];
-                _MESSAGE("FO4RemixPlugin: [UILayer] #%d tex=%p %ux%u bound=%d",
-                         i, (void*)L.tex, L.w, L.h, L.bound ? 1 : 0);
+                _MESSAGE("FO4RemixPlugin: [UILayer] #%d tex=%p %ux%u bound=%d live=%d",
+                         i, (void*)L.tex, L.w, L.h, L.bound ? 1 : 0,
+                         isLiveScreenLayer(L.tex) ? 1 : 0);
             }
         }
-
+    }
+    if (g_config.hudOverlayEnabled && g_config.overlayMultiLayer &&
+        g_remix.ready && otherBoundLayers > 0) {
         ID3D11Device* device = nullptr;
         swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&device);
         if (device) {
@@ -824,6 +845,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     const auto& L = g_uiLayers.layers[i];
                     if (!L.tex || !L.bound) continue;
                     if (L.tex == g_ui.renderTarget) continue;  // blended last below
+                    if (isLiveScreenLayer(L.tex)) continue;    // presents on its mesh
                     blendTexture(L.tex, L.w, L.h);
                 }
                 // Interface RT on top: HUD, subtitles, notifications draw
