@@ -214,7 +214,11 @@ static void BlendLayerIntoComposite(const uint8_t* src, uint32_t srcPitch,
         }
         return;
     }
-    const float fit = (std::min)(0.82f * dw / sw, 0.82f * dh / sh);
+    // Never upscale: a 876x700 Pip-Boy layer blown up to 82% of a 1440p+
+    // screen was "floating and way too large" (2026-07-18 verify) -- native
+    // size reads correctly; only oversized layers shrink to fit.
+    const float fit =
+        (std::min)(1.0f, (std::min)(0.82f * dw / sw, 0.82f * dh / sh));
     const uint32_t tw = (std::max)(1u, (uint32_t)(sw * fit));
     const uint32_t th = (std::max)(1u, (uint32_t)(sh * fit));
     const uint32_t ox = (dw - tw) / 2;
@@ -751,15 +755,30 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     bool uiActiveThisFrame =
         uiCleared && (uiDrawn || g_ui.currentlyBound.load(std::memory_order_relaxed));
 
-    // ---- Multi-layer UI capture (2026-07-18) ----
-    // Composite EVERY recorded Scaleform layer this frame (clear order =
-    // render order, bottom-most first) into one premultiplied buffer, then
-    // un-premultiply into the overlay handoff. Subsumes the single-RT path
-    // below whenever layers were seen; the legacy path remains for
-    // MultiLayerCapture=0 and frames with no recorded layers.
+    // ---- Multi-layer UI capture (2026-07-18, reworked same day) ----
+    // Composite = recorded Scaleform layers (clear order, bottom-most
+    // first) with the LOCKED interface RT blended LAST on top. The locked
+    // RT must NOT come from the recorded-layer list: the engine frequently
+    // skips its transparent clear (that is why the legacy path force-
+    // clears it on bind), so clear-event recording misses it -- v1 of this
+    // block dropped the entire in-game HUD whenever any other layer was
+    // present, and with no captures replacing the overlay the loading
+    // screen stuck on screen forever. The locked RT rides its own
+    // uiActiveThisFrame machinery (force-clear + sticky bind) instead.
     bool multiLayerCaptured = false;
+    const bool lockedRtActive =
+        g_ui.renderTarget != nullptr && uiActiveThisFrame;
+    // Composite only when a non-interface layer is actually in play (menu /
+    // Pip-Boy / terminal / load screen). Plain HUD frames -- the vast
+    // majority -- keep the legacy single-RT path below and its exact perf
+    // profile (no zero-fill + blend + re-un-premultiply passes).
+    int otherBoundLayers = 0;
+    for (int i = 0; i < g_uiLayers.count; ++i) {
+        const auto& L = g_uiLayers.layers[i];
+        if (L.tex && L.bound && L.tex != g_ui.renderTarget) ++otherBoundLayers;
+    }
     if (g_config.hudOverlayEnabled && g_config.overlayMultiLayer &&
-        g_remix.ready && g_uiLayers.count > 0) {
+        g_remix.ready && otherBoundLayers > 0) {
         // Diag: log the layer set when it changes ([UILayer], capped).
         uint64_t sig = 0x9E3779B97F4A7C15ull * (uint64_t)(g_uiLayers.count + 1);
         for (int i = 0; i < g_uiLayers.count; ++i) {
@@ -787,20 +806,32 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                 auto& comp = g_uiLayers.composite;
                 comp.assign((size_t)dw * dh * 4, 0);
                 int blended = 0;
-                for (int i = 0; i < g_uiLayers.count; ++i) {
-                    const auto& L = g_uiLayers.layers[i];
-                    if (!L.tex || !L.bound) continue;
-                    ID3D11Texture2D* st = GetLayerStaging(device, L.w, L.h);
-                    if (!st) continue;
-                    context->CopyResource(st, L.tex);
+                auto blendTexture = [&](ID3D11Texture2D* tex,
+                                        uint32_t w, uint32_t h) {
+                    ID3D11Texture2D* st = GetLayerStaging(device, w, h);
+                    if (!st) return;
+                    context->CopyResource(st, tex);
                     D3D11_MAPPED_SUBRESOURCE mapped;
                     if (SUCCEEDED(context->Map(st, 0, D3D11_MAP_READ, 0, &mapped))) {
                         BlendLayerIntoComposite(
                             static_cast<const uint8_t*>(mapped.pData),
-                            mapped.RowPitch, L.w, L.h, comp.data(), dw, dh);
+                            mapped.RowPitch, w, h, comp.data(), dw, dh);
                         context->Unmap(st, 0);
                         ++blended;
                     }
+                };
+                for (int i = 0; i < g_uiLayers.count; ++i) {
+                    const auto& L = g_uiLayers.layers[i];
+                    if (!L.tex || !L.bound) continue;
+                    if (L.tex == g_ui.renderTarget) continue;  // blended last below
+                    blendTexture(L.tex, L.w, L.h);
+                }
+                // Interface RT on top: HUD, subtitles, notifications draw
+                // over any panel layer (Pip-Boy, terminal).
+                if (lockedRtActive) {
+                    D3D11_TEXTURE2D_DESC ld;
+                    g_ui.renderTarget->GetDesc(&ld);
+                    blendTexture(g_ui.renderTarget, ld.Width, ld.Height);
                 }
                 if (blended > 0) {
                     std::lock_guard<std::mutex> lock(g_overlay.mutex);
@@ -828,6 +859,15 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     g_overlay.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
                     g_overlay.ready = true;
                     multiLayerCaptured = true;
+                    // Same post-first-capture lock as the legacy path: the
+                    // locked state arms the on-bind force-clear (the engine
+                    // frequently skips the interface RT's clear) and the
+                    // stale-unlock lifecycle.
+                    if (!g_ui.locked && lockedRtActive) {
+                        g_ui.locked = true;
+                        _MESSAGE("FO4RemixPlugin: UI RT locked at %p (multi-layer)",
+                                 g_ui.renderTarget);
+                    }
                 }
                 context->Release();
             }
