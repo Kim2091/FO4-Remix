@@ -141,6 +141,12 @@ static struct MultiLayerUI {
     // Screen-sized premultiplied composite scratch.
     std::vector<uint8_t> composite;
 
+    // Pip-Boy screen feed source (2026-07-18 v2): identity of the layer
+    // whose pixels are being routed onto the Screen:0 mesh (see
+    // SemanticCapture::SupplyPipboyScreenFeed). Identity compare only --
+    // no ref held. Cleared on the load reset with the rest of the state.
+    ID3D11Texture2D* pipboyFeedLayer = nullptr;
+
     // Diag: signature of the last logged layer set ([UILayer] on change).
     uint64_t lastLogSig = 0;
     int      logCount = 0;
@@ -606,6 +612,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         // surfaces; drop the frame layers AND the size-keyed staging pool.
         g_uiLayers.ReleaseFrameLayers();
         g_uiLayers.ReleaseStagings();
+        g_uiLayers.pipboyFeedLayer = nullptr;
         BsExtraction::ClearLiveRTScreenSources();
         if (g_ui.renderTarget) {
             g_ui.renderTarget->Release();
@@ -774,17 +781,72 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     // Pip-Boy / terminal / load screen). Plain HUD frames -- the vast
     // majority -- keep the legacy single-RT path below and its exact perf
     // profile (no zero-fill + blend + re-un-premultiply passes).
-    // Layers whose texture is an RT-backed MATERIAL source (Pip-Boy screen,
-    // terminal screens) present on their MESH via the live-texture refresh
-    // (0c0c9e7) -- compositing them here too painted the 876x700 Pip-Boy UI
-    // huge and untinted over the world (2026-07-18 verify). Excluded from
-    // the composite, but still recorded/bound-tracked: their Scaleform draws
-    // must keep executing under raster suppression or the mesh capture goes
-    // stale. ScreenRefreshFrames=0 (live screen off) restores compositing so
-    // the UI is never presented nowhere.
-    auto isLiveScreenLayer = [](ID3D11Texture2D* tex) {
-        return g_config.viewModelScreenRefreshFrames != 0 &&
-               BsExtraction::IsLiveRTScreenSource(tex);
+    // ---- Pip-Boy screen feed capture (2026-07-18 v2) ----
+    // While the 1P Pip-Boy screen mesh is live (SemanticCapture gate:
+    // Screen:0 registered + submitted + firing, viewmodel active), route
+    // the Pip-Boy Scaleform layer's pixels onto the MESH instead of the
+    // full-screen composite. Candidate = a bound panel layer that is
+    // neither the interface RT nor screen-sized (876x700 in the field
+    // log). Captured every ScreenRefreshFrames (and immediately when the
+    // layer identity changes -- menu re-open can recreate the RT).
+    const bool pipFeedWanted =
+        g_config.overlayMultiLayer && g_config.pipboyScreenFeed &&
+        g_remix.ready && SemanticCapture::PipboyScreenFeedWanted();
+    if (pipFeedWanted) {
+        const MultiLayerUI::Layer* cand = nullptr;
+        for (int i = 0; i < g_uiLayers.count; ++i) {
+            const auto& L = g_uiLayers.layers[i];
+            if (!L.tex || !L.bound) continue;
+            if (L.tex == g_ui.renderTarget) continue;
+            if (L.w == g_remix.gameWidth && L.h == g_remix.gameHeight) continue;
+            cand = &L;
+            break;
+        }
+        if (cand) {
+            const uint32_t period = g_config.viewModelScreenRefreshFrames
+                ? g_config.viewModelScreenRefreshFrames : 12;
+            if (cand->tex != g_uiLayers.pipboyFeedLayer ||
+                (presentIdx % period) == 0) {
+                ID3D11Device* fdev = nullptr;
+                swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&fdev);
+                if (fdev) {
+                    ID3D11DeviceContext* fctx = nullptr;
+                    fdev->GetImmediateContext(&fctx);
+                    if (fctx) {
+                        ID3D11Texture2D* st =
+                            GetLayerStaging(fdev, cand->w, cand->h);
+                        if (st) {
+                            fctx->CopyResource(st, cand->tex);
+                            D3D11_MAPPED_SUBRESOURCE mapped;
+                            if (SUCCEEDED(fctx->Map(st, 0, D3D11_MAP_READ, 0,
+                                                    &mapped))) {
+                                SemanticCapture::SupplyPipboyScreenFeed(
+                                    static_cast<const uint8_t*>(mapped.pData),
+                                    cand->w, cand->h, mapped.RowPitch);
+                                fctx->Unmap(st, 0);
+                                g_uiLayers.pipboyFeedLayer = cand->tex;
+                            }
+                        }
+                        fctx->Release();
+                    }
+                    fdev->Release();
+                }
+            }
+        }
+    }
+
+    // Layers excluded from the full-screen composite -- they present on a
+    // MESH instead: (a) RT-backed MATERIAL sources (live-texture refresh,
+    // 0c0c9e7 -- scopes, RT-material screens), (b) the Pip-Boy layer while
+    // the screen feed is live. Still recorded/bound-tracked either way:
+    // their Scaleform draws must keep executing under raster suppression or
+    // the mesh capture goes stale. When the feed/live-screen is off or the
+    // mesh is gone (Power Armor, terminals), compositing resumes so the UI
+    // is never presented nowhere.
+    auto isLiveScreenLayer = [&](ID3D11Texture2D* tex) {
+        if (g_config.viewModelScreenRefreshFrames != 0 &&
+            BsExtraction::IsLiveRTScreenSource(tex)) return true;
+        return pipFeedWanted && tex == g_uiLayers.pipboyFeedLayer;
     };
     int otherBoundLayers = 0;
     for (int i = 0; i < g_uiLayers.count; ++i) {

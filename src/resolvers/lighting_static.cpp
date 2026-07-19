@@ -1301,7 +1301,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                       ID3D11Device* device) {
     Resolvers::MergeProbe::Pump();  // delayed hdr re-reads; no-op when none pending
 
-    if (state.submittedToRemix) return true;
+    // Shadow-resolve door (2026-07-18 v2): the shadow-refresh polls (live-RT
+    // textures, Pip-Boy screen feed) re-run the resolver on a SUBMITTED
+    // drawable so SubmitDrawable can swap its handles in place. Without the
+    // flag this early-return made every shadow attempt a silent no-op -- the
+    // 0c0c9e7 live-refresh machinery never actually executed.
+    const bool shadowResolve =
+        state.submittedToRemix && state.shadowResolveRequested;
+    state.shadowResolveRequested = false;
+    if (state.submittedToRemix && !shadowResolve) return true;
 
     // Mark in-flight immediately so an SEH catch on an early-step crash
     // still reports the right hash.
@@ -1675,6 +1683,19 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             state.isViewModel = true;
         }
         mesh.isViewModel = state.isViewModel;
+        // Pip-Boy screen feed target (2026-07-18 v2): the 1P "Screen:0"
+        // leaf is the display surface the engine paints the Scaleform UI
+        // onto via a draw the capture pipeline never sees ([LiveTex]
+        // silent). Tag it so the feed override below can replace its
+        // textures with the captured UI layer.
+        if (g_config.pipboyScreenFeed && state.isViewModel &&
+            !state.isPipboyScreen) {
+            const char* nm = tri->m_name.c_str();
+            if (nm && strcmp(nm, "Screen:0") == 0) {
+                state.isPipboyScreen = true;
+                SemanticCapture::RegisterPipboyScreenDrawable(hash);
+            }
+        }
     }
 
     // ---- Skinned drawable wiring (2026-07-08) ----
@@ -2331,6 +2352,39 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                       mesh.emissiveTextureHash,
                                       mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
                                       mesh.emissiveIntensity);
+
+    // ---- Pip-Boy screen feed override (2026-07-18 v2) ----
+    // Replace the tagged Screen:0 drawable's diffuse AND emissive with the
+    // captured Scaleform UI layer (display-ready: tinted, composited over
+    // black). The mesh's own UVs are the engine's mapping for exactly this
+    // content, so no geometry work is needed. Forced opaque + emissive so
+    // the UI reads like a lit screen instead of dark glass. The fed seq is
+    // recorded on the DrawableState only at submit success (below) so a
+    // failed submit retries on the next refresh tick.
+    uint64_t pipboyFeedSeqUsed = 0;
+    if (state.isPipboyScreen && g_config.pipboyScreenFeed) {
+        auto feed = SemanticCapture::GetPipboyScreenFeedTexture();
+        if (feed) {
+            mesh.diffuseTextureHash  = feed->hash;
+            mesh.emissiveTextureHash = feed->hash;
+            mesh.emissiveColorR = 1.0f;
+            mesh.emissiveColorG = 1.0f;
+            mesh.emissiveColorB = 1.0f;
+            mesh.emissiveIntensity = g_config.pipboyScreenEmissiveScale;
+            mesh.alphaBlendEnabled = false;
+            mesh.alphaTestEnabled  = false;
+            newTextures.push_back(feed);
+            pipboyFeedSeqUsed = SemanticCapture::PipboyScreenFeedSeq();
+            static std::atomic<int> sPipFeedLogs{0};
+            if (sPipFeedLogs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                _MESSAGE("FO4RemixPlugin: [PipFeed] feeding UI %ux%u seq=%llu "
+                         "onto Screen:0 (shadow=%d)",
+                         feed->width, feed->height,
+                         (unsigned long long)pipboyFeedSeqUsed,
+                         shadowResolve ? 1 : 0);
+            }
+        }
+    }
 
     // Textures resolved: the phase-1 cache (if any) is consumed by this
     // attempt; cacheHolder frees it at return.
@@ -3487,6 +3541,11 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // (in-place handle swap already happened inside SubmitDrawable).
     state.liveTexRefreshInFlight = false;
     state.liveTexRefreshAttempts = 0;
+    // Pip-Boy screen feed: this submit carries the fed UI frame; stop the
+    // refresh polls until a newer feed arrives.
+    if (pipboyFeedSeqUsed != 0) {
+        state.pipboyFeedSeqSubmitted = pipboyFeedSeqUsed;
+    }
     state.meshHash = hash;
     if (headDiag) {
         HeadDiagLog(hash, "SUBMITTED skinned=%d bones=%u diffuse=%016llX matType=%u",

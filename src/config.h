@@ -118,6 +118,22 @@ struct PluginConfig {
     // 0 = off (static capture, old behavior).
     uint32_t viewModelScreenRefreshFrames;  // default 12
 
+    // Pip-Boy screen FEED (2026-07-18 v2). The screen material's texture is
+    // NOT the Scaleform RT (log-proven: [LiveTex] silent while Screen:0
+    // submits fine) -- the engine composites the UI onto the screen mesh
+    // via a separate draw the capture pipeline never sees. Instead, the
+    // overlay's multi-layer capture routes the Pip-Boy Scaleform layer's
+    // PIXELS onto the submitted "Screen:0" viewmodel drawable as its
+    // diffuse+emissive (the mesh's own UVs are the engine's mapping for
+    // exactly this content), refreshed every ScreenRefreshFrames via an
+    // in-place handle swap. The fed layer is dropped from the full-screen
+    // composite while the feed is live (the giant floating Pip-Boy UI).
+    bool  pipboyScreenFeed;           // default true
+    float pipboyScreenTintR;          // default 0.08 (vanilla fPipboyEffectColor)
+    float pipboyScreenTintG;          // default 1.00
+    float pipboyScreenTintB;          // default 0.09
+    float pipboyScreenEmissiveScale;  // default 1.5
+
     // [Overlay] Multi-layer UI capture (2026-07-18). FO4's Scaleform UI is
     // NOT one surface: the HUD/interface RT, the main menu, the Pip-Boy,
     // and terminals each composite into their OWN render target, so the

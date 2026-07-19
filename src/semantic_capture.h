@@ -9,6 +9,7 @@
 
 struct ID3D11Device;
 struct NiTransform;
+struct ExtractedTexture;   // bs_extraction.h (Pip-Boy screen feed texture)
 
 namespace SemanticCapture {
 
@@ -142,6 +143,22 @@ namespace SemanticCapture {
         bool    hasLiveTexture         = false;
         bool    liveTexRefreshInFlight = false;
         uint8_t liveTexRefreshAttempts = 0;
+
+        // Shadow-resolve door (2026-07-18 v2). TryResolveStatic early-
+        // returns on submitted entries; the shadow-refresh polls set this
+        // for exactly one resolver call so the re-resolve actually RUNS
+        // (without it every shadow attempt was a silent no-op -- the
+        // original 0c0c9e7 live-refresh never executed). Cleared by the
+        // resolver on entry.
+        bool    shadowResolveRequested = false;
+
+        // ---- Pip-Boy screen feed (2026-07-18 v2) ----
+        // isPipboyScreen: lighting resolver tags the 1P "Screen:0" leaf.
+        // pipboyFeedSeqSubmitted: feed sequence number baked into the
+        // currently-submitted screen texture; Tick schedules a shadow
+        // re-resolve whenever the live feed seq has moved past it.
+        bool     isPipboyScreen          = false;
+        uint64_t pipboyFeedSeqSubmitted  = 0;
 
         // ---- 1st-person viewmodel (2026-07-18) ----
         // Set by the lighting resolver when this geometry descends from
@@ -280,6 +297,36 @@ namespace SemanticCapture {
     // firing again.
     void SnapshotSkinnedStale(uint64_t currentFrame, uint64_t maxAge,
                               std::unordered_set<uint64_t>& out);
+
+    // ---- Pip-Boy screen feed (2026-07-18 v2) ----
+    // The Pip-Boy screen material's texture is NOT the Scaleform RT
+    // ([LiveTex] log-proven silent while "Screen:0" submits fine): the
+    // engine paints the UI onto the mesh via a draw the capture pipeline
+    // never sees. Route instead: hkPresent captures the Pip-Boy UI layer's
+    // pixels (multi-layer overlay machinery) and supplies them here; the
+    // lighting resolver overrides the tagged Screen:0 drawable's diffuse+
+    // emissive with the fed texture, re-submitted in place every
+    // [ViewModel] ScreenRefreshFrames. All calls are game-render-thread
+    // only (hkPresent / Tick / resolvers share that thread).
+    //
+    // Supply the latest UI layer pixels (RGBA8, PREMULTIPLIED alpha as the
+    // Scaleform target holds them). Composites over opaque black and bakes
+    // the [ViewModel] PipboyScreenTint so the fed texture is display-ready.
+    void SupplyPipboyScreenFeed(const uint8_t* rgba, uint32_t width,
+                                uint32_t height, uint32_t rowPitch);
+    // Monotonic sequence of supplied feeds (0 = never supplied).
+    uint64_t PipboyScreenFeedSeq();
+    // Latest display-ready feed texture (null before the first supply).
+    std::shared_ptr<const ExtractedTexture> GetPipboyScreenFeedTexture();
+    // Resolver callback: the lighting resolver tags the 1P Screen:0 leaf
+    // and registers its PassKey here so feed gating can find it.
+    void RegisterPipboyScreenDrawable(uint64_t key);
+    // present_hook gate: true while the fed pixels actually PRESENT on the
+    // mesh -- screen drawable registered + submitted + firing fresh AND the
+    // viewmodel is active. False in Power Armor (no 1P Screen:0), at
+    // terminals (viewmodel culled), and whenever the drawable is gone, so
+    // the full-screen composite fallback keeps the UI visible somewhere.
+    bool PipboyScreenFeedWanted();
 
     // Install the BSLightingShaderProperty render-pass-equivalent hook
     // (slot 0x2B at Fallout4.exe RVA 0x02172540) and start tracking

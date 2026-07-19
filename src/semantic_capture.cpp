@@ -369,6 +369,15 @@ struct {
     SemanticCapture::ViewModelAnchor xf = {};
 } g_vmAnchor;
 
+// ---- Pip-Boy screen feed state (2026-07-18 v2) ----
+// See semantic_capture.h. Game-render-thread only (hkPresent supplies, Tick
+// schedules, resolver consumes -- one thread); g_pipboyScreenKey is also
+// read by feedWanted alongside the drawable map. Definitions of the API
+// functions live near ClearDrawableMap below.
+uint64_t g_pipboyScreenKey = 0;   // PassKey of the tagged Screen:0
+uint64_t g_pipboyFeedSeq   = 0;
+std::shared_ptr<const ExtractedTexture> g_pipboyFeedTex;
+
 // POD mirror of NiTransform for the guarded bulk read (rot NiMatrix43
 // [3][4], pos, scale) -- same layout skinned_meshes.cpp anchors on.
 struct VmPodXf {
@@ -1471,7 +1480,15 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                          state.hasLiveTexture &&
                          (state.liveTexRefreshInFlight ||
                           (currentFrame %
-                           g_config.viewModelScreenRefreshFrames) == 0))) {
+                           g_config.viewModelScreenRefreshFrames) == 0)) ||
+                        // Pip-Boy screen feed (2026-07-18 v2): a newer fed
+                        // UI frame exists than the one baked into the
+                        // submitted screen texture.
+                        (g_config.viewModelScreenRefreshFrames != 0 &&
+                         state.isPipboyScreen && g_pipboyFeedTex &&
+                         state.pipboyFeedSeqSubmitted != g_pipboyFeedSeq &&
+                         (currentFrame %
+                          g_config.viewModelScreenRefreshFrames) == 0)) {
                         duePolls.push_back(key);
                     }
                     continue;
@@ -1845,9 +1862,29 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                         kMaxLiveTexAttemptsPerCycle) {
                         state.liveTexRefreshInFlight = false;
                     } else {
+                        // Open the resolver's shadow door (2026-07-18 v2):
+                        // TryResolveStatic early-returns on submitted
+                        // entries, so without this flag every shadow
+                        // attempt was a silent no-op and the 0c0c9e7
+                        // live-refresh never actually ran.
+                        state.shadowResolveRequested = true;
                         doShadowResolve = true;
                     }
                 }
+            }
+            // Pip-Boy screen feed refresh (2026-07-18 v2): a newer fed UI
+            // frame exists than the one the submitted screen texture was
+            // baked from. Shadow re-resolve exactly like the live-RT path
+            // above -- the drawable stays submitted and rendering; the
+            // resolver overrides its diffuse/emissive with the fed texture
+            // and SubmitDrawable swaps the handles in place.
+            else if (g_config.viewModelScreenRefreshFrames != 0 &&
+                     state.isPipboyScreen && g_pipboyFeedTex &&
+                     state.pipboyFeedSeqSubmitted != g_pipboyFeedSeq &&
+                     (currentFrame % g_config.viewModelScreenRefreshFrames) == 0 &&
+                     currentFrame - state.lastSeenFrame <= 4) {
+                state.shadowResolveRequested = true;
+                doShadowResolve = true;
             }
 
             if (!doReresolve && !doShadowResolve) continue;
@@ -2087,6 +2124,82 @@ void SemanticCapture::SetLoadingScreenActive(bool active) {
              active ? "ON (resolves suspended)" : "OFF (resolves resumed)");
 }
 
+// ---------------------------------------------------------------------------
+// Pip-Boy screen feed (2026-07-18 v2). See semantic_capture.h. All state is
+// game-render-thread only (hkPresent supplies, Tick schedules, the resolver
+// consumes -- one thread), except g_pipboyScreenKey which feedWanted reads
+// alongside the drawable map under g_drawableMutex.
+// ---------------------------------------------------------------------------
+void SemanticCapture::SupplyPipboyScreenFeed(const uint8_t* rgba,
+                                             uint32_t width, uint32_t height,
+                                             uint32_t rowPitch) {
+    if (!rgba || width == 0 || height == 0) return;
+    auto tex = std::make_shared<ExtractedTexture>();
+    tex->width = width;
+    tex->height = height;
+    tex->dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    tex->mipLevels = 1;
+    tex->pixels.resize((size_t)width * height * 4);
+    // Source is PREMULTIPLIED (Scaleform draws SrcAlpha over {0,0,0,0}), so
+    // compositing over an opaque black screen is just the premultiplied RGB.
+    // Bake the Pip-Boy tint here: the engine applies its screen color when
+    // it paints the RT onto the mesh; raw Scaleform pixels are white/gray.
+    const float tr = g_config.pipboyScreenTintR;
+    const float tg = g_config.pipboyScreenTintG;
+    const float tb = g_config.pipboyScreenTintB;
+    uint8_t* dst = tex->pixels.data();
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* srow = rgba + (size_t)y * rowPitch;
+        uint8_t* drow = dst + (size_t)y * width * 4;
+        for (uint32_t x = 0; x < width; ++x) {
+            drow[x * 4 + 0] = (uint8_t)(srow[x * 4 + 0] * tr + 0.5f);
+            drow[x * 4 + 1] = (uint8_t)(srow[x * 4 + 1] * tg + 0.5f);
+            drow[x * 4 + 2] = (uint8_t)(srow[x * 4 + 2] * tb + 0.5f);
+            drow[x * 4 + 3] = 255;
+        }
+    }
+    ++g_pipboyFeedSeq;
+    // Per-seq hash so every refresh creates a fresh runtime texture and the
+    // in-place SubmitDrawable swap releases the outgoing one.
+    tex->hash = 0xF0F0B0B0500EEDull ^ (g_pipboyFeedSeq * 0x9E3779B97F4A7C15ull);
+    g_pipboyFeedTex = std::move(tex);
+}
+
+uint64_t SemanticCapture::PipboyScreenFeedSeq() {
+    return g_pipboyFeedSeq;
+}
+
+std::shared_ptr<const ExtractedTexture> SemanticCapture::GetPipboyScreenFeedTexture() {
+    return g_pipboyFeedTex;
+}
+
+void SemanticCapture::RegisterPipboyScreenDrawable(uint64_t key) {
+    if (g_pipboyScreenKey != key) {
+        g_pipboyScreenKey = key;
+        _MESSAGE("FO4RemixPlugin: [PipFeed] Screen:0 drawable registered key=0x%llX",
+                 (unsigned long long)key);
+    }
+}
+
+bool SemanticCapture::PipboyScreenFeedWanted() {
+    if (!g_config.pipboyScreenFeed || g_pipboyScreenKey == 0) return false;
+    // Viewmodel must be live (arm on screen). Terminals cull the 1P root;
+    // Power Armor never registers a Screen:0 -- both keep the full-screen
+    // composite fallback.
+    {
+        std::lock_guard<std::mutex> lk(g_vmAnchorMx);
+        if (!g_vmAnchor.active) return false;
+    }
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    auto it = g_drawableMap.find(g_pipboyScreenKey);
+    if (it == g_drawableMap.end()) return false;
+    const auto& st = it->second;
+    if (!st.submittedToRemix) return false;
+    const uint64_t age = (now > st.lastSeenFrame) ? (now - st.lastSeenFrame) : 0;
+    return age <= 30;
+}
+
 void SemanticCapture::ClearDrawableMap() {
     std::lock_guard<std::mutex> lock(g_drawableMutex);
 
@@ -2124,6 +2237,12 @@ void SemanticCapture::ClearDrawableMap() {
     g_lodChunkKeys.clear();
     g_skinnedKeys.clear();
     g_viewModelKeys.clear();
+
+    // Pip-Boy screen feed: the tagged drawable is gone with the map, and a
+    // stale fed frame from the outgoing world must not survive the load.
+    g_pipboyScreenKey = 0;
+    g_pipboyFeedSeq = 0;
+    g_pipboyFeedTex.reset();
 
     // Async merge-readback slices are keyed by buffer identity; the
     // destination world recycles those addresses, so stale entries could

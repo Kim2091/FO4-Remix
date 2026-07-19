@@ -124,12 +124,24 @@ void LoadConfig() {
     g_config.viewModelCategoryTag = GetIniBool("ViewModel", "CategoryTag", true, dllPath);
     g_config.viewModelScreenRefreshFrames =
         GetIniUInt("ViewModel", "ScreenRefreshFrames", 12, dllPath);
+    g_config.pipboyScreenFeed = GetIniBool("ViewModel", "PipboyScreenFeed", true, dllPath);
+    g_config.pipboyScreenTintR =
+        GetIniFloatClamped("ViewModel", "PipboyScreenTintR", 0.08f, 0.0f, 1.0f, dllPath);
+    g_config.pipboyScreenTintG =
+        GetIniFloatClamped("ViewModel", "PipboyScreenTintG", 1.00f, 0.0f, 1.0f, dllPath);
+    g_config.pipboyScreenTintB =
+        GetIniFloatClamped("ViewModel", "PipboyScreenTintB", 0.09f, 0.0f, 1.0f, dllPath);
+    g_config.pipboyScreenEmissiveScale =
+        GetIniFloatClamped("ViewModel", "PipboyScreenEmissiveScale", 1.5f, 0.0f, 100.0f, dllPath);
     g_config.overlayMultiLayer = GetIniBool("Overlay", "MultiLayerCapture", true, dllPath);
     _MESSAGE("FO4RemixPlugin: Overlay - MultiLayerCapture=%d", g_config.overlayMultiLayer);
     _MESSAGE("FO4RemixPlugin: ViewModel - SeparateCamera=%d FovOverride=%.1f CategoryTag=%d "
-             "ScreenRefreshFrames=%u",
+             "ScreenRefreshFrames=%u PipboyScreenFeed=%d tint=(%.2f,%.2f,%.2f) emissive=%.1f",
              g_config.viewModelSeparateCamera, g_config.viewModelFovOverride,
-             g_config.viewModelCategoryTag, g_config.viewModelScreenRefreshFrames);
+             g_config.viewModelCategoryTag, g_config.viewModelScreenRefreshFrames,
+             g_config.pipboyScreenFeed, g_config.pipboyScreenTintR,
+             g_config.pipboyScreenTintG, g_config.pipboyScreenTintB,
+             g_config.pipboyScreenEmissiveScale);
 
     // [Emissive]
     g_config.emissiveGlowMapsEnabled = GetIniBool("Emissive", "GlowMapsEnabled", true, dllPath);
