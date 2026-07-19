@@ -106,6 +106,143 @@ static struct UIDetectionState {
     int                      presentCallCount = 0;
 } g_ui;
 
+// ---------------------------------------------------------------------------
+// Multi-layer UI capture (2026-07-18). FO4's Scaleform UI is NOT one
+// surface: the HUD/interface RT, the main menu, the Pip-Boy, and terminals
+// each composite into their OWN render target, so the single locked-RT
+// capture only ever shipped the HUD layer (user: "only VATS and the main
+// game ui work; pause menu partially"). Every Scaleform target shares one
+// fingerprint -- an R8G8B8A8 DEFAULT-usage texture cleared to TRANSPARENT
+// BLACK at the start of its UI pass, then sole-bound and drawn. Track the
+// frame's ordered set of such layers (clear order == Scaleform render
+// order, bottom-most first); the Present capture composites them all into
+// the one overlay image DrawScreenOverlay ships. All state is owned by the
+// game render thread like g_ui above.
+// ---------------------------------------------------------------------------
+static struct MultiLayerUI {
+    static constexpr int kMaxLayers = 8;
+    struct Layer {
+        ID3D11Texture2D* tex = nullptr;   // AddRef'd for the frame
+        uint32_t         w = 0, h = 0;
+        bool             bound = false;   // sole-bound at least once this frame
+    };
+    Layer layers[kMaxLayers];
+    int   count = 0;
+
+    // Per-size staging pool (layers keep their dimensions for the life of a
+    // menu, so entries stabilize after the first frame of each menu).
+    struct Staging {
+        ID3D11Texture2D* tex = nullptr;
+        uint32_t         w = 0, h = 0;
+    };
+    Staging stagings[kMaxLayers];
+
+    // Screen-sized premultiplied composite scratch.
+    std::vector<uint8_t> composite;
+
+    // Diag: signature of the last logged layer set ([UILayer] on change).
+    uint64_t lastLogSig = 0;
+    int      logCount = 0;
+
+    void ReleaseFrameLayers() {
+        for (int i = 0; i < count; ++i) {
+            if (layers[i].tex) layers[i].tex->Release();
+            layers[i] = {};
+        }
+        count = 0;
+    }
+    void ReleaseStagings() {
+        for (auto& s : stagings) {
+            if (s.tex) s.tex->Release();
+            s = {};
+        }
+    }
+} g_uiLayers;
+
+// Fetch (or create) a staging texture for a layer size. Render thread only.
+static ID3D11Texture2D* GetLayerStaging(ID3D11Device* device,
+                                        uint32_t w, uint32_t h) {
+    int freeSlot = -1;
+    for (int i = 0; i < MultiLayerUI::kMaxLayers; ++i) {
+        auto& s = g_uiLayers.stagings[i];
+        if (s.tex && s.w == w && s.h == h) return s.tex;
+        if (!s.tex && freeSlot < 0) freeSlot = i;
+    }
+    if (freeSlot < 0) return nullptr;
+    D3D11_TEXTURE2D_DESC d = {};
+    d.Width = w;
+    d.Height = h;
+    d.MipLevels = 1;
+    d.ArraySize = 1;
+    d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    d.SampleDesc.Count = 1;
+    d.Usage = D3D11_USAGE_STAGING;
+    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ID3D11Texture2D* tex = nullptr;
+    if (FAILED(device->CreateTexture2D(&d, nullptr, &tex))) return nullptr;
+    auto& s = g_uiLayers.stagings[freeSlot];
+    s.tex = tex;
+    s.w = w;
+    s.h = h;
+    return tex;
+}
+
+// Blend one mapped premultiplied-alpha layer into the screen-sized
+// premultiplied composite. Screen-sized layers blend 1:1; other sizes
+// (Pip-Boy 876x700, terminal screens) scale-to-fit inside 82% of the
+// screen, centered, bilinear (premultiplied space is the correct domain
+// for filtering).
+static void BlendLayerIntoComposite(const uint8_t* src, uint32_t srcPitch,
+                                    uint32_t sw, uint32_t sh,
+                                    uint8_t* dst, uint32_t dw, uint32_t dh) {
+    auto blendPx = [](uint8_t* d, const uint8_t* s) {
+        const uint32_t a = s[3];
+        if (a == 0) return;
+        const uint32_t ia = 255u - a;
+        d[0] = (uint8_t)(s[0] + (d[0] * ia + 127u) / 255u);
+        d[1] = (uint8_t)(s[1] + (d[1] * ia + 127u) / 255u);
+        d[2] = (uint8_t)(s[2] + (d[2] * ia + 127u) / 255u);
+        d[3] = (uint8_t)(a + (d[3] * ia + 127u) / 255u);
+    };
+    if (sw == dw && sh == dh) {
+        for (uint32_t y = 0; y < sh; ++y) {
+            const uint8_t* srow = src + (size_t)y * srcPitch;
+            uint8_t* drow = dst + (size_t)y * dw * 4;
+            for (uint32_t x = 0; x < sw; ++x) {
+                blendPx(drow + x * 4, srow + x * 4);
+            }
+        }
+        return;
+    }
+    const float fit = (std::min)(0.82f * dw / sw, 0.82f * dh / sh);
+    const uint32_t tw = (std::max)(1u, (uint32_t)(sw * fit));
+    const uint32_t th = (std::max)(1u, (uint32_t)(sh * fit));
+    const uint32_t ox = (dw - tw) / 2;
+    const uint32_t oy = (dh - th) / 2;
+    for (uint32_t y = 0; y < th; ++y) {
+        const float syf = (y + 0.5f) * sh / th - 0.5f;
+        const int32_t sy0 = (std::max)(0, (int32_t)syf);
+        const int32_t sy1 = (std::min)((int32_t)sh - 1, sy0 + 1);
+        const float fy = syf - sy0;
+        const uint8_t* r0 = src + (size_t)sy0 * srcPitch;
+        const uint8_t* r1 = src + (size_t)sy1 * srcPitch;
+        uint8_t* drow = dst + ((size_t)(oy + y) * dw + ox) * 4;
+        for (uint32_t x = 0; x < tw; ++x) {
+            const float sxf = (x + 0.5f) * sw / tw - 0.5f;
+            const int32_t sx0 = (std::max)(0, (int32_t)sxf);
+            const int32_t sx1 = (std::min)((int32_t)sw - 1, sx0 + 1);
+            const float fx = sxf - sx0;
+            uint8_t px[4];
+            for (int c = 0; c < 4; ++c) {
+                const float top = r0[sx0 * 4 + c] * (1.0f - fx) + r0[sx1 * 4 + c] * fx;
+                const float bot = r1[sx0 * 4 + c] * (1.0f - fx) + r1[sx1 * 4 + c] * fx;
+                px[c] = (uint8_t)(top * (1.0f - fy) + bot * fy + 0.5f);
+            }
+            blendPx(drow + x * 4, px);
+        }
+    }
+}
+
 // Present-call index for the UI liveness stamps above (game render thread).
 static std::atomic<uint64_t> g_presentIndex{0};
 // PreLoadGame reset request (F4SE messaging thread -> render thread).
@@ -142,6 +279,35 @@ static void STDMETHODCALLTYPE hkClearRenderTargetView(
         if (resource) {
             ID3D11Texture2D* tex = nullptr;
             if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
+                // Multi-layer UI tracking: a transparent-black clear of an
+                // R8G8B8A8 DEFAULT-usage surface is the start-of-pass
+                // signature of EVERY Scaleform target (interface RT, main
+                // menu, Pip-Boy 876x700, terminals). Record the frame's
+                // layers in clear order for the Present composite. Size
+                // floor rejects small FX scratch buffers.
+                if (g_config.overlayMultiLayer &&
+                    g_uiLayers.count < MultiLayerUI::kMaxLayers) {
+                    bool known = false;
+                    for (int i = 0; i < g_uiLayers.count; ++i) {
+                        if (g_uiLayers.layers[i].tex == tex) { known = true; break; }
+                    }
+                    if (!known) {
+                        D3D11_TEXTURE2D_DESC ld;
+                        tex->GetDesc(&ld);
+                        if (ld.Format == DXGI_FORMAT_R8G8B8A8_UNORM &&
+                            ld.Usage == D3D11_USAGE_DEFAULT &&
+                            ld.SampleDesc.Count == 1 &&
+                            ld.Width >= 256 && ld.Height >= 256 &&
+                            ld.Width <= 4096 && ld.Height <= 4096) {
+                            auto& L = g_uiLayers.layers[g_uiLayers.count++];
+                            L.tex = tex;
+                            L.tex->AddRef();
+                            L.w = ld.Width;
+                            L.h = ld.Height;
+                            L.bound = false;
+                        }
+                    }
+                }
                 if (g_ui.locked) {
                     if (tex == g_ui.renderTarget) {
                         g_ui.clearedThisFrame = true;
@@ -188,12 +354,27 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
     // target. The UI is always sole-bound (the detection below depends on
     // it), so any other bind -- MRT, depth-only, none -- flips this false.
     bool uiBoundNow = false;
+    bool uiLayerBound = false;
     if (numViews == 1 && ppRTVs && ppRTVs[0]) {
         ID3D11Resource* resource = nullptr;
         ppRTVs[0]->GetResource(&resource);
         if (resource) {
             ID3D11Texture2D* tex = nullptr;
             if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
+                // Multi-layer UI tracking: mark recorded layers that
+                // actually get bound (draw evidence for the composite), and
+                // treat the bind as a UI-phase opener -- menus whose draws
+                // never touch the locked RT (main menu, Pip-Boy, terminals)
+                // must forward under raster suppression too.
+                if (g_config.overlayMultiLayer) {
+                    for (int i = 0; i < g_uiLayers.count; ++i) {
+                        if (g_uiLayers.layers[i].tex == tex) {
+                            g_uiLayers.layers[i].bound = true;
+                            uiLayerBound = true;
+                            break;
+                        }
+                    }
+                }
                 if (g_ui.locked) {
                     if (tex == g_ui.renderTarget) {
                         // If the game didn't clear the RT this frame, do it ourselves
@@ -236,7 +417,7 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
         }
     }
     g_ui.currentlyBound.store(uiBoundNow, std::memory_order_relaxed);
-    RasterSuppress::NotifyUiTargetBound(uiBoundNow);
+    RasterSuppress::NotifyUiTargetBound(uiBoundNow || uiLayerBound);
     g_originalOMSetRTs(context, numViews, ppRTVs, pDSV);
 }
 
@@ -416,6 +597,10 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         _MESSAGE("FO4RemixPlugin: [UIRT] reset (save game load): re-detecting");
         RasterSuppress::NotifyUiRT(nullptr);
         RasterSuppress::NotifyUiTargetBound(false);
+        // Multi-layer UI: the load tears down/recreates the engine's UI
+        // surfaces; drop the frame layers AND the size-keyed staging pool.
+        g_uiLayers.ReleaseFrameLayers();
+        g_uiLayers.ReleaseStagings();
         if (g_ui.renderTarget) {
             g_ui.renderTarget->Release();
             g_ui.renderTarget = nullptr;
@@ -566,12 +751,97 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     bool uiActiveThisFrame =
         uiCleared && (uiDrawn || g_ui.currentlyBound.load(std::memory_order_relaxed));
 
+    // ---- Multi-layer UI capture (2026-07-18) ----
+    // Composite EVERY recorded Scaleform layer this frame (clear order =
+    // render order, bottom-most first) into one premultiplied buffer, then
+    // un-premultiply into the overlay handoff. Subsumes the single-RT path
+    // below whenever layers were seen; the legacy path remains for
+    // MultiLayerCapture=0 and frames with no recorded layers.
+    bool multiLayerCaptured = false;
+    if (g_config.hudOverlayEnabled && g_config.overlayMultiLayer &&
+        g_remix.ready && g_uiLayers.count > 0) {
+        // Diag: log the layer set when it changes ([UILayer], capped).
+        uint64_t sig = 0x9E3779B97F4A7C15ull * (uint64_t)(g_uiLayers.count + 1);
+        for (int i = 0; i < g_uiLayers.count; ++i) {
+            sig ^= (uint64_t)(uintptr_t)g_uiLayers.layers[i].tex +
+                   (g_uiLayers.layers[i].bound ? 1u : 0u) + i * 0x1000193u;
+        }
+        if (sig != g_uiLayers.lastLogSig && g_uiLayers.logCount < 60) {
+            g_uiLayers.lastLogSig = sig;
+            ++g_uiLayers.logCount;
+            for (int i = 0; i < g_uiLayers.count; ++i) {
+                const auto& L = g_uiLayers.layers[i];
+                _MESSAGE("FO4RemixPlugin: [UILayer] #%d tex=%p %ux%u bound=%d",
+                         i, (void*)L.tex, L.w, L.h, L.bound ? 1 : 0);
+            }
+        }
+
+        ID3D11Device* device = nullptr;
+        swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&device);
+        if (device) {
+            ID3D11DeviceContext* context = nullptr;
+            device->GetImmediateContext(&context);
+            if (context) {
+                const uint32_t dw = g_remix.gameWidth;
+                const uint32_t dh = g_remix.gameHeight;
+                auto& comp = g_uiLayers.composite;
+                comp.assign((size_t)dw * dh * 4, 0);
+                int blended = 0;
+                for (int i = 0; i < g_uiLayers.count; ++i) {
+                    const auto& L = g_uiLayers.layers[i];
+                    if (!L.tex || !L.bound) continue;
+                    ID3D11Texture2D* st = GetLayerStaging(device, L.w, L.h);
+                    if (!st) continue;
+                    context->CopyResource(st, L.tex);
+                    D3D11_MAPPED_SUBRESOURCE mapped;
+                    if (SUCCEEDED(context->Map(st, 0, D3D11_MAP_READ, 0, &mapped))) {
+                        BlendLayerIntoComposite(
+                            static_cast<const uint8_t*>(mapped.pData),
+                            mapped.RowPitch, L.w, L.h, comp.data(), dw, dh);
+                        context->Unmap(st, 0);
+                        ++blended;
+                    }
+                }
+                if (blended > 0) {
+                    std::lock_guard<std::mutex> lock(g_overlay.mutex);
+                    g_overlay.pixels.resize((size_t)dw * dh * 4);
+                    const uint8_t* src = comp.data();
+                    uint8_t* dst = g_overlay.pixels.data();
+                    for (size_t px = 0; px < (size_t)dw * dh; ++px) {
+                        const uint8_t r = src[px * 4 + 0];
+                        const uint8_t g = src[px * 4 + 1];
+                        const uint8_t b = src[px * 4 + 2];
+                        const uint8_t a = src[px * 4 + 3];
+                        if (a > 0 && a < 255) {
+                            dst[px * 4 + 0] = (uint8_t)(std::min)(255u, (uint32_t)r * 255u / a);
+                            dst[px * 4 + 1] = (uint8_t)(std::min)(255u, (uint32_t)g * 255u / a);
+                            dst[px * 4 + 2] = (uint8_t)(std::min)(255u, (uint32_t)b * 255u / a);
+                        } else {
+                            dst[px * 4 + 0] = r;
+                            dst[px * 4 + 1] = g;
+                            dst[px * 4 + 2] = b;
+                        }
+                        dst[px * 4 + 3] = a;
+                    }
+                    g_overlay.width = dw;
+                    g_overlay.height = dh;
+                    g_overlay.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    g_overlay.ready = true;
+                    multiLayerCaptured = true;
+                }
+                context->Release();
+            }
+            device->Release();
+        }
+    }
+
     // Gate on hudOverlayEnabled: without it this block ran the full capture
     // every frame — CopyResource + Map(READ) on a just-copied staging texture
     // (a forced CPU<->GPU pipeline stall on the game's render thread) plus a
     // ~1M-pixel un-premultiply pass — only for OnFrame to discard the result
     // because submission is gated on the same flag.
-    if (g_config.hudOverlayEnabled && g_remix.ready && g_ui.renderTarget && uiActiveThisFrame) {
+    if (!multiLayerCaptured &&
+        g_config.hudOverlayEnabled && g_remix.ready && g_ui.renderTarget && uiActiveThisFrame) {
         ID3D11Device* device = nullptr;
         swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&device);
         if (device) {
@@ -669,6 +939,10 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
             device->Release();
         }
     }
+
+    // Multi-layer UI: drop this frame's layer refs (recorded fresh each
+    // frame by the ClearRTV hook; the staging pool persists).
+    g_uiLayers.ReleaseFrameLayers();
 
     // Phase 1B: tick the semantic-capture resolve loop + TTL sweep.
     // Called from hkPresent (game thread) so we have the D3D11 device for

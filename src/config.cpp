@@ -124,6 +124,8 @@ void LoadConfig() {
     g_config.viewModelCategoryTag = GetIniBool("ViewModel", "CategoryTag", true, dllPath);
     g_config.viewModelScreenRefreshFrames =
         GetIniUInt("ViewModel", "ScreenRefreshFrames", 12, dllPath);
+    g_config.overlayMultiLayer = GetIniBool("Overlay", "MultiLayerCapture", true, dllPath);
+    _MESSAGE("FO4RemixPlugin: Overlay - MultiLayerCapture=%d", g_config.overlayMultiLayer);
     _MESSAGE("FO4RemixPlugin: ViewModel - SeparateCamera=%d FovOverride=%.1f CategoryTag=%d "
              "ScreenRefreshFrames=%u",
              g_config.viewModelSeparateCamera, g_config.viewModelFovOverride,

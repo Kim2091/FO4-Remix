@@ -118,6 +118,19 @@ struct PluginConfig {
     // 0 = off (static capture, old behavior).
     uint32_t viewModelScreenRefreshFrames;  // default 12
 
+    // [Overlay] Multi-layer UI capture (2026-07-18). FO4's Scaleform UI is
+    // NOT one surface: the HUD/interface RT, the main menu, the Pip-Boy,
+    // and terminals each composite into their OWN render target, so the
+    // single locked-RT capture only ever shipped the HUD layer. Every
+    // Scaleform target shares one fingerprint -- an R8G8B8A8 DEFAULT-usage
+    // texture cleared to transparent black at the start of its UI pass,
+    // then sole-bound and drawn. When enabled, ALL such layers are captured
+    // each frame and CPU-composited in clear order into the one overlay
+    // image DrawScreenOverlay ships; draws to any recognized layer also
+    // open the raster-suppression UI phase (fixes menus whose draws never
+    // touched the locked RT). 0 = legacy single-RT capture.
+    bool overlayMultiLayer;  // default true
+
     // [Emissive]
     bool  emissiveGlowMapsEnabled;  // Extract glow map textures from BSLightingShaderMaterialGlowmap
     bool  emissiveColorEnabled;     // Use emissive color/scale from BSLightingShaderProperty
