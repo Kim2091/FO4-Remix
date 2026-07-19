@@ -134,6 +134,16 @@ struct PluginConfig {
     float pipboyScreenTintB;          // default 0.09
     float pipboyScreenEmissiveScale;  // default 1.5
 
+    // Readable panel for the fed Pip-Boy layer (2026-07-18 v2 field fix).
+    // The physical screen is ~100px tall at typical camera distance -- the
+    // viewmodel anchor glues the 1P rig to the camera, so the engine's
+    // pipboy-view camera zoom (what makes the screen readable in vanilla)
+    // never happens in the Remix render. Until that camera story exists,
+    // the fed layer ALSO composites as a centered panel scaled to this
+    // fraction of screen height (never upscaled past native). 0 = no panel
+    // (mesh only -- the v2 initial behavior, unusable in the field test).
+    float overlayPipboyPanelFrac;     // default 0.55
+
     // [Overlay] Multi-layer UI capture (2026-07-18). FO4's Scaleform UI is
     // NOT one surface: the HUD/interface RT, the main menu, the Pip-Boy,
     // and terminals each composite into their OWN render target, so the

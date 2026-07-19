@@ -196,12 +196,15 @@ static ID3D11Texture2D* GetLayerStaging(ID3D11Device* device,
 
 // Blend one mapped premultiplied-alpha layer into the screen-sized
 // premultiplied composite. Screen-sized layers blend 1:1; other sizes
-// (Pip-Boy 876x700, terminal screens) scale-to-fit inside 82% of the
+// (Pip-Boy 876x700, terminal screens) scale-to-fit inside maxFrac of the
 // screen, centered, bilinear (premultiplied space is the correct domain
-// for filtering).
+// for filtering). maxFrac is 0.82 for ordinary panels; the fed Pip-Boy
+// layer passes a smaller configurable fraction (see
+// overlayPipboyPanelFrac).
 static void BlendLayerIntoComposite(const uint8_t* src, uint32_t srcPitch,
                                     uint32_t sw, uint32_t sh,
-                                    uint8_t* dst, uint32_t dw, uint32_t dh) {
+                                    uint8_t* dst, uint32_t dw, uint32_t dh,
+                                    float maxFrac = 0.82f) {
     auto blendPx = [](uint8_t* d, const uint8_t* s) {
         const uint32_t a = s[3];
         if (a == 0) return;
@@ -225,7 +228,7 @@ static void BlendLayerIntoComposite(const uint8_t* src, uint32_t srcPitch,
     // screen was "floating and way too large" (2026-07-18 verify) -- native
     // size reads correctly; only oversized layers shrink to fit.
     const float fit =
-        (std::min)(1.0f, (std::min)(0.82f * dw / sw, 0.82f * dh / sh));
+        (std::min)(1.0f, (std::min)(maxFrac * dw / sw, maxFrac * dh / sh));
     const uint32_t tw = (std::max)(1u, (uint32_t)(sw * fit));
     const uint32_t th = (std::max)(1u, (uint32_t)(sh * fit));
     const uint32_t ox = (dw - tw) / 2;
@@ -835,24 +838,32 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         }
     }
 
-    // Layers excluded from the full-screen composite -- they present on a
-    // MESH instead: (a) RT-backed MATERIAL sources (live-texture refresh,
-    // 0c0c9e7 -- scopes, RT-material screens), (b) the Pip-Boy layer while
-    // the screen feed is live. Still recorded/bound-tracked either way:
-    // their Scaleform draws must keep executing under raster suppression or
-    // the mesh capture goes stale. When the feed/live-screen is off or the
-    // mesh is gone (Power Armor, terminals), compositing resumes so the UI
-    // is never presented nowhere.
-    auto isLiveScreenLayer = [&](ID3D11Texture2D* tex) {
+    // Per-layer composite disposition:
+    //   0 = composite normally (0.82 panel fit / 1:1 screen-sized)
+    //   1 = composite as a REDUCED readable panel (the fed Pip-Boy layer;
+    //       the physical screen is ~100px tall at camera distance because
+    //       the viewmodel anchor cancels the engine's pipboy camera zoom,
+    //       so mesh-only presentation was invisible in the field test)
+    //   2 = exclude entirely -- presents on a mesh: RT-backed MATERIAL
+    //       sources (0c0c9e7 scopes/RT screens), or the fed layer when
+    //       PipboyPanelHeightFrac=0. Excluded layers stay recorded/bound-
+    //       tracked: their Scaleform draws must keep executing under raster
+    //       suppression or the mesh capture goes stale. When the feed is
+    //       off or the mesh is gone (Power Armor, terminals), everything
+    //       reverts to disposition 0 so the UI is never presented nowhere.
+    auto layerDisposition = [&](ID3D11Texture2D* tex) -> int {
         if (g_config.viewModelScreenRefreshFrames != 0 &&
-            BsExtraction::IsLiveRTScreenSource(tex)) return true;
-        return pipFeedWanted && tex == g_uiLayers.pipboyFeedLayer;
+            BsExtraction::IsLiveRTScreenSource(tex)) return 2;
+        if (pipFeedWanted && tex == g_uiLayers.pipboyFeedLayer) {
+            return g_config.overlayPipboyPanelFrac > 0.0f ? 1 : 2;
+        }
+        return 0;
     };
     int otherBoundLayers = 0;
     for (int i = 0; i < g_uiLayers.count; ++i) {
         const auto& L = g_uiLayers.layers[i];
         if (L.tex && L.bound && L.tex != g_ui.renderTarget &&
-            !isLiveScreenLayer(L.tex)) ++otherBoundLayers;
+            layerDisposition(L.tex) != 2) ++otherBoundLayers;
     }
     // Diag: log the layer set when it changes ([UILayer], capped). Outside
     // the composite gate on purpose: when every non-interface layer is a
@@ -870,9 +881,9 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
             ++g_uiLayers.logCount;
             for (int i = 0; i < g_uiLayers.count; ++i) {
                 const auto& L = g_uiLayers.layers[i];
-                _MESSAGE("FO4RemixPlugin: [UILayer] #%d tex=%p %ux%u bound=%d live=%d",
+                _MESSAGE("FO4RemixPlugin: [UILayer] #%d tex=%p %ux%u bound=%d disp=%d",
                          i, (void*)L.tex, L.w, L.h, L.bound ? 1 : 0,
-                         isLiveScreenLayer(L.tex) ? 1 : 0);
+                         layerDisposition(L.tex));
             }
         }
     }
@@ -890,7 +901,8 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                 comp.assign((size_t)dw * dh * 4, 0);
                 int blended = 0;
                 auto blendTexture = [&](ID3D11Texture2D* tex,
-                                        uint32_t w, uint32_t h) {
+                                        uint32_t w, uint32_t h,
+                                        float maxFrac = 0.82f) {
                     ID3D11Texture2D* st = GetLayerStaging(device, w, h);
                     if (!st) return;
                     context->CopyResource(st, tex);
@@ -898,7 +910,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     if (SUCCEEDED(context->Map(st, 0, D3D11_MAP_READ, 0, &mapped))) {
                         BlendLayerIntoComposite(
                             static_cast<const uint8_t*>(mapped.pData),
-                            mapped.RowPitch, w, h, comp.data(), dw, dh);
+                            mapped.RowPitch, w, h, comp.data(), dw, dh, maxFrac);
                         context->Unmap(st, 0);
                         ++blended;
                     }
@@ -907,8 +919,11 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                     const auto& L = g_uiLayers.layers[i];
                     if (!L.tex || !L.bound) continue;
                     if (L.tex == g_ui.renderTarget) continue;  // blended last below
-                    if (isLiveScreenLayer(L.tex)) continue;    // presents on its mesh
-                    blendTexture(L.tex, L.w, L.h);
+                    const int disp = layerDisposition(L.tex);
+                    if (disp == 2) continue;               // presents on its mesh
+                    blendTexture(L.tex, L.w, L.h,
+                                 disp == 1 ? g_config.overlayPipboyPanelFrac
+                                           : 0.82f);
                 }
                 // Interface RT on top: HUD, subtitles, notifications draw
                 // over any panel layer (Pip-Boy, terminal).

@@ -133,8 +133,11 @@ void LoadConfig() {
         GetIniFloatClamped("ViewModel", "PipboyScreenTintB", 0.09f, 0.0f, 1.0f, dllPath);
     g_config.pipboyScreenEmissiveScale =
         GetIniFloatClamped("ViewModel", "PipboyScreenEmissiveScale", 1.5f, 0.0f, 100.0f, dllPath);
+    g_config.overlayPipboyPanelFrac =
+        GetIniFloatClamped("Overlay", "PipboyPanelHeightFrac", 0.55f, 0.0f, 1.0f, dllPath);
     g_config.overlayMultiLayer = GetIniBool("Overlay", "MultiLayerCapture", true, dllPath);
-    _MESSAGE("FO4RemixPlugin: Overlay - MultiLayerCapture=%d", g_config.overlayMultiLayer);
+    _MESSAGE("FO4RemixPlugin: Overlay - MultiLayerCapture=%d PipboyPanelHeightFrac=%.2f",
+             g_config.overlayMultiLayer, g_config.overlayPipboyPanelFrac);
     _MESSAGE("FO4RemixPlugin: ViewModel - SeparateCamera=%d FovOverride=%.1f CategoryTag=%d "
              "ScreenRefreshFrames=%u PipboyScreenFeed=%d tint=(%.2f,%.2f,%.2f) emissive=%.1f",
              g_config.viewModelSeparateCamera, g_config.viewModelFovOverride,
