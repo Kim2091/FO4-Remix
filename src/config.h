@@ -193,6 +193,8 @@ struct PluginConfig {
     // frame or two. Only applies while the 3D scene is actively firing, so
     // pause menus don't age chunks out of the Remix view.
     uint32_t cullingLodChunkStaleFrames;     // default 30
+    float    cullingLodChunkFarExtentRatio;  // default 0 (off); skip LOD chunk when
+                                             // box distance > extent * ratio
 
     // [Materials]
     // Spec-gloss -> metal-rough conversion for FO4 environment-mapped

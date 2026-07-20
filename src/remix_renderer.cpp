@@ -2034,6 +2034,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t skippedInactive = 0;
     size_t skippedChunkPlayerInside = 0;
     size_t skippedChunkStale = 0;
+    size_t skippedChunkFar = 0;
     size_t skippedViewModel = 0;
     size_t vmDrawn = 0;
     {
@@ -2164,6 +2165,29 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                         playerY >= inst.chunkOriginY && playerY <= chunkMaxY) {
                         ++skippedChunkPlayerInside;
                         continue;
+                    }
+                    // Far cull (2026-07-20, GPU traversal load): skip a
+                    // chunk once its nearest box distance exceeds
+                    // extent * LodChunkFarExtentRatio -- an angular-size
+                    // rule, so fine near-ring chunks drop at range while
+                    // coarse 16/32-cell horizon chunks survive to the
+                    // skyline. The whole distant world lived in the TLAS
+                    // (2612 LOD drawables, hundreds of MB of BLAS every
+                    // ray traverses); this bounds that mass with a single
+                    // look-preserving knob. 0 disables.
+                    if (g_config.cullingLodChunkFarExtentRatio > 0.0f) {
+                        const float dx = (std::max)((std::max)(
+                            inst.chunkOriginX - playerX,
+                            playerX - chunkMaxX), 0.0f);
+                        const float dy = (std::max)((std::max)(
+                            inst.chunkOriginY - playerY,
+                            playerY - chunkMaxY), 0.0f);
+                        const float farDist =
+                            inst.chunkExtent * g_config.cullingLodChunkFarExtentRatio;
+                        if (dx * dx + dy * dy > farDist * farDist) {
+                            ++skippedChunkFar;
+                            continue;
+                        }
                     }
                 }
             }
@@ -2482,12 +2506,12 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                                                  kActiveAgeFrames, statsScratch,
                                                  &activeStats, nullptr);
         _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu "
-                 "skippedChunkPlayerInside=%zu skippedChunkStale=%zu chunks=%zu "
+                 "skippedChunkPlayerInside=%zu skippedChunkStale=%zu skippedChunkFar=%zu chunks=%zu "
                  "vmDrawn=%zu skippedVM=%zu "
                  "active=%u isLod=%u fadedIn=%u notVisible=%u lodFadingOut=%u forcedFadeOut=%u "
                  "player=(%.0f,%.0f,%.0f)",
                  drawableCount, bucketCount, batchedBucketCount, skippedInactive,
-                 skippedChunkPlayerInside, skippedChunkStale, lodChunkAges.size(),
+                 skippedChunkPlayerInside, skippedChunkStale, skippedChunkFar, lodChunkAges.size(),
                  vmDrawn, skippedViewModel,
                  activeStats.total, activeStats.isLod, activeStats.fadedIn,
                  activeStats.notVisible, activeStats.lodFadingOut, activeStats.forcedFadeOut,
