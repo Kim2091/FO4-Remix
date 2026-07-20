@@ -1369,7 +1369,16 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     // skeletons the registry points into (the reads are SEH-guarded, but a
     // half-freed skeleton can read as plausible garbage).
     if (!loadingGate && g_config.skinningEnabled) {
-        SkinnedMeshes::UpdateAndQueue();
+        // Perf (2026-07-20): elide bone reads/composes for drawables the
+        // renderer will skip anyway. Same culled+stale predicates OnFrame
+        // uses for its skinnedHidden skip (kSkinnedStaleAgeFrames=4 there);
+        // in a loaded urban cell this removes the vast majority of the
+        // per-Tick skeleton work (e.g. 350 of 367 actors engine-hidden).
+        static std::unordered_set<uint64_t> s_skinnedHidden;
+        s_skinnedHidden.clear();
+        SnapshotSkinnedCulled(s_skinnedHidden);
+        SnapshotSkinnedStale(currentFrame, 4, s_skinnedHidden);
+        SkinnedMeshes::UpdateAndQueue(&s_skinnedHidden);
     }
 
     // [ViewModel] anchor refresh (every tick; OnFrame consumes the snapshot)
@@ -1566,6 +1575,25 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             budgetMs *= 3.0;
         }
 
+        // Overrun-debt carry-over (2026-07-20): the budget check runs
+        // between items only, so the LAST admitted item can run unbounded
+        // (logged: 57.7ms spent on a 3.0ms budget — one merge submit stuck
+        // in the runtime's CS-backpressure convoy). The overshoot can't be
+        // prevented mid-item; repay it instead: while debt remains, skip
+        // the resolve phase entirely and retire one budget quantum per
+        // tick, amortizing a spike into several quiet ticks instead of
+        // letting back-to-back monster items pile onto consecutive frames.
+        static double s_budgetDebtMs = 0.0;
+        bool debtCooldown = false;
+        if (budgetMs > 0.0 && s_budgetDebtMs > 0.0) {
+            s_budgetDebtMs -= budgetMs;
+            if (s_budgetDebtMs > 0.0) {
+                debtCooldown = true;
+            } else {
+                s_budgetDebtMs = 0.0;
+            }
+        }
+
         // Gates + resolver call + retry bookkeeping for one entry. Caller
         // holds g_drawableMutex; `state` is the live map entry for `key`.
         // Returns true when the resolver actually ran (counts against the
@@ -1676,7 +1704,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         bool   liveGenBumped = false; // one generation bump per trigger tick
 
         const bool congestedCooldown = currentFrame < s_congestedUntilFrame;
-        if (!congestedCooldown)
+        if (!congestedCooldown && !debtCooldown)
         for (const PassKey key : dueNew) {
             if ((budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs) ||
                 uploadCapHit()) {
@@ -1700,7 +1728,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             }
         }
 
-        if (!congestedCooldown && !congestionTripped)
+        if (!congestedCooldown && !congestionTripped && !debtCooldown)
         for (const PassKey key : duePolls) {
             if (budgetHit ||
                 (budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs) ||
@@ -1788,15 +1816,17 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             // downgrades), so walking away can't blur a sharp capture; once
             // at the streamed max, live == submitted and it stops firing.
             // submittedDiffuseWidth is 0 for non-lighting drawables (water),
-            // so this branch never touches them. Capped at 3 upgrades per
-            // Tick on top of the time budget (each re-resolve allocates
-            // full-res RGBA mip chains; the uncapped storm was the
-            // 2026-07-08/09 fail-fast crashes). Skipped drawables re-qualify
-            // on their next 128-frame slot, so the backlog drains within
-            // seconds.
+            // so this branch never touches them. Capped at 1 upgrade per
+            // Tick on top of the time budget (each re-resolve is a full
+            // resolver re-run — mesh re-extract + full-res RGBA mip chains;
+            // at the old cap of 3 the sustained upgrade storm alone held
+            // Tick at ~30ms+ during streaming, and the uncapped storm was
+            // the 2026-07-08/09 fail-fast crashes). Skipped drawables
+            // re-qualify on their next 128-frame slot, so the backlog still
+            // drains — just spread across more ticks.
             else if (g_config.textureUpgradeOnApproach &&
                      state.submittedDiffuseWidth != 0 &&
-                     upgradesThisTick < 3 &&
+                     upgradesThisTick < 1 &&
                      ((currentFrame ^ key) & 127) == 0) {
                 const uint32_t liveW =
                     BsExtraction::GetMaterialDiffuseResidentWidth(state.material);
@@ -1898,6 +1928,15 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // resolve phase ran long or deferred work, so hitching reports can
         // be checked against exactly what this tick did.
         const double spentMs = resolveElapsedMs();
+        // Accrue overrun debt (see debtCooldown above). Only genuine
+        // overruns (2x budget) accrue — the routine "hit at 3.1ms on a
+        // 3.0ms budget" case is the budget working as designed. Congestion
+        // trips are excluded: their own 60-tick cooldown already pauses
+        // resolves, and stacking debt on top would double-punish. Capped at
+        // 8 quanta so one monster item costs at most ~8 quiet ticks.
+        if (budgetMs > 0.0 && !congestionTripped && spentMs > budgetMs * 2.0) {
+            s_budgetDebtMs = (std::min)(spentMs - budgetMs, budgetMs * 8.0);
+        }
         if (congestionTripped) {
             static std::atomic<int> sCongestLogs{0};
             const int n = sCongestLogs.fetch_add(1, std::memory_order_relaxed);

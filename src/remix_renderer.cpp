@@ -622,10 +622,15 @@ static void ParkForDestroy(std::vector<H>& parked, H h) {
 // churn paths the deferral serves: TTL eviction, merge/texture upgrades).
 // Called from SubmitDrawable's create sites under g_renderStateMutex.
 template <typename H>
-static void CancelParkedHandle(std::vector<H>& parked, H h) {
+static size_t EraseParkedHandle(std::vector<H>& parked, H h) {
     const size_t before = parked.size();
     parked.erase(std::remove(parked.begin(), parked.end(), h), parked.end());
-    const size_t removed = before - parked.size();
+    return before - parked.size();
+}
+
+template <typename H>
+static void CancelParkedHandle(std::vector<H>& parked, H h) {
+    const size_t removed = EraseParkedHandle(parked, h);
     if (removed) {
         g_pendingDestroyCount.fetch_sub(removed, std::memory_order_relaxed);
     }
@@ -1069,6 +1074,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         // deferred destroy hasn't drained yet, that parked destroy would
         // unregister the handle we just (re-)created -- pull it back out.
         CancelParkedHandle(g_pendingDestroys.textures, texHandle);
+        EraseParkedHandle(g_eagerPendingDestroys.textures, texHandle);
         g_textureHandles[tex.hash] = { texHandle, 1, Diagnostics::CurrentFrameIndex() };
         inst.textureHashes.insert(tex.hash);
         g_uploadBytesTick.fetch_add(tex.pixels.size(), std::memory_order_relaxed);
@@ -1341,6 +1347,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
             // Hash-valued handle: cancel any not-yet-drained deferred
             // destroy of this same material (see CancelParkedHandle).
             CancelParkedHandle(g_pendingDestroys.materials, newHandle);
+            EraseParkedHandle(g_eagerPendingDestroys.materials, newHandle);
             g_materialCache[matHash] = { newHandle, 1, Diagnostics::CurrentFrameIndex() };
             matHandle = newHandle;
         }
@@ -1439,6 +1446,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         // Hash-valued handle: cancel any not-yet-drained deferred destroy
         // of this same content (see CancelParkedHandle).
         CancelParkedHandle(g_pendingDestroys.meshes, meshHandle);
+        EraseParkedHandle(g_eagerPendingDestroys.meshes, meshHandle);
         g_meshCache[meshKey] = { meshHandle, 1 };
         g_uploadBytesTick.fetch_add(
             mesh.vertices.size() * sizeof(remixapi_HardcodedVertex) +
@@ -1698,13 +1706,24 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         }
     }
 
-    // Live-texture refresh churn (Pip-Boy screen): every-frame drain of the
-    // eager park list. Same top-of-frame Remix-thread timing as the normal
-    // drain (previous Present returned, no new draw recorded); the list is
-    // <= a handful of handles per refresh period, and each old screen
-    // texture holds ~2.4MB of VRAM -- deferring them to a load screen would
-    // leak hundreds of MB per minute of Pip-Boy use.
-    if (g_hasEagerDestroys.load(std::memory_order_acquire)) {
+    // Live-texture refresh churn (Pip-Boy screen): drain of the eager park
+    // list. Same top-of-frame Remix-thread timing as the normal drain
+    // (previous Present returned, no new draw recorded); the list is <= a
+    // handful of handles per refresh period, and each old screen texture
+    // holds ~2.4MB of VRAM -- deferring them to a load screen would leak
+    // hundreds of MB per minute of Pip-Boy use.
+    // Batched to a 30-frame cadence (2026-07-20, was every frame): each
+    // DestroyTexture bumps the runtime's texture-cache generation, which
+    // fails the preserve gate and sends ALL external draws down the full
+    // dynamic path for a frame. An every-frame drain while the Pip-Boy
+    // refreshes meant the whole scene ran dynamic the whole time the
+    // Pip-Boy was up. At 30 frames the parked backlog is <= ~3 screen
+    // textures (~7MB) and the re-translation cost is 1 frame in 30.
+    constexpr uint64_t kEagerDrainPeriodFrames = 30;
+    static uint64_t s_lastEagerDrainFrame = 0;
+    if (g_hasEagerDestroys.load(std::memory_order_acquire) &&
+        drainNow - s_lastEagerDrainFrame >= kEagerDrainPeriodFrames) {
+        s_lastEagerDrainFrame = drainNow;
         std::lock_guard<std::mutex> rsLock(g_renderStateMutex);
         g_hasEagerDestroys.store(false, std::memory_order_release);
         DestroyParkedHandles(api, g_eagerPendingDestroys);

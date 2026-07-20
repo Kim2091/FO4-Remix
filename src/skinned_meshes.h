@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_set>
 
 struct BSTriShape;
 
@@ -71,7 +72,12 @@ namespace SkinnedMeshes {
 
     // Read live bone transforms for every registered drawable and queue the
     // composed matrix sets to RemixRenderer. Game thread, once per Tick.
-    void UpdateAndQueue();
+    // skipHidden (optional): drawable hashes the renderer will skip anyway
+    // (engine app-culled / stale) — their bone reads and matrix composes are
+    // elided entirely; they keep their last queued pose and recompose the
+    // Tick after the engine unhides them. In a loaded urban cell this is
+    // typically the vast majority of registered actors (2026-07-20 perf).
+    void UpdateAndQueue(const std::unordered_set<uint64_t>* skipHidden = nullptr);
 
     // Drop everything (save load teardown).
     void Reset();

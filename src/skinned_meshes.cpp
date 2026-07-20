@@ -277,7 +277,7 @@ void SkinnedMeshes::Reset() {
     g_entries.clear();
 }
 
-void SkinnedMeshes::UpdateAndQueue() {
+void SkinnedMeshes::UpdateAndQueue(const std::unordered_set<uint64_t>* skipHidden) {
     std::unordered_map<uint64_t, std::vector<remixapi_Transform>> queued;
     {
         std::lock_guard<std::mutex> lk(g_mx);
@@ -293,6 +293,13 @@ void SkinnedMeshes::UpdateAndQueue() {
 
         for (auto it = g_entries.begin(); it != g_entries.end();) {
             Entry& e = it->second;
+            // Hidden/stale drawables: the renderer skips their draw, so
+            // reading + composing their whole skeleton every Tick is pure
+            // waste. Keep the entry (and its fault counter) untouched.
+            if (skipHidden && skipHidden->count(it->first)) {
+                ++it;
+                continue;
+            }
             const uint32_t n = (uint32_t)e.boneXfPtrs.size();
             const bool dumpThis =
                 n > 40 && s_boneDump.load(std::memory_order_relaxed) == 0 &&

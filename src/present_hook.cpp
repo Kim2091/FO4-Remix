@@ -67,6 +67,12 @@ static struct OverlayCapture {
     uint32_t                 stagingWidth = 0;
     uint32_t                 stagingHeight = 0;
     DXGI_FORMAT              stagingFormat = DXGI_FORMAT_UNKNOWN;
+    // Map-first capture (2026-07-20): true when stagingTex holds a queued
+    // CopyResource from a previous capture frame that has not been read yet.
+    // The read maps with DO_NOT_WAIT one-plus frames later, so the game
+    // thread never blocks on the GPU pipeline (the old copy-then-map-now
+    // pattern stalled the game thread for a full GPU frame every UI frame).
+    bool                     stagingPending = false;
 
     std::mutex               mutex;
     std::vector<uint8_t>     pixels;
@@ -130,13 +136,25 @@ static struct MultiLayerUI {
     Layer layers[kMaxLayers];
     int   count = 0;
 
-    // Per-size staging pool (layers keep their dimensions for the life of a
-    // menu, so entries stabilize after the first frame of each menu).
+    // Per-SOURCE staging pool (2026-07-20: keyed by source texture identity,
+    // not size — the map-first capture holds one queued copy per source
+    // across frames, and two same-sized layers, e.g. HUD + a screen-sized
+    // menu, must not overwrite each other's pending copy). `src` is an
+    // identity compare only, no ref held; a recycled pointer at worst reads
+    // one stale frame before the next copy refreshes it.
     struct Staging {
         ID3D11Texture2D* tex = nullptr;
+        ID3D11Texture2D* src = nullptr;
         uint32_t         w = 0, h = 0;
+        bool             pendingCopy = false;  // a queued CopyResource awaits mapping
+        uint64_t         lastUse = 0;          // present index, for eviction
     };
     Staging stagings[kMaxLayers];
+
+    // Pip-Boy feed supply state (map-first): a feed copy was queued and
+    // should be mapped + supplied on a following present.
+    ID3D11Texture2D* feedSupplySrc = nullptr;
+    uint32_t         feedSupplyW = 0, feedSupplyH = 0;
 
     // Screen-sized premultiplied composite scratch.
     std::vector<uint8_t> composite;
@@ -166,16 +184,44 @@ static struct MultiLayerUI {
     }
 } g_uiLayers;
 
-// Fetch (or create) a staging texture for a layer size. Render thread only.
-static ID3D11Texture2D* GetLayerStaging(ID3D11Device* device,
-                                        uint32_t w, uint32_t h) {
+// Fetch (or create) the staging slot for a source layer texture. Keyed by
+// source identity; a size change for the same source recreates the staging
+// (and drops any pending copy). When the pool is full the least-recently
+// used slot is evicted. Render thread only.
+static MultiLayerUI::Staging* GetLayerStaging(ID3D11Device* device,
+                                              ID3D11Texture2D* src,
+                                              uint32_t w, uint32_t h,
+                                              uint64_t presentIdx) {
     int freeSlot = -1;
+    int lruSlot = -1;
+    uint64_t lruStamp = UINT64_MAX;
+    MultiLayerUI::Staging* found = nullptr;
     for (int i = 0; i < MultiLayerUI::kMaxLayers; ++i) {
         auto& s = g_uiLayers.stagings[i];
-        if (s.tex && s.w == w && s.h == h) return s.tex;
+        if (s.tex && s.src == src) { found = &s; break; }
         if (!s.tex && freeSlot < 0) freeSlot = i;
+        if (s.tex && s.lastUse < lruStamp) { lruStamp = s.lastUse; lruSlot = i; }
     }
-    if (freeSlot < 0) return nullptr;
+    if (found) {
+        if (found->w == w && found->h == h) {
+            found->lastUse = presentIdx;
+            return found;
+        }
+        found->tex->Release();
+        *found = {};                        // size changed: rebuild below
+    }
+    MultiLayerUI::Staging* slot = found;
+    if (!slot) {
+        if (freeSlot >= 0) {
+            slot = &g_uiLayers.stagings[freeSlot];
+        } else if (lruSlot >= 0) {
+            slot = &g_uiLayers.stagings[lruSlot];
+            slot->tex->Release();
+            *slot = {};
+        } else {
+            return nullptr;
+        }
+    }
     D3D11_TEXTURE2D_DESC d = {};
     d.Width = w;
     d.Height = h;
@@ -187,11 +233,13 @@ static ID3D11Texture2D* GetLayerStaging(ID3D11Device* device,
     d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     ID3D11Texture2D* tex = nullptr;
     if (FAILED(device->CreateTexture2D(&d, nullptr, &tex))) return nullptr;
-    auto& s = g_uiLayers.stagings[freeSlot];
-    s.tex = tex;
-    s.w = w;
-    s.h = h;
-    return tex;
+    slot->tex = tex;
+    slot->src = src;
+    slot->w = w;
+    slot->h = h;
+    slot->pendingCopy = false;
+    slot->lastUse = presentIdx;
+    return slot;
 }
 
 // Blend one mapped premultiplied-alpha layer into the screen-sized
@@ -616,6 +664,8 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         g_uiLayers.ReleaseFrameLayers();
         g_uiLayers.ReleaseStagings();
         g_uiLayers.pipboyFeedLayer = nullptr;
+        g_uiLayers.feedSupplySrc = nullptr;
+        g_overlay.stagingPending = false;
         BsExtraction::ClearLiveRTScreenSources();
         if (g_ui.renderTarget) {
             g_ui.renderTarget->Release();
@@ -808,26 +858,51 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         if (cand) {
             const uint32_t period = g_config.viewModelScreenRefreshFrames
                 ? g_config.viewModelScreenRefreshFrames : 12;
-            if (cand->tex != g_uiLayers.pipboyFeedLayer ||
-                (presentIdx % period) == 0) {
+            // Map-first (2026-07-20): when a refresh is due, QUEUE the copy
+            // and map it on a later present with DO_NOT_WAIT — the old
+            // copy-then-map-now pattern stalled the game thread for a full
+            // GPU frame on every refresh. Feed latency becomes period+1
+            // frames instead of period; no pipeline stall.
+            const bool due = cand->tex != g_uiLayers.pipboyFeedLayer ||
+                             (presentIdx % period) == 0;
+            const bool supplyPending = g_uiLayers.feedSupplySrc != nullptr;
+            if (due || supplyPending) {
                 ID3D11Device* fdev = nullptr;
                 swapChain->GetDevice(__uuidof(ID3D11Device), (void**)&fdev);
                 if (fdev) {
                     ID3D11DeviceContext* fctx = nullptr;
                     fdev->GetImmediateContext(&fctx);
                     if (fctx) {
-                        ID3D11Texture2D* st =
-                            GetLayerStaging(fdev, cand->w, cand->h);
+                        MultiLayerUI::Staging* st =
+                            GetLayerStaging(fdev, cand->tex, cand->w, cand->h,
+                                            presentIdx);
                         if (st) {
-                            fctx->CopyResource(st, cand->tex);
-                            D3D11_MAPPED_SUBRESOURCE mapped;
-                            if (SUCCEEDED(fctx->Map(st, 0, D3D11_MAP_READ, 0,
-                                                    &mapped))) {
-                                SemanticCapture::SupplyPipboyScreenFeed(
-                                    static_cast<const uint8_t*>(mapped.pData),
-                                    cand->w, cand->h, mapped.RowPitch);
-                                fctx->Unmap(st, 0);
-                                g_uiLayers.pipboyFeedLayer = cand->tex;
+                            if (supplyPending &&
+                                st->src == g_uiLayers.feedSupplySrc &&
+                                st->pendingCopy) {
+                                D3D11_MAPPED_SUBRESOURCE mapped;
+                                if (SUCCEEDED(fctx->Map(st->tex, 0,
+                                        D3D11_MAP_READ,
+                                        D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped))) {
+                                    SemanticCapture::SupplyPipboyScreenFeed(
+                                        static_cast<const uint8_t*>(mapped.pData),
+                                        st->w, st->h, mapped.RowPitch);
+                                    fctx->Unmap(st->tex, 0);
+                                    st->pendingCopy = false;
+                                    g_uiLayers.feedSupplySrc = nullptr;
+                                    g_uiLayers.pipboyFeedLayer = cand->tex;
+                                }
+                                // WAS_STILL_DRAWING: retry next present.
+                            } else if (supplyPending) {
+                                // Candidate changed or slot recycled — drop.
+                                g_uiLayers.feedSupplySrc = nullptr;
+                            }
+                            if (due) {
+                                fctx->CopyResource(st->tex, cand->tex);
+                                st->pendingCopy = true;
+                                g_uiLayers.feedSupplySrc = cand->tex;
+                                g_uiLayers.feedSupplyW = st->w;
+                                g_uiLayers.feedSupplyH = st->h;
                             }
                         }
                         fctx->Release();
@@ -897,40 +972,81 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
             if (context) {
                 const uint32_t dw = g_remix.gameWidth;
                 const uint32_t dh = g_remix.gameHeight;
-                auto& comp = g_uiLayers.composite;
-                comp.assign((size_t)dw * dh * 4, 0);
-                int blended = 0;
-                auto blendTexture = [&](ID3D11Texture2D* tex,
-                                        uint32_t w, uint32_t h,
-                                        float maxFrac = 0.82f) {
-                    ID3D11Texture2D* st = GetLayerStaging(device, w, h);
-                    if (!st) return;
-                    context->CopyResource(st, tex);
-                    D3D11_MAPPED_SUBRESOURCE mapped;
-                    if (SUCCEEDED(context->Map(st, 0, D3D11_MAP_READ, 0, &mapped))) {
-                        BlendLayerIntoComposite(
-                            static_cast<const uint8_t*>(mapped.pData),
-                            mapped.RowPitch, w, h, comp.data(), dw, dh, maxFrac);
-                        context->Unmap(st, 0);
-                        ++blended;
-                    }
+                // Map-first capture (2026-07-20): each layer's staging holds
+                // the copy queued LAST frame; map it with DO_NOT_WAIT and
+                // queue this frame's copy afterwards, so the game thread
+                // never drains the GPU pipeline (the old per-layer
+                // copy-then-map pattern cost one full GPU sync PER LAYER
+                // per frame). The composite only builds when EVERY layer
+                // mapped — a partial set would drop a layer for a frame
+                // (visible flicker); keeping the previous overlay one more
+                // frame is invisible. Miss cases: a layer's first frame
+                // (nothing queued yet) or the GPU still chewing last
+                // frame's copy.
+                struct CapLayer {
+                    ID3D11Texture2D*         tex;
+                    uint32_t                 w, h;
+                    float                    maxFrac;
+                    MultiLayerUI::Staging*   st;
+                    bool                     mapped;
+                    D3D11_MAPPED_SUBRESOURCE m;
                 };
+                CapLayer caps[MultiLayerUI::kMaxLayers + 1];
+                int capCount = 0;
                 for (int i = 0; i < g_uiLayers.count; ++i) {
                     const auto& L = g_uiLayers.layers[i];
                     if (!L.tex || !L.bound) continue;
                     if (L.tex == g_ui.renderTarget) continue;  // blended last below
                     const int disp = layerDisposition(L.tex);
                     if (disp == 2) continue;               // presents on its mesh
-                    blendTexture(L.tex, L.w, L.h,
-                                 disp == 1 ? g_config.overlayPipboyPanelFrac
-                                           : 0.82f);
+                    caps[capCount++] = { L.tex, L.w, L.h,
+                                         disp == 1 ? g_config.overlayPipboyPanelFrac
+                                                   : 0.82f,
+                                         nullptr, false, {} };
                 }
                 // Interface RT on top: HUD, subtitles, notifications draw
                 // over any panel layer (Pip-Boy, terminal).
                 if (lockedRtActive) {
                     D3D11_TEXTURE2D_DESC ld;
                     g_ui.renderTarget->GetDesc(&ld);
-                    blendTexture(g_ui.renderTarget, ld.Width, ld.Height);
+                    caps[capCount++] = { g_ui.renderTarget, ld.Width, ld.Height,
+                                         0.82f, nullptr, false, {} };
+                }
+                bool allMapped = capCount > 0;
+                for (int i = 0; i < capCount; ++i) {
+                    auto& c = caps[i];
+                    c.st = GetLayerStaging(device, c.tex, c.w, c.h, presentIdx);
+                    if (c.st && c.st->pendingCopy &&
+                        SUCCEEDED(context->Map(c.st->tex, 0, D3D11_MAP_READ,
+                                               D3D11_MAP_FLAG_DO_NOT_WAIT,
+                                               &c.m))) {
+                        c.mapped = true;
+                    } else {
+                        allMapped = false;
+                    }
+                }
+                int blended = 0;
+                auto& comp = g_uiLayers.composite;
+                if (allMapped) {
+                    comp.assign((size_t)dw * dh * 4, 0);
+                    for (int i = 0; i < capCount; ++i) {
+                        const auto& c = caps[i];
+                        BlendLayerIntoComposite(
+                            static_cast<const uint8_t*>(c.m.pData),
+                            c.m.RowPitch, c.w, c.h, comp.data(), dw, dh,
+                            c.maxFrac);
+                        ++blended;
+                    }
+                }
+                for (int i = 0; i < capCount; ++i) {
+                    if (caps[i].mapped) context->Unmap(caps[i].st->tex, 0);
+                }
+                // Queue this frame's copies (also primes first-frame layers).
+                for (int i = 0; i < capCount; ++i) {
+                    if (caps[i].st) {
+                        context->CopyResource(caps[i].st->tex, caps[i].tex);
+                        caps[i].st->pendingCopy = true;
+                    }
                 }
                 if (blended > 0) {
                     std::lock_guard<std::mutex> lock(g_overlay.mutex);
@@ -1011,6 +1127,7 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                         g_overlay.stagingWidth = uiDesc.Width;
                         g_overlay.stagingHeight = uiDesc.Height;
                         g_overlay.stagingFormat = uiDesc.Format;
+                        g_overlay.stagingPending = false;
                         _MESSAGE("FO4RemixPlugin: Created UI overlay staging texture %ux%u fmt=%u",
                                  g_overlay.stagingWidth, g_overlay.stagingHeight, (unsigned)g_overlay.stagingFormat);
                     } else {
@@ -1019,10 +1136,18 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                 }
 
                 if (g_overlay.stagingTex) {
-                    context->CopyResource(g_overlay.stagingTex, g_ui.renderTarget);
-
+                    // Map-first (2026-07-20): read the copy queued on the
+                    // PREVIOUS capture frame with DO_NOT_WAIT — by now the
+                    // GPU has long finished it, so this succeeds without
+                    // the full-pipeline stall the old copy-then-map-now
+                    // pattern forced every UI frame. The fresh copy is
+                    // queued after the read (and on the priming frame,
+                    // where there is nothing to read yet).
                     D3D11_MAPPED_SUBRESOURCE mapped;
-                    HRESULT hr = context->Map(g_overlay.stagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+                    HRESULT hr = g_overlay.stagingPending
+                        ? context->Map(g_overlay.stagingTex, 0, D3D11_MAP_READ,
+                                       D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped)
+                        : DXGI_ERROR_WAS_STILL_DRAWING;
                     if (SUCCEEDED(hr)) {
                         uint32_t w = g_overlay.stagingWidth;
                         uint32_t h = g_overlay.stagingHeight;
@@ -1072,6 +1197,11 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                                      g_ui.renderTarget, w, h);
                         }
                     }
+
+                    // Queue this frame's copy for a later capture frame's
+                    // non-blocking map (also primes the very first frame).
+                    context->CopyResource(g_overlay.stagingTex, g_ui.renderTarget);
+                    g_overlay.stagingPending = true;
                 }
             }
             if (context) context->Release();
