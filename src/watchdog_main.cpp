@@ -20,6 +20,7 @@
 #include <windows.h>
 #include <psapi.h>
 #include <dbghelp.h>
+#include <share.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -81,6 +82,23 @@ static void FormatRemoteAddr(HANDLE proc, void* addr, char* out, size_t outSize)
     } else {
         sprintf_s(out, outSize, "unmapped:%p", addr);
     }
+}
+
+// Reaper (2026-07-20): the 07-19 instance's debug loop never saw its
+// EXIT_PROCESS_DEBUG_EVENT (cause unknown -- target died at 23:23, the
+// instance was still alive 18 hours later) and immortal instances cascade
+// into the mute-log failure above. Belt-and-braces: wait on the target
+// process handle; once the target is gone, the debug loop must wind down
+// within the grace window or this instance force-exits.
+struct ReaperArgs { HANDLE proc; DWORD pid; };
+static DWORD WINAPI ReaperThread(LPVOID p) {
+    ReaperArgs* a = (ReaperArgs*)p;
+    WaitForSingleObject(a->proc, INFINITE);
+    Sleep(30000);
+    LogLine("pid=%lu reaper: target dead 30s, debug loop still alive -- force exit",
+            a->pid);
+    if (g_log) fflush(g_log);
+    ExitProcess(3);
 }
 
 static void WriteExternalDump(HANDLE proc, DWORD pid, DWORD tid,
@@ -161,7 +179,12 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
         EnsureDumpDir(dir);
         char path[MAX_PATH];
         sprintf_s(path, "%s\\CrashDumps\\FO4Remix_exitcodes.log", dir);
-        fopen_s(&g_log, path, "a");
+        // _SH_DENYNO (2026-07-20): fopen_s opens deny-all; one wedged
+        // instance (07-19) held the log for 18 hours and every later
+        // watchdog ran MUTE -- attached, wrote dumps, logged nothing
+        // (the 07-20 17:30 fatal crash produced a dump but no log line).
+        // Shared append: instances interleave at line granularity.
+        g_log = _fsopen(path, "a", _SH_DENYNO);
     }
 
     if (!DebugActiveProcess(pid)) {
@@ -188,6 +211,17 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR cmdLine, int) {
     HANDLE proc = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
     bool fatalSeen = false;
     bool dumpWritten = false;
+
+    // Own SYNCHRONIZE handle: the debug loop closes `proc` on exit, and the
+    // reaper must not wait on a handle another thread closes.
+    static ReaperArgs s_reaperArgs;
+    s_reaperArgs.proc = OpenProcess(SYNCHRONIZE, FALSE, pid);
+    s_reaperArgs.pid  = pid;
+    if (s_reaperArgs.proc) {
+        HANDLE reaper = CreateThread(nullptr, 0, ReaperThread, &s_reaperArgs,
+                                     0, nullptr);
+        if (reaper) CloseHandle(reaper);
+    }
 
     for (;;) {
         DEBUG_EVENT ev = {};
