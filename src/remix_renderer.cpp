@@ -2841,9 +2841,16 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // the standard grace periods would sit on the refcounts that the
             // drawable eviction just released for ~10s before parking anything.
             // Tighten 8x so the cascade reclaims within a couple of sweeps
-            // (2026-07-20, Sanctuary->Concord VRAM pileup).
+            // (2026-07-20, Sanctuary->Concord VRAM pileup). Keyed on the
+            // SOFTER of the two thresholds (tier-1 view parking starts at
+            // ForceEvictViewPct) so the cascade accelerates as soon as any
+            // pressure reclamation is active.
             uint64_t vramUsedMiB = 0, vramBudgetMiB = 0;
-            const uint32_t evictPct = g_config.cullingForceEvictVramPct;
+            uint32_t evictPct = g_config.cullingForceEvictVramPct;
+            const uint32_t viewPct = g_config.cullingForceEvictViewPct;
+            if (viewPct > 0 && (evictPct == 0 || viewPct < evictPct)) {
+                evictPct = viewPct;
+            }
             const bool vramPressure = evictPct > 0 &&
                 PresentHook::GetVramBudgetSnapshot(&vramUsedMiB, &vramBudgetMiB) &&
                 vramUsedMiB * 100u > static_cast<uint64_t>(evictPct) * vramBudgetMiB;

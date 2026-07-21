@@ -1522,6 +1522,12 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 // by the CallResolverGuarded SEH backstop below -- bounded
                 // risk, and the window is ini-tunable ([SemanticCapture]
                 // ResolveRetryWindowFrames).
+                //
+                // VRAM-pressure parked (2026-07-20): resources deliberately
+                // released while the entry sits far behind the camera; the
+                // sweep un-parks it on re-entering the view (or when
+                // pressure clears), which re-admits it here.
+                if (state.pressureParked) continue;
                 const uint64_t age = (currentFrame > state.lastSeenFrame)
                     ? (currentFrame - state.lastSeenFrame) : 0;
                 if (age > g_config.resolveRetryWindowFrames) continue;
@@ -2093,35 +2099,155 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             return g_drawableMap.erase(it);
         };
 
-        // ---- VRAM-pressure force-eviction (2026-07-20) ----
+        // ---- VRAM-pressure reclamation (2026-07-20, tiered rework) ----
         // The frame-based TTL below (kTTLFrames = 18000, ~5 min @60fps and
         // longer as fps degrades) never fires on a cross-country run:
         // Sanctuary->Concord pinned ~10K drawables -> materials -> textures
         // until process VRAM hit the driver budget (13.5/14.7 GiB) and fps
-        // collapsed to 1. When usage crosses the configured fraction of the
-        // DXGI budget, evict the oldest-seen entries (never anything seen in
-        // the last kPressureMinAgeFrames) so the material/texture LRU
-        // cascade has something to reclaim. Runs before the TTL loop so the
-        // status counters below reflect the post-eviction map.
-        uint32_t pressureEvicted = 0;
+        // collapsed to 1.
+        //
+        // Tier 1 (ForceEvictViewPct, softer threshold): PARK submitted
+        //   drawables that sit behind the camera beyond
+        //   ForceEvictBehindDistance, furthest first -- release their Remix
+        //   resources but KEEP the map entry flagged pressureParked. They
+        //   are usually still firing (the engine renders a wide radius), so
+        //   a full erase would re-create -> re-resolve -> re-park every
+        //   sweep: a texture-upload churn loop. The resolver skips parked
+        //   entries; the un-park pass below re-admits them when they enter
+        //   the front hemisphere / close range or when pressure clears
+        //   (5%-point hysteresis).
+        // Tier 2 (ForceEvictVramPct, harder threshold, the FALLBACK): the
+        //   original oldest-lastSeen hard eviction, for entries that are
+        //   not classifiable by view (no live transform) or when tier 1
+        //   alone cannot get usage back under control.
+        // Runs before the TTL loop so the status counters below reflect
+        // the post-reclamation map.
+        uint32_t pressureParkedNow = 0, pressureUnparked = 0, pressureEvicted = 0;
         {
             uint64_t vramUsedMiB = 0, vramBudgetMiB = 0;
-            const uint32_t evictPct = g_config.cullingForceEvictVramPct;
-            if (evictPct > 0 &&
-                PresentHook::GetVramBudgetSnapshot(&vramUsedMiB, &vramBudgetMiB) &&
-                vramUsedMiB * 100u > static_cast<uint64_t>(evictPct) * vramBudgetMiB) {
+            const bool haveVram =
+                PresentHook::GetVramBudgetSnapshot(&vramUsedMiB, &vramBudgetMiB);
+            const auto overPct = [&](uint32_t pct) {
+                return pct > 0 && haveVram &&
+                       vramUsedMiB * 100u > static_cast<uint64_t>(pct) * vramBudgetMiB;
+            };
+            const uint32_t viewPct   = g_config.cullingForceEvictViewPct;
+            const uint32_t oldestPct = g_config.cullingForceEvictVramPct;
+
+            const CameraState cam = Camera::Get();
+            const float minDist = g_config.cullingForceEvictBehindDistance;
+            // Behind the camera (rear hemisphere) AND farther than minDist.
+            // Both liveWorldTransform and CameraState are Remix coords.
+            const auto behindAndFar = [&](const SemanticCapture::DrawableState& st,
+                                          float* dist2Out) {
+                if (!cam.valid || !st.liveTransformValid) return false;
+                const float dx = st.liveWorldTransform[0][3] - cam.position[0];
+                const float dy = st.liveWorldTransform[1][3] - cam.position[1];
+                const float dz = st.liveWorldTransform[2][3] - cam.position[2];
+                const float proj = dx * cam.forward[0] + dy * cam.forward[1] +
+                                   dz * cam.forward[2];
+                const float d2 = dx * dx + dy * dy + dz * dz;
+                if (dist2Out) *dist2Out = d2;
+                return proj < 0.0f && d2 > minDist * minDist;
+            };
+
+            // Un-park pass first: camera turned around, entry got close, or
+            // pressure dropped below (viewPct - 5). The resolver's
+            // nearest-in-view-first ranking then restores what the player is
+            // actually looking at before the rest.
+            const uint32_t clearPct = (viewPct > 5) ? (viewPct - 5) : viewPct;
+            const bool pressureCleared = !overPct(clearPct);
+            for (auto& [key, st] : g_drawableMap) {
+                if (!st.pressureParked) continue;
+                if (pressureCleared || !behindAndFar(st, nullptr)) {
+                    st.pressureParked = false;
+                    ++pressureUnparked;
+                }
+            }
+
+            uint32_t cap = g_config.cullingForceEvictPerSweep;
+            if (cap == 0) cap = 512;
+            size_t viewCandidates = 0;
+
+            // Tier 1: park behind+far, furthest first.
+            if (overPct(viewPct)) {
+                std::vector<std::pair<float, PassKey>> byDist;  // (dist2, key)
+                byDist.reserve(256);
+                for (const auto& [key, st] : g_drawableMap) {
+                    if (!st.submittedToRemix || st.pressureParked) continue;
+                    // Never park the always-near / special-lifecycle sets:
+                    // view models, the Pip-Boy screen, live-RT textures, and
+                    // skinned actors (they move on their own; their VRAM
+                    // share is small next to the static mass).
+                    if (g_viewModelKeys.count(key)) continue;
+                    if (key == g_pipboyScreenKey) continue;
+                    if (st.hasLiveTexture) continue;
+                    if (g_skinnedKeys.count(key)) continue;
+                    float d2 = 0.0f;
+                    if (!behindAndFar(st, &d2)) continue;
+                    byDist.emplace_back(d2, key);
+                }
+                viewCandidates = byDist.size();
+                const size_t take = (std::min)(static_cast<size_t>(cap), byDist.size());
+                if (take > 0) {
+                    std::partial_sort(
+                        byDist.begin(), byDist.begin() + take, byDist.end(),
+                        [](const std::pair<float, PassKey>& a,
+                           const std::pair<float, PassKey>& b) {
+                            return a.first > b.first;  // furthest first
+                        });
+                    for (size_t i = 0; i < take; ++i) {
+                        auto mapIt = g_drawableMap.find(byDist[i].second);
+                        if (mapIt == g_drawableMap.end()) continue;
+                        auto& st = mapIt->second;
+                        unsigned long excCode = 0;
+                        if (st.meshHash != 0) {
+                            if (CallReleaseDrawableGuarded(st.meshHash, &excCode) != 0) {
+                                _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in "
+                                         "ReleaseDrawable (park) hash=0x%llX exception=0x%08lX",
+                                         (unsigned long long)st.meshHash, excCode);
+                            }
+                            for (uint64_t xh : st.extraMeshHashes) {
+                                if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                                    _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in "
+                                             "ReleaseDrawable (park extra) hash=0x%llX "
+                                             "exception=0x%08lX",
+                                             (unsigned long long)xh, excCode);
+                                }
+                            }
+                        }
+                        st.extraMeshHashes.clear();
+                        st.textureHashes.clear();
+                        st.meshHash              = 0;
+                        st.materialHash          = 0;
+                        st.submittedToRemix      = false;
+                        st.submittedDiffuseWidth = 0;
+                        st.lastFailedResolverStep = 0;
+                        st.resolveAttempts       = 0;
+                        st.nextRetryFrame        = 0;
+                        st.pressureParked        = true;
+                        DrawCapture::Drop(mapIt->first);
+                        ++pressureParkedNow;
+                    }
+                }
+            }
+
+            // Tier 2 fallback: oldest-lastSeen hard eviction. Parked entries
+            // are skipped (they hold no Remix resources; erasing them would
+            // just re-admit the churn loop tier 1 exists to prevent).
+            if (overPct(oldestPct) && pressureParkedNow < cap) {
                 constexpr uint64_t kPressureMinAgeFrames = 300;  // ~5s @60fps
                 std::vector<std::pair<uint64_t, PassKey>> byAge;  // (lastSeen, key)
                 byAge.reserve(g_drawableMap.size());
                 for (const auto& [key, st] : g_drawableMap) {
+                    if (st.pressureParked) continue;
                     const uint64_t age = (now > st.lastSeenFrame)
                         ? (now - st.lastSeenFrame) : 0;
                     if (age < kPressureMinAgeFrames) continue;
                     byAge.emplace_back(st.lastSeenFrame, key);
                 }
-                uint32_t cap = g_config.cullingForceEvictPerSweep;
-                if (cap == 0) cap = 512;
-                const size_t take = (std::min)(static_cast<size_t>(cap), byAge.size());
+                const size_t take = (std::min)(
+                    static_cast<size_t>(cap - pressureParkedNow), byAge.size());
                 if (take > 0) {
                     std::partial_sort(byAge.begin(), byAge.begin() + take, byAge.end());
                     for (size_t i = 0; i < take; ++i) {
@@ -2131,11 +2257,17 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                         ++pressureEvicted;
                     }
                 }
-                _MESSAGE("FO4RemixPlugin: [SemCapture] PRESSURE evict: vram=%llu/%llu MiB "
-                         "(threshold %u%%) evicted=%u candidates=%zu",
+            }
+
+            if (pressureParkedNow || pressureUnparked || pressureEvicted ||
+                overPct(viewPct)) {
+                _MESSAGE("FO4RemixPlugin: [SemCapture] PRESSURE vram=%llu/%llu MiB "
+                         "parked=%u (viewCandidates=%zu, >%u%%) unparked=%u "
+                         "evictedOldest=%u (>%u%%)",
                          (unsigned long long)vramUsedMiB,
                          (unsigned long long)vramBudgetMiB,
-                         evictPct, pressureEvicted, byAge.size());
+                         pressureParkedNow, viewCandidates, viewPct,
+                         pressureUnparked, pressureEvicted, oldestPct);
             }
         }
         evicted += pressureEvicted;

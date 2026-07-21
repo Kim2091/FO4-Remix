@@ -203,8 +203,17 @@ struct PluginConfig {
     // usage exceeds ForceEvictVramPct% of the DXGI budget, Tick's sweep
     // force-evicts the oldest-seen submitted drawables (min age 300 frames,
     // ForceEvictPerSweep per sweep) so the LRU cascade can reclaim.
-    uint32_t cullingForceEvictVramPct;       // default 88; 0 = off
+    uint32_t cullingForceEvictVramPct;       // default 88; 0 = off (tier-2 oldest-first fallback)
     uint32_t cullingForceEvictPerSweep;      // default 512
+
+    // Tier-1 view-based parking (2026-07-20 rework): at this softer
+    // threshold, submitted drawables behind the camera and farther than
+    // ForceEvictBehindDistance are PARKED (Remix resources released, entry
+    // kept + resolver-skipped) furthest-first, before the oldest-first
+    // fallback above ever fires. Un-parks on view re-entry or when usage
+    // drops 5 points below the threshold.
+    uint32_t cullingForceEvictViewPct;       // default 80; 0 = off
+    float    cullingForceEvictBehindDistance; // game units, default 8000 (~2 cells)
 
     // [Materials]
     // Spec-gloss -> metal-rough conversion for FO4 environment-mapped

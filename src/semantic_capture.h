@@ -62,6 +62,14 @@ namespace SemanticCapture {
         uint64_t meshHash            = 0;        // == PassKey, used as Remix submission key
         uint64_t materialHash        = 0;        // index into g_materialCache
         bool     submittedToRemix    = false;
+        // VRAM-pressure parked (2026-07-20): the sweep released this entry's
+        // Remix resources while it sat behind the camera beyond the eviction
+        // distance under VRAM pressure. Still firing, so the entry stays in
+        // the map (a full erase would re-create + re-resolve + re-park every
+        // sweep = texture-upload churn); the resolver skips parked entries.
+        // The sweep un-parks when the entry re-enters the front hemisphere /
+        // close range, or when pressure clears (hysteresis).
+        bool     pressureParked      = false;
         // Merge-instanced expansion (2026-07-03): derived hashes of the extra
         // per-hardware-instance drawables submitted beyond meshHash (instance
         // 0 keeps meshHash). Same lifecycle: released wherever meshHash is
