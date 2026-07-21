@@ -212,7 +212,8 @@ struct PluginConfig {
     // kept + resolver-skipped) furthest-first, before the oldest-first
     // fallback above ever fires. Un-parks on view re-entry or when usage
     // drops 5 points below the threshold.
-    uint32_t cullingForceEvictViewPct;       // default 80; 0 = off
+    uint32_t cullingForceEvictViewPct;       // default 60 (field-validated 2026-07-20:
+                                             // steadier fps, no visible downside); 0 = off
     float    cullingForceEvictBehindDistance; // game units, default 8000 (~2 cells)
 
     // [Materials]
