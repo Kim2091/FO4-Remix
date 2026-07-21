@@ -672,6 +672,157 @@ static bool PeekBytesGuarded(const void* src, void* dst, size_t bytes) {
 // just the world bound recentered on the leaf position).
 enum class BakeStatus { kOk, kPending, kFailed };
 
+// ---- Async chunk bake (2026-07-21) ----
+// The bake's build pass is the merge path's 35ms monster: per-vertex
+// inside-bound tests nested over up to ~1700 record anchors, then a full
+// per-vertex format conversion. The gather pass (D3D11 readback polling)
+// stays on the game thread; once every slice is in hand the build inputs
+// are all plugin-owned copies, so the build runs on the mesh worker pool
+// and the resolver re-enters through the same kPendingDefer fast-poll it
+// already uses while slices are in flight. Same generation discipline as
+// the async parse: PassKeys are pointer-derived, results from the outgoing
+// world are discarded after a world swap.
+struct BakeChunkSlices {
+    std::vector<uint8_t> ib;
+    std::vector<uint8_t> vb;
+    uint32_t             mn = 0;
+    bool                 usable = false;
+};
+struct BakeRecAnchor { float x, y, z, reach2; };
+
+struct BakeBuildInputs {
+    std::vector<DrawCapture::ChunkDraw> chunks;
+    std::vector<BakeChunkSlices>        gathered;
+    std::vector<BakeRecAnchor>          anchors;
+    float    cx = 0, cy = 0, cz = 0, radSq = 0, rad = 0, rSrc = 0;
+    size_t   recCount = 0;
+    uint64_t hash = 0;
+    int      dFmt = 0, dIb = 0, dWin = 0, dVb = 0;  // gather-side drop counts
+};
+
+struct BakeResult {
+    BakeStatus status = BakeStatus::kFailed;
+    std::vector<remixapi_HardcodedVertex> verts;
+    std::vector<uint32_t> indices;
+    int      keptChunks = 0;
+    uint64_t doneFrame = 0;
+};
+
+static std::mutex g_bakeMutex;
+static std::unordered_map<uint64_t, BakeResult> g_bakeDone;
+static std::unordered_set<uint64_t> g_bakeInflight;   // queued or building
+static uint64_t g_bakeGen = 0;                         // guarded by g_bakeMutex
+constexpr uint64_t kBakeDoneTTLFrames = 600;
+
+// Build pass. Pure function of `in` -- safe on the mesh worker pool.
+static void RunBakeBuildPass(BakeBuildInputs& in, BakeResult& out)
+{
+    out.keptChunks = 0;
+    int dBound = 0, dRec = 0;
+    const int nChunks = (int)in.chunks.size();
+    for (int c = 0; c < nChunks; ++c) {
+        const DrawCapture::ChunkDraw& ch = in.chunks[(size_t)c];
+        const BakeChunkSlices& cs = in.gathered[(size_t)c];
+        if (!cs.usable) continue;
+        const uint16_t* idx = reinterpret_cast<const uint16_t*>(cs.ib.data());
+        const uint32_t mn = cs.mn;
+        const uint32_t nVerts = (uint32_t)(cs.vb.size() / 32u);
+        const std::vector<uint8_t>& vbytes = cs.vb;
+        // Every vertex must (a) land inside the cluster bound and (b) lie
+        // within source-extent of SOME record translation. (a) kills
+        // NaN/garbage from repacked pool slices (comparisons with NaN are
+        // false); (b) kills in-radius NEIGHBOR geometry drawn under the
+        // sticky t8 binding. One bad vertex disqualifies the whole chunk.
+        bool inside = true;
+        bool anchored = true;
+        for (uint32_t v = 0; v < nVerts && inside && anchored; ++v) {
+            float p[3];
+            std::memcpy(p, vbytes.data() + v * 32u, 12);
+            const float dx = p[0] - in.cx, dy = p[1] - in.cy, dz = p[2] - in.cz;
+            inside = (dx * dx + dy * dy + dz * dz) <= in.radSq;
+            if (!inside) break;
+            bool nearRec = false;
+            for (const BakeRecAnchor& a : in.anchors) {
+                const float ax = p[0] - a.x, ay = p[1] - a.y, az = p[2] - a.z;
+                if (ax * ax + ay * ay + az * az <= a.reach2) { nearRec = true; break; }
+            }
+            anchored = nearRec;
+        }
+        if (!inside) { ++dBound; continue; }
+        if (!anchored) { ++dRec; continue; }
+        // append: positions float3@0, UV half2@16, normal biased-ubyte@20
+        const uint32_t vbase = (uint32_t)out.verts.size();
+        out.verts.resize(vbase + nVerts);
+        for (uint32_t v = 0; v < nVerts; ++v) {
+            const uint8_t* p = vbytes.data() + v * 32u;
+            remixapi_HardcodedVertex& hv = out.verts[vbase + v];
+            std::memset(&hv, 0, sizeof(hv));
+            std::memcpy(hv.position, p, 12);
+            uint16_t uvh[2];
+            std::memcpy(uvh, p + 16, 4);
+            hv.texcoord[0] = HalfToFloat(uvh[0]);
+            hv.texcoord[1] = HalfToFloat(uvh[1]);
+            float nx = (p[20] / 255.0f) * 2.0f - 1.0f;
+            float ny = (p[21] / 255.0f) * 2.0f - 1.0f;
+            float nz = (p[22] / 255.0f) * 2.0f - 1.0f;
+            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl > 0.25f) {
+                nx /= nl; ny /= nl; nz /= nl;
+            } else {
+                nx = 0.0f; ny = 0.0f; nz = 1.0f;
+            }
+            hv.normal[0] = nx;
+            hv.normal[1] = ny;
+            hv.normal[2] = nz;
+            hv.color = 0xFFFFFFFF;
+        }
+        // same per-triangle 1<->2 winding flip the parser applies
+        const size_t ibase = out.indices.size();
+        out.indices.resize(ibase + ch.idxCount);
+        for (uint32_t t = 0; t + 2 < ch.idxCount; t += 3) {
+            out.indices[ibase + t]     = vbase + (uint32_t)(idx[t] - mn);
+            out.indices[ibase + t + 1] = vbase + (uint32_t)(idx[t + 2] - mn);
+            out.indices[ibase + t + 2] = vbase + (uint32_t)(idx[t + 1] - mn);
+        }
+        ++out.keptChunks;
+    }
+    const bool ok = out.keptChunks > 0 && out.indices.size() >= 48;
+    static std::atomic<int> sBakeLogs{0};
+    const int bl = sBakeLogs.fetch_add(1, std::memory_order_relaxed);
+    if (bl < 48) {
+        _MESSAGE("FO4RemixPlugin: [MergeBake] hash=0x%llX %s chunks=%d/%d tris=%zu "
+                 "verts=%zu rSrc=%.0f recs=%zu drop=[fmt%d ib%d win%d vb%d bnd%d rec%d] "
+                 "bound=(%.0f,%.0f,%.0f r=%.0f)",
+                 (unsigned long long)in.hash, ok ? "OK" : "REJECT",
+                 out.keptChunks, nChunks,
+                 out.indices.size() / 3, out.verts.size(), in.rSrc, in.recCount,
+                 in.dFmt, in.dIb, in.dWin, in.dVb, dBound, dRec,
+                 in.cx, in.cy, in.cz, in.rad);
+    }
+    out.status = ok ? BakeStatus::kOk : BakeStatus::kFailed;
+}
+
+void SweepAsyncBakes(uint64_t currentFrame)
+{
+    std::lock_guard<std::mutex> lk(g_bakeMutex);
+    for (auto it = g_bakeDone.begin(); it != g_bakeDone.end();) {
+        if (currentFrame > it->second.doneFrame &&
+            currentFrame - it->second.doneFrame > kBakeDoneTTLFrames) {
+            it = g_bakeDone.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ResetAsyncBakes()
+{
+    std::lock_guard<std::mutex> lk(g_bakeMutex);
+    ++g_bakeGen;
+    g_bakeDone.clear();
+    // Inflight jobs publish under the old generation and are discarded.
+}
+
 static BakeStatus BuildMeshFromChunks(BSTriShape* tri,
                                 const DrawCapture::ChunkDraw* chunks, int nChunks,
                                 uint64_t hash,
@@ -681,6 +832,22 @@ static BakeStatus BuildMeshFromChunks(BSTriShape* tri,
                                 std::vector<uint32_t>& outIndices,
                                 int& keptChunks) {
     keptChunks = 0;
+    // Async rendezvous: a finished worker build is consumed exactly once;
+    // an in-flight build keeps reporting pending (same caller behavior as
+    // slices still in flight).
+    if (g_config.asyncMeshParse) {
+        std::lock_guard<std::mutex> lk(g_bakeMutex);
+        auto it = g_bakeDone.find(hash);
+        if (it != g_bakeDone.end()) {
+            BakeResult r = std::move(it->second);
+            g_bakeDone.erase(it);
+            outVerts   = std::move(r.verts);
+            outIndices = std::move(r.indices);
+            keptChunks = r.keptChunks;
+            return r.status;
+        }
+        if (g_bakeInflight.count(hash)) return BakeStatus::kPending;
+    }
     const NiTransform& W = tri->m_worldTransform;
     const NiBound& B = tri->m_worldBound;
     const float cx = B.m_kCenter.x - W.pos.x;
@@ -706,8 +873,7 @@ static BakeStatus BuildMeshFromChunks(BSTriShape* tri,
     }
     float rSrc = std::sqrt(rSrcSq);
     if (rSrc < 64.0f) rSrc = 64.0f;
-    struct RecAnchor { float x, y, z, reach2; };
-    std::vector<RecAnchor> anchors;
+    std::vector<BakeRecAnchor> anchors;
     anchors.reserve(recs.size());
     for (const auto& r : recs) {
         const float* f = r.data();
@@ -715,20 +881,14 @@ static BakeStatus BuildMeshFromChunks(BSTriShape* tri,
         const float reach = rSrc * s + 96.0f;
         anchors.push_back({ f[12], f[13], f[14], reach * reach });
     }
-    int dFmt = 0, dIb = 0, dWin = 0, dVb = 0, dBound = 0, dRec = 0;
+    int dFmt = 0, dIb = 0, dWin = 0, dVb = 0;  // bound/rec drops counted in the build pass
 
     // ---- Gather pass: request/poll every chunk's slices (async). ----
     // All copies for all chunks get ISSUED on the first attempt (they fly in
     // parallel); nothing is appended until every non-dropped chunk has both
     // slices in hand, so a pending return leaves no partial output and the
     // retry rebuilds from the still-cached slices.
-    struct ChunkSlices {
-        std::vector<uint8_t> ib;
-        std::vector<uint8_t> vb;
-        uint32_t             mn = 0;
-        bool                 usable = false;
-    };
-    std::vector<ChunkSlices> gathered((size_t)nChunks);
+    std::vector<BakeChunkSlices> gathered((size_t)nChunks);
     bool anyPending = false;
     for (int c = 0; c < nChunks; ++c) {
         const DrawCapture::ChunkDraw& ch = chunks[c];
@@ -739,7 +899,7 @@ static BakeStatus BuildMeshFromChunks(BSTriShape* tri,
         }
         ID3D11Buffer* ibb = SafeBufferFromIdentity(ch.ib);
         if (!ibb) { ++dIb; continue; }
-        ChunkSlices& cs = gathered[(size_t)c];
+        BakeChunkSlices& cs = gathered[(size_t)c];
         const SliceStatus ibSt = ReadbackBufferSliceAsync(
             ibb, ch.ib, ch.ibOffset, ch.idxCount * 2, cs.ib);
         ibb->Release();
@@ -765,85 +925,50 @@ static BakeStatus BuildMeshFromChunks(BSTriShape* tri,
     }
     if (anyPending) return BakeStatus::kPending;
 
-    // ---- Build pass: everything readable is in hand. ----
-    for (int c = 0; c < nChunks; ++c) {
-        const DrawCapture::ChunkDraw& ch = chunks[c];
-        const ChunkSlices& cs = gathered[(size_t)c];
-        if (!cs.usable) continue;
-        const uint16_t* idx = reinterpret_cast<const uint16_t*>(cs.ib.data());
-        const uint32_t mn = cs.mn;
-        const uint32_t nVerts = (uint32_t)(cs.vb.size() / 32u);
-        const std::vector<uint8_t>& vbytes = cs.vb;
-        // Every vertex must (a) land inside the cluster bound and (b) lie
-        // within source-extent of SOME record translation. (a) kills
-        // NaN/garbage from repacked pool slices (comparisons with NaN are
-        // false); (b) kills in-radius NEIGHBOR geometry drawn under the
-        // sticky t8 binding. One bad vertex disqualifies the whole chunk.
-        bool inside = true;
-        bool anchored = true;
-        for (uint32_t v = 0; v < nVerts && inside && anchored; ++v) {
-            float p[3];
-            std::memcpy(p, vbytes.data() + v * 32u, 12);
-            const float dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
-            inside = (dx * dx + dy * dy + dz * dz) <= radSq;
-            if (!inside) break;
-            bool nearRec = false;
-            for (const RecAnchor& a : anchors) {
-                const float ax = p[0] - a.x, ay = p[1] - a.y, az = p[2] - a.z;
-                if (ax * ax + ay * ay + az * az <= a.reach2) { nearRec = true; break; }
-            }
-            anchored = nearRec;
+    // ---- Build inputs are all plugin-owned now: run the build pass on a
+    // worker (async) or inline (sync fallback). ----
+    BakeBuildInputs in;
+    in.chunks.assign(chunks, chunks + nChunks);
+    in.gathered = std::move(gathered);
+    in.anchors  = std::move(anchors);
+    in.cx = cx; in.cy = cy; in.cz = cz;
+    in.radSq = radSq; in.rad = rad; in.rSrc = rSrc;
+    in.recCount = recs.size();
+    in.hash = hash;
+    in.dFmt = dFmt; in.dIb = dIb; in.dWin = dWin; in.dVb = dVb;
+
+    if (g_config.asyncMeshParse) {
+        if (BsExtraction::MeshWorkQueueSaturated()) return BakeStatus::kPending;
+        uint64_t gen;
+        {
+            std::lock_guard<std::mutex> lk(g_bakeMutex);
+            gen = g_bakeGen;
+            g_bakeInflight.insert(hash);
         }
-        if (!inside) { ++dBound; continue; }
-        if (!anchored) { ++dRec; continue; }
-        // append: positions float3@0, UV half2@16, normal biased-ubyte@20
-        const uint32_t vbase = (uint32_t)outVerts.size();
-        outVerts.resize(vbase + nVerts);
-        for (uint32_t v = 0; v < nVerts; ++v) {
-            const uint8_t* p = vbytes.data() + v * 32u;
-            remixapi_HardcodedVertex& hv = outVerts[vbase + v];
-            std::memset(&hv, 0, sizeof(hv));
-            std::memcpy(hv.position, p, 12);
-            uint16_t uvh[2];
-            std::memcpy(uvh, p + 16, 4);
-            hv.texcoord[0] = HalfToFloat(uvh[0]);
-            hv.texcoord[1] = HalfToFloat(uvh[1]);
-            float nx = (p[20] / 255.0f) * 2.0f - 1.0f;
-            float ny = (p[21] / 255.0f) * 2.0f - 1.0f;
-            float nz = (p[22] / 255.0f) * 2.0f - 1.0f;
-            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
-            if (nl > 0.25f) {
-                nx /= nl; ny /= nl; nz /= nl;
-            } else {
-                nx = 0.0f; ny = 0.0f; nz = 1.0f;
-            }
-            hv.normal[0] = nx;
-            hv.normal[1] = ny;
-            hv.normal[2] = nz;
-            hv.color = 0xFFFFFFFF;
+        // MSVC's std::function requires copyable closures; share the inputs.
+        auto holder = std::make_shared<BakeBuildInputs>(std::move(in));
+        const bool queued = BsExtraction::EnqueueMeshWork([holder, gen, hash] {
+            BakeResult r;
+            RunBakeBuildPass(*holder, r);
+            r.doneFrame = Diagnostics::CurrentFrameIndex();
+            std::lock_guard<std::mutex> lk(g_bakeMutex);
+            g_bakeInflight.erase(hash);
+            if (gen != g_bakeGen) return;  // world swapped mid-build
+            g_bakeDone[hash] = std::move(r);
+        });
+        if (!queued) {
+            std::lock_guard<std::mutex> lk(g_bakeMutex);
+            g_bakeInflight.erase(hash);
         }
-        // same per-triangle 1<->2 winding flip the parser applies
-        const size_t ibase = outIndices.size();
-        outIndices.resize(ibase + ch.idxCount);
-        for (uint32_t t = 0; t + 2 < ch.idxCount; t += 3) {
-            outIndices[ibase + t]     = vbase + (uint32_t)(idx[t] - mn);
-            outIndices[ibase + t + 1] = vbase + (uint32_t)(idx[t + 2] - mn);
-            outIndices[ibase + t + 2] = vbase + (uint32_t)(idx[t + 1] - mn);
-        }
-        ++keptChunks;
+        return BakeStatus::kPending;
     }
-    const bool ok = keptChunks > 0 && outIndices.size() >= 48;
-    static std::atomic<int> sBakeLogs{0};
-    const int bl = sBakeLogs.fetch_add(1, std::memory_order_relaxed);
-    if (bl < 48) {
-        _MESSAGE("FO4RemixPlugin: [MergeBake] hash=0x%llX %s chunks=%d/%d tris=%zu "
-                 "verts=%zu rSrc=%.0f recs=%zu drop=[fmt%d ib%d win%d vb%d bnd%d rec%d] "
-                 "bound=(%.0f,%.0f,%.0f r=%.0f)",
-                 (unsigned long long)hash, ok ? "OK" : "REJECT", keptChunks, nChunks,
-                 outIndices.size() / 3, outVerts.size(), rSrc, recs.size(),
-                 dFmt, dIb, dWin, dVb, dBound, dRec, cx, cy, cz, rad);
-    }
-    return ok ? BakeStatus::kOk : BakeStatus::kFailed;
+
+    BakeResult r;
+    RunBakeBuildPass(in, r);
+    outVerts   = std::move(r.verts);
+    outIndices = std::move(r.indices);
+    keptChunks = r.keptChunks;
+    return r.status;
 }
 
 static inline int PermXY(int i) { return i == 0 ? 1 : (i == 1 ? 0 : 2); }
@@ -1518,10 +1643,33 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // ==================================================================
 
     // ---- Parse vertex / index data ----
+    // Async by default (2026-07-21, [Performance] AsyncMeshParse): the
+    // per-vertex decode was the dominant always-on game-thread cost of a
+    // resolve (the [ResolveBudget] 35ms single-item hitches). First attempt
+    // snapshots the raw VB/IB bytes here (bounded memcpy, still under the
+    // caller's SEH frame -- the only step that touches engine memory) and
+    // decodes on the mesh worker pool; the kPendingDefer fast-poll
+    // rendezvouses the finished ParsedGeometry by PassKey a tick or two
+    // later, exactly like an in-flight texture decode.
     ResolverTrace::g_lastStep.store(Trace::kParseStart, std::memory_order_relaxed);
     ParsedGeometry parsed;
-    if (!BsExtraction::ParseShapeGeometry(tri, parsed, /*logRejections=*/g_config.logRejections,
-                                          applyVertexColors, /*parseSkinning=*/isSkinned)) {
+    if (g_config.asyncMeshParse) {
+        const auto ps = BsExtraction::ParseShapeGeometryAsync(
+            tri, hash, parsed, /*logRejections=*/g_config.logRejections,
+            applyVertexColors, /*parseSkinning=*/isSkinned);
+        if (ps == BsExtraction::MeshParseStatus::kPending) {
+            ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                            std::memory_order_relaxed);
+            return false;
+        }
+        if (ps == BsExtraction::MeshParseStatus::kFailed) {
+            if (headDiag) HeadDiagLog(hash, "GATE parse FAILED (see [ParseBail])");
+            return false;
+        }
+    } else if (!BsExtraction::ParseShapeGeometry(tri, parsed,
+                                          /*logRejections=*/g_config.logRejections,
+                                          applyVertexColors,
+                                          /*parseSkinning=*/isSkinned)) {
         if (headDiag) HeadDiagLog(hash, "GATE parse FAILED (see [ParseBail])");
         return false;
     }
@@ -2045,7 +2193,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 const uint32_t oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
                 if (oColor + 4 <= parsed.vertexSize) {
                     uint32_t histo[256] = {};
-                    const size_t nV = tri->numVertices;
+                    // vbCount, not tri->numVertices: vbData is the parse-time
+                    // COPY (async parse), sized for the snapshot's count.
+                    const size_t nV = parsed.vbCount;
                     for (size_t i = 0; i < nV; ++i) {
                         const uint8_t r = parsed.vbData[i * parsed.vertexSize + oColor];
                         ++histo[r];
@@ -2147,9 +2297,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 }
                 if (first) {
                     // parsed.vertices was std::move'd into mesh.vertices
-                    // above -- use the shape's own count and read raw colors
-                    // straight from the (still-valid) engine VB pointer.
-                    const size_t nV = tri->numVertices;
+                    // above -- vbCount is the count vbData (the parse-time
+                    // copy, async-parse safe) was sized for.
+                    const size_t nV = parsed.vbCount;
                     uint32_t sr = 0, sg = 0, sb = 0, sa = 0;
                     uint8_t mnr = 255, mng = 255, mnb = 255;
                     for (size_t i = 0; i < nV; ++i) {

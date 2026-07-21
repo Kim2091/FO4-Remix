@@ -114,6 +114,17 @@ namespace SemanticCapture {
         uint32_t resolveAttempts     = 0;
         uint64_t nextRetryFrame      = 0;
 
+        // ---- Resolver crash blacklist (2026-07-21) ----
+        // SEH-caught resolver crashes for this key. At
+        // kResolverCrashBlacklistCount the key is blacklisted: the resolve
+        // loop skips it entirely instead of re-faulting through the guard
+        // every kCrashRetryDelayFrames forever (field log: CRASH CAUGHT #200
+        // with the same key as #100). Pardoned wholesale when a load screen
+        // ends -- the moment the engine rebuilds the world and a reused
+        // pointer value can legitimately become valid again.
+        uint8_t  resolveCrashCount   = 0;
+        bool     crashBlacklisted    = false;
+
         // ---- Live transform (animated statics) ----
         // Refreshed on every hook fire from BSGeometry::m_worldTransform
         // (offset 0x70 on NiAVObject). The engine evaluates scene-graph

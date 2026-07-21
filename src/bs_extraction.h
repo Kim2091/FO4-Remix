@@ -4,6 +4,7 @@
 #include <vector>
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <d3d11.h>
@@ -218,7 +219,16 @@ struct ParsedGeometry {
     std::vector<uint32_t> indices;
     uint64_t vertexDesc;
     uint16_t vertexSize;
-    uint8_t* vbData;        // raw vertex buffer pointer (for blend weight reading)
+    // Owned copy of the raw vertex buffer bytes; vbData points at
+    // vbBytes.data() (2026-07-21 async parse: consumers -- palette
+    // histogram, detail diagnostics -- used to read the LIVE engine VB
+    // through this pointer; with the parse snapshotted the copy is what's
+    // coherent with the parsed vertices, and reading it can't race engine
+    // frees). vbCount is the vertex count the copy was sized for -- index
+    // with it, never with the live shape's numVertices.
+    std::vector<uint8_t> vbBytes;
+    uint8_t* vbData;        // == vbBytes.data() (kept for existing readers)
+    uint32_t vbCount = 0;
     bool isDynamic;
 
     // Skinning attributes (filled only when parseSkinning is requested AND
@@ -301,6 +311,41 @@ namespace BsExtraction {
     // (or when the mesh has no color stream), vertices get 0xFFFFFFFF.
     bool ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections = true,
                             bool applyVertexColors = true, bool parseSkinning = false);
+
+    // ---- Async mesh parse (2026-07-21) ----
+    // Off-threads the per-vertex decode of ParseShapeGeometry: the first
+    // call snapshots the engine-side VB/IB bytes on the GAME thread (bounded
+    // memcpy under the resolver's SEH frame) and enqueues the decode on the
+    // mesh worker pool; later calls rendezvous the finished ParsedGeometry
+    // by `key` (the drawable's PassKey). kPending maps onto the resolver's
+    // kPendingDefer fast-poll exactly like an in-flight texture decode.
+    // kFailed covers both snapshot-gate failures (same set of bails as the
+    // sync parse) and decode rejections (NaN positions, bad indices) --
+    // callers treat it exactly like ParseShapeGeometry returning false.
+    enum class MeshParseStatus { kReady, kPending, kFailed };
+    MeshParseStatus ParseShapeGeometryAsync(BSTriShape* shape, uint64_t key,
+                                            ParsedGeometry& out,
+                                            bool logRejections = true,
+                                            bool applyVertexColors = true,
+                                            bool parseSkinning = false);
+
+    // Generic mesh worker pool (shared by the async parse above and the
+    // merge-chunk bake in lighting_static). Jobs must carry copies/moves of
+    // everything they touch -- NO engine pointers, no game-thread caches.
+    // EnqueueMeshWork returns false when the queue is saturated or the pool
+    // is stopped (caller keeps reporting pending and retries later);
+    // MeshWorkQueueSaturated lets callers skip building an expensive job
+    // when it would only be dropped. StopMeshWorkers joins at shutdown.
+    bool EnqueueMeshWork(std::function<void()> job);
+    bool MeshWorkQueueSaturated();
+    void StopMeshWorkers();
+
+    // Drop completed-but-unconsumed async parses and bump the parse
+    // generation so in-flight jobs from the outgoing world can't be
+    // consumed after a world swap (PassKeys are pointer-derived and the
+    // destination world recycles those addresses). Called from
+    // ClearDrawableMap on PreLoadGame.
+    void ResetMeshParseQueues();
 
     // Get the BSLightingShaderMaterialBase from a shape, or nullptr
     BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape);

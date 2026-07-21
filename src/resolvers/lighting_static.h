@@ -76,6 +76,14 @@ namespace Resolvers {
     // with matching offset+size would serve stale-world bytes.
     void ResetSliceCache();
 
+    // Async merge-chunk bakes (2026-07-21, mesh worker pool). Sweep drops
+    // finished-but-unconsumed builds (drawable evicted mid-build); called
+    // from the Tick sweep cadence. Reset bumps the bake generation and MUST
+    // run on world swap alongside ResetSliceCache -- PassKeys are pointer-
+    // derived, so a stale-world build could rendezvous with a new-world key.
+    void SweepAsyncBakes(uint64_t currentFrame);
+    void ResetAsyncBakes();
+
     namespace Lighting {
 
     // Try to resolve a captured-but-not-yet-submitted DrawableState into a

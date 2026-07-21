@@ -1423,6 +1423,7 @@ void PresentHook::ResetExtractionState() {
 
 void PresentHook::Uninstall() {
     BsExtraction::StopTextureConversionWorkers();
+    BsExtraction::StopMeshWorkers();
     g_remix.running = false;
     if (g_remix.thread.joinable()) {
         g_remix.thread.join();

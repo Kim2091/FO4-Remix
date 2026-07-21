@@ -2212,10 +2212,17 @@ void BsExtraction::StopTextureConversionWorkers()
     _MESSAGE("FO4RemixPlugin: [TexConvert] texture decode workers stopped");
 }
 
+// Defined with the async mesh-parse front-end below (same Tick cadence:
+// parses whose drawable was evicted mid-decode age out like textures).
+static void SweepMeshParseQueues();
+
 void BsExtraction::SweepTextureQueues()
 {
-    std::lock_guard<std::mutex> lk(g_texConvMutex);
-    SweepTexConvDoneLocked();
+    {
+        std::lock_guard<std::mutex> lk(g_texConvMutex);
+        SweepTexConvDoneLocked();
+    }
+    SweepMeshParseQueues();
 }
 
 // ---------------------------------------------------------------------------
@@ -2659,11 +2666,45 @@ void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMateri
     }
 }
 
-// Parse vertices and indices from a BSTriShape. Returns false if the shape
-// should be skipped (effect shader, missing data, NaN positions, bad indices).
-// When logRejections is false, NaN/Inf and bad-index rejections are silent.
-bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections,
-                                      bool applyVertexColors, bool parseSkinning)
+// ---------------------------------------------------------------------------
+// Mesh parse, split for the async pipeline (2026-07-21).
+//
+// SnapshotShapeGeometry: GAME THREAD ONLY. Runs every live-memory gate the
+// old single-pass parse ran (effect shader, renderer data, stride) and then
+// memcpy's the raw VB/IB (and dynamicVertices) bytes into plugin-owned
+// storage. Bounded work -- the per-vertex decode does NOT happen here.
+// Callers run it under the resolver's SEH frame; nothing here follows a
+// pointer the gates didn't validate first.
+//
+// ParseSnapshotGeometry: ANY THREAD. Pure function of the snapshot -- the
+// per-vertex decode, skinning attributes, NaN/index validation, winding
+// flip. Touches no engine memory and no game-thread caches.
+//
+// BsExtraction::ParseShapeGeometry keeps the old synchronous contract as
+// snapshot+decode back-to-back (water resolver, AsyncMeshParse=0 fallback).
+// ---------------------------------------------------------------------------
+struct GeometrySnapshot {
+    std::vector<uint8_t> vb;      // numVertices * vertexSize bytes
+    std::vector<uint8_t> ib;      // numTriangles * 3 uint16 indices
+    std::vector<uint8_t> dynVb;   // dynamicVertices copy (dynamic shapes only)
+    uint64_t vertexDesc    = 0;
+    uint16_t vertexSize    = 0;
+    uint16_t dynVertexSize = 0;
+    uint32_t numVertices   = 0;
+    uint32_t numTriangles  = 0;
+    // RTTI-subclass flag (attrShift keys off the CLASS) vs "has dynamic
+    // data" (position source keys off the DATA) -- distinct on a
+    // BSDynamicTriShape with null dynamicVertices, same as the live parse.
+    bool     isDynShapeClass = false;
+    bool     isDynamic     = false;
+    bool     applyVertexColors = true;
+    bool     parseSkinning     = false;
+    char     name[96]      = "";  // rejection-log identity (copied, not live)
+};
+
+static bool SnapshotShapeGeometry(BSTriShape* shape, GeometrySnapshot& snap,
+                                  bool logRejections,
+                                  bool applyVertexColors, bool parseSkinning)
 {
     if (!shape)
         return false;
@@ -2732,11 +2773,64 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         return false;
     }
 
+    BSDynamicTriShape* dynShape = shape->GetAsBSDynamicTriShape();
+
+    // BSDynamicTriShape stores morphed positions outside the normal vertex
+    // buffer. Only take that path for the actual dynamic subclass
+    // (RTTI-checked): some plain BSTriShape vertex descriptors have the
+    // szVertex nibble set even though the object has no dynamicVertices
+    // field -- on those, reading +0x180 dereferences memory past the
+    // object (plain BSTriShape) or an unrelated field (subclass
+    // neighbors), and the resulting "positions" render as garbled or
+    // misplaced geometry. Cherry-picked from PR #1 (Kralich),
+    // user-verified 2026-07-07 as the PR's load-bearing fix.
+    uint8_t* dynVerts = nullptr;
+    uint16_t dynVertexSize = 0;
+    if (dynShape) {
+        dynVerts = dynShape->dynamicVertices;
+        dynVertexSize = dynShape->GetDynamicVertexSize();
+    }
+
+    // Everything below is bounded copies into plugin-owned storage; the
+    // per-vertex decode happens in ParseSnapshotGeometry (any thread).
+    const char* nm = shape->m_name.c_str();
+    if (nm) {
+        std::strncpy(snap.name, nm, sizeof(snap.name) - 1);
+        snap.name[sizeof(snap.name) - 1] = '\0';
+    }
+    snap.vertexDesc        = desc;
+    snap.vertexSize        = vertexSize;
+    snap.numVertices       = shape->numVertices;
+    snap.numTriangles      = shape->numTriangles;
+    snap.isDynShapeClass   = dynShape != nullptr;
+    snap.applyVertexColors = applyVertexColors;
+    snap.parseSkinning     = parseSkinning;
+    snap.vb.assign(vbData, vbData + (size_t)snap.numVertices * vertexSize);
+    snap.ib.assign(ibData, ibData + (size_t)snap.numTriangles * 3u * 2u);
+    if (dynVerts && dynVertexSize != 0) {
+        snap.isDynamic     = true;
+        snap.dynVertexSize = dynVertexSize;
+        snap.dynVb.assign(dynVerts,
+                          dynVerts + (size_t)snap.numVertices * dynVertexSize);
+    }
+    return true;
+}
+
+// Decode a snapshot into ParsedGeometry. Pure function of `snap` -- safe on
+// the mesh worker pool. Consumes the snapshot: the VB copy moves into
+// out.vbBytes so downstream readers (palette histogram, detail diagnostics)
+// get a copy coherent with the parsed vertices.
+static bool ParseSnapshotGeometry(GeometrySnapshot&& snap, ParsedGeometry& out,
+                                  bool logRejections)
+{
+    const uint64_t desc        = snap.vertexDesc;
+    const uint16_t vertexSize  = snap.vertexSize;
+    const uint32_t numVertices = snap.numVertices;
+    uint8_t* vbData = snap.vb.data();
+
     bool hasUVs     = (desc & BSGeometry::kFlag_UVs) != 0;
     bool hasNormals = (desc & BSGeometry::kFlag_Normals) != 0;
     bool hasColors  = (desc & BSGeometry::kFlag_VertexColors) != 0;
-
-    BSDynamicTriShape* dynShape = shape->GetAsBSDynamicTriShape();
 
     // Attribute offsets are ABSOLUTE dword offsets within the static vertex
     // record -- including on real dynamic shapes. The engine's facegen
@@ -2755,40 +2849,26 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     // PR#1 population of non-dynamic shapes carrying a junk n1 nibble keeps
     // its long-verified behavior.
     uint32_t szVertex = (desc >> 4) & 0xF;
-    const uint32_t attrShift = dynShape ? 0 : szVertex;
+    const uint32_t attrShift = snap.isDynShapeClass ? 0 : szVertex;
     uint32_t oUV     = (attrShift + ((desc >>  8) & 0xF)) * 4;
     uint32_t oNormal = (attrShift + ((desc >> 16) & 0xF)) * 4;
     uint32_t oColor  = (attrShift + ((desc >> 24) & 0xF)) * 4;
 
     bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
 
-    // BSDynamicTriShape stores morphed positions outside the normal vertex
-    // buffer. Only take that path for the actual dynamic subclass
-    // (RTTI-checked): some plain BSTriShape vertex descriptors have the
-    // szVertex nibble set even though the object has no dynamicVertices
-    // field -- on those, reading +0x180 dereferences memory past the
-    // object (plain BSTriShape) or an unrelated field (subclass
-    // neighbors), and the resulting "positions" render as garbled or
-    // misplaced geometry. Cherry-picked from PR #1 (Kralich),
-    // user-verified 2026-07-07 as the PR's load-bearing fix.
     uint8_t* posData = vbData;
     uint32_t posStride = vertexSize;
-    bool isDynamic = false;
-    if (dynShape) {
-        uint8_t* dynVerts = dynShape->dynamicVertices;
-        const uint16_t dynVertexSize = dynShape->GetDynamicVertexSize();
-        if (dynVerts && dynVertexSize != 0) {
-            posData = dynVerts;
-            posStride = dynVertexSize;
-            isDynamic = true;
-        }
+    const bool isDynamic = snap.isDynamic;
+    if (isDynamic) {
+        posData = snap.dynVb.data();
+        posStride = snap.dynVertexSize;
     }
 
     // Parse vertices
-    out.vertices.resize(shape->numVertices);
+    out.vertices.resize(numVertices);
 
-    for (uint16_t i = 0; i < shape->numVertices; i++) {
-        uint8_t* v = vbData + (uint32_t)i * vertexSize;
+    for (uint32_t i = 0; i < numVertices; i++) {
+        uint8_t* v = vbData + i * vertexSize;
         remixapi_HardcodedVertex& out_v = out.vertices[i];
         memset(&out_v, 0, sizeof(out_v));
 
@@ -2840,7 +2920,7 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         // Color. Gated on the shader property's SLSF2_Vertex_Colors flag
         // (threaded in by the caller): FO4 meshes often carry a painted
         // color stream the vanilla shader ignores unless the flag is set.
-        if (applyVertexColors && hasColors && oColor + 4 <= vertexSize) {
+        if (snap.applyVertexColors && hasColors && oColor + 4 <= vertexSize) {
             memcpy(&out_v.color, v + oColor, 4);
         } else {
             out_v.color = 0xFFFFFFFF;
@@ -2854,15 +2934,15 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     // engine's vertex shader consumes weights .xyz and reconstructs the 4th
     // as 1-(x+y+z); replicate that (the 4th stored half is not trusted).
     out.hasSkinning = false;
-    if (parseSkinning && (desc & BSGeometry::kFlag_Skinned)) {
+    if (snap.parseSkinning && (desc & BSGeometry::kFlag_Skinned)) {
         // attrShift, not szVertex: on converted facegen heads the skin
         // nibble is already rebased (3 -> byte 12 of the 24-byte record).
         const uint32_t oSkin = (attrShift + (uint32_t)((desc >> 28) & 0xF)) * 4;
         if (oSkin + 12 <= vertexSize) {
-            out.blendWeights.resize((size_t)shape->numVertices * 4);
-            out.blendIndices.resize((size_t)shape->numVertices * 4);
-            for (uint16_t i = 0; i < shape->numVertices; i++) {
-                const uint8_t* v = vbData + (uint32_t)i * vertexSize;
+            out.blendWeights.resize((size_t)numVertices * 4);
+            out.blendIndices.resize((size_t)numVertices * 4);
+            for (uint32_t i = 0; i < numVertices; i++) {
+                const uint8_t* v = vbData + i * vertexSize;
                 const uint16_t* wRaw = reinterpret_cast<const uint16_t*>(v + oSkin);
                 float w0 = HalfToFloat(wRaw[0]);
                 float w1 = HalfToFloat(wRaw[1]);
@@ -2897,14 +2977,13 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         } else if (logRejections) {
             _MESSAGE("FO4RemixPlugin: [Skinning] shape \"%s\" skinned desc=%016llX but "
                      "oSkin=%u+12 > stride=%u -- skinning attributes skipped",
-                     shape->m_name.c_str() ? shape->m_name.c_str() : "",
-                     (unsigned long long)desc, oSkin, vertexSize);
+                     snap.name, (unsigned long long)desc, oSkin, vertexSize);
         }
     }
 
     // Validate vertex positions
-    const char* shapeName = shape->m_name.c_str();
-    for (uint16_t i = 0; i < shape->numVertices; i++) {
+    const char* shapeName = snap.name;
+    for (uint32_t i = 0; i < numVertices; i++) {
         const auto& pos = out.vertices[i].position;
         for (int j = 0; j < 3; j++) {
             if (std::isnan(pos[j]) || std::isinf(pos[j])) {
@@ -2927,15 +3006,15 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     // terrain shells). Swapping the 2nd/3rd index of each triangle restores
     // the authored facing under the mirrored transform, and also makes
     // geometric normals (derived from winding) agree with the vertex normals.
-    uint32_t indexCount = shape->numTriangles * 3;
-    uint16_t* indices16 = reinterpret_cast<uint16_t*>(ibData);
+    uint32_t indexCount = snap.numTriangles * 3;
+    const uint16_t* indices16 = reinterpret_cast<const uint16_t*>(snap.ib.data());
     out.indices.resize(indexCount);
     for (uint32_t i = 0; i < indexCount; i++) {
         uint32_t idx = indices16[i];
-        if (idx >= shape->numVertices) {
+        if (idx >= numVertices) {
             if (logRejections)
                 _MESSAGE("FO4RemixPlugin: Rejecting mesh \"%s\" - index[%u]=%u >= numVertices=%u",
-                         shapeName ? shapeName : "<null>", i, idx, shape->numVertices);
+                         shapeName, i, idx, numVertices);
             return false;
         }
         // Destination slot swaps indices 1<->2 within each triangle.
@@ -2947,10 +3026,224 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
 
     out.vertexDesc = desc;
     out.vertexSize = vertexSize;
-    out.vbData = vbData;
-    out.isDynamic = isDynamic;
+    out.vbCount    = numVertices;
+    out.vbBytes    = std::move(snap.vb);
+    out.vbData     = out.vbBytes.data();
+    out.isDynamic  = isDynamic;
 
     return true;
+}
+
+// Parse vertices and indices from a BSTriShape. Returns false if the shape
+// should be skipped (effect shader, missing data, NaN positions, bad indices).
+// When logRejections is false, NaN/Inf and bad-index rejections are silent.
+// Synchronous: snapshot + decode back-to-back on the calling (game) thread.
+bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections,
+                                      bool applyVertexColors, bool parseSkinning)
+{
+    GeometrySnapshot snap;
+    if (!SnapshotShapeGeometry(shape, snap, logRejections,
+                               applyVertexColors, parseSkinning)) {
+        return false;
+    }
+    return ParseSnapshotGeometry(std::move(snap), out, logRejections);
+}
+
+// ---------------------------------------------------------------------------
+// Mesh worker pool (2026-07-21). Shared by the async parse below and the
+// merge-chunk bake in lighting_static. Same shape as the texture decode
+// pool: lazy start, below-normal priority, cv-driven deque, drop-on-stop.
+//
+// Thread contract: jobs are opaque closures that must carry copies/moves of
+// everything they touch -- NO engine pointers, no game-thread caches. Each
+// feature owns its done-map + mutex; this pool only runs the closures.
+// ---------------------------------------------------------------------------
+static std::mutex                        g_meshWorkMutex;
+static std::condition_variable           g_meshWorkCv;
+static std::deque<std::function<void()>> g_meshWorkJobs;
+static std::vector<std::thread>          g_meshWorkWorkers;
+static bool                              g_meshWorkStop = false;  // guarded by g_meshWorkMutex
+// Job-count bound: parse jobs own a VB+IB copy (<= ~2.5 MiB each), bake
+// jobs own gathered chunk slices (a few MiB); 512 queued jobs is far past
+// any real burst and bounds worst-case memory to a comfortable level.
+static constexpr size_t kMaxMeshWorkJobs = 512;
+
+static void MeshWorkWorkerMain()
+{
+    std::unique_lock<std::mutex> lk(g_meshWorkMutex);
+    for (;;) {
+        g_meshWorkCv.wait(lk, [] {
+            return g_meshWorkStop || !g_meshWorkJobs.empty();
+        });
+        if (g_meshWorkStop) return;  // queued jobs dropped by design
+        std::function<void()> job = std::move(g_meshWorkJobs.front());
+        g_meshWorkJobs.pop_front();
+        lk.unlock();
+        // C++ fence, mirroring the texture workers: a bad_alloc/length_error
+        // escaping a thread proc is std::terminate -> process fast-fail.
+        // A caught failure just drops the job; the feature's inflight entry
+        // is cleared by the closure's own catch or ages out via its sweep.
+        try {
+            job();
+        } catch (const std::exception& e) {
+            static std::atomic<int> sLogs{0};
+            const int n = sLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [MeshWork] job threw #%d what=%s -- dropped",
+                         n, e.what());
+            }
+        } catch (...) {
+            static std::atomic<int> sLogs{0};
+            const int n = sLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [MeshWork] job threw #%d (non-std) -- dropped", n);
+            }
+        }
+        lk.lock();
+    }
+}
+
+bool BsExtraction::MeshWorkQueueSaturated()
+{
+    std::lock_guard<std::mutex> lk(g_meshWorkMutex);
+    return g_meshWorkStop || g_meshWorkJobs.size() >= kMaxMeshWorkJobs;
+}
+
+bool BsExtraction::EnqueueMeshWork(std::function<void()> job)
+{
+    std::lock_guard<std::mutex> lk(g_meshWorkMutex);
+    if (g_meshWorkStop || g_meshWorkJobs.size() >= kMaxMeshWorkJobs) return false;
+    g_meshWorkJobs.push_back(std::move(job));
+    if (g_meshWorkWorkers.empty()) {
+        // Two workers: parses are far lighter than BC7 decode and the point
+        // is overlap with the game thread, not throughput scaling; one
+        // worker could head-of-line-block a burst behind a monster merge
+        // bake, two keeps small parses flowing past it.
+        for (int i = 0; i < 2; ++i) {
+            g_meshWorkWorkers.emplace_back([] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                MeshWorkWorkerMain();
+            });
+        }
+        _MESSAGE("FO4RemixPlugin: [MeshWork] started 2 mesh workers");
+    }
+    g_meshWorkCv.notify_one();
+    return true;
+}
+
+void BsExtraction::StopMeshWorkers()
+{
+    {
+        std::lock_guard<std::mutex> lk(g_meshWorkMutex);
+        if (g_meshWorkWorkers.empty()) return;
+        g_meshWorkStop = true;
+    }
+    g_meshWorkCv.notify_all();
+    for (auto& t : g_meshWorkWorkers) {
+        if (t.joinable()) t.join();
+    }
+    g_meshWorkWorkers.clear();
+    _MESSAGE("FO4RemixPlugin: [MeshWork] mesh workers stopped");
+}
+
+// ---------------------------------------------------------------------------
+// Async mesh parse front-end (2026-07-21). Keyed by the drawable's PassKey.
+// Generation counter: PassKeys are pointer-derived and the destination
+// world recycles those addresses, so results enqueued before a world swap
+// must never be consumed after it (ResetMeshParseQueues bumps the gen; a
+// worker publishing under a stale gen discards its result).
+// ---------------------------------------------------------------------------
+struct CompletedMeshParse {
+    bool ok = false;
+    ParsedGeometry parsed;
+    uint64_t doneFrame = 0;   // for the orphan TTL sweep
+};
+
+static std::mutex g_meshParseMutex;
+static std::unordered_map<uint64_t, CompletedMeshParse> g_meshParseDone;
+static std::unordered_set<uint64_t> g_meshParseInflight;  // queued or decoding
+static uint64_t g_meshParseGen = 0;    // guarded by g_meshParseMutex
+constexpr uint64_t kMeshParseDoneTTLFrames = 600;
+
+static void SweepMeshParseQueues()
+{
+    std::lock_guard<std::mutex> lk(g_meshParseMutex);
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    for (auto it = g_meshParseDone.begin(); it != g_meshParseDone.end();) {
+        if (now > it->second.doneFrame &&
+            now - it->second.doneFrame > kMeshParseDoneTTLFrames) {
+            it = g_meshParseDone.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+BsExtraction::MeshParseStatus BsExtraction::ParseShapeGeometryAsync(
+    BSTriShape* shape, uint64_t key, ParsedGeometry& out,
+    bool logRejections, bool applyVertexColors, bool parseSkinning)
+{
+    // Rendezvous first: a finished decode is consumed exactly once.
+    {
+        std::lock_guard<std::mutex> lk(g_meshParseMutex);
+        auto it = g_meshParseDone.find(key);
+        if (it != g_meshParseDone.end()) {
+            const bool ok = it->second.ok;
+            if (ok) out = std::move(it->second.parsed);
+            g_meshParseDone.erase(it);
+            return ok ? MeshParseStatus::kReady : MeshParseStatus::kFailed;
+        }
+        if (g_meshParseInflight.count(key)) return MeshParseStatus::kPending;
+    }
+
+    // Don't pay the snapshot memcpy for a job that would only be dropped;
+    // the caller keeps reporting pending and retries on its fast poll.
+    if (MeshWorkQueueSaturated()) return MeshParseStatus::kPending;
+
+    // Snapshot on this (game) thread under the caller's SEH frame. A gate
+    // failure here is exactly the sync parse returning false.
+    GeometrySnapshot snap;
+    if (!SnapshotShapeGeometry(shape, snap, logRejections,
+                               applyVertexColors, parseSkinning)) {
+        return MeshParseStatus::kFailed;
+    }
+
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lk(g_meshParseMutex);
+        gen = g_meshParseGen;
+        g_meshParseInflight.insert(key);
+    }
+    // MSVC's std::function requires copyable closures; share the snapshot.
+    auto snapHolder = std::make_shared<GeometrySnapshot>(std::move(snap));
+    const bool queued = EnqueueMeshWork(
+        [key, gen, snapHolder, logRejections] {
+            ParsedGeometry parsed;
+            const bool ok =
+                ParseSnapshotGeometry(std::move(*snapHolder), parsed, logRejections);
+            std::lock_guard<std::mutex> lk(g_meshParseMutex);
+            g_meshParseInflight.erase(key);
+            if (gen != g_meshParseGen) return;  // world swapped mid-decode
+            CompletedMeshParse done;
+            done.ok = ok;
+            done.parsed = std::move(parsed);
+            done.doneFrame = Diagnostics::CurrentFrameIndex();
+            g_meshParseDone[key] = std::move(done);
+        });
+    if (!queued) {
+        std::lock_guard<std::mutex> lk(g_meshParseMutex);
+        g_meshParseInflight.erase(key);
+    }
+    return MeshParseStatus::kPending;
+}
+
+void BsExtraction::ResetMeshParseQueues()
+{
+    std::lock_guard<std::mutex> lk(g_meshParseMutex);
+    ++g_meshParseGen;
+    g_meshParseDone.clear();
+    // Inflight entries clear themselves as their jobs finish; their
+    // publishes are discarded by the generation check.
 }
 
 // ---------------------------------------------------------------------------

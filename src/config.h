@@ -393,6 +393,16 @@ struct PluginConfig {
     // throughput. Default 4.
     uint32_t decodeWorkerMax;
 
+    // Off-thread the mesh resolve parse and the merge-chunk bake
+    // ([Performance] AsyncMeshParse, default 1). The resolver snapshots the
+    // engine-side VB/IB bytes on the game thread (bounded memcpy) and runs
+    // the per-vertex decode / chunk-bake build pass on a 2-thread mesh
+    // worker pool -- these were the last big always-on game-thread costs of
+    // a resolve (35ms single-item [ResolveBudget] hitches on giant
+    // precombine merges). 0 = legacy inline parse (safety fallback; costs
+    // the full decode on the game render thread again).
+    bool asyncMeshParse;
+
     // SOFT byte budget (MiB) for the CPU-side decoded-texture cache in
     // bs_extraction (the name+resolution-keyed mip-chain cache that feeds
     // SubmitDrawable re-supplies). Decoded RGBA chains are large (~22 MiB

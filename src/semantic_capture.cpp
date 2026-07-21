@@ -248,6 +248,11 @@ constexpr uint64_t    kLoadingGateFailsafeFrames = 3600;  // ~60s: clear a stuck
 // texture-heavy drawable's pop-in.
 constexpr uint64_t kMaxRetryDelayFrames   = 512;
 constexpr uint64_t kCrashRetryDelayFrames = 120;
+// Crash-catch count at which a key stops being retried until the next
+// load-screen exit (see the blacklist notes in attemptResolve). 5 catches
+// at the 120-frame backoff means >=10s of persistent faulting -- well past
+// any transient mid-load race.
+constexpr uint32_t kResolverCrashBlacklistCount = 5;
 
 static uint64_t RetryDelayFrames(uint32_t attempts) {
     if (attempts <= 8) return 1;
@@ -1362,6 +1367,31 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         }
     }
 
+    // Crash-blacklist pardon (2026-07-21): the gate's falling edge is the
+    // one moment a blacklisted key can legitimately become resolvable again
+    // -- the engine rebuilds the world behind load screens and reuses the
+    // exact pointer values the PassKeys are derived from. Pardoning here
+    // keeps the blacklist from ever permanently killing a drawable across
+    // loads (the failure mode that ruled out a permanent blacklist; see the
+    // notes above attemptResolve).
+    {
+        static bool s_prevLoadingGate = false;
+        if (s_prevLoadingGate && !loadingGate) {
+            uint32_t pardoned = 0;
+            std::lock_guard<std::mutex> lock(g_drawableMutex);
+            for (auto& [key, st] : g_drawableMap) {
+                if (st.crashBlacklisted) ++pardoned;
+                st.crashBlacklisted  = false;
+                st.resolveCrashCount = 0;
+            }
+            if (pardoned) {
+                _MESSAGE("FO4RemixPlugin: [Resolver] load-screen exit -- "
+                         "pardoned %u crash-blacklisted keys", pardoned);
+            }
+        }
+        s_prevLoadingGate = loadingGate;
+    }
+
     // ---- Skinned bone updates (2026-07-08) ----
     // Once per Tick (== once per game frame), read every registered skinned
     // drawable's live bone world transforms, compose bind->world matrices,
@@ -1528,6 +1558,9 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 // sweep un-parks it on re-entering the view (or when
                 // pressure clears), which re-admits it here.
                 if (state.pressureParked) continue;
+                // Crash-blacklisted: proven to fault through the SEH guard
+                // repeatedly; skipped until the load-screen pardon below.
+                if (state.crashBlacklisted) continue;
                 const uint64_t age = (currentFrame > state.lastSeenFrame)
                     ? (currentFrame - state.lastSeenFrame) : 0;
                 if (age > g_config.resolveRetryWindowFrames) continue;
@@ -1608,13 +1641,21 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         //
         // SEH-guarded: stale geometry pointers (freed while the entry sat
         // inside the retry window) can dereference freed memory. Catch the
-        // AV and back off HARD -- but do NOT permanently blacklist the key.
-        // The engine reuses those exact pointer values when it rebuilds the
-        // world (same PassKey), so a permanent skip turned one transient
-        // mid-load race into "this drawable can never render again this
-        // session" (the missing-destination-cell-after-load report). If the
-        // geometry stays dead, its fires stop and the retry-window gate
-        // retires the entry naturally.
+        // AV and back off HARD. Blacklist rules (2026-07-21): an UNBOUNDED
+        // permanent skip is off the table -- the engine reuses those exact
+        // pointer values when it rebuilds the world (same PassKey), so a
+        // permanent skip turned one transient mid-load race into "this
+        // drawable can never render again this session" (the missing-
+        // destination-cell-after-load report). But the opposite failure is
+        // real too: a persistently-dead key kept firing and re-faulted
+        // through the guard every 120-frame backoff for the whole session
+        // (field: CRASH CAUGHT #200 with the same key as #100). Compromise:
+        // after kResolverCrashBlacklistCount catches (>=10s of persistent
+        // faulting) the key is blacklisted, and ALL blacklists are pardoned
+        // when a load screen ends -- world rebuilds happen behind loads, so
+        // that is exactly when a reused pointer value can become valid
+        // again. If the geometry stays dead, its fires stop and the
+        // retry-window gate retires the entry naturally.
         auto attemptResolve = [&](PassKey key,
                                   SemanticCapture::DrawableState& state) -> bool {
             // Re-check the gates under the lock: the fire hook / a poll
@@ -1645,6 +1686,19 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 }
                 state.resolveAttempts++;
                 state.nextRetryFrame = currentFrame + kCrashRetryDelayFrames;
+                if (++state.resolveCrashCount >= kResolverCrashBlacklistCount &&
+                    !state.crashBlacklisted) {
+                    state.crashBlacklisted = true;
+                    static std::atomic<int> sBlacklistLogs{0};
+                    const int bn = sBlacklistLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (bn < 40) {
+                        _MESSAGE("FO4RemixPlugin: [Resolver] #%d key=0x%llX "
+                                 "blacklisted after %u crashes -- skipping "
+                                 "until next load-screen exit",
+                                 bn, (unsigned long long)key,
+                                 (unsigned)state.resolveCrashCount);
+                    }
+                }
             }
 
             // Diagnostic: log every water entry's post-resolver state so we
@@ -2038,14 +2092,17 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     g_sweepCounter.store(0, std::memory_order_relaxed);
 
     // Reap orphaned async texture decodes on the same cadence (enqueue-time
-    // sweeping alone can't run once a streaming burst ends).
+    // sweeping alone can't run once a streaming burst ends). Async mesh
+    // parses sweep inside SweepTextureQueues; merge-chunk bakes here.
     BsExtraction::SweepTextureQueues();
+    Resolvers::SweepAsyncBakes(currentFrame);
 
     const uint64_t now = currentFrame;
     uint32_t evicted = 0;
     uint32_t submittedCount = 0;
     uint32_t pendingCount = 0;
     uint32_t parkedCount = 0;
+    uint32_t blacklistedCount = 0;
     size_t   unique  = 0;
     size_t   distinctGeoPtrs = 0;
     size_t   entriesWithGeo = 0;
@@ -2339,6 +2396,11 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                     ++parkedCount;
                 } else if (it->second.submittedToRemix) {
                     ++submittedCount;
+                } else if (it->second.crashBlacklisted) {
+                    // Resolver-skipped until the load-screen pardon; keeping
+                    // them out of "pending" keeps the per-gate breakdown
+                    // honest (they'd all pile into one stale bucket).
+                    ++blacklistedCount;
                 } else {
                     ++pendingCount;
                     using Resolvers::Trace::Step;
@@ -2384,11 +2446,11 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         ? (entriesWithGeo - distinctGeoPtrs) : 0;
     _MESSAGE("FO4RemixPlugin: [SemCapture] uniqueDrawables=%zu totalFires=%llu "
              "evictedThisSweep=%u submitted=%u pending=%u parked=%u "
-             "distinctGeoPtrs=%zu entriesWithGeo=%zu geoDups=%zu",
+             "blacklisted=%u distinctGeoPtrs=%zu entriesWithGeo=%zu geoDups=%zu",
              unique,
              (unsigned long long)g_totalFires.load(std::memory_order_relaxed),
              evicted, submittedCount, pendingCount, parkedCount,
-             distinctGeoPtrs, entriesWithGeo, geoDups);
+             blacklistedCount, distinctGeoPtrs, entriesWithGeo, geoDups);
 
     _MESSAGE("FO4RemixPlugin: [SemCapture] pendingByGate "
              "notResolved=%u notTriShape=%u skinned=%u lod=%u "
@@ -2531,8 +2593,13 @@ void SemanticCapture::ClearDrawableMap() {
 
     // Async merge-readback slices are keyed by buffer identity; the
     // destination world recycles those addresses, so stale entries could
-    // serve old-world bytes to a new-world bake.
+    // serve old-world bytes to a new-world bake. Same reasoning for the
+    // async parse/bake result maps (keyed by pointer-derived PassKeys):
+    // bump their generations so nothing from the outgoing world can
+    // rendezvous with a recycled key in the destination world.
     Resolvers::ResetSliceCache();
+    Resolvers::ResetAsyncBakes();
+    BsExtraction::ResetMeshParseQueues();
 
     _MESSAGE("FO4RemixPlugin: [Reload] cleared %zu drawables (%zu submitted) on PreLoadGame",
              totalCount, submittedCount);
