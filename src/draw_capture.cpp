@@ -6,6 +6,8 @@
 #include <atomic>
 #include <mutex>
 #include <cstring>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "f4se/PluginAPI.h"  // _MESSAGE
 
@@ -29,6 +31,8 @@ typedef void (STDMETHODCALLTYPE* PFN_AsyncOp)(
     ID3D11DeviceContext*, ID3D11Asynchronous*);
 typedef void (STDMETHODCALLTYPE* PFN_SetShaderResources)(
     ID3D11DeviceContext*, UINT, UINT, ID3D11ShaderResourceView* const*);
+typedef void (STDMETHODCALLTYPE* PFN_IASetIndexBuffer)(
+    ID3D11DeviceContext*, ID3D11Buffer*, DXGI_FORMAT, UINT);
 static PFN_DrawIndexedInstanced g_original = nullptr;
 static PFN_DrawIndexed g_originalDX = nullptr;
 static PFN_Draw g_originalDraw = nullptr;
@@ -41,7 +45,38 @@ static PFN_AsyncOp g_originalEnd = nullptr;
 static PFN_SetShaderResources g_originalVSSet = nullptr;
 static PFN_SetShaderResources g_originalPSSet = nullptr;
 static PFN_SetShaderResources g_originalCSSet = nullptr;
+static PFN_IASetIndexBuffer g_originalIASetIB = nullptr;
 static std::atomic<bool> g_hooked{false};
+
+// ---------------------------------------------------------------------------
+// Occlusion visibility signal (2026-07-21). See the header block.
+//
+// Threading: the draw hooks and IASetIndexBuffer run on the game's D3D11
+// immediate-context thread (the same single-thread assumption g_boundT8
+// already relies on). Accumulation into g_visThisFrame is therefore
+// lock-free. Once per Present (also that thread) the frame's set is merged
+// into g_visMap under g_visLock; the Remix thread copies g_visMap out under
+// the same lock in SnapshotVisible.
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_occlusionEnabled{false};
+// Currently-bound index buffer (identity + byte offset), maintained by the
+// IASetIndexBuffer hook and read by the draw hooks -- render thread only.
+static const void* g_boundIB     = nullptr;
+static uint32_t    g_boundIBOff  = 0;
+// This frame's distinct drawn keys (render thread only; no lock).
+static std::unordered_set<uint64_t> g_visThisFrame;
+// Run-collapse: consecutive draws in a batch share one IB, so remembering
+// the last stamped key skips the vast majority of set inserts.
+static uint64_t g_lastVisKey = 0;
+// Published map: key -> present-frame it was last drawn on.
+static std::mutex g_visLock;
+static std::unordered_map<uint64_t, uint32_t> g_visMap;
+static std::atomic<uint32_t> g_visLastFrameCount{0};
+// Entries un-drawn this many present-frames are pruned (bounds memory).
+// Beyond this a still-loaded, still-occluded drawable would be forgotten and
+// re-rendered; 3600 (~60s) makes that vanishingly rare in practice since the
+// parking/TTL systems evict long-unseen drawables well before then.
+constexpr uint32_t kVisForgetFrames = 3600;
 
 constexpr int      kMaxWatches       = 32;
 constexpr int      kMaxDrawsPerFrame = 24;
@@ -261,6 +296,29 @@ static bool DescMatches(ID3D11Resource* r, uint32_t expectedBytes) {
            bd.StructureByteStride == 80 && bd.ByteWidth == expectedBytes;
 }
 
+// Record the currently-bound index buffer as "drawn this frame" for the
+// occlusion signal. Render thread only; the last-key shortcut collapses the
+// long runs of same-IB draws inside a batch to a single set insert.
+static inline void StampVisible() {
+    if (!g_occlusionEnabled.load(std::memory_order_relaxed)) return;
+    if (!g_boundIB) return;
+    const uint64_t key = EngineIbKey(g_boundIB, g_boundIBOff);
+    if (key == g_lastVisKey) return;
+    g_lastVisKey = key;
+    g_visThisFrame.insert(key);
+}
+
+// Track the bound index buffer so the draw hooks can key visibility without
+// a per-draw IAGetIndexBuffer (a D3D call we deliberately avoid on the fast
+// path). Same-thread ordered with the draws that read it.
+static void STDMETHODCALLTYPE hkIASetIndexBuffer(
+    ID3D11DeviceContext* ctx, ID3D11Buffer* ib, DXGI_FORMAT fmt, UINT offset)
+{
+    g_boundIB    = ib;
+    g_boundIBOff = offset;
+    g_originalIASetIB(ctx, ib, fmt, offset);
+}
+
 static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
     ID3D11DeviceContext* ctx, UINT idxCount, UINT instCount,
     UINT startIdx, INT baseVtx, UINT startInst)
@@ -270,6 +328,7 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
     if (g_activeCount.load(std::memory_order_relaxed) > 0) {
         g_diiCalls.fetch_add(1, std::memory_order_relaxed);
     }
+    StampVisible();
     LogWindowDraw(ctx, "DII", idxCount, startIdx, baseVtx, instCount);
     // SegDraw sampling REMOVED (2026-07-04). Run-4 ground truth: with 15
     // watches active for a full 17s window (9.3M DII calls, record SRVs
@@ -297,6 +356,7 @@ static void STDMETHODCALLTYPE hkDrawIndexedInstanced(
 static void STDMETHODCALLTYPE hkDrawIndexed(
     ID3D11DeviceContext* ctx, UINT idxCount, UINT startIdx, INT baseVtx)
 {
+    StampVisible();
     LogWindowDraw(ctx, "DX", idxCount, startIdx, baseVtx, 1);
     Watch* w = g_boundT8.load(std::memory_order_relaxed);
     if (w) {
@@ -536,6 +596,7 @@ void InstallHook(ID3D11DeviceContext* ctx) {
     void** vtbl = *reinterpret_cast<void***>(ctx);
     void* target = vtbl[20];      // DrawIndexedInstanced
     void* targetDX = vtbl[12];    // DrawIndexed (the actual merge draw path)
+    void* targetIASetIB = vtbl[19]; // IASetIndexBuffer (occlusion IB tracking)
     void* targetDI = vtbl[21];    // DrawInstanced (counter only)
     void* targetDIII = vtbl[39];  // DrawIndexedInstancedIndirect (counter only)
     void* targetDraw = vtbl[13];  // Draw (raster suppression only)
@@ -558,6 +619,10 @@ void InstallHook(ID3D11DeviceContext* ctx) {
                  (int)ctx->GetType());
     } else {
         _MESSAGE("FO4RemixPlugin: [DrawCap] ERROR - draw hooks failed");
+    }
+    if (MH_CreateHook(targetIASetIB, &hkIASetIndexBuffer,
+                      reinterpret_cast<void**>(&g_originalIASetIB)) == MH_OK) {
+        MH_EnableHook(targetIASetIB);
     }
     if (MH_CreateHook(targetDI, &hkDrawInstanced,
                       reinterpret_cast<void**>(&g_originalDI)) == MH_OK) {
@@ -605,8 +670,45 @@ bool Hooked() {
     return g_hooked.load(std::memory_order_acquire);
 }
 
+void SetOcclusionEnabled(bool enabled) {
+    g_occlusionEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+void SnapshotVisible(std::unordered_map<uint64_t, uint32_t>& out,
+                     uint32_t& outFrame, uint32_t& outLastFrameDrawCount) {
+    std::lock_guard<std::mutex> g(g_visLock);
+    out = g_visMap;
+    outFrame = g_frame.load(std::memory_order_relaxed);
+    outLastFrameDrawCount = g_visLastFrameCount.load(std::memory_order_relaxed);
+}
+
 void OnPresent() {
     const uint32_t f = g_frame.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    // Publish this frame's drawn-key set into the recency map (render thread).
+    // Merge is O(distinct keys drawn this frame); the amortized prune keeps
+    // the map bounded without walking it every frame.
+    if (g_occlusionEnabled.load(std::memory_order_relaxed) ||
+        !g_visThisFrame.empty()) {
+        std::lock_guard<std::mutex> g(g_visLock);
+        for (uint64_t key : g_visThisFrame) {
+            g_visMap[key] = f;
+        }
+        g_visLastFrameCount.store((uint32_t)g_visThisFrame.size(),
+                                  std::memory_order_relaxed);
+        if ((f % 120u) == 0) {
+            for (auto it = g_visMap.begin(); it != g_visMap.end();) {
+                if (f > it->second && f - it->second > kVisForgetFrames) {
+                    it = g_visMap.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+    }
+    g_visThisFrame.clear();
+    g_lastVisKey = 0;
+
     // Reap orphaned upgrade hunts every ~5s: a hunt nobody polls anymore
     // (see kHuntOrphanMs) is expired so its slot recycles and, once none
     // are left, g_activeCount hits 0 and the CheckBind scan goes cold.
@@ -948,6 +1050,22 @@ void ResetAll() {
     g_winCount.store(0, std::memory_order_relaxed);
     g_winRemaining.store(0, std::memory_order_relaxed);
     g_lastWinKey.store(0, std::memory_order_relaxed);
+    // Occlusion visibility map: its keys are (IB pointer, offset) into the
+    // engine's geometry pools, which the destination world repacks -- a
+    // stale "was drawn" verdict served after reload would occlude live
+    // geometry. Same reasoning as the watch purge above. Only the published
+    // map is touched here (under its lock): g_visThisFrame / g_lastVisKey /
+    // g_boundIB are render-thread-only, and ResetAll runs on the game thread
+    // -- clearing them from here would race a concurrent draw. Their stale
+    // contents publish at most once more into g_visMap, which is harmless:
+    // occlusion is suspended through the load by the scene-active floor, and
+    // those entries age out (or are overwritten by the new world) before it
+    // resumes.
+    {
+        std::lock_guard<std::mutex> gv(g_visLock);
+        g_visMap.clear();
+        g_visLastFrameCount.store(0, std::memory_order_relaxed);
+    }
     _MESSAGE("FO4RemixPlugin: [DrawCap] ResetAll (reload): watches purged");
 }
 

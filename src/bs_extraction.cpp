@@ -2700,6 +2700,11 @@ struct GeometrySnapshot {
     bool     applyVertexColors = true;
     bool     parseSkinning     = false;
     char     name[96]      = "";  // rejection-log identity (copied, not live)
+    // Engine index-buffer identity for the occlusion signal (2026-07-21):
+    // the D3D11 IB pointer + byte offset the engine binds when it draws this
+    // shape. DrawCapture keys its per-frame visibility set on the same pair.
+    uint64_t engineIbPtr    = 0;
+    uint32_t engineIbOffset = 0;
 };
 
 static bool SnapshotShapeGeometry(BSTriShape* shape, GeometrySnapshot& snap,
@@ -2766,6 +2771,14 @@ static bool SnapshotShapeGeometry(BSTriShape* shape, GeometrySnapshot& snap,
         return false;
     }
 
+    // Occlusion key source (2026-07-21): the D3D11 index buffer this shape
+    // draws from, plus its byte offset within that (pooled) buffer. The
+    // engine binds exactly this pair via IASetIndexBuffer; DrawCapture's
+    // draw-side stamp reads the same pair, so a submitted drawable can be
+    // matched against "did the engine draw this geometry this frame".
+    snap.engineIbPtr    = reinterpret_cast<uint64_t>(gfxData->pIB->pBuffer);
+    snap.engineIbOffset = gfxData->pIB->DataOffset;
+
     uint64_t desc = shape->vertexDesc;
     uint16_t vertexSize = shape->GetVertexSize();
     if (vertexSize == 0) {
@@ -2827,6 +2840,10 @@ static bool ParseSnapshotGeometry(GeometrySnapshot&& snap, ParsedGeometry& out,
     const uint16_t vertexSize  = snap.vertexSize;
     const uint32_t numVertices = snap.numVertices;
     uint8_t* vbData = snap.vb.data();
+
+    // Carry the occlusion key through (pure copy, no engine access).
+    out.engineIbPtr    = snap.engineIbPtr;
+    out.engineIbOffset = snap.engineIbOffset;
 
     bool hasUVs     = (desc & BSGeometry::kFlag_UVs) != 0;
     bool hasNormals = (desc & BSGeometry::kFlag_Normals) != 0;

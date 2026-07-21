@@ -179,7 +179,10 @@ void LoadConfig() {
     g_config.cullingFrustumKeepRadius   = GetIniFloat("Culling", "FrustumKeepRadius",    8192.0f, dllPath);
     g_config.cullingFrustumFovMarginDeg = GetIniFloat("Culling", "FrustumFovMarginDeg",  12.0f,   dllPath);
     g_config.cullingFrustumLodChunks    = GetIniBool("Culling",  "FrustumCullLodChunks", false,   dllPath);
-    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u LodChunkFarExtentRatio=%.1f ForceEvictVramPct=%u ForceEvictPerSweep=%u ForceEvictViewPct=%u ForceEvictBehindDistance=%.0f ForceEvictAlwaysBehindDistance=%.0f ForceEvictLodBehindDistance=%.0f FrustumCull=%d FrustumKeepRadius=%.0f FrustumFovMarginDeg=%.1f FrustumCullLodChunks=%d",
+    g_config.cullingOcclusionEnabled       = GetIniBool("Culling", "OcclusionCull",           true, dllPath);
+    g_config.cullingOcclusionStaleFrames   = GetIniUInt("Culling", "OcclusionStaleFrames",    30,   dllPath);
+    g_config.cullingOcclusionMinSceneDraws = GetIniUInt("Culling", "OcclusionMinSceneDraws",  500,  dllPath);
+    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u LodChunkFarExtentRatio=%.1f ForceEvictVramPct=%u ForceEvictPerSweep=%u ForceEvictViewPct=%u ForceEvictBehindDistance=%.0f ForceEvictAlwaysBehindDistance=%.0f ForceEvictLodBehindDistance=%.0f FrustumCull=%d FrustumKeepRadius=%.0f FrustumFovMarginDeg=%.1f FrustumCullLodChunks=%d OcclusionCull=%d OcclusionStaleFrames=%u OcclusionMinSceneDraws=%u",
              g_config.cullingTextureLRUGraceFrames,
              g_config.cullingTextureLRUSweepPeriod,
              g_config.cullingTextureBudgetMiB,
@@ -195,7 +198,10 @@ void LoadConfig() {
              g_config.cullingFrustumEnabled,
              g_config.cullingFrustumKeepRadius,
              g_config.cullingFrustumFovMarginDeg,
-             g_config.cullingFrustumLodChunks);
+             g_config.cullingFrustumLodChunks,
+             g_config.cullingOcclusionEnabled,
+             g_config.cullingOcclusionStaleFrames,
+             g_config.cullingOcclusionMinSceneDraws);
 
     // [Materials]
     g_config.metalConversionEnabled = GetIniBool("Materials", "MetalConversionEnabled", true, dllPath);

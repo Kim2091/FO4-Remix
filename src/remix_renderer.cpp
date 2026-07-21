@@ -5,6 +5,7 @@
 #include "fo4_diagnostics.h"
 #include "fo4_tracy.h"
 #include "present_hook.h"     // GetVramBudgetSnapshot (pressure-tightened LRU grace)
+#include "draw_capture.h"     // EngineIbKey + SnapshotVisible (occlusion cull)
 #include "semantic_capture.h"
 #include "skinned_meshes.h"
 #include "resolvers/lighting_static.h"  // Trace::SetStep + Trace::Step constants
@@ -463,6 +464,14 @@ namespace {
         // flap the decision frame-to-frame. Consumed at BUCKET granularity
         // in the draw loop (see the all-or-nothing comment there).
         bool  frustumCulled = false;
+
+        // Occlusion cull (2026-07-21). engineIbKey is the (IB pointer, byte
+        // offset) identity of the engine draw this geometry comes from; 0 =
+        // no key (exempt). OnFrame matches it against DrawCapture's per-frame
+        // "was drawn" map: a key drawn recently then stopped is occluded (or
+        // engine-frustum-culled). occlusionCulled carries the last verdict.
+        uint64_t engineIbKey    = 0;
+        bool     occlusionCulled = false;
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
@@ -1528,6 +1537,11 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.isWater      = mesh.isWater;
     inst.isViewModel  = mesh.isViewModel;
 
+    // Occlusion key (2026-07-21): fold the engine IB identity into the same
+    // hash DrawCapture stamps on the draw side. 0 stays 0 (exempt).
+    inst.engineIbKey  = DrawCapture::EngineIbKey(
+        reinterpret_cast<const void*>(mesh.engineIbPtr), mesh.engineIbOffset);
+
     // Alpha-blend + alpha-test state for the OnFrame InstanceInfoBlendEXT
     // chain (only consumed when alphaBlendEnabled=true; the material was
     // built with useDrawCallAlphaState=1 in that case so the per-instance
@@ -2092,8 +2106,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t skippedChunkStale = 0;
     size_t skippedChunkFar = 0;
     size_t skippedViewModel = 0;
-    size_t skippedFrustum = 0;         // drawables in fully-culled buckets
-    size_t skippedFrustumBuckets = 0;  // whole buckets skipped
+    size_t skippedFrustum = 0;           // drawables in fully-culled buckets
+    size_t skippedFrustumBuckets = 0;    // whole buckets skipped (pure frustum)
+    size_t skippedOcclusion = 0;         // drawables in occlusion-culled buckets
+    size_t skippedOcclusionBuckets = 0;  // whole buckets skipped (occlusion)
     size_t vmDrawn = 0;
     {
         // Zone opens BEFORE the lock so lock-wait time shows inside it.
@@ -2181,6 +2197,62 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                            g_config.cullingFrustumKeepRadius;
             frustumCullActive = true;
         }
+
+        // Occlusion cull precompute (2026-07-21). The engine's own per-frame
+        // draw stream (captured by DrawCapture before raster suppression) is
+        // its visibility verdict: geometry it stopped drawing is occluded or
+        // engine-frustum-culled. We copy the "drawn recently" map once here
+        // (lock-free lookups below) and decide per drawable whether its
+        // engine-IB key has gone stale. Two hard fail-safes: (1) a key never
+        // seen is ABSENT from the map -> exempt, so a key-convention mismatch
+        // makes the feature inert, never wrong; (2) if the engine barely drew
+        // anything this frame (pause menu, load screen, UI-only), the whole
+        // pass is suspended so nothing mass-culls. Occlusion still respects
+        // the frustum keep radius -- geometry near the camera is never
+        // occlusion-culled, since it can show up in secondary rays.
+        // Copied on a cadence, not every OnFrame: the map can hold thousands
+        // of entries and copying it under lock every frame is real Remix-
+        // thread cost. A copy up to kVisSnapInterval frames stale is provably
+        // safe -- the interval is far below OcclusionStaleFrames, so a
+        // geometry the engine just redrew still reads as recent (age <
+        // interval < threshold) and is never wrongly culled; a cull is merely
+        // delayed a few frames. Persists across OnFrames on the Remix thread.
+        static thread_local std::unordered_map<uint64_t, uint32_t> s_visMap;
+        static thread_local uint32_t s_visFrame = 0;
+        static thread_local uint32_t s_visDrawCount = 0;
+        static thread_local uint32_t s_visSnapCountdown = 0;
+        constexpr uint32_t kVisSnapInterval = 4;
+        // Keep the draw-side stamping in lock-step with the config flag. Set
+        // unconditionally (cheap atomic) so the "was drawn" map is already
+        // warm by the time the cull below reads it, and stops accumulating
+        // the moment the feature is toggled off.
+        DrawCapture::SetOcclusionEnabled(g_config.cullingOcclusionEnabled);
+        bool  occlusionCullActive = false;
+        uint32_t occlStaleFrames = 0;
+        // Occlusion needs the keep sphere too; reuse the frustum radius (both
+        // are "the local neighborhood that matters to ray tracing").
+        float occlKeepRadiusSq = keepRadiusSq;
+        if (occlKeepRadiusSq <= 0.0f) {
+            occlKeepRadiusSq = g_config.cullingFrustumKeepRadius *
+                               g_config.cullingFrustumKeepRadius;
+        }
+        if (g_config.cullingOcclusionEnabled && cam.valid) {
+            if (s_visSnapCountdown == 0) {
+                DrawCapture::SnapshotVisible(s_visMap, s_visFrame, s_visDrawCount);
+                s_visSnapCountdown = kVisSnapInterval;
+            }
+            --s_visSnapCountdown;
+            // Scene-active gate: a real gameplay frame draws thousands of
+            // distinct index buffers. Well below that (menus, loads, the
+            // occlusion hook not yet warmed) means the "drawn" map is not a
+            // trustworthy visibility verdict -- suspend rather than mass-cull.
+            occlusionCullActive =
+                s_visDrawCount >= g_config.cullingOcclusionMinSceneDraws;
+            occlStaleFrames = g_config.cullingOcclusionStaleFrames;
+        } else {
+            s_visSnapCountdown = 0;  // re-snapshot immediately when re-enabled
+        }
+        const uint32_t visFrame = s_visFrame;
 
         struct DrawBucket {
             std::vector<DrawableInstance*> members;
@@ -2319,17 +2391,20 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     }
                 }
             }
-            // Frustum + keep-radius cull decision (2026-07-21; see the plane
-            // precompute above). Per-DRAWABLE decision recorded here, but the
-            // skip is applied per-BUCKET in the draw loop below -- see the
-            // all-or-nothing comment there for why (batched-draw identity
-            // hashing). Exemptions: viewmodels (own camera path), skinned
-            // (no valid bounds -- bones carry the placement), LOD chunks
-            // unless opted in (they ARE the horizon in reflections and the
-            // far cull already bounds them).
-            if (frustumCullActive && inst.hasBounds &&
+            // Frustum + occlusion cull decision (2026-07-21). Per-DRAWABLE
+            // decision recorded here; the skip is applied per-BUCKET in the
+            // draw loop below -- see the all-or-nothing comment there for why
+            // (batched-draw identity hashing). Shared exemptions: viewmodels
+            // (own camera path), skinned (no valid bounds -- bones carry the
+            // placement), LOD chunks unless opted in (they ARE the horizon in
+            // reflections and the far cull already bounds them). Both filters
+            // share one world-AABB build and one keep-sphere test.
+            inst.frustumCulled   = false;
+            inst.occlusionCulled = false;
+            const bool cullEligible = inst.hasBounds &&
                 !inst.isViewModel && !inst.isSkinned &&
-                (g_config.cullingFrustumLodChunks || !inst.isLODChunk)) {
+                (g_config.cullingFrustumLodChunks || !inst.isLODChunk);
+            if (cullEligible && (frustumCullActive || occlusionCullActive)) {
                 // Local AABB -> world-space center + extents through the
                 // live worldTransform (post-livePoses, so animated statics
                 // test their current pose).
@@ -2343,33 +2418,54 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     wc[r] = M[r][3] + M[r][0]*lc[0] + M[r][1]*lc[1] + M[r][2]*lc[2];
                     we[r] = fabsf(M[r][0])*le[0] + fabsf(M[r][1])*le[1] + fabsf(M[r][2])*le[2];
                 }
-                // Keep sphere: closest point on the world AABB to the
-                // camera within FrustumKeepRadius -> always rendered.
+                // Closest-point distance camera -> world AABB (shared keep
+                // sphere: geometry this near always renders regardless of
+                // view direction or engine-visibility, since it can show up
+                // in secondary rays).
                 const float gx = (std::max)(fabsf(cam.position[0] - wc[0]) - we[0], 0.0f);
                 const float gy = (std::max)(fabsf(cam.position[1] - wc[1]) - we[1], 0.0f);
                 const float gz = (std::max)(fabsf(cam.position[2] - wc[2]) - we[2], 0.0f);
-                if (gx * gx + gy * gy + gz * gz <= keepRadiusSq) {
-                    inst.frustumCulled = false;
-                } else {
-                    // Hysteresis: currently-culled entries test against the
-                    // tighter INNER set (re-enter early), visible entries
-                    // against the wider OUTER set (leave late).
-                    const CullPlane* planes = inst.frustumCulled ? cullInner
-                                                                 : cullOuter;
-                    bool outside = false;
-                    for (int p = 0; p < 5 && !outside; ++p) {
-                        const float dist = planes[p].nx * wc[0] +
-                                           planes[p].ny * wc[1] +
-                                           planes[p].nz * wc[2] + planes[p].d;
-                        const float rad  = fabsf(planes[p].nx) * we[0] +
-                                           fabsf(planes[p].ny) * we[1] +
-                                           fabsf(planes[p].nz) * we[2];
-                        if (dist < -rad) outside = true;
+                const float nearDistSq = gx * gx + gy * gy + gz * gz;
+
+                if (frustumCullActive) {
+                    if (nearDistSq <= keepRadiusSq) {
+                        inst.frustumCulled = false;
+                    } else {
+                        // Hysteresis: currently-culled entries test against
+                        // the tighter INNER set (re-enter early), visible
+                        // entries against the wider OUTER set (leave late).
+                        const CullPlane* planes = inst.frustumCulled ? cullInner
+                                                                     : cullOuter;
+                        bool outside = false;
+                        for (int p = 0; p < 5 && !outside; ++p) {
+                            const float dist = planes[p].nx * wc[0] +
+                                               planes[p].ny * wc[1] +
+                                               planes[p].nz * wc[2] + planes[p].d;
+                            const float rad  = fabsf(planes[p].nx) * we[0] +
+                                               fabsf(planes[p].ny) * we[1] +
+                                               fabsf(planes[p].nz) * we[2];
+                            if (dist < -rad) outside = true;
+                        }
+                        inst.frustumCulled = outside;
                     }
-                    inst.frustumCulled = outside;
                 }
-            } else {
-                inst.frustumCulled = false;
+
+                // Occlusion: the engine's own draw verdict for this geometry.
+                // A key drawn recently then gone stale (age past the
+                // threshold) is occluded/engine-culled; a key absent from the
+                // map was never drawn since submit -> EXEMPT (fail-safe: a
+                // key-convention mismatch can only under-cull). No plane
+                // hysteresis needed -- "drawn" is binary and authoritative, so
+                // age resets to 0 the instant the engine redraws it.
+                if (occlusionCullActive && inst.engineIbKey != 0 &&
+                    nearDistSq > occlKeepRadiusSq) {
+                    auto vit = s_visMap.find(inst.engineIbKey);
+                    if (vit != s_visMap.end()) {
+                        const uint32_t age = (visFrame > vit->second)
+                            ? (visFrame - vit->second) : 0;
+                        inst.occlusionCulled = age > occlStaleFrames;
+                    }
+                }
             }
             buckets[BucketKey{inst.meshHandle, vmCategoryTag && inst.isViewModel}]
                 .members.push_back(&inst);
@@ -2398,27 +2494,37 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         for (auto& [bucketKey, bucket] : buckets) {
             if (bucket.members.empty()) continue;
 
-            // Frustum cull, applied at BUCKET granularity: skip only when
-            // EVERY member is culled. The runtime folds the whole
-            // per-instance transform array (content AND order) into the
-            // batched-draw identity hash (computeExternalDrawIdentityHash),
-            // so submitting a batch minus its off-screen members would
-            // re-key the batch on every membership change -- a full
-            // processDrawCallState retranslation per affected bucket, every
-            // frame the camera turns (the exact CS-thread storm the
-            // preserve path exists to prevent). All-or-nothing keeps every
-            // identity byte-stable; a partially-visible batch rides along
-            // whole, costing only TLAS residency for its off-screen
-            // members. Fully-off-screen buckets (the common case behind
-            // the camera) drop out entirely.
-            if (frustumCullActive) {
+            // Frustum + occlusion cull, applied at BUCKET granularity: skip
+            // only when EVERY member is culled (by frustum OR occlusion). The
+            // runtime folds the whole per-instance transform array (content
+            // AND order) into the batched-draw identity hash
+            // (computeExternalDrawIdentityHash), so submitting a batch minus
+            // its off-screen members would re-key the batch on every
+            // membership change -- a full processDrawCallState retranslation
+            // per affected bucket, every frame the camera turns (the exact
+            // CS-thread storm the preserve path exists to prevent).
+            // All-or-nothing keeps every identity byte-stable; a
+            // partially-visible batch rides along whole, costing only TLAS
+            // residency for its off-screen members. Fully-hidden buckets (the
+            // common case behind the camera or behind a wall) drop entirely.
+            if (frustumCullActive || occlusionCullActive) {
                 bool allCulled = true;
+                bool allFrustum = true;  // attribution: pure-frustum vs occl
                 for (const DrawableInstance* m : bucket.members) {
-                    if (!m->frustumCulled) { allCulled = false; break; }
+                    if (!m->frustumCulled && !m->occlusionCulled) {
+                        allCulled = false;
+                        break;
+                    }
+                    if (!m->frustumCulled) allFrustum = false;
                 }
                 if (allCulled) {
-                    skippedFrustum += bucket.members.size();
-                    ++skippedFrustumBuckets;
+                    if (allFrustum) {
+                        skippedFrustum += bucket.members.size();
+                        ++skippedFrustumBuckets;
+                    } else {
+                        skippedOcclusion += bucket.members.size();
+                        ++skippedOcclusionBuckets;
+                    }
                     // Keep skipped members' resources LRU-live at a spread
                     // cadence (~1/60 of members per frame; grace is 600, and
                     // 75 under pressure-tightening, so 60 clears both). A
@@ -2741,13 +2847,14 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                                                  &activeStats, nullptr);
         _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu "
                  "skippedChunkPlayerInside=%zu skippedChunkStale=%zu skippedChunkFar=%zu chunks=%zu "
-                 "skippedFrustum=%zu (%zu buckets) "
+                 "skippedFrustum=%zu (%zu buckets) skippedOccl=%zu (%zu buckets) "
                  "vmDrawn=%zu skippedVM=%zu "
                  "active=%u isLod=%u fadedIn=%u notVisible=%u lodFadingOut=%u forcedFadeOut=%u "
                  "player=(%.0f,%.0f,%.0f)",
                  drawableCount, bucketCount, batchedBucketCount, skippedInactive,
                  skippedChunkPlayerInside, skippedChunkStale, skippedChunkFar, lodChunkAges.size(),
                  skippedFrustum, skippedFrustumBuckets,
+                 skippedOcclusion, skippedOcclusionBuckets,
                  vmDrawn, skippedViewModel,
                  activeStats.total, activeStats.isLod, activeStats.fadedIn,
                  activeStats.notVisible, activeStats.lodFadingOut, activeStats.forcedFadeOut,

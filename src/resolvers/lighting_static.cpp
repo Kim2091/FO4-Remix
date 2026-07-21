@@ -1788,6 +1788,11 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     mesh.hash = hash;
     mesh.vertices = std::move(parsed.vertices);
     mesh.indices  = std::move(parsed.indices);
+    // Occlusion key (engine IB identity). Merge-baked meshes take a
+    // different build path (below) and never reach here, so they keep the
+    // default 0 = exempt.
+    mesh.engineIbPtr    = parsed.engineIbPtr;
+    mesh.engineIbOffset = parsed.engineIbOffset;
     SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
     BsExtraction::ExtractAlphaState(tri, mesh);
 

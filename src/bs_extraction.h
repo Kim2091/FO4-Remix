@@ -146,6 +146,12 @@ struct ExtractedMesh {
     uint32_t boneCount = 0;
     std::vector<float>    blendWeights;
     std::vector<uint32_t> blendIndices;
+
+    // Engine index-buffer identity for the occlusion signal (2026-07-21).
+    // 0 = no key captured (merge-baked meshes, water, fallbacks) -> the
+    // drawable is EXEMPT from occlusion culling. See DrawCapture::EngineIbKey.
+    uint64_t engineIbPtr    = 0;
+    uint32_t engineIbOffset = 0;
 };
 
 struct CellInfo {
@@ -243,6 +249,12 @@ struct ParsedGeometry {
     bool hasSkinning = false;
     std::vector<float>    blendWeights;   // numVertices * 4
     std::vector<uint32_t> blendIndices;   // numVertices * 4 (u8 widened)
+
+    // Engine index-buffer identity for the occlusion signal (2026-07-21):
+    // (D3D11 IB pointer, byte offset) the engine binds to draw this shape.
+    // Carried snapshot -> parsed -> ExtractedMesh -> DrawableInstance.
+    uint64_t engineIbPtr    = 0;
+    uint32_t engineIbOffset = 0;
 };
 
 // Forward declarations for F4SE types used in shared function signatures

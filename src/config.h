@@ -253,6 +253,28 @@ struct PluginConfig {
     // already bound their cost. Opt-in for max TLAS savings.
     bool     cullingFrustumLodChunks;    // default false
 
+    // Occlusion culling (2026-07-21). The engine still issues every scene
+    // draw each frame (we swallow them at the D3D11 hooks after observing),
+    // and FO4's previs occlusion is CPU-side, so the surviving draw stream
+    // is the engine's per-frame visibility verdict. OnFrame skips a
+    // drawable whose captured engine index-buffer key was drawn recently
+    // then went stale (occluded or engine-frustum-culled), reusing the
+    // frustum keep radius so nearby geometry is never occlusion-culled.
+    // Fail-safe: a drawable whose key was never observed (convention
+    // mismatch, unhooked draw path, merge-baked mesh) stays exempt, so the
+    // filter can only ever under-cull. Shares the frustum's exemptions +
+    // keep radius + all-or-nothing bucket skip.
+    bool     cullingOcclusionEnabled;    // default true
+    // Frames a geometry's engine draw must be absent before its bucket is
+    // culled. Higher = more conservative (later cull, less flicker risk on
+    // brief occlusions); lower = more aggressive.
+    uint32_t cullingOcclusionStaleFrames;  // default 30 (~0.5s @60fps)
+    // Scene-active floor: a real gameplay frame draws at least this many
+    // distinct index buffers. Below it (menus, load screens, UI-only, hook
+    // not yet warm) the draw map is not a trustworthy verdict and occlusion
+    // is suspended for the frame so nothing mass-culls.
+    uint32_t cullingOcclusionMinSceneDraws; // default 500
+
     // [Materials]
     // Spec-gloss -> metal-rough conversion for FO4 environment-mapped
     // materials (2026-07-02, take 2). FO4 authors metal albedo near-black;

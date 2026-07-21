@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 
 struct ID3D11DeviceContext;
@@ -123,5 +124,48 @@ struct ChunkDraw {
 // while the watch's SRV was verified live at t8). Returns the count
 // copied into out (0 = none captured).
 int GetChunks(uint64_t key, ChunkDraw* out, int maxOut);
+
+// ---------------------------------------------------------------------------
+// Occlusion signal (2026-07-21). The engine still ISSUES every scene draw
+// each frame (we swallow them at the D3D11 hooks via RasterSuppress after
+// observing), and FO4's previs occlusion + frustum culling is CPU-side, so
+// the surviving draw stream IS the engine's per-frame visibility verdict for
+// exactly the geometry it decided to render. We key each draw by its bound
+// index buffer identity -- run-5 [DrawWin] proved the engine selects
+// geometry via the IASetIndexBuffer OFFSET (StartIndexLocation stays 0), so
+// (ID3D11Buffer*, byte offset) uniquely tags a shape's slice of a shared
+// pool. OnFrame compares each submitted drawable's captured key against this
+// per-frame "was drawn" set: a key that was drawn recently then stopped is
+// occluded (or engine-frustum-culled), and its bucket can leave the TLAS.
+//
+// Fail-safe by construction: a key NEVER seen (convention mismatch, or a
+// draw path we don't hook) is absent from the map and stays EXEMPT, so a
+// wrong guess only makes the feature do nothing -- it never culls something
+// the engine is drawing.
+
+// Shared key formula -- MUST match between the draw-side stamp and the
+// submit-side capture. 0 is reserved for "no key" (exempt).
+inline uint64_t EngineIbKey(const void* ib, uint32_t offset) {
+    if (!ib) return 0;
+    uint64_t h = reinterpret_cast<uintptr_t>(ib);
+    h ^= (uint64_t)offset * 0x9E3779B97F4A7C15ull;
+    h *= 0xD6E8FEB86659FD93ull;
+    h ^= h >> 32;
+    return h ? h : 1;
+}
+
+// Master gate. Cheap atomic; set from OnFrame each frame off the config
+// flag so there is no init-ordering dependency. While false the draw hooks
+// skip all visibility bookkeeping (one relaxed load per draw).
+void SetOcclusionEnabled(bool enabled);
+
+// Copy the published "drawn recently" map for the Remix thread to read
+// lock-free. `outFrame` receives the present-frame counter the ages are
+// measured against; `outLastFrameDrawCount` receives how many distinct keys
+// the engine drew on the most recent published frame -- OnFrame treats a
+// near-zero count as "scene not actively rendering" (pause/menu/load) and
+// suspends occlusion culling that frame so nothing mass-culls.
+void SnapshotVisible(std::unordered_map<uint64_t, uint32_t>& out,
+                     uint32_t& outFrame, uint32_t& outLastFrameDrawCount);
 
 }  // namespace DrawCapture
