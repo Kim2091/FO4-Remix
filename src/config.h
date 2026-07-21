@@ -226,7 +226,10 @@ struct PluginConfig {
     // the chunk ORIGIN to sit a fixed slack (~5 cells, internal constant)
     // past the camera plane -- a plain hemisphere test would despawn chunks
     // whose far edge still reaches into peripheral view.
-    float    cullingForceEvictLodBehindDistance; // game units, default 12000 (~3 cells)
+    // DEFAULT OFF (field verdict 2026-07-20: turn-around horizon re-stream
+    // is visually detrimental) -- an opt-in VRAM lever for low-end cards;
+    // 12000 is the recommended on-value.
+    float    cullingForceEvictLodBehindDistance; // game units, default 0 (off)
 
     // [Materials]
     // Spec-gloss -> metal-rough conversion for FO4 environment-mapped
