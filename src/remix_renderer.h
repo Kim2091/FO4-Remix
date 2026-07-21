@@ -85,12 +85,23 @@ namespace RemixRenderer {
     void ReleaseDrawable(uint64_t hash);
 
     // Ask the next OnFrame to destroy every parked handle. Called from the
-    // PreLoadGame message: under [Performance] DeferHandleDestroyToLoad the
-    // load screen is the ONLY time parked destroys run (the runtime is
-    // quiescent there; mid-gameplay destroys are the live suspect for the
-    // AV-inside-CreateMesh session killer). Thread-safe, callable from the
-    // game thread.
+    // PreLoadGame message and -- since 2026-07-20 -- from the VRAM-pressure
+    // sweep: under [Performance] DeferHandleDestroyToLoad parked destroys
+    // normally wait for a load screen (the runtime is quiescent there;
+    // mid-gameplay destroys are the live suspect for the AV-inside-
+    // CreateMesh session killer), but parked handles HOLD their VRAM, so on
+    // a long no-load wander the pressure tiers were releasing thousands of
+    // drawables without returning a byte -- the driver budget ratcheted to
+    // the ceiling and the 90% resolve gate shut new geometry off for the
+    // rest of the session. The drain itself always executes at OnFrame's
+    // top-of-frame safe point (both locks held, previous Present returned)
+    // regardless of who requested it. Thread-safe, callable from the game
+    // thread.
     void RequestDestroyDrain();
+
+    // Current parked-destroy handle count (atomic mirror; approximate).
+    // Lets the pressure sweep skip pointless drain requests.
+    size_t PendingDestroyCount();
 
     // Bytes handed to the runtime by SubmitDrawable since the last reset:
     // CreateTexture pixel chains + CreateMesh vertex/index data. Every one

@@ -598,6 +598,10 @@ void RemixRenderer::RequestDestroyDrain() {
     g_destroyDrainRequested.store(true, std::memory_order_release);
 }
 
+size_t RemixRenderer::PendingDestroyCount() {
+    return g_pendingDestroyCount.load(std::memory_order_relaxed);
+}
+
 void RemixRenderer::ResetUploadBytesTick() {
     g_uploadBytesTick.store(0, std::memory_order_relaxed);
 }

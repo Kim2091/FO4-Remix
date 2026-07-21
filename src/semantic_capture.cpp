@@ -2368,15 +2368,35 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 }
             }
 
+            // Drain request (2026-07-20 evening, VRAM-ratchet fix): parking
+            // RELEASES handles but with DeferHandleDestroyToLoad=1 they sit
+            // on the parked-destroy list still holding their VRAM until a
+            // load screen -- on a long no-load wander the sweep parked
+            // thousands of drawables while the driver budget kept climbing,
+            // the 90% resolve gate closed, and no new geometry could load
+            // for the rest of the session. While actually reclaiming under
+            // pressure (or still above the hysteresis-clear threshold with
+            // a meaningful parked backlog), ask OnFrame to run the drain --
+            // same top-of-frame safe point as the load-screen drain, so the
+            // mid-gameplay-destroy deferral still holds for normal play.
+            bool drainRequested = false;
+            if ((pressureParkedNow || pressureEvicted || overPct(clearPct)) &&
+                RemixRenderer::PendingDestroyCount() >= 64) {
+                RemixRenderer::RequestDestroyDrain();
+                drainRequested = true;
+            }
+
             if (pressureParkedNow || pressureUnparked || pressureEvicted ||
                 overPct(viewPct)) {
                 _MESSAGE("FO4RemixPlugin: [SemCapture] PRESSURE vram=%llu/%llu MiB "
                          "parked=%u (viewCandidates=%zu, >%u%%) unparked=%u "
-                         "evictedOldest=%u (>%u%%)",
+                         "evictedOldest=%u (>%u%%) drainReq=%d pendingDestroys=%zu",
                          (unsigned long long)vramUsedMiB,
                          (unsigned long long)vramBudgetMiB,
                          pressureParkedNow, viewCandidates, viewPct,
-                         pressureUnparked, pressureEvicted, oldestPct);
+                         pressureUnparked, pressureEvicted, oldestPct,
+                         drainRequested ? 1 : 0,
+                         RemixRenderer::PendingDestroyCount());
             }
         }
         evicted += pressureEvicted;
