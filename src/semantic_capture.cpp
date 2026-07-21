@@ -2045,6 +2045,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     uint32_t evicted = 0;
     uint32_t submittedCount = 0;
     uint32_t pendingCount = 0;
+    uint32_t parkedCount = 0;
     size_t   unique  = 0;
     size_t   distinctGeoPtrs = 0;
     size_t   entriesWithGeo = 0;
@@ -2136,30 +2137,69 @@ void SemanticCapture::Tick(ID3D11Device* device) {
 
             const CameraState cam = Camera::Get();
             const float minDist = g_config.cullingForceEvictBehindDistance;
-            // Behind the camera (rear hemisphere) AND farther than minDist.
-            // Both liveWorldTransform and CameraState are Remix coords.
-            const auto behindAndFar = [&](const SemanticCapture::DrawableState& st,
-                                          float* dist2Out) {
-                if (!cam.valid || !st.liveTransformValid) return false;
+            const float alwaysDist = g_config.cullingForceEvictAlwaysBehindDistance;
+            const float lodDist = g_config.cullingForceEvictLodBehindDistance;
+            const float minDist2 = minDist * minDist;
+            const float alwaysDist2 = alwaysDist * alwaysDist;
+            const float lodDist2 = lodDist * lodDist;
+            // LOD chunks are multi-cell meshes and the map has no per-entry
+            // extent, so their behind test needs the chunk ORIGIN a fixed
+            // slack past the camera plane (a plain hemisphere test despawns
+            // chunks whose far edge still reaches peripheral view). Un-park
+            // at half the slack for hysteresis.
+            constexpr float kLodBehindSlackPark   = 20000.0f;  // ~5 cells
+            constexpr float kLodBehindSlackUnpark = 10000.0f;
+
+            // Camera-relative probe. Both liveWorldTransform and CameraState
+            // are Remix coords.
+            struct ViewProbe { bool valid; float proj; float d2; };
+            const auto probe = [&](const SemanticCapture::DrawableState& st) -> ViewProbe {
+                if (!cam.valid || !st.liveTransformValid) return { false, 0.0f, 0.0f };
                 const float dx = st.liveWorldTransform[0][3] - cam.position[0];
                 const float dy = st.liveWorldTransform[1][3] - cam.position[1];
                 const float dz = st.liveWorldTransform[2][3] - cam.position[2];
                 const float proj = dx * cam.forward[0] + dy * cam.forward[1] +
                                    dz * cam.forward[2];
-                const float d2 = dx * dx + dy * dy + dz * dz;
-                if (dist2Out) *dist2Out = d2;
-                return proj < 0.0f && d2 > minDist * minDist;
+                return { true, proj, dx * dx + dy * dy + dz * dz };
+            };
+            // Park classification, with an angular hysteresis margin: PARK
+            // requires ~6 degrees past the 90-degree plane (proj < -0.1*dist,
+            // tested squared), while un-park triggers on any front-hemisphere
+            // reading (proj >= 0) -- otherwise an object sitting exactly
+            // abeam would flap park/release every sweep as the camera
+            // jitters, churning resolve + texture uploads.
+            //   0 = not parkable, 1 = pressure tier (behind + minDist),
+            //   2 = always tier (behind + alwaysDist, no VRAM gate).
+            const auto parkClass = [&](const ViewProbe& p) -> int {
+                if (!p.valid) return 0;
+                if (p.proj >= 0.0f || p.proj * p.proj < 0.01f * p.d2) return 0;
+                if (alwaysDist > 0.0f && p.d2 > alwaysDist2) return 2;
+                if (p.d2 > minDist2) return 1;
+                return 0;
             };
 
             // Un-park pass first: camera turned around, entry got close, or
-            // pressure dropped below (viewPct - 5). The resolver's
-            // nearest-in-view-first ranking then restores what the player is
-            // actually looking at before the rest.
+            // (pressure tier only) usage dropped below (viewPct - 5). The
+            // always tier holds parked regardless of pressure while the
+            // entry stays behind + ultra-far. The resolver's nearest-in-
+            // view-first ranking then restores what the player is actually
+            // looking at before the rest.
             const uint32_t clearPct = (viewPct > 5) ? (viewPct - 5) : viewPct;
             const bool pressureCleared = !overPct(clearPct);
             for (auto& [key, st] : g_drawableMap) {
                 if (!st.pressureParked) continue;
-                if (pressureCleared || !behindAndFar(st, nullptr)) {
+                const ViewProbe p = probe(st);
+                bool stayParked = p.valid && p.proj < 0.0f &&
+                    ((alwaysDist > 0.0f && p.d2 > alwaysDist2) ||
+                     (!pressureCleared && p.d2 > minDist2));
+                // LOD tier holds parked (no VRAM gate) while the chunk
+                // origin stays behind by the un-park slack.
+                if (!stayParked && p.valid && lodDist > 0.0f &&
+                    p.proj < -kLodBehindSlackUnpark && p.d2 > lodDist2 &&
+                    g_lodChunkKeys.count(key) != 0) {
+                    stayParked = true;
+                }
+                if (!stayParked) {
                     st.pressureParked = false;
                     ++pressureUnparked;
                 }
@@ -2169,8 +2209,11 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             if (cap == 0) cap = 512;
             size_t viewCandidates = 0;
 
-            // Tier 1: park behind+far, furthest first.
-            if (overPct(viewPct)) {
+            // Park pass: the always tier (behind + ultra-far) collects with
+            // no VRAM gate; the pressure tier (behind + minDist) only while
+            // over the view threshold. Furthest first either way.
+            const bool viewPressure = overPct(viewPct);
+            if (viewPressure || alwaysDist > 0.0f || lodDist > 0.0f) {
                 std::vector<std::pair<float, PassKey>> byDist;  // (dist2, key)
                 byDist.reserve(256);
                 for (const auto& [key, st] : g_drawableMap) {
@@ -2183,9 +2226,18 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                     if (key == g_pipboyScreenKey) continue;
                     if (st.hasLiveTexture) continue;
                     if (g_skinnedKeys.count(key)) continue;
-                    float d2 = 0.0f;
-                    if (!behindAndFar(st, &d2)) continue;
-                    byDist.emplace_back(d2, key);
+                    const ViewProbe p = probe(st);
+                    int cls = parkClass(p);
+                    // Tier 3: worldspace LOD chunk, behind by the full park
+                    // slack, beyond lodDist -- no VRAM gate.
+                    if (cls != 2 && p.valid && lodDist > 0.0f &&
+                        p.proj < -kLodBehindSlackPark && p.d2 > lodDist2 &&
+                        g_lodChunkKeys.count(key) != 0) {
+                        cls = 3;
+                    }
+                    if (cls == 0) continue;
+                    if (cls == 1 && !viewPressure) continue;
+                    byDist.emplace_back(p.d2, key);
                 }
                 viewCandidates = byDist.size();
                 const size_t take = (std::min)(static_cast<size_t>(cap), byDist.size());
@@ -2279,7 +2331,13 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 it = evictEntry(it);
                 ++evicted;
             } else {
-                if (it->second.submittedToRemix) {
+                if (it->second.pressureParked) {
+                    // Parked entries hold no Remix resources and are
+                    // resolver-skipped -- counting them as "pending" would
+                    // skew the per-gate breakdown (they'd all land in
+                    // notResolved).
+                    ++parkedCount;
+                } else if (it->second.submittedToRemix) {
                     ++submittedCount;
                 } else {
                     ++pendingCount;
@@ -2325,11 +2383,11 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     const size_t geoDups = (entriesWithGeo > distinctGeoPtrs)
         ? (entriesWithGeo - distinctGeoPtrs) : 0;
     _MESSAGE("FO4RemixPlugin: [SemCapture] uniqueDrawables=%zu totalFires=%llu "
-             "evictedThisSweep=%u submitted=%u pending=%u "
+             "evictedThisSweep=%u submitted=%u pending=%u parked=%u "
              "distinctGeoPtrs=%zu entriesWithGeo=%zu geoDups=%zu",
              unique,
              (unsigned long long)g_totalFires.load(std::memory_order_relaxed),
-             evicted, submittedCount, pendingCount,
+             evicted, submittedCount, pendingCount, parkedCount,
              distinctGeoPtrs, entriesWithGeo, geoDups);
 
     _MESSAGE("FO4RemixPlugin: [SemCapture] pendingByGate "

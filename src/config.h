@@ -215,6 +215,18 @@ struct PluginConfig {
     uint32_t cullingForceEvictViewPct;       // default 60 (field-validated 2026-07-20:
                                              // steadier fps, no visible downside); 0 = off
     float    cullingForceEvictBehindDistance; // game units, default 8000 (~2 cells)
+    // Behind-camera drawables beyond THIS distance park unconditionally --
+    // no VRAM threshold. Ultra-far restores are rare and visually invisible
+    // (tiny on screen, horizon covered by LOD chunks), so keeping them
+    // resident buys nothing. 0 = off.
+    float    cullingForceEvictAlwaysBehindDistance; // game units, default 40000 (~10 cells)
+    // Worldspace LOD chunks park unconditionally when behind the camera
+    // beyond THIS distance (0 = off). Chunks are multi-cell meshes with no
+    // per-entry extent in the capture map, so "behind" additionally requires
+    // the chunk ORIGIN to sit a fixed slack (~5 cells, internal constant)
+    // past the camera plane -- a plain hemisphere test would despawn chunks
+    // whose far edge still reaches into peripheral view.
+    float    cullingForceEvictLodBehindDistance; // game units, default 12000 (~3 cells)
 
     // [Materials]
     // Spec-gloss -> metal-rough conversion for FO4 environment-mapped

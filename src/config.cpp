@@ -173,7 +173,9 @@ void LoadConfig() {
     g_config.cullingForceEvictPerSweep     = GetIniUInt("Culling", "ForceEvictPerSweep",     512, dllPath);
     g_config.cullingForceEvictViewPct      = GetIniUInt("Culling", "ForceEvictViewPct",      60,  dllPath);
     g_config.cullingForceEvictBehindDistance = GetIniFloat("Culling", "ForceEvictBehindDistance", 8000.0f, dllPath);
-    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u LodChunkFarExtentRatio=%.1f ForceEvictVramPct=%u ForceEvictPerSweep=%u ForceEvictViewPct=%u ForceEvictBehindDistance=%.0f",
+    g_config.cullingForceEvictAlwaysBehindDistance = GetIniFloat("Culling", "ForceEvictAlwaysBehindDistance", 40000.0f, dllPath);
+    g_config.cullingForceEvictLodBehindDistance = GetIniFloat("Culling", "ForceEvictLodBehindDistance", 12000.0f, dllPath);
+    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u LodChunkFarExtentRatio=%.1f ForceEvictVramPct=%u ForceEvictPerSweep=%u ForceEvictViewPct=%u ForceEvictBehindDistance=%.0f ForceEvictAlwaysBehindDistance=%.0f ForceEvictLodBehindDistance=%.0f",
              g_config.cullingTextureLRUGraceFrames,
              g_config.cullingTextureLRUSweepPeriod,
              g_config.cullingTextureBudgetMiB,
@@ -183,7 +185,9 @@ void LoadConfig() {
              g_config.cullingForceEvictVramPct,
              g_config.cullingForceEvictPerSweep,
              g_config.cullingForceEvictViewPct,
-             g_config.cullingForceEvictBehindDistance);
+             g_config.cullingForceEvictBehindDistance,
+             g_config.cullingForceEvictAlwaysBehindDistance,
+             g_config.cullingForceEvictLodBehindDistance);
 
     // [Materials]
     g_config.metalConversionEnabled = GetIniBool("Materials", "MetalConversionEnabled", true, dllPath);
