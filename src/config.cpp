@@ -175,7 +175,11 @@ void LoadConfig() {
     g_config.cullingForceEvictBehindDistance = GetIniFloat("Culling", "ForceEvictBehindDistance", 8000.0f, dllPath);
     g_config.cullingForceEvictAlwaysBehindDistance = GetIniFloat("Culling", "ForceEvictAlwaysBehindDistance", 40000.0f, dllPath);
     g_config.cullingForceEvictLodBehindDistance = GetIniFloat("Culling", "ForceEvictLodBehindDistance", 0.0f, dllPath);
-    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u LodChunkFarExtentRatio=%.1f ForceEvictVramPct=%u ForceEvictPerSweep=%u ForceEvictViewPct=%u ForceEvictBehindDistance=%.0f ForceEvictAlwaysBehindDistance=%.0f ForceEvictLodBehindDistance=%.0f",
+    g_config.cullingFrustumEnabled      = GetIniBool("Culling",  "FrustumCull",          true,    dllPath);
+    g_config.cullingFrustumKeepRadius   = GetIniFloat("Culling", "FrustumKeepRadius",    8192.0f, dllPath);
+    g_config.cullingFrustumFovMarginDeg = GetIniFloat("Culling", "FrustumFovMarginDeg",  12.0f,   dllPath);
+    g_config.cullingFrustumLodChunks    = GetIniBool("Culling",  "FrustumCullLodChunks", false,   dllPath);
+    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u LodChunkFarExtentRatio=%.1f ForceEvictVramPct=%u ForceEvictPerSweep=%u ForceEvictViewPct=%u ForceEvictBehindDistance=%.0f ForceEvictAlwaysBehindDistance=%.0f ForceEvictLodBehindDistance=%.0f FrustumCull=%d FrustumKeepRadius=%.0f FrustumFovMarginDeg=%.1f FrustumCullLodChunks=%d",
              g_config.cullingTextureLRUGraceFrames,
              g_config.cullingTextureLRUSweepPeriod,
              g_config.cullingTextureBudgetMiB,
@@ -187,7 +191,11 @@ void LoadConfig() {
              g_config.cullingForceEvictViewPct,
              g_config.cullingForceEvictBehindDistance,
              g_config.cullingForceEvictAlwaysBehindDistance,
-             g_config.cullingForceEvictLodBehindDistance);
+             g_config.cullingForceEvictLodBehindDistance,
+             g_config.cullingFrustumEnabled,
+             g_config.cullingFrustumKeepRadius,
+             g_config.cullingFrustumFovMarginDeg,
+             g_config.cullingFrustumLodChunks);
 
     // [Materials]
     g_config.metalConversionEnabled = GetIniBool("Materials", "MetalConversionEnabled", true, dllPath);

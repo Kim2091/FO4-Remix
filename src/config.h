@@ -231,6 +231,28 @@ struct PluginConfig {
     // 12000 is the recommended on-value.
     float    cullingForceEvictLodBehindDistance; // game units, default 0 (off)
 
+    // Frustum culling (2026-07-21). OnFrame skips DrawInstance for
+    // drawables whose world-space AABB (mesh-local bounds x live transform)
+    // sits fully outside a margin-expanded view frustum AND beyond
+    // FrustumKeepRadius of the camera. Path-tracer-aware: everything within
+    // the keep radius renders regardless of view direction, so nearby
+    // off-screen geometry still contributes shadows/reflections/GI. Skipped
+    // drawables keep all Remix handles warm (nothing released -- distinct
+    // from the parking tiers above); the win is a smaller TLAS and fewer
+    // BLAS builds. Multi-member GPU-instanced buckets skip all-or-nothing
+    // so the runtime's batched-draw identity hash never churns.
+    bool     cullingFrustumEnabled;      // default true
+    float    cullingFrustumKeepRadius;   // game units, default 8192 (~2 cells)
+    // Guard band added to each frustum half-angle for the cull boundary;
+    // re-entry tests at half this margin (angular hysteresis, so edge
+    // jitter can't flap the decision). Raise if reflective surfaces show
+    // popping at the screen edge.
+    float    cullingFrustumFovMarginDeg; // default 12
+    // LOD chunks are exempt by default: they ARE the horizon in
+    // reflections (water especially), and the far cull + parking tiers
+    // already bound their cost. Opt-in for max TLAS savings.
+    bool     cullingFrustumLodChunks;    // default false
+
     // [Materials]
     // Spec-gloss -> metal-rough conversion for FO4 environment-mapped
     // materials (2026-07-02, take 2). FO4 authors metal albedo near-black;

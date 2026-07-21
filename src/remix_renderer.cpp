@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>    // sinf/cosf/tanf/atanf (OnFrame frustum-cull plane build)
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -449,6 +450,19 @@ namespace {
         // model-space -- drawn boneless they'd T-pose at the world origin).
         bool                            isSkinned = false;
         std::vector<remixapi_Transform> boneTransforms;
+
+        // Frustum cull (2026-07-21). Mesh-local AABB copied from the mesh
+        // cache at submit; hasBounds false for skinned meshes (bind-pose
+        // bounds test the wrong spot -- bones carry the placement).
+        float boundMin[3] = {};
+        float boundMax[3] = {};
+        bool  hasBounds   = false;
+        // Per-drawable cull state for angular hysteresis: a culled entry
+        // re-enters through a TIGHTER (but still wider-than-view) frustum
+        // than the one that culled it, so camera jitter at the edge can't
+        // flap the decision frame-to-frame. Consumed at BUCKET granularity
+        // in the draw loop (see the all-or-nothing comment there).
+        bool  frustumCulled = false;
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
@@ -463,6 +477,15 @@ namespace {
     struct MeshRef {
         remixapi_MeshHandle handle;
         uint32_t            refCount;
+        // Mesh-local AABB over the uploaded vertex array (frustum cull,
+        // 2026-07-21). Computed once on the cache-miss path and copied to
+        // every DrawableInstance that shares the handle. hasBounds stays
+        // false for skinned meshes: their verts are bind-pose model space
+        // and the bones carry the world placement, so a transformed bind
+        // AABB would test the wrong location.
+        float boundMin[3] = {};
+        float boundMax[3] = {};
+        bool  hasBounds   = false;
     };
     std::unordered_map<MeshCacheKey, MeshRef, MeshCacheKeyHash> g_meshCache;
 
@@ -1380,6 +1403,11 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     if (cacheIt != g_meshCache.end()) {
         cacheIt->second.refCount++;
         meshHandle = cacheIt->second.handle;
+        if (cacheIt->second.hasBounds) {
+            memcpy(inst.boundMin, cacheIt->second.boundMin, sizeof(inst.boundMin));
+            memcpy(inst.boundMax, cacheIt->second.boundMax, sizeof(inst.boundMax));
+            inst.hasBounds = true;
+        }
     } else {
         // Cache miss -- create a new Remix mesh handle. The runtime stores the
         // surface material on this immutable, hash-valued handle, so hash the
@@ -1452,7 +1480,30 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         // of this same content (see CancelParkedHandle).
         CancelParkedHandle(g_pendingDestroys.meshes, meshHandle);
         EraseParkedHandle(g_eagerPendingDestroys.meshes, meshHandle);
-        g_meshCache[meshKey] = { meshHandle, 1 };
+        MeshRef ref{};
+        ref.handle   = meshHandle;
+        ref.refCount = 1;
+        if (!mesh.hasSkinning) {
+            // O(verts) min/max, once per unique mesh -- noise next to the
+            // upload memcpy the runtime just did for the same array.
+            float mn[3] = {  3.4e38f,  3.4e38f,  3.4e38f };
+            float mx[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+            for (const remixapi_HardcodedVertex& v : mesh.vertices) {
+                for (int i = 0; i < 3; ++i) {
+                    mn[i] = (std::min)(mn[i], v.position[i]);
+                    mx[i] = (std::max)(mx[i], v.position[i]);
+                }
+            }
+            memcpy(ref.boundMin, mn, sizeof(mn));
+            memcpy(ref.boundMax, mx, sizeof(mx));
+            ref.hasBounds = true;
+        }
+        if (ref.hasBounds) {
+            memcpy(inst.boundMin, ref.boundMin, sizeof(inst.boundMin));
+            memcpy(inst.boundMax, ref.boundMax, sizeof(inst.boundMax));
+            inst.hasBounds = true;
+        }
+        g_meshCache[meshKey] = ref;
         g_uploadBytesTick.fetch_add(
             mesh.vertices.size() * sizeof(remixapi_HardcodedVertex) +
             mesh.indices.size() * sizeof(uint32_t) +
@@ -2041,6 +2092,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t skippedChunkStale = 0;
     size_t skippedChunkFar = 0;
     size_t skippedViewModel = 0;
+    size_t skippedFrustum = 0;         // drawables in fully-culled buckets
+    size_t skippedFrustumBuckets = 0;  // whole buckets skipped
     size_t vmDrawn = 0;
     {
         // Zone opens BEFORE the lock so lock-wait time shows inside it.
@@ -2058,6 +2111,76 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         // directly from the player ref's pos at +0xD0).
         const float playerX = cam.playerWorldPos[0];
         const float playerY = cam.playerWorldPos[1];
+
+        // Frustum + keep-radius cull precompute (2026-07-21). Rationale: in
+        // a path tracer, off-screen geometry still matters (shadows,
+        // reflections, GI from behind the camera), so a classic frustum cull
+        // would visibly break lighting. Split the difference: everything
+        // within FrustumKeepRadius of the camera renders regardless of view
+        // direction (the local neighborhood that actually shows up in
+        // secondary rays), and only OUTSIDE that sphere do we drop
+        // drawables whose world AABB sits fully outside a margin-expanded
+        // view frustum. Skipped drawables keep every Remix handle warm --
+        // unlike the pressure-parking tiers nothing is released, so
+        // re-entry on a camera turn costs one DrawInstance, not a
+        // re-resolve. The win is a smaller TLAS (fewer instances every ray
+        // traverses) and fewer BLAS builds for off-screen streaming.
+        //
+        // Two plane sets for angular hysteresis: the OUTER set (half-angles
+        // + full margin) flips visible->culled; the INNER set (+half
+        // margin) flips culled->visible. Between the boundaries an entry
+        // keeps its previous state, so edge jitter can't flap bucket
+        // membership (same idea as the pressure-parking angular margin).
+        // Both sets are wider than the real frustum -- nothing on screen is
+        // ever culled. 5 planes each: near + 4 sides; a far plane is
+        // deliberately absent (distance is the far-cull / parking tiers'
+        // job).
+        struct CullPlane { float nx, ny, nz, d; };
+        CullPlane cullOuter[5], cullInner[5];
+        bool frustumCullActive = false;
+        float keepRadiusSq = 0.0f;
+        if (g_config.cullingFrustumEnabled && cam.valid && cam.fovY > 1.0f) {
+            const float kDegToRad = 3.14159265358979323846f / 180.0f;
+            const float halfV0 = 0.5f * cam.fovY * kDegToRad;
+            const float aspect = (cam.aspectRatio > 0.01f) ? cam.aspectRatio
+                                                           : (16.0f / 9.0f);
+            const float halfH0 = atanf(tanf(halfV0) * aspect);
+            const float marginOuter =
+                (std::max)(g_config.cullingFrustumFovMarginDeg, 1.0f) * kDegToRad;
+            const auto buildPlanes = [&](float margin, CullPlane out[5]) {
+                // Half-angles saturate just under 90 degrees; at the cap the
+                // corresponding planes stop culling anything (a >=180-degree
+                // "frustum" has no outside on that axis), which fails safe.
+                const float kMaxHalf = 1.55f;  // ~88.8 deg
+                const float hv = (std::min)(halfV0 + margin, kMaxHalf);
+                const float hh = (std::min)(halfH0 + margin, kMaxHalf);
+                const float* F = cam.forward;
+                const float* U = cam.up;
+                const float* R = cam.right;
+                // Inward-pointing unit normals through the camera position:
+                // near = forward; sides tilt forward by sin(half-angle).
+                const float n[5][3] = {
+                    { F[0], F[1], F[2] },
+                    { F[0]*sinf(hv) - U[0]*cosf(hv), F[1]*sinf(hv) - U[1]*cosf(hv), F[2]*sinf(hv) - U[2]*cosf(hv) },  // top
+                    { F[0]*sinf(hv) + U[0]*cosf(hv), F[1]*sinf(hv) + U[1]*cosf(hv), F[2]*sinf(hv) + U[2]*cosf(hv) },  // bottom
+                    { F[0]*sinf(hh) - R[0]*cosf(hh), F[1]*sinf(hh) - R[1]*cosf(hh), F[2]*sinf(hh) - R[2]*cosf(hh) },  // right
+                    { F[0]*sinf(hh) + R[0]*cosf(hh), F[1]*sinf(hh) + R[1]*cosf(hh), F[2]*sinf(hh) + R[2]*cosf(hh) },  // left
+                };
+                for (int p = 0; p < 5; ++p) {
+                    out[p].nx = n[p][0];
+                    out[p].ny = n[p][1];
+                    out[p].nz = n[p][2];
+                    out[p].d  = -(n[p][0] * cam.position[0] +
+                                  n[p][1] * cam.position[1] +
+                                  n[p][2] * cam.position[2]);
+                }
+            };
+            buildPlanes(marginOuter, cullOuter);
+            buildPlanes(0.5f * marginOuter, cullInner);
+            keepRadiusSq = g_config.cullingFrustumKeepRadius *
+                           g_config.cullingFrustumKeepRadius;
+            frustumCullActive = true;
+        }
 
         struct DrawBucket {
             std::vector<DrawableInstance*> members;
@@ -2196,6 +2319,58 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     }
                 }
             }
+            // Frustum + keep-radius cull decision (2026-07-21; see the plane
+            // precompute above). Per-DRAWABLE decision recorded here, but the
+            // skip is applied per-BUCKET in the draw loop below -- see the
+            // all-or-nothing comment there for why (batched-draw identity
+            // hashing). Exemptions: viewmodels (own camera path), skinned
+            // (no valid bounds -- bones carry the placement), LOD chunks
+            // unless opted in (they ARE the horizon in reflections and the
+            // far cull already bounds them).
+            if (frustumCullActive && inst.hasBounds &&
+                !inst.isViewModel && !inst.isSkinned &&
+                (g_config.cullingFrustumLodChunks || !inst.isLODChunk)) {
+                // Local AABB -> world-space center + extents through the
+                // live worldTransform (post-livePoses, so animated statics
+                // test their current pose).
+                const float (&M)[3][4] = inst.worldTransform;
+                float lc[3], le[3], wc[3], we[3];
+                for (int i = 0; i < 3; ++i) {
+                    lc[i] = 0.5f * (inst.boundMin[i] + inst.boundMax[i]);
+                    le[i] = 0.5f * (inst.boundMax[i] - inst.boundMin[i]);
+                }
+                for (int r = 0; r < 3; ++r) {
+                    wc[r] = M[r][3] + M[r][0]*lc[0] + M[r][1]*lc[1] + M[r][2]*lc[2];
+                    we[r] = fabsf(M[r][0])*le[0] + fabsf(M[r][1])*le[1] + fabsf(M[r][2])*le[2];
+                }
+                // Keep sphere: closest point on the world AABB to the
+                // camera within FrustumKeepRadius -> always rendered.
+                const float gx = (std::max)(fabsf(cam.position[0] - wc[0]) - we[0], 0.0f);
+                const float gy = (std::max)(fabsf(cam.position[1] - wc[1]) - we[1], 0.0f);
+                const float gz = (std::max)(fabsf(cam.position[2] - wc[2]) - we[2], 0.0f);
+                if (gx * gx + gy * gy + gz * gz <= keepRadiusSq) {
+                    inst.frustumCulled = false;
+                } else {
+                    // Hysteresis: currently-culled entries test against the
+                    // tighter INNER set (re-enter early), visible entries
+                    // against the wider OUTER set (leave late).
+                    const CullPlane* planes = inst.frustumCulled ? cullInner
+                                                                 : cullOuter;
+                    bool outside = false;
+                    for (int p = 0; p < 5 && !outside; ++p) {
+                        const float dist = planes[p].nx * wc[0] +
+                                           planes[p].ny * wc[1] +
+                                           planes[p].nz * wc[2] + planes[p].d;
+                        const float rad  = fabsf(planes[p].nx) * we[0] +
+                                           fabsf(planes[p].ny) * we[1] +
+                                           fabsf(planes[p].nz) * we[2];
+                        if (dist < -rad) outside = true;
+                    }
+                    inst.frustumCulled = outside;
+                }
+            } else {
+                inst.frustumCulled = false;
+            }
             buckets[BucketKey{inst.meshHandle, vmCategoryTag && inst.isViewModel}]
                 .members.push_back(&inst);
         }
@@ -2222,6 +2397,60 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
         for (auto& [bucketKey, bucket] : buckets) {
             if (bucket.members.empty()) continue;
+
+            // Frustum cull, applied at BUCKET granularity: skip only when
+            // EVERY member is culled. The runtime folds the whole
+            // per-instance transform array (content AND order) into the
+            // batched-draw identity hash (computeExternalDrawIdentityHash),
+            // so submitting a batch minus its off-screen members would
+            // re-key the batch on every membership change -- a full
+            // processDrawCallState retranslation per affected bucket, every
+            // frame the camera turns (the exact CS-thread storm the
+            // preserve path exists to prevent). All-or-nothing keeps every
+            // identity byte-stable; a partially-visible batch rides along
+            // whole, costing only TLAS residency for its off-screen
+            // members. Fully-off-screen buckets (the common case behind
+            // the camera) drop out entirely.
+            if (frustumCullActive) {
+                bool allCulled = true;
+                for (const DrawableInstance* m : bucket.members) {
+                    if (!m->frustumCulled) { allCulled = false; break; }
+                }
+                if (allCulled) {
+                    skippedFrustum += bucket.members.size();
+                    ++skippedFrustumBuckets;
+                    // Keep skipped members' resources LRU-live at a spread
+                    // cadence (~1/60 of members per frame; grace is 600, and
+                    // 75 under pressure-tightening, so 60 clears both). A
+                    // frustum-culled drawable is still logically present --
+                    // letting the texture LRU cascade it away would turn
+                    // every camera swing into re-resolve churn. VRAM under
+                    // pressure stays the parking tiers' call: parked entries
+                    // leave g_drawables and stop being stamped here.
+                    for (DrawableInstance* m : bucket.members) {
+                        // Addition, not XOR: (P + frame) walks every residue
+                        // mod 60, guaranteeing exactly one stamp per member
+                        // per 60-frame window.
+                        if (((reinterpret_cast<uintptr_t>(m) >> 4) + currentFrame) % 60 != 0) {
+                            continue;
+                        }
+                        m->lastDrawnFrame = currentFrame;
+                        if (m->materialHash != 0) {
+                            auto matIt = g_materialCache.find(m->materialHash);
+                            if (matIt != g_materialCache.end()) {
+                                matIt->second.lastDrawnFrame = currentFrame;
+                            }
+                        }
+                        for (uint64_t texHash : m->textureHashes) {
+                            auto texIt = g_textureHandles.find(texHash);
+                            if (texIt != g_textureHandles.end()) {
+                                texIt->second.lastDrawnFrame = currentFrame;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
 
             remixapi_InstanceInfo instance = {};
             instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
@@ -2512,11 +2741,13 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                                                  &activeStats, nullptr);
         _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu "
                  "skippedChunkPlayerInside=%zu skippedChunkStale=%zu skippedChunkFar=%zu chunks=%zu "
+                 "skippedFrustum=%zu (%zu buckets) "
                  "vmDrawn=%zu skippedVM=%zu "
                  "active=%u isLod=%u fadedIn=%u notVisible=%u lodFadingOut=%u forcedFadeOut=%u "
                  "player=(%.0f,%.0f,%.0f)",
                  drawableCount, bucketCount, batchedBucketCount, skippedInactive,
                  skippedChunkPlayerInside, skippedChunkStale, skippedChunkFar, lodChunkAges.size(),
+                 skippedFrustum, skippedFrustumBuckets,
                  vmDrawn, skippedViewModel,
                  activeStats.total, activeStats.isLod, activeStats.fadedIn,
                  activeStats.notVisible, activeStats.lodFadingOut, activeStats.forcedFadeOut,
