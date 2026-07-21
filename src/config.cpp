@@ -169,13 +169,17 @@ void LoadConfig() {
     g_config.cullingMaterialLRUGraceFrames = GetIniUInt("Culling", "MaterialLRUGraceFrames", 600, dllPath);
     g_config.cullingLodChunkStaleFrames    = GetIniUInt("Culling", "LodChunkStaleFrames",    30,  dllPath);
     g_config.cullingLodChunkFarExtentRatio = GetIniFloat("Culling", "LodChunkFarExtentRatio", 0.0f, dllPath);
-    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u LodChunkFarExtentRatio=%.1f",
+    g_config.cullingForceEvictVramPct      = GetIniUInt("Culling", "ForceEvictVramPct",      88,  dllPath);
+    g_config.cullingForceEvictPerSweep     = GetIniUInt("Culling", "ForceEvictPerSweep",     512, dllPath);
+    _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u LodChunkFarExtentRatio=%.1f ForceEvictVramPct=%u ForceEvictPerSweep=%u",
              g_config.cullingTextureLRUGraceFrames,
              g_config.cullingTextureLRUSweepPeriod,
              g_config.cullingTextureBudgetMiB,
              g_config.cullingMaterialLRUGraceFrames,
              g_config.cullingLodChunkStaleFrames,
-             g_config.cullingLodChunkFarExtentRatio);
+             g_config.cullingLodChunkFarExtentRatio,
+             g_config.cullingForceEvictVramPct,
+             g_config.cullingForceEvictPerSweep);
 
     // [Materials]
     g_config.metalConversionEnabled = GetIniBool("Materials", "MetalConversionEnabled", true, dllPath);

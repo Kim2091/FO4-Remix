@@ -4,6 +4,7 @@
 #include "remix_api.h"
 #include "fo4_diagnostics.h"
 #include "fo4_tracy.h"
+#include "present_hook.h"     // GetVramBudgetSnapshot (pressure-tightened LRU grace)
 #include "semantic_capture.h"
 #include "skinned_meshes.h"
 #include "resolvers/lighting_static.h"  // Trace::SetStep + Trace::Step constants
@@ -2836,10 +2837,23 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             }
             const uint64_t budgetBytes = static_cast<uint64_t>(g_config.cullingTextureBudgetMiB) << 20;
 
+            // Under VRAM pressure (same signal as SemCapture's force-eviction)
+            // the standard grace periods would sit on the refcounts that the
+            // drawable eviction just released for ~10s before parking anything.
+            // Tighten 8x so the cascade reclaims within a couple of sweeps
+            // (2026-07-20, Sanctuary->Concord VRAM pileup).
+            uint64_t vramUsedMiB = 0, vramBudgetMiB = 0;
+            const uint32_t evictPct = g_config.cullingForceEvictVramPct;
+            const bool vramPressure = evictPct > 0 &&
+                PresentHook::GetVramBudgetSnapshot(&vramUsedMiB, &vramBudgetMiB) &&
+                vramUsedMiB * 100u > static_cast<uint64_t>(evictPct) * vramBudgetMiB;
+
             if (g_config.cullingMaterialLRUGraceFrames > 0) {
+                uint64_t matGrace = g_config.cullingMaterialLRUGraceFrames;
+                if (vramPressure && matGrace > 8) matGrace /= 8;
                 auto matResult = RemixRenderer::SweepStaleMaterials(
                     currentFrameIndex,
-                    g_config.cullingMaterialLRUGraceFrames,
+                    matGrace,
                     budgetBytes,
                     currentMaterialTexBytes);
                 _MESSAGE("FO4RemixPlugin: [LRU] Material sweep: %u/%u stale, %u cells evicted",
@@ -2854,9 +2868,11 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // the queued releases have already reclaimed memory.
 
             if (g_config.cullingTextureLRUGraceFrames > 0) {
+                uint64_t texGrace = g_config.cullingTextureLRUGraceFrames;
+                if (vramPressure && texGrace > 8) texGrace /= 8;
                 auto texResult = RemixRenderer::SweepStaleTextures(
                     currentFrameIndex,
-                    g_config.cullingTextureLRUGraceFrames,
+                    texGrace,
                     budgetBytes,
                     currentMaterialTexBytes);
                 _MESSAGE("FO4RemixPlugin: [LRU] Texture sweep: %u/%u stale, %u cells evicted, %u budget, %u orphans parked",

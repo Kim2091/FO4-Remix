@@ -5,6 +5,7 @@
 #include "fo4_diagnostics.h"
 #include "resolvers/lighting_static.h"
 #include "resolvers/water.h"
+#include "present_hook.h"     // GetVramBudgetSnapshot (pressure force-eviction)
 #include "remix_renderer.h"
 #include "skinned_meshes.h"
 
@@ -2059,36 +2060,91 @@ void SemanticCapture::Tick(ID3D11Device* device) {
 
     {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
+
+        // Release one entry's Remix-side resources and erase it from the map
+        // (+ every side index). Returns the next iterator. Shared by the TTL
+        // loop and the VRAM-pressure pass below.
+        auto evictEntry = [&](auto it) {
+            if (it->second.submittedToRemix && it->second.meshHash != 0) {
+                unsigned long excCode = 0;
+                if (CallReleaseDrawableGuarded(it->second.meshHash, &excCode) != 0) {
+                    _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
+                             "hash=0x%llX exception=0x%08lX -- continuing eviction; "
+                             "Remix-side handles may leak",
+                             (unsigned long long)it->second.meshHash, excCode);
+                }
+                // Merge-instanced extras share the base drawable's lifecycle.
+                for (uint64_t xh : it->second.extraMeshHashes) {
+                    if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                        _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
+                                 "(instance extra) hash=0x%llX exception=0x%08lX",
+                                 (unsigned long long)xh, excCode);
+                    }
+                }
+            }
+            g_lodChunkKeys.erase(it->first);
+            g_skinnedKeys.erase(it->first);
+            g_viewModelKeys.erase(it->first);
+            // Free any DrawCapture watch keyed to this drawable: after
+            // this erase nothing will ever poll it again, and a stranded
+            // upgrade-hunt watch would pin a slot + keep the bind scan
+            // hot for the rest of the session (cell-churn staleness).
+            DrawCapture::Drop(it->first);
+            return g_drawableMap.erase(it);
+        };
+
+        // ---- VRAM-pressure force-eviction (2026-07-20) ----
+        // The frame-based TTL below (kTTLFrames = 18000, ~5 min @60fps and
+        // longer as fps degrades) never fires on a cross-country run:
+        // Sanctuary->Concord pinned ~10K drawables -> materials -> textures
+        // until process VRAM hit the driver budget (13.5/14.7 GiB) and fps
+        // collapsed to 1. When usage crosses the configured fraction of the
+        // DXGI budget, evict the oldest-seen entries (never anything seen in
+        // the last kPressureMinAgeFrames) so the material/texture LRU
+        // cascade has something to reclaim. Runs before the TTL loop so the
+        // status counters below reflect the post-eviction map.
+        uint32_t pressureEvicted = 0;
+        {
+            uint64_t vramUsedMiB = 0, vramBudgetMiB = 0;
+            const uint32_t evictPct = g_config.cullingForceEvictVramPct;
+            if (evictPct > 0 &&
+                PresentHook::GetVramBudgetSnapshot(&vramUsedMiB, &vramBudgetMiB) &&
+                vramUsedMiB * 100u > static_cast<uint64_t>(evictPct) * vramBudgetMiB) {
+                constexpr uint64_t kPressureMinAgeFrames = 300;  // ~5s @60fps
+                std::vector<std::pair<uint64_t, PassKey>> byAge;  // (lastSeen, key)
+                byAge.reserve(g_drawableMap.size());
+                for (const auto& [key, st] : g_drawableMap) {
+                    const uint64_t age = (now > st.lastSeenFrame)
+                        ? (now - st.lastSeenFrame) : 0;
+                    if (age < kPressureMinAgeFrames) continue;
+                    byAge.emplace_back(st.lastSeenFrame, key);
+                }
+                uint32_t cap = g_config.cullingForceEvictPerSweep;
+                if (cap == 0) cap = 512;
+                const size_t take = (std::min)(static_cast<size_t>(cap), byAge.size());
+                if (take > 0) {
+                    std::partial_sort(byAge.begin(), byAge.begin() + take, byAge.end());
+                    for (size_t i = 0; i < take; ++i) {
+                        auto mapIt = g_drawableMap.find(byAge[i].second);
+                        if (mapIt == g_drawableMap.end()) continue;
+                        evictEntry(mapIt);
+                        ++pressureEvicted;
+                    }
+                }
+                _MESSAGE("FO4RemixPlugin: [SemCapture] PRESSURE evict: vram=%llu/%llu MiB "
+                         "(threshold %u%%) evicted=%u candidates=%zu",
+                         (unsigned long long)vramUsedMiB,
+                         (unsigned long long)vramBudgetMiB,
+                         evictPct, pressureEvicted, byAge.size());
+            }
+        }
+        evicted += pressureEvicted;
+
         for (auto it = g_drawableMap.begin(); it != g_drawableMap.end();) {
             const uint64_t age = (now > it->second.lastSeenFrame)
                 ? (now - it->second.lastSeenFrame) : 0;
             if (age > kTTLFrames) {
-                if (it->second.submittedToRemix && it->second.meshHash != 0) {
-                    unsigned long excCode = 0;
-                    if (CallReleaseDrawableGuarded(it->second.meshHash, &excCode) != 0) {
-                        _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
-                                 "hash=0x%llX exception=0x%08lX -- continuing eviction; "
-                                 "Remix-side handles may leak",
-                                 (unsigned long long)it->second.meshHash, excCode);
-                    }
-                    // Merge-instanced extras share the base drawable's lifecycle.
-                    for (uint64_t xh : it->second.extraMeshHashes) {
-                        if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
-                            _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
-                                     "(instance extra) hash=0x%llX exception=0x%08lX",
-                                     (unsigned long long)xh, excCode);
-                        }
-                    }
-                }
-                g_lodChunkKeys.erase(it->first);
-                g_skinnedKeys.erase(it->first);
-                g_viewModelKeys.erase(it->first);
-                // Free any DrawCapture watch keyed to this drawable: after
-                // this erase nothing will ever poll it again, and a stranded
-                // upgrade-hunt watch would pin a slot + keep the bind scan
-                // hot for the rest of the session (cell-churn staleness).
-                DrawCapture::Drop(it->first);
-                it = g_drawableMap.erase(it);
+                it = evictEntry(it);
                 ++evicted;
             } else {
                 if (it->second.submittedToRemix) {

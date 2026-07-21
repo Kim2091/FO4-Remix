@@ -24,6 +24,21 @@
 #include <algorithm>
 #include <timeapi.h>   // timeBeginPeriod/timeEndPeriod (links winmm)
 
+// Latest process-local adapter memory reading, published by the [VRAM]
+// telemetry block in HookedPresent (~every 60 frames) and consumed by
+// SemanticCapture::Tick's pressure force-eviction via
+// PresentHook::GetVramBudgetSnapshot (2026-07-20). Zero until first query.
+static std::atomic<uint64_t> g_vramUsedMiB{0};
+static std::atomic<uint64_t> g_vramBudgetMiB{0};
+
+bool PresentHook::GetVramBudgetSnapshot(uint64_t* usedMiB, uint64_t* budgetMiB) {
+    const uint64_t used   = g_vramUsedMiB.load(std::memory_order_relaxed);
+    const uint64_t budget = g_vramBudgetMiB.load(std::memory_order_relaxed);
+    if (usedMiB)   *usedMiB   = used;
+    if (budgetMiB) *budgetMiB = budget;
+    return budget != 0;
+}
+
 #include "f4se_common/f4se_version.h"
 #include "f4se/PluginAPI.h"
 
@@ -1255,18 +1270,24 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         }
     }
 
-    // [VRAM] telemetry every ~300 game frames: process-wide adapter usage
-    // (DXGI -- covers the game's D3D11 AND dxvk-remix's Vulkan, same process)
-    // plus the raster-suppression counters. This is the A/B instrument for
-    // the modded-texture budget fight: with SuppressGameRaster on, "used"
-    // should fall well below "budget" as WDDM demotes unreferenced game
-    // textures; suppressed/fwd counters prove the kill switch is live.
+    // [VRAM] telemetry: process-wide adapter usage (DXGI -- covers the game's
+    // D3D11 AND dxvk-remix's Vulkan, same process) plus the raster-suppression
+    // counters. This is the A/B instrument for the modded-texture budget
+    // fight: with SuppressGameRaster on, "used" should fall well below
+    // "budget" as WDDM demotes unreferenced game textures; suppressed/fwd
+    // counters prove the kill switch is live.
+    // 2026-07-20: the query now runs every ~60 frames (was 300, log-only) and
+    // publishes the reading to g_vramUsed/BudgetMiB -- the pressure signal for
+    // SemanticCapture::Tick's force-eviction (GetVramBudgetSnapshot). The log
+    // line keeps its ~300-frame cadence.
     {
+        static uint32_t s_vramQueryCounter = 0;
         static uint32_t s_vramLogCounter = 0;
         static IDXGIAdapter3* s_adapter3 = nullptr;
         static bool s_adapterTried = false;
-        if (++s_vramLogCounter >= 300) {
-            s_vramLogCounter = 0;
+        ++s_vramLogCounter;
+        if (++s_vramQueryCounter >= 60) {
+            s_vramQueryCounter = 0;
             if (!s_adapterTried) {
                 s_adapterTried = true;
                 ID3D11Device* dev = nullptr;
@@ -1291,17 +1312,24 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
                 DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
                 if (SUCCEEDED(s_adapter3->QueryVideoMemoryInfo(
                         0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local))) {
-                    uint64_t suppressed = 0, fwdUi = 0, fwdQuery = 0;
-                    RasterSuppress::ConsumeStats(&suppressed, &fwdUi, &fwdQuery);
-                    _MESSAGE("FO4RemixPlugin: [VRAM] process local used=%llu MiB "
-                             "budget=%llu MiB | raster suppress=%d drawsSuppressed=%llu "
-                             "fwdUI=%llu fwdQuery=%llu (since last)",
-                             (unsigned long long)(local.CurrentUsage >> 20),
-                             (unsigned long long)(local.Budget >> 20),
-                             g_config.suppressGameRaster ? 1 : 0,
-                             (unsigned long long)suppressed,
-                             (unsigned long long)fwdUi,
-                             (unsigned long long)fwdQuery);
+                    g_vramUsedMiB.store(local.CurrentUsage >> 20,
+                                        std::memory_order_relaxed);
+                    g_vramBudgetMiB.store(local.Budget >> 20,
+                                          std::memory_order_relaxed);
+                    if (s_vramLogCounter >= 300) {
+                        s_vramLogCounter = 0;
+                        uint64_t suppressed = 0, fwdUi = 0, fwdQuery = 0;
+                        RasterSuppress::ConsumeStats(&suppressed, &fwdUi, &fwdQuery);
+                        _MESSAGE("FO4RemixPlugin: [VRAM] process local used=%llu MiB "
+                                 "budget=%llu MiB | raster suppress=%d drawsSuppressed=%llu "
+                                 "fwdUI=%llu fwdQuery=%llu (since last)",
+                                 (unsigned long long)(local.CurrentUsage >> 20),
+                                 (unsigned long long)(local.Budget >> 20),
+                                 g_config.suppressGameRaster ? 1 : 0,
+                                 (unsigned long long)suppressed,
+                                 (unsigned long long)fwdUi,
+                                 (unsigned long long)fwdQuery);
+                    }
                 }
             }
         }

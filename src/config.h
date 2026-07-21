@@ -196,6 +196,16 @@ struct PluginConfig {
     float    cullingLodChunkFarExtentRatio;  // default 0 (off); skip LOD chunk when
                                              // box distance > extent * ratio
 
+    // VRAM-pressure force-eviction (2026-07-20). The drawable TTL
+    // (kTTLFrames=18000, ~5 min) never fires on a cross-country run, so
+    // drawables pin materials pin textures until the driver budget cliff
+    // (Sanctuary->Concord: 13.5/14.7 GiB, 1 fps). When process-local VRAM
+    // usage exceeds ForceEvictVramPct% of the DXGI budget, Tick's sweep
+    // force-evicts the oldest-seen submitted drawables (min age 300 frames,
+    // ForceEvictPerSweep per sweep) so the LRU cascade can reclaim.
+    uint32_t cullingForceEvictVramPct;       // default 88; 0 = off
+    uint32_t cullingForceEvictPerSweep;      // default 512
+
     // [Materials]
     // Spec-gloss -> metal-rough conversion for FO4 environment-mapped
     // materials (2026-07-02, take 2). FO4 authors metal albedo near-black;
