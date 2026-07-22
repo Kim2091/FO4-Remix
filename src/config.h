@@ -275,6 +275,60 @@ struct PluginConfig {
     // is suspended for the frame so nothing mass-culls.
     uint32_t cullingOcclusionMinSceneDraws; // default 500
 
+    // Hierarchical-Z per-item occlusion (2026-07-21). A CPU software depth
+    // rasterizer (src/hzb_occlusion) renders large STATIC occluders into a
+    // small Hi-Z buffer each frame; a drawable whose world AABB is confidently
+    // behind that buffer for HzbCullDelayFrames consecutive frames is culled.
+    // This catches items individually hidden behind a wall INSIDE a cell that
+    // the engine's cell-granular previs still draws (the case draw-stream
+    // occlusion can't). Default OFF -- opt-in, field-unvalidated.
+    //
+    // NEVER-FALSE-CULL is structural: occluders are only meshes proven static
+    // (never seen in the per-frame dirty-pose set + aged past MinAgeFrames),
+    // opaque (alpha-test/blend excluded so foliage/fence holes are never
+    // treated as solid), and the buffer under-claims coverage at silhouettes
+    // (max-reduced pyramid). An AABB near the camera (inside the shared
+    // frustum keep radius) or crossing the near plane is never culled.
+    bool     cullingHzbEnabled;          // "HzbCull", default false
+    uint32_t cullingHzbWidth;            // "HzbWidth", default 256
+    uint32_t cullingHzbHeight;           // "HzbHeight", default 144
+    // Geometry within this distance of the camera is never Hi-Z-culled. MUCH
+    // smaller than the frustum keep radius on purpose: the frustum radius (8192)
+    // exists so off-screen-but-near geometry still shows in reflections/GI, but
+    // geometry behind a SOLID occluder is hidden from those secondary rays too,
+    // so occlusion can safely cull far closer to the camera. This is the primary
+    // effectiveness knob -- at 8192 almost everything indoors was exempt and
+    // kept rendering. Lower for more aggressive culling; raise if near geometry
+    // pops in reflections.
+    float    cullingHzbKeepRadius;       // "HzbKeepRadius", default 1024
+    // Min world-AABB largest dimension (game units) for a mesh to be trusted as
+    // an occluder. Small props make poor occluders and cost raster time.
+    float    cullingHzbOccluderMinSize;  // "HzbOccluderMinSize", default 512
+    // Consecutive fully-occluded frames before a drawable is actually culled;
+    // reset to 0 the instant it reads visible (instant un-cull). Absorbs the
+    // 1-frame transient when a static begins moving. Higher = safer/later.
+    uint32_t cullingHzbCullDelayFrames;  // "HzbCullDelayFrames", default 10
+    // Extra depth cushion (normalized-linear [0,1]) an occludee's nearest point
+    // must clear beyond the occluder before it counts as behind. 0 disables.
+    float    cullingHzbDepthMargin;      // "HzbDepthMargin", default 0.002
+    // Frames a submitted drawable must exist (and stay un-animated) before it is
+    // eligible as an occluder -- gives engine controllers time to reveal an
+    // animated static before it is ever trusted static.
+    uint32_t cullingHzbOccluderMinAge;   // "HzbOccluderMinAgeFrames", default 30
+    // Cost bounds per rebuild: at most this many occluders (nearest first) and
+    // at most this many total triangles rasterized.
+    uint32_t cullingHzbMaxOccluders;     // "HzbMaxOccluders", default 256
+    uint32_t cullingHzbMaxTris;          // "HzbMaxTris", default 200000
+    // Rebuild the Hi-Z every N frames (the buffer is reused between rebuilds).
+    // Occluder POSITIONS reuse exactly (occluders are proven static), but the
+    // buffer also bakes the BUILD-frame camera, so during camera motion the
+    // test runs against a 1..N-frame-old view -- a geometry emerging from
+    // behind a wall as you turn can read occluded for a few frames. That is the
+    // same corner-turn pop-in the draw-stream occlusion has; it self-resolves
+    // on the next rebuild. Keep HzbCullDelayFrames > HzbRebuildInterval so the
+    // stale window can never commit a cull on its own. Lower N = fresher view.
+    uint32_t cullingHzbRebuildInterval;  // "HzbRebuildInterval", default 2
+
     // [Materials]
     // Spec-gloss -> metal-rough conversion for FO4 environment-mapped
     // materials (2026-07-02, take 2). FO4 authors metal albedo near-black;

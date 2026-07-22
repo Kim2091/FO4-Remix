@@ -182,6 +182,29 @@ void LoadConfig() {
     g_config.cullingOcclusionEnabled       = GetIniBool("Culling", "OcclusionCull",           true, dllPath);
     g_config.cullingOcclusionStaleFrames   = GetIniUInt("Culling", "OcclusionStaleFrames",    30,   dllPath);
     g_config.cullingOcclusionMinSceneDraws = GetIniUInt("Culling", "OcclusionMinSceneDraws",  500,  dllPath);
+    g_config.cullingHzbEnabled         = GetIniBool("Culling",  "HzbCull",               false,    dllPath);
+    g_config.cullingHzbWidth           = GetIniUInt("Culling",  "HzbWidth",              256,      dllPath);
+    g_config.cullingHzbHeight          = GetIniUInt("Culling",  "HzbHeight",             144,      dllPath);
+    g_config.cullingHzbKeepRadius      = GetIniFloat("Culling", "HzbKeepRadius",         1024.0f,  dllPath);
+    g_config.cullingHzbOccluderMinSize = GetIniFloat("Culling", "HzbOccluderMinSize",    512.0f,   dllPath);
+    g_config.cullingHzbCullDelayFrames = GetIniUInt("Culling",  "HzbCullDelayFrames",    10,       dllPath);
+    g_config.cullingHzbDepthMargin     = GetIniFloat("Culling", "HzbDepthMargin",        0.002f,   dllPath);
+    g_config.cullingHzbOccluderMinAge  = GetIniUInt("Culling",  "HzbOccluderMinAgeFrames", 30,     dllPath);
+    g_config.cullingHzbMaxOccluders    = GetIniUInt("Culling",  "HzbMaxOccluders",       256,      dllPath);
+    g_config.cullingHzbMaxTris         = GetIniUInt("Culling",  "HzbMaxTris",            200000,   dllPath);
+    g_config.cullingHzbRebuildInterval = GetIniUInt("Culling",  "HzbRebuildInterval",    2,        dllPath);
+    _MESSAGE("FO4RemixPlugin: Culling(HZB) - HzbCull=%d Width=%u Height=%u KeepRadius=%.0f OccluderMinSize=%.0f CullDelayFrames=%u DepthMargin=%.4f OccluderMinAgeFrames=%u MaxOccluders=%u MaxTris=%u RebuildInterval=%u",
+             g_config.cullingHzbEnabled,
+             g_config.cullingHzbWidth,
+             g_config.cullingHzbHeight,
+             g_config.cullingHzbKeepRadius,
+             g_config.cullingHzbOccluderMinSize,
+             g_config.cullingHzbCullDelayFrames,
+             g_config.cullingHzbDepthMargin,
+             g_config.cullingHzbOccluderMinAge,
+             g_config.cullingHzbMaxOccluders,
+             g_config.cullingHzbMaxTris,
+             g_config.cullingHzbRebuildInterval);
     _MESSAGE("FO4RemixPlugin: Culling - TextureLRUGraceFrames=%u TextureLRUSweepPeriod=%u TextureBudgetMiB=%u MaterialLRUGraceFrames=%u LodChunkStaleFrames=%u LodChunkFarExtentRatio=%.1f ForceEvictVramPct=%u ForceEvictPerSweep=%u ForceEvictViewPct=%u ForceEvictBehindDistance=%.0f ForceEvictAlwaysBehindDistance=%.0f ForceEvictLodBehindDistance=%.0f FrustumCull=%d FrustumKeepRadius=%.0f FrustumFovMarginDeg=%.1f FrustumCullLodChunks=%d OcclusionCull=%d OcclusionStaleFrames=%u OcclusionMinSceneDraws=%u",
              g_config.cullingTextureLRUGraceFrames,
              g_config.cullingTextureLRUSweepPeriod,

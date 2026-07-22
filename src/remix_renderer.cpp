@@ -6,6 +6,7 @@
 #include "fo4_tracy.h"
 #include "present_hook.h"     // GetVramBudgetSnapshot (pressure-tightened LRU grace)
 #include "draw_capture.h"     // EngineIbKey + SnapshotVisible (occlusion cull)
+#include "hzb_occlusion.h"    // CPU Hi-Z per-item occlusion (HzbCull)
 #include "semantic_capture.h"
 #include "skinned_meshes.h"
 #include "resolvers/lighting_static.h"  // Trace::SetStep + Trace::Step constants
@@ -20,6 +21,7 @@
 #include <chrono>
 #include <cmath>    // sinf/cosf/tanf/atanf (OnFrame frustum-cull plane build)
 #include <cstring>
+#include <memory>   // shared_ptr (occluder geometry lifetime tied to MeshRef)
 #include <mutex>
 #include <vector>
 #include <algorithm>
@@ -472,6 +474,20 @@ namespace {
         // engine-frustum-culled). occlusionCulled carries the last verdict.
         uint64_t engineIbKey    = 0;
         bool     occlusionCulled = false;
+
+        // Hi-Z per-item occlusion (HzbCull, 2026-07-21). hzbCulled is the last
+        // committed verdict; hzbOccludedStreak counts consecutive frames the
+        // world AABB read fully behind the Hi-Z buffer and only commits the
+        // cull once it reaches HzbCullDelayFrames (reset to 0 the instant it
+        // reads visible -> instant un-cull). everAnimated is a sticky flag set
+        // the first frame this drawable appears in the dirty-pose set: an
+        // animated thing can NEVER be an occluder (the 1-frame-stale buffer is
+        // only false-cull-safe for geometry that provably does not move).
+        // firstFrame is the submit frame, for the occluder min-age gate.
+        bool     hzbCulled         = false;
+        uint32_t hzbOccludedStreak = 0;
+        bool     everAnimated      = false;
+        uint32_t firstFrame        = 0;
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
@@ -483,6 +499,14 @@ namespace {
     // When g_config.gpuInstancingEnabled is false the cache key has the
     // drawable hash in `contentHash`, so each drawable lands in its own bucket
     // and no sharing happens -- preserves pre-instancing behavior for rollback.
+    // Immutable mesh-local geometry copy for the Hi-Z occlusion rasterizer:
+    // interleaved xyz positions + triangle indices. Held by shared_ptr from
+    // MeshRef so it outlives a mesh release if a build still references it.
+    struct OccluderGeom {
+        std::vector<float>    positions; // xyz triplets, mesh-local
+        std::vector<uint32_t> indices;
+    };
+
     struct MeshRef {
         remixapi_MeshHandle handle;
         uint32_t            refCount;
@@ -495,6 +519,13 @@ namespace {
         float boundMin[3] = {};
         float boundMax[3] = {};
         bool  hasBounds   = false;
+        // Positions-only + index copy retained for the CPU Hi-Z occlusion
+        // rasterizer (HzbCull), populated at the cache-miss below only when the
+        // mesh is large enough to be a useful occluder. shared_ptr so an
+        // in-flight build keeps the geometry alive across a mesh release, and
+        // so the lifetime is auto-tied to this MeshRef (no separate store to
+        // keep in sync). Null when HzbCull is off or the mesh is too small.
+        std::shared_ptr<const OccluderGeom> occluderGeom;
     };
     std::unordered_map<MeshCacheKey, MeshRef, MeshCacheKeyHash> g_meshCache;
 
@@ -1506,6 +1537,28 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
             memcpy(ref.boundMin, mn, sizeof(mn));
             memcpy(ref.boundMax, mx, sizeof(mx));
             ref.hasBounds = true;
+            // Retain a mesh-local positions + index copy for the Hi-Z occlusion
+            // rasterizer, but only for meshes large enough to be worthwhile
+            // occluders (bounds the memory + per-frame raster cost). Whether a
+            // given instance is actually USED as an occluder is decided per
+            // frame in OnFrame (must also be proven static + opaque). Gated on
+            // HzbCull so there is zero cost when the feature is off.
+            if (g_config.cullingHzbEnabled && !mesh.indices.empty() &&
+                !mesh.vertices.empty()) {
+                const float maxDim = (std::max)(mx[0] - mn[0],
+                    (std::max)(mx[1] - mn[1], mx[2] - mn[2]));
+                if (maxDim >= g_config.cullingHzbOccluderMinSize) {
+                    auto geom = std::make_shared<OccluderGeom>();
+                    geom->positions.resize(mesh.vertices.size() * 3);
+                    for (size_t vi = 0; vi < mesh.vertices.size(); ++vi) {
+                        geom->positions[vi * 3 + 0] = mesh.vertices[vi].position[0];
+                        geom->positions[vi * 3 + 1] = mesh.vertices[vi].position[1];
+                        geom->positions[vi * 3 + 2] = mesh.vertices[vi].position[2];
+                    }
+                    geom->indices = mesh.indices;
+                    ref.occluderGeom = std::move(geom);
+                }
+            }
         }
         if (ref.hasBounds) {
             memcpy(inst.boundMin, ref.boundMin, sizeof(inst.boundMin));
@@ -1524,6 +1577,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.meshHandle     = meshHandle;
     inst.meshCacheKey   = meshKey;
     inst.lastDrawnFrame = Diagnostics::CurrentFrameIndex();
+    if (inst.firstFrame == 0) inst.firstFrame = inst.lastDrawnFrame; // occluder min-age gate
 
     // Save the world transform; the OnFrame draw loop reads it back per-frame.
     // Resolver-provided in row-major 3x4 layout matching remixapi_Transform.matrix.
@@ -2110,6 +2164,13 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t skippedFrustumBuckets = 0;    // whole buckets skipped (pure frustum)
     size_t skippedOcclusion = 0;         // drawables in occlusion-culled buckets
     size_t skippedOcclusionBuckets = 0;  // whole buckets skipped (occlusion)
+    size_t skippedHzb = 0;               // drawables in Hi-Z-culled buckets
+    size_t skippedHzbBuckets = 0;        // whole buckets skipped (Hi-Z occlusion)
+    // Last Hi-Z build's occluder + triangle counts (persist across frames so the
+    // status log shows them even on non-collect frames). Function scope so the
+    // periodic log below the lock block can read them.
+    static thread_local uint32_t s_hzbBuildOccluders = 0;
+    static thread_local uint32_t s_hzbBuildTris = 0;
     size_t vmDrawn = 0;
     {
         // Zone opens BEFORE the lock so lock-wait time shows inside it.
@@ -2254,6 +2315,50 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         }
         const uint32_t visFrame = s_visFrame;
 
+        // Hi-Z per-item occlusion precompute (2026-07-21). The depth pyramid
+        // built from the PREVIOUS collect frame's static occluders is what we
+        // test this frame's occludees against (the accepted 1-frame staleness;
+        // exact for static occluders). The snapshot feeding the NEXT build is
+        // gathered inside the per-drawable loop below on collect frames. Persist
+        // one buffer across frames on this (Remix) thread.
+        struct OccluderRef {
+            std::shared_ptr<const OccluderGeom> geom;
+            float    xf[3][4];
+            float    distSq;
+        };
+        static thread_local HzbOcclusion::Hzb s_hzb;
+        static thread_local bool     s_hzbInited = false;
+        static thread_local uint32_t s_hzbCountdown = 0;
+        std::vector<OccluderRef> hzbOccluders;
+        bool     hzbCullActive = false; // test occludees this frame
+        bool     hzbCollect    = false; // gather + rebuild this frame
+        uint32_t hzbDelay      = 0;
+        float    hzbMargin     = 0.0f;
+        float    hzbKeepRadiusSq = g_config.cullingHzbKeepRadius *
+                                   g_config.cullingHzbKeepRadius;
+        if (g_config.cullingHzbEnabled && cam.valid) {
+            const int hw = static_cast<int>(
+                (std::min)((std::max)(g_config.cullingHzbWidth, 16u), 1024u));
+            const int hh = static_cast<int>(
+                (std::min)((std::max)(g_config.cullingHzbHeight, 16u), 1024u));
+            if (!s_hzbInited || s_hzb.Width() != hw || s_hzb.Height() != hh) {
+                s_hzb.Init(hw, hh);
+                s_hzbInited = true;
+                s_hzbCountdown = 0; // rebuild immediately after a (re)Init
+            }
+            hzbCullActive = s_hzb.Ready(); // only once a build exists
+            hzbDelay      = g_config.cullingHzbCullDelayFrames;
+            hzbMargin     = g_config.cullingHzbDepthMargin;
+            if (s_hzbCountdown == 0) {
+                hzbCollect = true;
+                s_hzbCountdown = (std::max)(1u, g_config.cullingHzbRebuildInterval);
+                hzbOccluders.reserve(g_config.cullingHzbMaxOccluders + 16u);
+            }
+            --s_hzbCountdown;
+        } else {
+            s_hzbCountdown = 0; // rebuild promptly when re-enabled
+        }
+
         struct DrawBucket {
             std::vector<DrawableInstance*> members;
             std::vector<remixapi_Transform> transforms;  // built only for batched path
@@ -2311,14 +2416,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // the current pose. Drawables without a live transform fall back
             // to the baked transform from SubmitDrawable.
             auto poseIt = livePoses.find(drawHash);
-            if (poseIt != livePoses.end() && !inst.isSkinned) {
-                // Skinned instances keep their bare mirror-P base: bone
-                // matrices carry all motion, and the shape's own transform
-                // (what livePoses holds) must not stomp it.
-                const auto& pose = poseIt->second;
-                for (int r = 0; r < 3; ++r) {
-                    for (int c = 0; c < 4; ++c) {
-                        inst.worldTransform[r][c] = pose[r * 4 + c];
+            if (poseIt != livePoses.end()) {
+                // This drawable's transform changed at least once -> it moves,
+                // so it can NEVER serve as a Hi-Z occluder (the 1-frame-stale
+                // buffer is only false-cull-safe for provably static geometry).
+                // Sticky: once animated, always excluded while this handle lives.
+                inst.everAnimated = true;
+                if (!inst.isSkinned) {
+                    // Skinned instances keep their bare mirror-P base: bone
+                    // matrices carry all motion, and the shape's own transform
+                    // (what livePoses holds) must not stomp it.
+                    const auto& pose = poseIt->second;
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 4; ++c) {
+                            inst.worldTransform[r][c] = pose[r * 4 + c];
+                        }
                     }
                 }
             }
@@ -2401,10 +2513,12 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // share one world-AABB build and one keep-sphere test.
             inst.frustumCulled   = false;
             inst.occlusionCulled = false;
+            inst.hzbCulled       = false;
             const bool cullEligible = inst.hasBounds &&
                 !inst.isViewModel && !inst.isSkinned &&
                 (g_config.cullingFrustumLodChunks || !inst.isLODChunk);
-            if (cullEligible && (frustumCullActive || occlusionCullActive)) {
+            if (cullEligible && (frustumCullActive || occlusionCullActive ||
+                                 hzbCullActive || hzbCollect)) {
                 // Local AABB -> world-space center + extents through the
                 // live worldTransform (post-livePoses, so animated statics
                 // test their current pose).
@@ -2466,11 +2580,98 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                         inst.occlusionCulled = age > occlStaleFrames;
                     }
                 }
+
+                // Hi-Z occludee test: is the world AABB confidently behind the
+                // static-occluder depth pyramid? Same keep-sphere clearance as
+                // occlusion (near geometry can appear in secondary rays). A cull
+                // commits only after HzbCullDelayFrames consecutive occluded
+                // frames; the streak resets the instant it reads visible, so the
+                // handle re-appears with no latency.
+                if (hzbCullActive && nearDistSq > hzbKeepRadiusSq) {
+                    const float amin[3] = { wc[0]-we[0], wc[1]-we[1], wc[2]-we[2] };
+                    const float amax[3] = { wc[0]+we[0], wc[1]+we[1], wc[2]+we[2] };
+                    if (s_hzb.IsOccluded(amin, amax, hzbMargin)) {
+                        if (inst.hzbOccludedStreak < 0xffffffffu) ++inst.hzbOccludedStreak;
+                    } else {
+                        inst.hzbOccludedStreak = 0;
+                    }
+                    const uint32_t need = (hzbDelay == 0) ? 1u : hzbDelay;
+                    inst.hzbCulled = inst.hzbOccludedStreak >= need;
+                } else {
+                    inst.hzbOccludedStreak = 0;
+                }
+
+                // Occluder collection (collect frames only): a drawable proven
+                // static (never animated), opaque (alpha-test/blend excluded so
+                // fence/foliage holes are never treated as solid), aged past the
+                // min-age gate, and large enough in world space, whose mesh kept
+                // an occluder-geometry copy. Its baked worldTransform is its
+                // final placement (livePoses never touches a static).
+                if (hzbCollect && !inst.isLODChunk && !inst.isWater &&
+                    !inst.everAnimated && !inst.alphaBlendEnabled &&
+                    !inst.alphaTestEnabled &&
+                    (currentFrame - inst.firstFrame) >= g_config.cullingHzbOccluderMinAge) {
+                    const float wsize =
+                        2.0f * (std::max)(we[0], (std::max)(we[1], we[2]));
+                    if (wsize >= g_config.cullingHzbOccluderMinSize) {
+                        auto mit = g_meshCache.find(inst.meshCacheKey);
+                        if (mit != g_meshCache.end() && mit->second.occluderGeom) {
+                            OccluderRef oref;
+                            oref.geom = mit->second.occluderGeom;
+                            memcpy(oref.xf, inst.worldTransform, sizeof(oref.xf));
+                            oref.distSq = nearDistSq;
+                            hzbOccluders.push_back(std::move(oref));
+                        }
+                    }
+                }
             }
             buckets[BucketKey{inst.meshHandle, vmCategoryTag && inst.isViewModel}]
                 .members.push_back(&inst);
         }
         bucketCount = buckets.size();
+
+        // Rebuild the Hi-Z from this collect frame's static occluders (used by
+        // NEXT frame's occludee tests). Nearest-first, capped by the occluder
+        // and total-triangle budgets so the synchronous raster stays bounded.
+        // Runs on the Remix thread for v1 simplicity (no cross-thread races);
+        // if the CPU timer shows it too costly, move to the mesh worker pool
+        // (the shared_ptr geometry already makes that a mechanical change).
+        if (hzbCollect && s_hzbInited) {
+            std::sort(hzbOccluders.begin(), hzbOccluders.end(),
+                      [](const OccluderRef& a, const OccluderRef& b) {
+                          return a.distSq < b.distSq;
+                      });
+            HzbOcclusion::CameraParams hcam{};
+            memcpy(hcam.position, cam.position, sizeof(hcam.position));
+            memcpy(hcam.forward,  cam.forward,  sizeof(hcam.forward));
+            memcpy(hcam.up,       cam.up,       sizeof(hcam.up));
+            memcpy(hcam.right,    cam.right,    sizeof(hcam.right));
+            hcam.fovYDeg   = cam.fovY;
+            hcam.aspect    = cam.aspectRatio;
+            hcam.nearPlane = cam.nearPlane;
+            hcam.farPlane  = cam.farPlane;
+            s_hzb.Reset(hcam);
+            uint32_t builtOcc = 0, builtTris = 0;
+            const uint32_t maxOcc  = g_config.cullingHzbMaxOccluders;
+            const uint32_t maxTris = g_config.cullingHzbMaxTris;
+            for (const OccluderRef& o : hzbOccluders) {
+                if (builtOcc >= maxOcc || builtTris >= maxTris) break;
+                if (!o.geom || o.geom->indices.size() < 3) continue;
+                HzbOcclusion::OccluderMesh om;
+                om.positionBase   = o.geom->positions.data();
+                om.positionStride = sizeof(float) * 3;
+                om.vertexCount    = o.geom->positions.size() / 3;
+                om.indices        = o.geom->indices.data();
+                om.indexCount     = o.geom->indices.size();
+                memcpy(om.worldTransform, o.xf, sizeof(om.worldTransform));
+                s_hzb.RasterizeOccluder(om);
+                ++builtOcc;
+                builtTris += static_cast<uint32_t>(o.geom->indices.size() / 3);
+            }
+            s_hzb.BuildMips();
+            s_hzbBuildOccluders = builtOcc;
+            s_hzbBuildTris = builtTris;
+        }
         if (skinnedHeldNoBones > 0 || skinnedHidden > 0) {
             // First occurrence logs immediately, then every ~300 frames,
             // capped for the session. OnFrame is single-threaded.
@@ -2507,23 +2708,28 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // partially-visible batch rides along whole, costing only TLAS
             // residency for its off-screen members. Fully-hidden buckets (the
             // common case behind the camera or behind a wall) drop entirely.
-            if (frustumCullActive || occlusionCullActive) {
+            if (frustumCullActive || occlusionCullActive || hzbCullActive) {
                 bool allCulled = true;
-                bool allFrustum = true;  // attribution: pure-frustum vs occl
+                bool allFrustum = true;      // attribution ladder: frustum ...
+                bool allFrustOrOccl = true;  // ... then occlusion, else Hi-Z
                 for (const DrawableInstance* m : bucket.members) {
-                    if (!m->frustumCulled && !m->occlusionCulled) {
+                    if (!m->frustumCulled && !m->occlusionCulled && !m->hzbCulled) {
                         allCulled = false;
                         break;
                     }
                     if (!m->frustumCulled) allFrustum = false;
+                    if (!m->frustumCulled && !m->occlusionCulled) allFrustOrOccl = false;
                 }
                 if (allCulled) {
                     if (allFrustum) {
                         skippedFrustum += bucket.members.size();
                         ++skippedFrustumBuckets;
-                    } else {
+                    } else if (allFrustOrOccl) {
                         skippedOcclusion += bucket.members.size();
                         ++skippedOcclusionBuckets;
+                    } else {
+                        skippedHzb += bucket.members.size();
+                        ++skippedHzbBuckets;
                     }
                     // Keep skipped members' resources LRU-live at a spread
                     // cadence (~1/60 of members per frame; grace is 600, and
@@ -2848,6 +3054,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu "
                  "skippedChunkPlayerInside=%zu skippedChunkStale=%zu skippedChunkFar=%zu chunks=%zu "
                  "skippedFrustum=%zu (%zu buckets) skippedOccl=%zu (%zu buckets) "
+                 "skippedHzb=%zu (%zu buckets) hzbOccluders=%u hzbTris=%u "
                  "vmDrawn=%zu skippedVM=%zu "
                  "active=%u isLod=%u fadedIn=%u notVisible=%u lodFadingOut=%u forcedFadeOut=%u "
                  "player=(%.0f,%.0f,%.0f)",
@@ -2855,6 +3062,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                  skippedChunkPlayerInside, skippedChunkStale, skippedChunkFar, lodChunkAges.size(),
                  skippedFrustum, skippedFrustumBuckets,
                  skippedOcclusion, skippedOcclusionBuckets,
+                 skippedHzb, skippedHzbBuckets, s_hzbBuildOccluders, s_hzbBuildTris,
                  vmDrawn, skippedViewModel,
                  activeStats.total, activeStats.isLod, activeStats.fadedIn,
                  activeStats.notVisible, activeStats.lodFadingOut, activeStats.forcedFadeOut,

@@ -85,6 +85,8 @@ add_library(FO4RemixPlugin SHARED
     src/bs_extraction.cpp
     src/draw_capture.h
     src/draw_capture.cpp
+    src/hzb_occlusion.h
+    src/hzb_occlusion.cpp
     src/raster_suppress.h
     src/raster_suppress.cpp
     src/fo4_diagnostics.h
