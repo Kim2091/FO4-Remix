@@ -54,6 +54,19 @@ static remixapi_Format DxgiToRemixFormat(DXGI_FORMAT fmt) {
     }
 }
 
+// Map an sRGB remixapi_Format to its UNORM equivalent (pass-through for non-sRGB formats). Used to force
+// the ALBEDO/diffuse map to be sampled linearly (see the call site for why only albedo).
+static remixapi_Format ToUnormRemixFormat(remixapi_Format fmt) {
+    switch (fmt) {
+        case REMIXAPI_FORMAT_BC1_RGB_SRGB:  return REMIXAPI_FORMAT_BC1_RGB_UNORM;
+        case REMIXAPI_FORMAT_BC3_SRGB:      return REMIXAPI_FORMAT_BC3_UNORM;
+        case REMIXAPI_FORMAT_BC7_SRGB:      return REMIXAPI_FORMAT_BC7_UNORM;
+        case REMIXAPI_FORMAT_R8G8B8A8_SRGB: return REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+        case REMIXAPI_FORMAT_B8G8R8A8_SRGB: return REMIXAPI_FORMAT_B8G8R8A8_UNORM;
+        default: return fmt;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Hash -> wstring path for Remix texture references
 // ---------------------------------------------------------------------------
@@ -1097,6 +1110,23 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         if (remixFmt == (remixapi_Format)0) {
             // Unsupported format; skip — material will reference hash path anyway.
             continue;
+        }
+
+        // Force ONLY the albedo/diffuse map to UNORM. Albedo is the single texture the path tracer runs its
+        // software gamma correction (gammaToLinear / pow 2.2) over, so if it is ALSO sRGB-decoded by the
+        // sampler it double-linearizes -> the washed-out-albedo bug. Submitting it UNORM leaves the shader's
+        // pow(2.2) as the only linearization.
+        //
+        // Everything else stays NATIVE and must NOT be touched:
+        //  - Normal maps are already linear (the game only promotes COLOR textures to sRGB, so normals keep
+        //    UNORM; octahedral-encoded normals are emitted R8G8B8A8_UNORM) and encode direction data.
+        //  - Roughness/smoothness reads correctly through its native format; forcing it linear roughly doubles
+        //    mid roughness (byte 128: sRGB 0.22 -> UNORM 0.50) and over-roughens everything (matte/flat/noisy,
+        //    rust reduced to plain brown).
+        //  - Emissive stays sRGB and is handled by the runtime's per-material sRGB gamma-skip
+        //    (rtx.linearizeSrgbTextures), so it is single-linearized without being converted here.
+        if (tex.hash == mesh.diffuseTextureHash) {
+            remixFmt = ToUnormRemixFormat(remixFmt);
         }
 
         remixapi_TextureInfo texInfo = {};
