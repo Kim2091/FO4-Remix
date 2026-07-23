@@ -343,6 +343,88 @@ static void PumpMessages() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Main-menu RT diagnostic (opt-in, [Logging] LogMainMenuRT). Field-verified:
+// with every capture hook live and Remix ready, sitting at the FO4 main menu
+// produced ZERO "UI RT detected"/[UILayer] records and fwdUI=0 -- nothing the
+// menu renders matches the Scaleform fingerprint (transparent-black clear of
+// a full-screen R8G8B8A8_UNORM DEFAULT RT), so the overlay ships nothing and,
+// with drawables=0, Remix outputs black => the menu is invisible. This logs
+// what the menu ACTUALLY does -- every RT clear (its real color/format/usage/
+// size) and every sole-bound RT -- while no UI RT is locked yet (exactly the
+// main-menu / pre-detection window; auto-silent once gameplay locks the RT).
+// Render-thread only, like g_ui; dedup by signature, hard line cap.
+// ---------------------------------------------------------------------------
+static struct MainMenuRtDiag {
+    static constexpr int kMaxSigs  = 256;
+    static constexpr int kMaxLines = 120;
+    uint64_t sigs[kMaxSigs] = {};
+    int      sigCount = 0;
+    int      lines = 0;
+    bool     announced = false;
+
+    bool Seen(uint64_t sig) {
+        for (int i = 0; i < sigCount; ++i) if (sigs[i] == sig) return true;
+        if (sigCount < kMaxSigs) sigs[sigCount++] = sig;
+        return false;
+    }
+} g_mmDiag;
+
+static void MainMenuRtDiag_Clear(ID3D11RenderTargetView* rtv, const FLOAT color[4]) {
+    if (g_mmDiag.lines >= MainMenuRtDiag::kMaxLines || !rtv) return;
+    if (!g_mmDiag.announced) {
+        g_mmDiag.announced = true;
+        _MESSAGE("FO4RemixPlugin: [MainMenuRT] diag active (no UI RT locked); game=%ux%u",
+                 g_remix.gameWidth, g_remix.gameHeight);
+    }
+    ID3D11Resource* res = nullptr;
+    rtv->GetResource(&res);
+    if (!res) return;
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
+        D3D11_TEXTURE2D_DESC d;
+        tex->GetDesc(&d);
+        // Quantize color so per-frame float jitter doesn't defeat dedup.
+        auto q = [](float c){ int v = (int)(c * 255.0f + 0.5f); return v < 0 ? 0 : (v > 255 ? 255 : v); };
+        uint64_t sig = (uint64_t)(uintptr_t)tex;
+        sig = sig * 131 + d.Format;
+        sig = sig * 131 + (((uint64_t)q(color[0]) << 24) | ((uint64_t)q(color[1]) << 16) |
+                           ((uint64_t)q(color[2]) << 8) | (uint64_t)q(color[3]));
+        if (!g_mmDiag.Seen(sig)) {
+            ++g_mmDiag.lines;
+            _MESSAGE("FO4RemixPlugin: [MainMenuRT] CLEAR tex=%p %ux%u fmt=%u usage=%u bind=0x%X clr=(%.3f,%.3f,%.3f,%.3f)",
+                     (void*)tex, d.Width, d.Height, (unsigned)d.Format,
+                     (unsigned)d.Usage, (unsigned)d.BindFlags,
+                     color[0], color[1], color[2], color[3]);
+        }
+        tex->Release();
+    }
+    res->Release();
+}
+
+static void MainMenuRtDiag_OM(UINT numViews, ID3D11RenderTargetView* const* ppRTVs,
+                              ID3D11DepthStencilView* pDSV) {
+    if (g_mmDiag.lines >= MainMenuRtDiag::kMaxLines || numViews == 0 || !ppRTVs || !ppRTVs[0]) return;
+    ID3D11Resource* res = nullptr;
+    ppRTVs[0]->GetResource(&res);
+    if (!res) return;
+    ID3D11Texture2D* tex = nullptr;
+    if (SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
+        D3D11_TEXTURE2D_DESC d;
+        tex->GetDesc(&d);
+        uint64_t sig = 0xB1ull ^ ((uint64_t)(uintptr_t)tex * 131 + numViews * 7 + (pDSV ? 1u : 0u));
+        sig = sig * 131 + d.Format;
+        if (!g_mmDiag.Seen(sig)) {
+            ++g_mmDiag.lines;
+            _MESSAGE("FO4RemixPlugin: [MainMenuRT] OMSET rt0=%p %ux%u fmt=%u usage=%u bind=0x%X numViews=%u dsv=%d",
+                     (void*)tex, d.Width, d.Height, (unsigned)d.Format,
+                     (unsigned)d.Usage, (unsigned)d.BindFlags, numViews, pDSV ? 1 : 0);
+        }
+        tex->Release();
+    }
+    res->Release();
+}
+
 // ClearRTV hook — Phase 1 of detection: records R8G8B8A8_UNORM candidates.
 // Once locked, just sets the active flag when the known UI RT is cleared.
 static void STDMETHODCALLTYPE hkClearRenderTargetView(
@@ -350,19 +432,38 @@ static void STDMETHODCALLTYPE hkClearRenderTargetView(
     ID3D11RenderTargetView* rtv,
     const FLOAT color[4])
 {
-    if (color[0] == 0.0f && color[1] == 0.0f && color[2] == 0.0f && color[3] == 0.0f) {
+    if (g_config.logMainMenuRT && !g_ui.locked) {
+        MainMenuRtDiag_Clear(rtv, color);
+    }
+    // A Scaleform target is cleared to pure black at the start of its UI
+    // pass. HUD/loading/Pip-Boy/terminals use TRANSPARENT black {0,0,0,0};
+    // the FO4 MAIN MENU uses OPAQUE black {0,0,0,1} (field-verified: its
+    // full-screen R8G8B8A8_UNORM RT clears to alpha=1), which the old
+    // transparent-only gate rejected -- so the menu was never detected,
+    // never had its draws forwarded (fwdUI=0), and rendered black. Accept
+    // opaque black for DETECTION only while no UI RT is locked yet (the
+    // menu / pre-detection window) and only when captureMainMenu is on, so a
+    // gameplay scene/post buffer cleared to opaque black is never mistaken
+    // for the UI RT (by gameplay the transparent HUD/loading RT is already
+    // locked). Tracking a locked RT's own clear accepts either alpha.
+    const bool blackRGB = color[0] == 0.0f && color[1] == 0.0f && color[2] == 0.0f;
+    const bool transpBlack = blackRGB && color[3] == 0.0f;
+    const bool opaqueBlack = blackRGB && color[3] == 1.0f;
+    const bool acceptForDetect =
+        transpBlack || (opaqueBlack && g_config.captureMainMenu && !g_ui.locked);
+    if (transpBlack || opaqueBlack) {
         ID3D11Resource* resource = nullptr;
         rtv->GetResource(&resource);
         if (resource) {
             ID3D11Texture2D* tex = nullptr;
             if (SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex))) {
-                // Multi-layer UI tracking: a transparent-black clear of an
-                // R8G8B8A8 DEFAULT-usage surface is the start-of-pass
-                // signature of EVERY Scaleform target (interface RT, main
-                // menu, Pip-Boy 876x700, terminals). Record the frame's
-                // layers in clear order for the Present composite. Size
-                // floor rejects small FX scratch buffers.
-                if (g_config.overlayMultiLayer &&
+                // Multi-layer UI tracking: a black clear of an R8G8B8A8
+                // DEFAULT-usage surface is the start-of-pass signature of
+                // EVERY Scaleform target (interface RT, main menu, Pip-Boy
+                // 876x700, terminals). Record the frame's layers in clear
+                // order for the Present composite. Size floor rejects small
+                // FX scratch buffers.
+                if (g_config.overlayMultiLayer && acceptForDetect &&
                     g_uiLayers.count < MultiLayerUI::kMaxLayers) {
                     bool known = false;
                     for (int i = 0; i < g_uiLayers.count; ++i) {
@@ -386,13 +487,16 @@ static void STDMETHODCALLTYPE hkClearRenderTargetView(
                     }
                 }
                 if (g_ui.locked) {
+                    // The locked UI RT's own start-of-frame clear -- either
+                    // alpha (the menu RT clears opaque). Marks the RT live so
+                    // the capture doesn't force-clear + ghost.
                     if (tex == g_ui.renderTarget) {
                         g_ui.clearedThisFrame = true;
                         g_ui.lastActivityPresent.store(
                             g_presentIndex.load(std::memory_order_relaxed),
                             std::memory_order_relaxed);
                     }
-                } else {
+                } else if (acceptForDetect) {
                     // Detection phase: add matching textures to per-frame candidate list
                     D3D11_TEXTURE2D_DESC desc;
                     tex->GetDesc(&desc);
@@ -427,6 +531,9 @@ static void STDMETHODCALLTYPE hkOMSetRenderTargets(
     ID3D11RenderTargetView* const* ppRTVs,
     ID3D11DepthStencilView* pDSV)
 {
+    if (g_config.logMainMenuRT && !g_ui.locked) {
+        MainMenuRtDiag_OM(numViews, ppRTVs, pDSV);
+    }
     // Raster suppression tracks whether the UI RT is the CURRENT color
     // target. The UI is always sole-bound (the detection below depends on
     // it), so any other bind -- MRT, depth-only, none -- flips this false.

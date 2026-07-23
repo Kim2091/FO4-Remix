@@ -64,6 +64,15 @@ struct PluginConfig {
     bool logTextures;        // Log extracted texture info
     bool logLights;          // Log extracted light info
     bool logBoneDiag;        // One-shot bone matrix diagnostic dump (first skinned mesh, bone 0)
+    // Diagnostic for the missing main menu. While NO UI render target is
+    // locked yet (the FO4 main menu, plus the brief pre-detection window of
+    // each load), log every RT clear (real color/format/usage/size) and every
+    // sole-bound RT on the hooked immediate context. The Scaleform overlay
+    // fingerprint (transparent-black clear of a full-screen R8G8B8A8_UNORM
+    // DEFAULT RT) matches NOTHING at the main menu -- this reveals what the
+    // menu actually renders. Dedup'd + capped; silent once gameplay locks the
+    // UI RT. Default false.
+    bool logMainMenuRT;
 
     // [Lights]
     bool  lightsEnabled;     // Master toggle for all extracted lights
@@ -156,6 +165,19 @@ struct PluginConfig {
     // open the raster-suppression UI phase (fixes menus whose draws never
     // touched the locked RT). 0 = legacy single-RT capture.
     bool overlayMultiLayer;  // default true
+
+    // Capture the FO4 main menu (2026-07-22). The main menu's Scaleform
+    // target is a full-screen R8G8B8A8_UNORM DEFAULT RT identical to the HUD
+    // fingerprint EXCEPT it clears to OPAQUE black {0,0,0,1} instead of
+    // transparent {0,0,0,0} (field-verified), so the transparent-only gate
+    // rejected it: the menu was never detected, its draws never forwarded
+    // (fwdUI=0), and it rendered black. When on, opaque-black full-screen
+    // clears are accepted for UI-RT detection -- but ONLY while no UI RT is
+    // locked yet (the menu / each load's pre-detection window), so a gameplay
+    // scene/post buffer cleared to opaque black is never grabbed (by gameplay
+    // the transparent HUD/loading RT is already locked). 0 = legacy
+    // transparent-only detection (main menu stays black).
+    bool captureMainMenu;    // default true
 
     // [Emissive]
     bool  emissiveGlowMapsEnabled;  // Extract glow map textures from BSLightingShaderMaterialGlowmap
