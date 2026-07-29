@@ -53,8 +53,10 @@ endif()
 # We use our own compatibility header (f4se_compat.h) instead of xse::common
 add_library(f4se_minimal STATIC
     "${F4SE_SDK_DIR}/f4se_common/Relocation.cpp"
+    "${F4SE_SDK_DIR}/f4se/GameAPI.cpp"
     "${F4SE_SDK_DIR}/f4se/GameCamera.cpp"
     "${F4SE_SDK_DIR}/f4se/GameForms.cpp"
+    "${F4SE_SDK_DIR}/f4se/GameStreams.cpp"
 )
 target_include_directories(f4se_minimal PUBLIC
     "${F4SE_SDK_DIR}"

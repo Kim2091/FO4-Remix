@@ -366,15 +366,24 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
         `SubmitDrawable` recreates the handle — without this, a hash-only
         hit made the drawable fail its diffuse-loaded gate silently and
         permanently (the 2026-07-02 empty-world-after-save-load bug).
-     3. Reads every mip via `ReadbackAllMips` (creates a per-mip staging
-        texture, `CopySubresourceRegion`, `Map`, copies pixels honouring
-        block-compressed row pitch). BC textures truncate the chain at the
-        4x4 boundary so D3D11 doesn't reject sub-block standalone resources.
-     4. Software-decompresses BC1/BC2/BC3/BC5 to RGBA8 only when the
+     3. With `[Materials] AuthoredTextureSource=1`, first tries to read a
+        complete 2D DDS mip chain through `BSResourceNiBinaryStream`, which
+        follows Fallout's virtual resource lookup order. Supported DDS input
+        enters the normal conversion/cache path under a separate salted hash;
+        unavailable, headerless, unsupported, generated, and live render-
+        target textures fall back to the resident D3D resource. Capped
+        `[AuthoredTex]` lines compare authored, live-resource, and
+        `BSRenderData` dimensions so BA2 behavior can be verified in-game.
+     4. On fallback, reads every mip via `ReadbackAllMips` (creates a
+        per-mip staging texture, `CopySubresourceRegion`, `Map`, copies
+        pixels honouring block-compressed row pitch). BC textures truncate
+        the chain at the 4x4 boundary so D3D11 doesn't reject sub-block
+        standalone resources.
+     5. Software-decompresses BC1/BC2/BC3/BC5 to RGBA8 only when the
         post-process pipeline needs an uncompressed input
         (`SmoothnessToRoughness` / `ConvertNormalToOctahedral`).
         Pure-diffuse textures stay in their source BC format.
-     5. Concatenates the per-mip buffers into one tightly-packed mip chain
+     6. Concatenates the per-mip buffers into one tightly-packed mip chain
         suitable for `remixapi_TextureInfo`.
    - Pull emissive color/scale from `BSLightingShaderProperty::pEmissiveColor`
      and `fEmitColorScale` when the `kShaderFlags_EmitColor` bit is set.
@@ -611,6 +620,8 @@ from FO4 is outstanding.
 | Overlay | `RestoreLegacyInput` | bool | 1 | issue `RIDEV_REMOVE` for keyboard so the game still receives `WM_KEYDOWN` after Remix's overlay-thread `RIDEV_NOLEGACY` registration | `remix_api.cpp:162` |
 | Performance | `GpuInstancing` | bool | 1 | share Remix mesh handles across drawables with byte-identical geometry+material and batch via `InstanceInfoGpuInstancingEXT` | `remix_renderer.cpp:820` |
 | Performance | `CpuTextureCacheMiB` | uint32 | 1024 | byte budget for the CPU-side decoded-texture cache in bs_extraction (LRU eviction past it; 0 = unbounded legacy) | `bs_extraction.cpp` (`TextureCacheEnforceBudget`) |
+| Materials | `TextureUpgradeOnApproach` | bool | 0 | legacy resident-mip poll that releases and re-resolves drawables after a sharper D3D resource appears; remains off because the churn caused hitches and resource growth | `semantic_capture.cpp`, `bs_extraction.cpp` |
+| Materials | `AuthoredTextureSource` | bool | 0 | experimental: prefer a supported authored 2D DDS chain from Fallout's virtual filesystem, then fall back to live GPU readback; avoids the resident-resolution upgrade loop | `bs_extraction.cpp` (`ReadAuthoredDdsMips`) |
 | Precombines | `MergeTwoSided` | bool | 1 | render merge-expanded precombines double-sided (vanilla-faithful). 0 = single-sided experiment: re-enables the per-instance mirrored-record winding flip; potential path-tracing perf win if content winding holds up post-b112e08 | `lighting_static.cpp` (merge submit) |
 
 `[Limits] MaxExtent` was retired 2026-07-10: documented but never consumed
@@ -619,6 +630,14 @@ would have started rejecting huge-local-extent LOD chunks.
 
 ## Known limitations
 
+- **Authored DDS loading is experimental and opt-in.** Loose DDS input and
+  standard DDS streams are parsed directly, but Fallout's DX10 BA2 resource
+  stream must be verified in-game. A `[AuthoredTex] ... FALLBACK
+  reason=not-dds-stream` line means the engine exposed headerless archive
+  payload rather than a standard DDS; the plugin safely retains async GPU
+  readback in that case. Only 2D, single-image BC1/2/3/4/5/7 and RGBA/BGRA8
+  DDS files are accepted. Cubemaps, arrays, volumes, and unknown formats
+  deliberately fall back.
 - **`cell_pipeline.{cpp,h}` is paused.** The cell-granular state machine for
   per-cell extraction and Remix loading was retired with Phase 1B in favour
   of the event-driven `semantic_capture` path. The files remain in `src/`
@@ -731,4 +750,3 @@ would have started rejecting huge-local-extent LOD chunks.
   notes the previous budget cap (4 submissions/frame) starved streaming.
   Protection now lives in the VRAM gate (90 % of `driverBudgetBytes`)
   plus per-call SEH/C++ exception fences inside `SubmitDrawable`.
-

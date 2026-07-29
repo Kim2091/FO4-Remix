@@ -8,6 +8,7 @@
 #include "f4se_common/f4se_version.h"
 #include "f4se_common/Relocation.h"
 #include "f4se/PluginAPI.h"
+#include "f4se/GameStreams.h"
 #include "f4se/NiNodes.h"
 #include "f4se/NiObjects.h"
 #include "f4se/NiTypes.h"
@@ -371,6 +372,346 @@ static bool IsBlockCompressed(DXGI_FORMAT fmt, uint32_t& blockSize)
             return false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Authored DDS source (experimental).
+//
+// FO4's texture streamer can replace a material's D3D resource with a
+// reduced-resolution resource while the object is distant. Capturing that
+// resource by name permanently locks the reduced mip into our cache. When
+// enabled, this path asks Fallout's own virtual filesystem for the named DDS
+// instead, preserving loose-file override and BA2 lookup order. Only ordinary
+// 2D DDS files in formats already supported by the conversion pipeline are
+// accepted; every other case retains the existing GPU-readback path.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr uint32_t MakeFourCC(char a, char b, char c, char d)
+{
+    return static_cast<uint32_t>(static_cast<uint8_t>(a)) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(b)) << 8) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(c)) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(d)) << 24);
+}
+
+#pragma pack(push, 1)
+struct DdsPixelFormat {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t fourCC;
+    uint32_t rgbBitCount;
+    uint32_t rMask;
+    uint32_t gMask;
+    uint32_t bMask;
+    uint32_t aMask;
+};
+
+struct DdsHeader {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t height;
+    uint32_t width;
+    uint32_t pitchOrLinearSize;
+    uint32_t depth;
+    uint32_t mipMapCount;
+    uint32_t reserved1[11];
+    DdsPixelFormat pixelFormat;
+    uint32_t caps;
+    uint32_t caps2;
+    uint32_t caps3;
+    uint32_t caps4;
+    uint32_t reserved2;
+};
+
+struct DdsHeaderDx10 {
+    uint32_t dxgiFormat;
+    uint32_t resourceDimension;
+    uint32_t miscFlag;
+    uint32_t arraySize;
+    uint32_t miscFlags2;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(DdsPixelFormat) == 32, "DDS pixel format layout");
+static_assert(sizeof(DdsHeader) == 124, "DDS header layout");
+static_assert(sizeof(DdsHeaderDx10) == 20, "DDS DX10 header layout");
+
+enum class AuthoredDdsStatus {
+    Ready,
+    Unavailable,
+    NotDds,
+    Unsupported,
+    ReadFailed,
+};
+
+struct AuthoredDdsInfo {
+    uint32_t sourceWidth = 0;
+    uint32_t sourceHeight = 0;
+    uint32_t sourceMipCount = 0;
+    uint32_t streamMagic = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+
+static std::unordered_set<uint64_t> g_authoredDdsUnavailable;
+
+static bool HasDdsExtension(const char* path)
+{
+    if (!path) return false;
+    const size_t n = std::strlen(path);
+    return n >= 4 && _stricmp(path + n - 4, ".dds") == 0;
+}
+
+static bool ResourceReadExact(BSResourceNiBinaryStream& stream, void* dst,
+                              size_t byteCount)
+{
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    while (byteCount > 0) {
+        const UInt64 request = static_cast<UInt64>(
+            std::min<size_t>(byteCount, static_cast<size_t>(UINT32_MAX)));
+        const UInt32 got = stream.Read(out, request);
+        if (got == 0 || got > request) return false;
+        out += got;
+        byteCount -= got;
+    }
+    return true;
+}
+
+static bool ResourceSkipExact(BSResourceNiBinaryStream& stream, uint64_t byteCount)
+{
+    if (byteCount == 0) return true;
+    if (byteCount > static_cast<uint64_t>(INT64_MAX)) return false;
+    const uint64_t before = stream.GetOffset();
+    stream.Seek(static_cast<SInt64>(byteCount));
+    return stream.GetOffset() == before + byteCount;
+}
+
+static uint32_t DdsMipDimension(uint32_t base, uint32_t mip)
+{
+    const uint32_t value = base >> mip;
+    return value ? value : 1;
+}
+
+static uint32_t FormatFamily(DXGI_FORMAT fmt)
+{
+    switch (fmt) {
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC1_UNORM_SRGB: return 1;
+        case DXGI_FORMAT_BC2_TYPELESS:
+        case DXGI_FORMAT_BC2_UNORM:
+        case DXGI_FORMAT_BC2_UNORM_SRGB: return 2;
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_BC3_UNORM_SRGB: return 3;
+        case DXGI_FORMAT_BC4_TYPELESS:
+        case DXGI_FORMAT_BC4_UNORM: return 4;
+        case DXGI_FORMAT_BC5_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM:
+        case DXGI_FORMAT_BC5_SNORM: return 5;
+        case DXGI_FORMAT_BC7_TYPELESS:
+        case DXGI_FORMAT_BC7_UNORM:
+        case DXGI_FORMAT_BC7_UNORM_SRGB: return 7;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return 8;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return 9;
+        default: return 0;
+    }
+}
+
+static DXGI_FORMAT NormalizeDdsFormat(DXGI_FORMAT parsed, DXGI_FORMAT live)
+{
+    const uint32_t parsedFamily = FormatFamily(parsed);
+    if (parsedFamily != 0 && parsedFamily == FormatFamily(live) &&
+        ComputeMip0Size(4, 4, live) != 0) {
+        return live;
+    }
+    switch (parsed) {
+        case DXGI_FORMAT_BC1_TYPELESS: return DXGI_FORMAT_BC1_UNORM;
+        case DXGI_FORMAT_BC2_TYPELESS: return DXGI_FORMAT_BC2_UNORM;
+        case DXGI_FORMAT_BC3_TYPELESS: return DXGI_FORMAT_BC3_UNORM;
+        case DXGI_FORMAT_BC4_TYPELESS: return DXGI_FORMAT_BC4_UNORM;
+        case DXGI_FORMAT_BC5_TYPELESS: return DXGI_FORMAT_BC5_UNORM;
+        case DXGI_FORMAT_BC7_TYPELESS: return DXGI_FORMAT_BC7_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        default: return parsed;
+    }
+}
+
+static DXGI_FORMAT LegacyDdsFormat(const DdsPixelFormat& pf)
+{
+    constexpr uint32_t kDdsPfFourCC = 0x4;
+    constexpr uint32_t kDdsPfRgb = 0x40;
+    if (pf.flags & kDdsPfFourCC) {
+        switch (pf.fourCC) {
+            case MakeFourCC('D', 'X', 'T', '1'): return DXGI_FORMAT_BC1_UNORM;
+            case MakeFourCC('D', 'X', 'T', '3'): return DXGI_FORMAT_BC2_UNORM;
+            case MakeFourCC('D', 'X', 'T', '5'): return DXGI_FORMAT_BC3_UNORM;
+            case MakeFourCC('A', 'T', 'I', '1'):
+            case MakeFourCC('B', 'C', '4', 'U'): return DXGI_FORMAT_BC4_UNORM;
+            case MakeFourCC('A', 'T', 'I', '2'):
+            case MakeFourCC('B', 'C', '5', 'U'): return DXGI_FORMAT_BC5_UNORM;
+            case MakeFourCC('B', 'C', '5', 'S'): return DXGI_FORMAT_BC5_SNORM;
+            default: return DXGI_FORMAT_UNKNOWN;
+        }
+    }
+    if ((pf.flags & kDdsPfRgb) && pf.rgbBitCount == 32) {
+        if (pf.rMask == 0x000000FF && pf.gMask == 0x0000FF00 &&
+            pf.bMask == 0x00FF0000 && pf.aMask == 0xFF000000) {
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+        if (pf.rMask == 0x00FF0000 && pf.gMask == 0x0000FF00 &&
+            pf.bMask == 0x000000FF && pf.aMask == 0xFF000000) {
+            return DXGI_FORMAT_B8G8R8A8_UNORM;
+        }
+    }
+    return DXGI_FORMAT_UNKNOWN;
+}
+
+static AuthoredDdsStatus ReadAuthoredDdsMips(
+    const char* path, DXGI_FORMAT liveFormat,
+    std::vector<ExtractedTexture>& outMips, AuthoredDdsInfo& outInfo)
+{
+    constexpr uint32_t kDdsMagic = MakeFourCC('D', 'D', 'S', ' ');
+    constexpr uint32_t kDx10FourCC = MakeFourCC('D', 'X', '1', '0');
+    constexpr uint32_t kDdsCaps2Cubemap = 0x200;
+    constexpr uint32_t kDdsCaps2Volume = 0x200000;
+    constexpr uint64_t kMaxRawBytes = 256ull << 20;
+
+    outMips.clear();
+    outInfo = {};
+    if (!HasDdsExtension(path)) return AuthoredDdsStatus::Unavailable;
+
+    BSResourceNiBinaryStream stream(path);
+    if (!stream.IsValid()) return AuthoredDdsStatus::Unavailable;
+
+    uint32_t magic = 0;
+    DdsHeader header = {};
+    if (!ResourceReadExact(stream, &magic, sizeof(magic)) ||
+        !ResourceReadExact(stream, &header, sizeof(header))) {
+        return AuthoredDdsStatus::ReadFailed;
+    }
+    outInfo.streamMagic = magic;
+    if (magic != kDdsMagic) return AuthoredDdsStatus::NotDds;
+    if (header.size != sizeof(DdsHeader) ||
+        header.pixelFormat.size != sizeof(DdsPixelFormat) ||
+        header.width == 0 || header.height == 0 ||
+        header.width > 32768 || header.height > 32768 ||
+        (header.caps2 & (kDdsCaps2Cubemap | kDdsCaps2Volume)) != 0) {
+        return AuthoredDdsStatus::Unsupported;
+    }
+
+    DXGI_FORMAT parsedFormat = DXGI_FORMAT_UNKNOWN;
+    if (header.pixelFormat.fourCC == kDx10FourCC) {
+        DdsHeaderDx10 dx10 = {};
+        if (!ResourceReadExact(stream, &dx10, sizeof(dx10))) {
+            return AuthoredDdsStatus::ReadFailed;
+        }
+        if (dx10.resourceDimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D ||
+            dx10.arraySize != 1 ||
+            (dx10.miscFlag & D3D11_RESOURCE_MISC_TEXTURECUBE) != 0) {
+            return AuthoredDdsStatus::Unsupported;
+        }
+        parsedFormat = static_cast<DXGI_FORMAT>(dx10.dxgiFormat);
+    } else {
+        parsedFormat = LegacyDdsFormat(header.pixelFormat);
+    }
+
+    const DXGI_FORMAT format = NormalizeDdsFormat(parsedFormat, liveFormat);
+    if (FormatFamily(format) == 0 ||
+        ComputeMip0Size(header.width, header.height, format) == 0) {
+        return AuthoredDdsStatus::Unsupported;
+    }
+
+    uint32_t maxMipCount = 1;
+    for (uint32_t edge =
+             header.width > header.height ? header.width : header.height;
+         edge > 1; edge >>= 1) {
+        ++maxMipCount;
+    }
+    uint32_t sourceMipCount = header.mipMapCount ? header.mipMapCount : 1;
+    if (sourceMipCount > maxMipCount) return AuthoredDdsStatus::Unsupported;
+
+    uint32_t firstMip = 0;
+    if (g_config.maxTextureDimension > 0) {
+        while (firstMip + 1 < sourceMipCount) {
+            const uint32_t w = DdsMipDimension(header.width, firstMip);
+            const uint32_t h = DdsMipDimension(header.height, firstMip);
+            if (w <= g_config.maxTextureDimension &&
+                h <= g_config.maxTextureDimension) {
+                break;
+            }
+            ++firstMip;
+        }
+    }
+
+    uint64_t skipBytes = 0;
+    for (uint32_t mip = 0; mip < firstMip; ++mip) {
+        const uint32_t w = DdsMipDimension(header.width, mip);
+        const uint32_t h = DdsMipDimension(header.height, mip);
+        const uint32_t bytes = ComputeMip0Size(w, h, format);
+        if (bytes == 0 || skipBytes > UINT64_MAX - bytes) {
+            return AuthoredDdsStatus::Unsupported;
+        }
+        skipBytes += bytes;
+    }
+    if (!ResourceSkipExact(stream, skipBytes)) {
+        return AuthoredDdsStatus::ReadFailed;
+    }
+
+    uint32_t blockSize = 0;
+    const bool isBC = IsBlockCompressed(format, blockSize);
+    uint64_t rawBytes = 0;
+    outMips.reserve(sourceMipCount - firstMip);
+    for (uint32_t mip = firstMip; mip < sourceMipCount; ++mip) {
+        const uint32_t w = DdsMipDimension(header.width, mip);
+        const uint32_t h = DdsMipDimension(header.height, mip);
+        if (isBC && (w < 4 || h < 4)) break;
+
+        const uint32_t bytes = ComputeMip0Size(w, h, format);
+        if (bytes == 0 || rawBytes + bytes > kMaxRawBytes) {
+            outMips.clear();
+            return AuthoredDdsStatus::Unsupported;
+        }
+
+        ExtractedTexture extractedMip;
+        extractedMip.width = w;
+        extractedMip.height = h;
+        extractedMip.dxgiFormat = format;
+        extractedMip.mipLevels = 1;
+        extractedMip.pixels.resize(bytes);
+        if (!ResourceReadExact(stream, extractedMip.pixels.data(), bytes)) {
+            outMips.clear();
+            return AuthoredDdsStatus::ReadFailed;
+        }
+        rawBytes += bytes;
+        outMips.push_back(std::move(extractedMip));
+    }
+    if (outMips.empty()) return AuthoredDdsStatus::Unsupported;
+
+    outInfo.sourceWidth = header.width;
+    outInfo.sourceHeight = header.height;
+    outInfo.sourceMipCount = sourceMipCount;
+    outInfo.format = format;
+    return AuthoredDdsStatus::Ready;
+}
+
+static const char* AuthoredDdsStatusName(AuthoredDdsStatus status)
+{
+    switch (status) {
+        case AuthoredDdsStatus::Ready: return "ready";
+        case AuthoredDdsStatus::Unavailable: return "unavailable";
+        case AuthoredDdsStatus::NotDds: return "not-dds-stream";
+        case AuthoredDdsStatus::Unsupported: return "unsupported";
+        case AuthoredDdsStatus::ReadFailed: return "read-failed";
+        default: return "unknown";
+    }
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Async GPU readback (2026-07-02): read every mip level of a texture into CPU
@@ -2359,7 +2700,8 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
 
     // Stable hash from texture name so hashes are consistent across runs
     const char* texName = tex->name.c_str();
-    uint64_t hash = FnvHash(texName ? texName : "");
+    const uint64_t sourceNameHash = FnvHash(texName ? texName : "");
+    uint64_t hash = sourceNameHash;
     // Include post-processing mode so variants don't collide
     if (postProcess == TexturePostProcess::InvertRGB)                         hash = FnvHashCombine(hash, 1);
     if (postProcess == TexturePostProcess::Octahedral)                        hash = FnvHashCombine(hash, 2);
@@ -2386,6 +2728,13 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
         hash = FnvHashCombine(hash, FnvHash(lutName ? lutName : ""));
         hash = FnvHashCombine(hash, 10 | ((uint64_t)(uint8_t)(paletteRowV * 255.0f + 0.5f) << 8));
     }
+    // Keep authored-source output distinct from the old live-resource path,
+    // including persistent disk-cache files left by earlier builds. The salt
+    // also covers fallback output while the option is enabled so a transient
+    // source failure can never consume a stale unsalted low-mip cache entry.
+    if (g_config.authoredTextureSource) {
+        hash = FnvHashCombine(hash, 12);
+    }
     // Resident RESOLUTION variant (2026-07-08 re-capture-on-approach): FO4
     // streams textures in progressively, so `resource` is whatever mip level
     // is currently resident -- often reduced (1/2, 1/4) when the object first
@@ -2401,7 +2750,7 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // TextureUpgradeOnApproach): default OFF keeps the name-only key (and thus
     // byte-identical caching + no upgrade churn).
     const uint64_t preResolutionHash = hash;  // for superseded-variant eviction
-    if (g_config.textureUpgradeOnApproach) {
+    if (g_config.textureUpgradeOnApproach && !g_config.authoredTextureSource) {
         ID3D11Texture2D* t2d = nullptr;
         if (SUCCEEDED(resource->QueryInterface(
                 __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t2d))) && t2d) {
@@ -2566,13 +2915,75 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                                           reinterpret_cast<void**>(&tex2D));
     if (FAILED(hr) || !tex2D) return 0;
 
-    // Persistent disk cache probe: a prior session already converted this
-    // exact chain -- stream it back on a worker instead of paying readback
-    // + convert. Probed at most once per hash per session
-    // (g_diskProbeMissing suppresses the per-retry stat; the resolver polls
-    // pending textures every 2 frames).
+    // Prefer the authored DDS chain when configured. This is deliberately
+    // attempted after live-RT classification: render targets and generated
+    // textures must preserve their live pixels. Failures are remembered by
+    // source name for the session and fall through to the proven GPU path.
+    std::vector<ExtractedTexture> mips;
     D3D11_TEXTURE2D_DESC srcDescForCache = {};
     tex2D->GetDesc(&srcDescForCache);
+    const D3D11_TEXTURE2D_DESC liveDesc = srcDescForCache;
+    bool usedAuthoredSource = false;
+    if (g_config.authoredTextureSource && !isLiveRT &&
+        !g_authoredDdsUnavailable.count(sourceNameHash)) {
+        AuthoredDdsInfo authoredInfo;
+        const AuthoredDdsStatus authoredStatus =
+            ReadAuthoredDdsMips(texName, srcDescForCache.Format, mips,
+                                authoredInfo);
+        if (authoredStatus == AuthoredDdsStatus::Ready) {
+            usedAuthoredSource = true;
+            srcDescForCache.Width = mips[0].width;
+            srcDescForCache.Height = mips[0].height;
+            srcDescForCache.MipLevels = static_cast<UINT>(mips.size());
+            srcDescForCache.Format = mips[0].dxgiFormat;
+
+            static std::atomic<int> sAuthoredReadyLogs{0};
+            const int n =
+                sAuthoredReadyLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 64 || (g_config.logTextures && (n % 256) == 0)) {
+                _MESSAGE("FO4RemixPlugin: [AuthoredTex] #%d slot=%s \"%s\" "
+                         "authored=%ux%u/%u mips upload=%ux%u/%zu fmt=%u "
+                         "live=%ux%u/%u fmt=%u rd=%ux%u",
+                         n, slotName ? slotName : "<null>",
+                         texName ? texName : "<unnamed>",
+                         authoredInfo.sourceWidth, authoredInfo.sourceHeight,
+                         authoredInfo.sourceMipCount,
+                         mips[0].width, mips[0].height, mips.size(),
+                         (unsigned)mips[0].dxgiFormat,
+                         liveDesc.Width, liveDesc.Height,
+                         liveDesc.MipLevels,
+                         (unsigned)liveDesc.Format,
+                         (unsigned)renderData->width,
+                         (unsigned)renderData->height);
+            }
+        } else {
+            g_authoredDdsUnavailable.insert(sourceNameHash);
+            static std::atomic<int> sAuthoredFallbackLogs{0};
+            const int n =
+                sAuthoredFallbackLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 64 || (g_config.logTextures && (n % 256) == 0)) {
+                _MESSAGE("FO4RemixPlugin: [AuthoredTex] #%d FALLBACK slot=%s "
+                         "\"%s\" reason=%s magic=0x%08X live=%ux%u "
+                         "mips=%u fmt=%u rd=%ux%u",
+                         n, slotName ? slotName : "<null>",
+                         texName ? texName : "<unnamed>",
+                         AuthoredDdsStatusName(authoredStatus),
+                         authoredInfo.streamMagic,
+                         srcDescForCache.Width, srcDescForCache.Height,
+                         srcDescForCache.MipLevels,
+                         (unsigned)srcDescForCache.Format,
+                         (unsigned)renderData->width,
+                         (unsigned)renderData->height);
+            }
+        }
+    }
+
+    // Persistent disk cache probe: a prior session already converted this
+    // exact chain -- stream it back on a worker instead of paying readback
+    // + convert. For authored DDS input, srcDescForCache describes the capped
+    // authored chain rather than the reduced live resource. Probed at most
+    // once per hash per session (g_diskProbeMissing suppresses the per-retry
+    // stat; the resolver polls pending textures every 2 frames).
     uint64_t diskKey = 0;
     // Live RTs bypass the disk cache entirely: their pixels are per-frame
     // runtime content, and per-generation keys would flood the folder.
@@ -2595,17 +3006,14 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
         }
     }
 
-    // Read every mip from the source D3D texture. Each entry is a single-mip
-    // ExtractedTexture so we can reuse the existing per-mip decompression and
-    // post-process functions unchanged. They get concatenated into a packed
-    // mip chain at the end.
-    //
-    // Async: the first attempt queues GPU copies and returns Pending; the
-    // resolver's retry loop calls back next tick(s) until the copies have
-    // landed. Returning 0 here is the existing "no texture yet" signal the
-    // resolver already handles by retrying -- no stalls on the game thread.
-    std::vector<ExtractedTexture> mips;
-    ReadbackStatus rbStatus = ReadbackAllMipsAsync(device, tex2D, hash, mips);
+    // If authored loading declined, read every mip from the current D3D
+    // texture. Each entry is a single-mip ExtractedTexture so both source
+    // paths share all decompression, material transforms, cache packing, and
+    // Remix upload behavior below.
+    ReadbackStatus rbStatus = ReadbackStatus::Ready;
+    if (!usedAuthoredSource) {
+        rbStatus = ReadbackAllMipsAsync(device, tex2D, hash, mips);
+    }
     tex2D->Release();
 
     if (rbStatus == ReadbackStatus::Pending) {
