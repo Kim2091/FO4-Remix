@@ -99,6 +99,14 @@ struct PluginConfig {
 
     // [Skinning]
     bool  skinningEnabled;   // Extract and animate skinned meshes (characters, creatures)
+    // FaceGen morph refresh: re-upload facegen head/mouth/eye meshes when
+    // FO4 rewrites BSDynamicTriShape::dynamicVertices for lip sync, blinks,
+    // and expressions. Interval is staggered by hash; maxPerTick caps mesh
+    // rebuilds queued from one game tick.
+    bool     faceMorphRefreshEnabled;
+    uint32_t faceMorphCheckIntervalFrames;
+    uint32_t faceMorphMaxPerTick;
+
     bool  viewModelEnabled;  // Render the 1st-person arms/weapon/Pip-Boy (synthetic-space remap)
     bool  viewModelBoneConventionFix;  // Camera bone is NIF-camera-convention {right,up,back} vs cameraNode {right,fwd,up}
     // Submit a second SetupCamera of type VIEW_MODEL each frame (2026-07-18,

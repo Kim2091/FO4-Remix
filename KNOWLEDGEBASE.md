@@ -378,6 +378,12 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
         suitable for `remixapi_TextureInfo`.
    - Pull emissive color/scale from `BSLightingShaderProperty::pEmissiveColor`
      and `fEmitColorScale` when the `kShaderFlags_EmitColor` bit is set.
+   - Skinned dynamic FaceGen drawables can be watched for live
+     `dynamicVertices` changes. Tick fingerprints the buffer and queues
+     decoded positions; `OnFrame` rebuilds the drawable's private skinned mesh
+     with a salted replacement `meshInfo.hash` before destroying the previous
+     handle. The salt is the v2 change from the reverted same-hash refresh that
+     made refreshed heads, mouths, and hair disappear.
    - Bail with `false` if the diffuse hash is zero (retry next frame).
    - Call `RemixRenderer::SubmitDrawable(hash, mesh, newTextures)`. On
      success mark `state.submittedToRemix = true` and store `meshHash = hash`.
@@ -586,7 +592,10 @@ from FO4 is outstanding.
 | Lights | `Intensity` | float | 1.0 | radiance multiplier | (plumbed) |
 | Lights | `RadiusMultiplier` | float | 1.0 | sphere-light radius multiplier | (plumbed) |
 | Lights | `ColorStrength` | float | 1.0 | 0 = white, 1 = full game color | (plumbed) |
-| Skinning | `Enabled` | bool | 1 | extract animated skinned meshes | (plumbed; resolvers currently skip skinned) |
+| Skinning | `Enabled` | bool | 1 | extract animated skinned meshes | `lighting_static.cpp`, `skinned_meshes.cpp`, `remix_renderer.cpp` |
+| Skinning | `FaceMorphRefreshEnabled` | bool | 1 | watch FaceGen dynamic vertex buffers and re-upload changed positions | `semantic_capture.cpp`, `remix_renderer.cpp` |
+| Skinning | `FaceMorphCheckIntervalFrames` | uint32 | 2 | staggered frames between face buffer fingerprint checks | `semantic_capture.cpp` |
+| Skinning | `FaceMorphMaxPerTick` | uint32 | 8 | cap face mesh rebuilds queued from one game tick | `semantic_capture.cpp` |
 | Emissive | `GlowMapsEnabled` | bool | 1 | extract `BSLightingShaderMaterialGlowmap::spGlowMapTexture` | `bs_extraction.cpp` (`ExtractEmissiveData`) |
 | Emissive | `EmissiveColorEnabled` | bool | 1 | use `pEmissiveColor` + `fEmitColorScale` | `bs_extraction.cpp` (`ExtractEmissiveData`) |
 | Emissive | `Intensity` | float | 1.0 | global multiplier on `fEmitColorScale` | `remix_renderer.cpp:787` |
@@ -623,9 +632,12 @@ would have started rejecting huge-local-extent LOD chunks.
   `BSLightingShaderMaterialBase::kType_Landscape` (`lighting_static.cpp:197-200`).
   The path tracer renders distance via worldspace LOD chunks and falls back
   to the atmospheric model elsewhere.
-- **Skinned meshes are skipped.** Both resolvers reject
-  `tri->vertexDesc & BSGeometry::kFlag_Skinned`. Characters and creatures
-  do not appear in the path-traced view yet.
+- **Face morph refresh is experimental.** Skinned meshes are submitted, and
+  FaceGen dynamic meshes can be position-refreshed when FO4 rewrites their
+  live `dynamicVertices` buffers. v2 salts each replacement `meshInfo.hash`
+  before destroying the previous handle to avoid the reverted v1 failure
+  where refreshed heads, mouths, and hair disappeared. If this path regresses,
+  disable `[Skinning] FaceMorphRefreshEnabled`.
 - **Precombined / merge-instanced transforms are wrong (open, 2026-07-03).**
   The resolver's model is "local-space vertices x leaf `m_worldTransform`",
   which holds for plain refs but not for precombined geometry

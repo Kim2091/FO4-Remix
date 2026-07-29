@@ -1926,6 +1926,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // Skinned-key side index (Tick's live app-culled refresh + OnFrame's
         // hidden-geometry skip -- hair-under-hats, 2026-07-08).
         state.isSkinnedActor = true;
+        state.faceMorphWatch = tri->GetAsBSDynamicTriShape() != nullptr;
+        mesh.isFaceGenDynamic = state.faceMorphWatch;
         // [FaceAnim] expressions probe: track the first facegen head's bone
         // motion (heads carry ~10 bones; eyes/mouths only 1).
         if (headDiag && tri->GetAsBSDynamicTriShape() && boneCount >= 8) {

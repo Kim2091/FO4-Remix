@@ -1503,10 +1503,48 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // Camera snapshot for the priority ranking (engine reads on the same
         // thread hkPresent already calls Camera::Get from).
         const CameraState resolveCam = Camera::Get();
+        uint32_t faceRefreshesThisTick = 0;
         {
             std::lock_guard<std::mutex> lock(g_drawableMutex);
             for (auto& [key, state] : g_drawableMap) {
                 if (state.submittedToRemix) {
+                    // FaceGen morph watch: FO4 rewrites BSDynamicTriShape
+                    // dynamicVertices during lip sync/blinks/expressions.
+                    // Hash the live buffer on a staggered cadence and queue
+                    // decoded positions only when the content changes.
+                    if (state.faceMorphWatch &&
+                        g_config.faceMorphRefreshEnabled &&
+                        faceRefreshesThisTick < g_config.faceMorphMaxPerTick &&
+                        (g_config.faceMorphCheckIntervalFrames <= 1 ||
+                         ((currentFrame ^ key) %
+                          g_config.faceMorphCheckIntervalFrames) == 0)) {
+                        static std::vector<uint8_t> s_faceRaw;
+                        static std::vector<float>   s_faceXyz;
+                        uint32_t liveVerts = 0;
+                        if (BsExtraction::SnapshotDynamicVertices(state.geometry,
+                                                                  s_faceRaw,
+                                                                  liveVerts)) {
+                            uint64_t fp = 0xCBF29CE484222325ULL;
+                            for (uint8_t b : s_faceRaw) {
+                                fp ^= b;
+                                fp *= 0x100000001B3ULL;
+                            }
+                            if (fp == 0) fp = 1;  // 0 = no baseline yet
+                            if (state.faceMorphFingerprint == 0) {
+                                state.faceMorphFingerprint = fp;
+                            } else if (fp != state.faceMorphFingerprint) {
+                                state.faceMorphFingerprint = fp;
+                                if (BsExtraction::DecodeDynamicPositions(
+                                        s_faceRaw, liveVerts, s_faceXyz)) {
+                                    RemixRenderer::QueueFaceMorphPositions(
+                                        state.meshHash,
+                                        std::vector<float>(s_faceXyz));
+                                    ++faceRefreshesThisTick;
+                                }
+                            }
+                        }
+                    }
+
                     if ((state.mergeCaptureUpgradePending &&
                          ((currentFrame ^ key) & 63) == 0) ||
                         (g_config.textureUpgradeOnApproach &&

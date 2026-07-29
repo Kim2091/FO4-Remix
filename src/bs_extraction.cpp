@@ -1487,6 +1487,86 @@ uint32_t BsExtraction::GetMaterialDiffuseResidentWidth(void* material) {
 }
 
 // ---------------------------------------------------------------------------
+// FaceGen morph refresh: live dynamicVertices snapshot + decode.
+//
+// During dialogue and ambient expressions, FO4 memcpy's freshly CPU-deformed
+// model-space positions into facegen BSDynamicTriShape::dynamicVertices. The
+// normal resolver snapshots the buffer once; these helpers let Tick detect a
+// changed buffer and re-upload just the positions.
+// ---------------------------------------------------------------------------
+namespace {
+
+bool ReadDynamicRawGuarded(void* geometry, uint8_t* dst, uint32_t dstCap,
+                           uint32_t* outSize, uint32_t* outNumVerts) {
+    __try {
+        const uintptr_t g = reinterpret_cast<uintptr_t>(geometry);
+        const uint32_t size = *reinterpret_cast<const volatile uint32_t*>(g + 0x170);
+        const uint16_t numVerts = *reinterpret_cast<const volatile uint16_t*>(g + 0x164);
+        uint8_t* src = *reinterpret_cast<uint8_t* const volatile*>(g + 0x180);
+        *outSize = size;
+        *outNumVerts = numVerts;
+        if (!src || size == 0 || size > 4u * 1024u * 1024u) return false;
+        if (dst) {
+            if (size > dstCap) return false;
+            memcpy(dst, src, size);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+} // namespace
+
+bool BsExtraction::SnapshotDynamicVertices(void* geometry,
+                                           std::vector<uint8_t>& outRaw,
+                                           uint32_t& outNumVertices) {
+    if (!geometry) return false;
+    uint32_t size = 0, nv = 0;
+    if (!ReadDynamicRawGuarded(geometry, nullptr, 0, &size, &nv)) return false;
+    outRaw.resize(size);
+    uint32_t size2 = 0, nv2 = 0;
+    if (!ReadDynamicRawGuarded(geometry, outRaw.data(),
+                               (uint32_t)outRaw.size(), &size2, &nv2) ||
+        size2 != size || nv2 != nv || nv == 0) {
+        return false;
+    }
+    outNumVertices = nv;
+    return true;
+}
+
+bool BsExtraction::DecodeDynamicPositions(const std::vector<uint8_t>& raw,
+                                          uint32_t numVertices,
+                                          std::vector<float>& outXyz) {
+    if (numVertices == 0 || raw.empty()) return false;
+    if (raw.size() % numVertices != 0) return false;
+    const uint32_t elem = (uint32_t)(raw.size() / numVertices);
+    if (elem < 8) return false;
+    outXyz.resize((size_t)numVertices * 3);
+    const uint8_t* p = raw.data();
+    if (elem <= 12) {
+        // Byte-verified facegen layout: half4 position
+        // (x, y, z, bitangentX) plus a 4-byte tail.
+        for (uint32_t i = 0; i < numVertices; ++i) {
+            const uint16_t* hp =
+                reinterpret_cast<const uint16_t*>(p + (size_t)i * elem);
+            outXyz[(size_t)i * 3 + 0] = HalfToFloat(hp[0]);
+            outXyz[(size_t)i * 3 + 1] = HalfToFloat(hp[1]);
+            outXyz[(size_t)i * 3 + 2] = HalfToFloat(hp[2]);
+        }
+    } else {
+        for (uint32_t i = 0; i < numVertices; ++i) {
+            const float* fp =
+                reinterpret_cast<const float*>(p + (size_t)i * elem);
+            outXyz[(size_t)i * 3 + 0] = fp[0];
+            outXyz[(size_t)i * 3 + 1] = fp[1];
+            outXyz[(size_t)i * 3 + 2] = fp[2];
+        }
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Async texture conversion workers (2026-07-09 pop-in speed).
 //
 // Everything downstream of the GPU readback -- BC decompression, octahedral

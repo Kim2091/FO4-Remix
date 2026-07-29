@@ -668,6 +668,20 @@ namespace {
     // (writers hold g_renderStateMutex).
     PendingDestroys   g_eagerPendingDestroys;
     std::atomic<bool> g_hasEagerDestroys{false};
+
+    // FaceGen morph refresh. CPU copies of private skinned face meshes let
+    // OnFrame rebuild only the changed positions when FO4 rewrites a live
+    // BSDynamicTriShape dynamicVertices buffer.
+    struct FaceMeshData {
+        std::vector<remixapi_HardcodedVertex> vertices;
+        std::vector<uint32_t> indices;
+        std::vector<float>    blendWeights;
+        std::vector<uint32_t> blendIndices;
+    };
+    std::unordered_map<uint64_t, FaceMeshData> g_faceMeshData;
+    std::mutex g_faceMorphQueueMutex;
+    std::unordered_map<uint64_t, std::vector<float>> g_faceMorphQueue;
+    uint64_t g_faceMorphMeshSerial = 0;
 }
 
 void RemixRenderer::RequestDestroyDrain() {
@@ -1656,6 +1670,16 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     if (g_drawables.count(hash)) {
         ReleaseDrawableRefsLocked(hash, /*eagerPark=*/true);
     }
+
+    if (mesh.isFaceGenDynamic && mesh.hasSkinning &&
+        g_config.faceMorphRefreshEnabled) {
+        FaceMeshData fm;
+        fm.vertices     = mesh.vertices;
+        fm.indices      = mesh.indices;
+        fm.blendWeights = mesh.blendWeights;
+        fm.blendIndices = mesh.blendIndices;
+        g_faceMeshData[hash] = std::move(fm);
+    }
     g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
     } catch (const std::exception& e) {
@@ -1682,6 +1706,7 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 // g_eagerPendingDestroys). Shared by the public ReleaseDrawable and
 // SubmitDrawable's in-place replacement.
 static void ReleaseDrawableRefsLocked(uint64_t hash, bool eagerPark) {
+    g_faceMeshData.erase(hash);
     auto it = g_drawables.find(hash);
     if (it == g_drawables.end()) return;
 
@@ -2022,6 +2047,14 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         freshBones.swap(g_boneQueue);
     }
 
+    // Drain face morph position updates before taking g_renderStateMutex.
+    static std::unordered_map<uint64_t, std::vector<float>> faceUpdates;
+    faceUpdates.clear();
+    {
+        std::lock_guard<std::mutex> faceLock(g_faceMorphQueueMutex);
+        faceUpdates.swap(g_faceMorphQueue);
+    }
+
     // Stale-chunk filter inputs. The engine fires GetRenderPasses every frame
     // for geometry that survives its culling and HIDES worldspace LOD chunks
     // when their cells attach at full detail -- so a chunk whose fire age
@@ -2209,6 +2242,104 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         const PerfClock::time_point tBucket0 = PerfClock::now();
         const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
         drawableCount = g_drawables.size();
+
+        // ---- FaceGen morph refresh v2 ----
+        // v1 rebuilt replacement meshes with the same meshInfo.hash as the
+        // still-live handle, then destroyed the old handle; user testing made
+        // heads/mouths/hair disappear, likely because DestroyMesh unregisters
+        // by that shared hash. v2 keeps the same drawable/cache ownership but
+        // gives each replacement mesh a salted Remix hash before retiring the
+        // old handle.
+        {
+            static std::atomic<int> sFaceLogs{0};
+            for (auto& [fhash, xyz] : faceUpdates) {
+                auto dIt = g_drawables.find(fhash);
+                auto mIt = g_faceMeshData.find(fhash);
+                if (dIt == g_drawables.end() || mIt == g_faceMeshData.end())
+                    continue;
+
+                DrawableInstance& inst = dIt->second;
+                FaceMeshData& fm = mIt->second;
+                if (!inst.meshHandle || xyz.size() != fm.vertices.size() * 3) {
+                    const int fn = sFaceLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (fn < 12) {
+                        _MESSAGE("FO4RemixPlugin: [FaceMorph] drop hash=0x%llX "
+                                 "verts=%zu xyz=%zu handle=%p",
+                                 (unsigned long long)fhash, fm.vertices.size(),
+                                 xyz.size() / 3, (void*)inst.meshHandle);
+                    }
+                    continue;
+                }
+
+                auto matIt = g_materialCache.find(inst.materialHash);
+                if (matIt == g_materialCache.end() || !matIt->second.handle)
+                    continue;
+
+                for (size_t i = 0; i < fm.vertices.size(); ++i) {
+                    fm.vertices[i].position[0] = xyz[i * 3 + 0];
+                    fm.vertices[i].position[1] = xyz[i * 3 + 1];
+                    fm.vertices[i].position[2] = xyz[i * 3 + 2];
+                }
+
+                remixapi_MeshInfoSurfaceTriangles surface = {};
+                surface.vertices_values = fm.vertices.data();
+                surface.vertices_count  = (uint32_t)fm.vertices.size();
+                surface.indices_values  = fm.indices.empty() ? nullptr
+                                                             : fm.indices.data();
+                surface.indices_count   = (uint32_t)fm.indices.size();
+                surface.skinning_hasvalue = 0;
+                if (fm.blendWeights.size() == fm.vertices.size() * 4 &&
+                    fm.blendIndices.size() == fm.vertices.size() * 4) {
+                    surface.skinning_hasvalue = 1;
+                    surface.skinning_value.bonesPerVertex      = 4;
+                    surface.skinning_value.blendWeights_values = fm.blendWeights.data();
+                    surface.skinning_value.blendWeights_count  = (uint32_t)fm.blendWeights.size();
+                    surface.skinning_value.blendIndices_values = fm.blendIndices.data();
+                    surface.skinning_value.blendIndices_count  = (uint32_t)fm.blendIndices.size();
+                }
+                surface.material = matIt->second.handle;
+
+                remixapi_MeshInfo meshInfo = {};
+                meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+                meshInfo.hash = FnvHashCombine(inst.meshCacheKey.contentHash,
+                                               ++g_faceMorphMeshSerial);
+                meshInfo.surfaces_values = &surface;
+                meshInfo.surfaces_count  = 1;
+
+                remixapi_MeshHandle newHandle = nullptr;
+                remixapi_ErrorCode meshStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+                RemixCallGuarded("CreateMesh(faceMorph)",
+                                 [&] { meshStatus = api->CreateMesh(&meshInfo, &newHandle); });
+                if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !newHandle) {
+                    const int fn = sFaceLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (fn < 12) {
+                        _MESSAGE("FO4RemixPlugin: [FaceMorph] CreateMesh failed "
+                                 "hash=0x%llX err=%d -- keeping previous pose",
+                                 (unsigned long long)fhash, (int)meshStatus);
+                    }
+                    continue;
+                }
+
+                remixapi_MeshHandle oldHandle = inst.meshHandle;
+                inst.meshHandle = newHandle;
+                auto cIt = g_meshCache.find(inst.meshCacheKey);
+                if (cIt != g_meshCache.end()) {
+                    cIt->second.handle = newHandle;
+                }
+                if (oldHandle) {
+                    RemixCallGuarded("DestroyMesh(faceMorph)",
+                                     [&] { api->DestroyMesh(oldHandle); });
+                }
+
+                const int fn = sFaceLogs.fetch_add(1, std::memory_order_relaxed);
+                if (fn < 24) {
+                    _MESSAGE("FO4RemixPlugin: [FaceMorph] #%d refreshed hash=0x%llX "
+                             "meshHash=0x%llX verts=%zu",
+                             fn, (unsigned long long)fhash,
+                             (unsigned long long)meshInfo.hash, fm.vertices.size());
+                }
+            }
+        }
 
         // Worldspace LOD chunk spatial filter: skip drawing chunks whose
         // coverage area contains the player. The in-cell static refs render
@@ -3490,6 +3621,12 @@ void RemixRenderer::Shutdown() {
 
     remixapi_Interface* api = RemixAPI::GetInterface();
 
+    g_faceMeshData.clear();
+    {
+        std::lock_guard<std::mutex> faceLock(g_faceMorphQueueMutex);
+        g_faceMorphQueue.clear();
+    }
+
     // Drop drawable entries first; their meshHandle members alias g_meshCache,
     // so we don't DestroyMesh here -- the cache loop below does that once per
     // unique handle.
@@ -3569,6 +3706,12 @@ void RemixRenderer::QueueBoneTransforms(
             g_boneQueue[kv.first] = std::move(kv.second);
         }
     }
+}
+
+void RemixRenderer::QueueFaceMorphPositions(uint64_t drawableHash,
+                                            std::vector<float>&& xyz) {
+    std::lock_guard<std::mutex> lock(g_faceMorphQueueMutex);
+    g_faceMorphQueue[drawableHash] = std::move(xyz);
 }
 
 bool RemixRenderer::HasTextureHandle(uint64_t hash) {

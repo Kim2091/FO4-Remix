@@ -155,6 +155,11 @@ namespace RemixRenderer {
     // any thread.
     void WriteDiagDump(const char* tag);
 
+    // Queue decoded model-space float3 positions for a facegen dynamic
+    // drawable whose live dynamicVertices changed. OnFrame rebuilds that
+    // drawable's private skinned mesh handle before drawing.
+    void QueueFaceMorphPositions(uint64_t drawableHash, std::vector<float>&& xyz);
+
     // True if a Remix-side texture handle currently exists for `hash`.
     // Used by the extraction cache to decide whether a cache hit must
     // re-supply pixel data so SubmitDrawable can recreate a handle that was
