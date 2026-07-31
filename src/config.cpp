@@ -116,6 +116,13 @@ void LoadConfig() {
 
     // [Skinning]
     g_config.skinningEnabled = GetIniBool("Skinning", "Enabled", true, dllPath);
+    g_config.faceMorphRefreshEnabled =
+        GetIniBool("Skinning", "FaceMorphRefreshEnabled", true, dllPath);
+    g_config.faceMorphCheckIntervalFrames =
+        GetIniUInt("Skinning", "FaceMorphCheckIntervalFrames", 2, dllPath);
+    g_config.faceMorphMaxPerTick =
+        GetIniUInt("Skinning", "FaceMorphMaxPerTick", 8, dllPath);
+
     g_config.viewModelEnabled = GetIniBool("ViewModel", "Enabled", true, dllPath);
     g_config.viewModelBoneConventionFix =
         GetIniBool("ViewModel", "BoneConventionFix", true, dllPath);
@@ -230,6 +237,7 @@ void LoadConfig() {
 
     // [Materials]
     g_config.metalConversionEnabled = GetIniBool("Materials", "MetalConversionEnabled", true, dllPath);
+    g_config.eyeWetOverlay          = GetIniBool("Materials", "EyeWetOverlay",          false, dllPath);
     g_config.metalMetallicEnabled   = GetIniBool("Materials", "MetalMetallicEnabled",   false, dllPath);
     g_config.metalRoughnessEnabled  = GetIniBool("Materials", "MetalRoughnessEnabled",  false, dllPath);
     g_config.metalMetallic          = GetIniFloatClamped("Materials", "MetalMetallic",       0.85f, 0.0f, 1.0f, dllPath);
@@ -322,7 +330,10 @@ void LoadConfig() {
     _MESSAGE("FO4RemixPlugin: Lights - Enabled=%d Intensity=%.2f RadiusMul=%.2f ColorStrength=%.2f",
              g_config.lightsEnabled, g_config.lightIntensity,
              g_config.lightRadius, g_config.lightColorStrength);
-    _MESSAGE("FO4RemixPlugin: Skinning - Enabled=%d", g_config.skinningEnabled);
+    _MESSAGE("FO4RemixPlugin: Skinning - Enabled=%d FaceMorphRefresh=%d "
+             "FaceMorphCheckInterval=%u FaceMorphMaxPerTick=%u",
+             g_config.skinningEnabled, g_config.faceMorphRefreshEnabled,
+             g_config.faceMorphCheckIntervalFrames, g_config.faceMorphMaxPerTick);
     _MESSAGE("FO4RemixPlugin: ViewModel - Enabled=%d BoneConventionFix=%d",
              g_config.viewModelEnabled, g_config.viewModelBoneConventionFix);
     _MESSAGE("FO4RemixPlugin: Emissive - GlowMaps=%d EmissiveColor=%d Intensity=%.2f LogEmissive=%d",

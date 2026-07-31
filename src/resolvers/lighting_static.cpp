@@ -1212,6 +1212,30 @@ static bool HeadDiagMatch(BSTriShape* tri,
     return false;
 }
 
+// True when this drawable hangs off a FaceGen head node -- eyes, lashes,
+// brows, mouth, the head itself. Structural, not name-based: every facegen
+// part logs p1="BSFaceGenNiNodeSkinned" (2026-07-31 [HeadDiag] run).
+//
+// Needed because GetType() cannot separate face parts from props in this
+// build: the eyeball and its wet overlay both report kType_Envmap (==1), the
+// same value the power-armor stands and street lamps use, so the metal/envmap
+// conversion was treating eyeballs as painted metal. See the exclusion at the
+// kType_Envmap branch below.
+// NOTE: "BSFaceGenNiNodeSkinned" is the node's NAME (NiObjectNET::m_name), not
+// its RTTI class -- Bethesda names the node after a class. The first cut of this
+// compared it against GetLeafClassName and so returned false for every drawable,
+// silently disabling both eye fixes (2026-07-31 run: zero "GATE eye wet overlay
+// skipped" lines while FemaleEyesHumanWet kept refreshing 59 times). Match on
+// the name, and accept an RTTI leaf hit too in case a build reports it there.
+static bool IsFaceGenPart(const SemanticCapture::DrawableState& state) {
+    if (!state.parent1) return false;
+    const char* p1Name = static_cast<NiAVObject*>(state.parent1)->m_name.c_str();
+    if (NameContainsCI(p1Name, "facegen")) return true;
+    char p1Leaf[64] = "";
+    SemanticCapture::GetLeafClassName(state.parent1, p1Leaf, sizeof(p1Leaf));
+    return NameContainsCI(p1Leaf, "facegen");
+}
+
 static void HeadDiagLog(uint64_t hash, const char* fmt, ...) {
     char msg[448];
     va_list ap;
@@ -1463,6 +1487,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // substring scans per drawable per attempt, pure scaffolding from the
     // (resolved) missing-FaceGen-heads investigation.
     const bool headDiag = g_config.diagEnabled && HeadDiagMatch(tri, state);
+    // Face parts need to opt out of several prop-oriented material paths; see
+    // IsFaceGenPart and the kType_Envmap exclusion below.
+    const bool isFaceGenPart = IsFaceGenPart(state);
     if (headDiag) {
         char leaf[64] = "?";
         SemanticCapture::GetLeafClassName(tri, leaf, sizeof(leaf));
@@ -1575,6 +1602,36 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     if (mat->GetType() == BSLightingShaderMaterialBase::kType_Landscape) {
         ResolverTrace::g_lastStep.store(Trace::kLandscapeSkipped, std::memory_order_relaxed);
         if (headDiag) HeadDiagLog(hash, "GATE landscape material skip");
+        return false;
+    }
+
+    // Eye "wet" overlay (2026-07-31). FemaleEyesHumanWet / MaleEyesHumanWet is
+    // a raster-era trick: a 36-vertex shell over the eyeball carrying
+    // BSLightingShaderMaterialEnvmap with diffuse "Textures\Shared\
+    // FlatGray01_d.DDS" and vertex alpha ~50/255, which the engine draws as a
+    // near-transparent environment-mapped highlight. Submitted to a path tracer
+    // as an ordinary surface it is just a grey disc laid over the iris -- the
+    // milky, washed-out eyes reported 2026-07-31. Remix derives a corneal
+    // highlight from the eyeball's own smoothness/specular, so the shell is
+    // redundant here rather than merely mis-shaded.
+    //
+    // Off by default via [Materials] EyeWetOverlay=0. Set it to 1 to submit the
+    // shell anyway (it will read as a grey film until it is given a genuinely
+    // translucent material).
+    if (!g_config.eyeWetOverlay && isFaceGenPart &&
+        NameContainsCI(tri->m_name.c_str(), "eyes") &&
+        NameContainsCI(tri->m_name.c_str(), "wet")) {
+        // Logged independently of headDiag: the previous attempt failed
+        // silently, and HeadDiagLog's shared 160-line cap can be exhausted
+        // before the eyes resolve. This one is unconditional (capped at 8) so
+        // "did the skip actually fire" is always answerable from the log.
+        static std::atomic<int> sWetSkips{0};
+        const int wn = sWetSkips.fetch_add(1, std::memory_order_relaxed);
+        if (wn < 8) {
+            _MESSAGE("FO4RemixPlugin: [EyeWet] #%d skipped \"%s\" hash=%016llX",
+                     wn, tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                     (unsigned long long)hash);
+        }
         return false;
     }
 
@@ -1926,6 +1983,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // Skinned-key side index (Tick's live app-culled refresh + OnFrame's
         // hidden-geometry skip -- hair-under-hats, 2026-07-08).
         state.isSkinnedActor = true;
+        state.faceMorphWatch = tri->GetAsBSDynamicTriShape() != nullptr;
+        mesh.isFaceGenDynamic = state.faceMorphWatch;
         // [FaceAnim] expressions probe: track the first facegen head's bone
         // motion (heads carry ~10 bones; eyes/mouths only 1).
         if (headDiag && tri->GetAsBSDynamicTriShape() && boneCount >= 8) {
@@ -2019,7 +2078,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // [Materials] MetalMetallicEnabled / MetalRoughnessEnabled, default OFF;
     // when off, materials keep the legacy constants (metallic 0, rough 0.8).
     // (albedoLumFloor is declared at function scope for the retry cache.)
-    if (g_config.metalConversionEnabled &&
+    // FaceGen parts are excluded: eyeballs and their wet overlay report
+    // kType_Envmap (==1) exactly like a power-armor stand, so they were being
+    // run through a conversion meant for painted metal. The damage was the
+    // albedo luminance floor -- AlbedoLumFloor_Apply multiplies sub-floor
+    // pixels by up to 6x with per-channel clamping, then neutral-fills what is
+    // still too dark. On an iris that blows the saturated darks toward white
+    // (the brightest channel clamps first, destroying the hue ratio) and turns
+    // the pupil flat grey: the "white iris" symptom, 2026-07-31.
+    if (g_config.metalConversionEnabled && !isFaceGenPart &&
         mat->GetType() == BSLightingShaderMaterialBase::kType_Envmap) {
         float smooth = mat->fSmoothness;
         if (smooth < 0.0f) smooth = 0.0f;

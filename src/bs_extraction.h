@@ -152,6 +152,12 @@ struct ExtractedMesh {
     // drawable is EXEMPT from occlusion culling. See DrawCapture::EngineIbKey.
     uint64_t engineIbPtr    = 0;
     uint32_t engineIbOffset = 0;
+
+    // FaceGen morph refresh. True for skinned BSDynamicTriShape drawables
+    // whose dynamicVertices buffer can be rewritten by FO4 during lip sync,
+    // blinks, and expressions. The renderer keeps a CPU copy so only
+    // positions need to be re-uploaded when that live buffer changes.
+    bool isFaceGenDynamic = false;
 };
 
 struct CellInfo {
@@ -361,6 +367,19 @@ namespace BsExtraction {
 
     // Get the BSLightingShaderMaterialBase from a shape, or nullptr
     BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape);
+
+    // SEH-guarded snapshot of a live BSDynamicTriShape dynamicVertices
+    // buffer (+0x170 size, +0x180 pointer). Returns raw bytes plus the live
+    // vertex count, or false when the pointer chain is stale/unreadable.
+    bool SnapshotDynamicVertices(void* geometry, std::vector<uint8_t>& outRaw,
+                                 uint32_t& outNumVertices);
+
+    // Decode a SnapshotDynamicVertices buffer into model-space float3
+    // positions. Elements <= 12 bytes decode as the byte-verified half4
+    // facegen layout; 16-byte elements decode as float3 defensively.
+    bool DecodeDynamicPositions(const std::vector<uint8_t>& raw,
+                                uint32_t numVertices,
+                                std::vector<float>& outXyz);
 
     // Current resident WIDTH (px) of a lighting material's diffuse D3D
     // texture, SEH-guarded (0 on null/fault/non-Texture2D). FO4 streams

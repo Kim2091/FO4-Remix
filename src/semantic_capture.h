@@ -200,6 +200,13 @@ namespace SemanticCapture {
         bool  isSkinnedActor           = false;
         bool  engineCulled             = false;
 
+        // ---- FaceGen morph watch ----
+        // Set for skinned BSDynamicTriShape drawables. FO4 rewrites their
+        // dynamicVertices during facial animation; Tick fingerprints the live
+        // buffer and queues position-only mesh refreshes when it changes.
+        bool     faceMorphWatch        = false;
+        uint64_t faceMorphFingerprint  = 0;
+
         // ---- Merge-instanced capture upgrade (2026-07-04) ----
         // Set by the lighting resolver when a multi-segment merge shape had
         // to submit with a fallback partition because DrawCapture starved:
