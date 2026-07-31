@@ -237,6 +237,7 @@ void LoadConfig() {
 
     // [Materials]
     g_config.metalConversionEnabled = GetIniBool("Materials", "MetalConversionEnabled", true, dllPath);
+    g_config.eyeWetOverlay          = GetIniBool("Materials", "EyeWetOverlay",          false, dllPath);
     g_config.metalMetallicEnabled   = GetIniBool("Materials", "MetalMetallicEnabled",   false, dllPath);
     g_config.metalRoughnessEnabled  = GetIniBool("Materials", "MetalRoughnessEnabled",  false, dllPath);
     g_config.metalMetallic          = GetIniFloatClamped("Materials", "MetalMetallic",       0.85f, 0.0f, 1.0f, dllPath);

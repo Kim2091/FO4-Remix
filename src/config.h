@@ -374,6 +374,12 @@ struct PluginConfig {
     // metallic still reads near-black -- the metallic constant fights the
     // floor). They are therefore opt-in, default OFF.
     bool  metalConversionEnabled;   // master toggle: classification + albedo floor (default true)
+    // Submit the eye "wet" shell (MaleEyesHumanWet / FemaleEyesHumanWet).
+    // Default OFF: it is a raster-era near-transparent envmap highlight whose
+    // diffuse is a flat grey swatch, and as an ordinary path-traced surface it
+    // just films over the iris. Remix gets the corneal highlight from the
+    // eyeball's own specular instead.
+    bool  eyeWetOverlay;            // (default false)
     bool  metalMetallicEnabled;     // apply derived metallicConstant (default false)
     bool  metalRoughnessEnabled;    // apply derived roughnessConstant (default false)
     float metalMetallic;            // metallic at fSmoothness=1; scaled down to 0.2x of this at fSmoothness=0 (default 0.85)

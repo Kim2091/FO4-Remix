@@ -1662,7 +1662,10 @@ struct DiskCacheHeader {
     uint64_t pixelBytes;
 };
 constexpr uint32_t kDiskCacheMagic   = 0x31545246u;  // 'FRT1'
-constexpr uint32_t kDiskCacheVersion = 1;            // bump on pipeline changes
+// v2 (2026-07-31): FaceGen parts no longer take the kType_Envmap albedo
+// luminance floor, so every cached eye/face texture baked with the old
+// lum-floored pixels must be re-converted rather than served from disk.
+constexpr uint32_t kDiskCacheVersion = 2;            // bump on pipeline changes
 
 static std::once_flag g_diskCacheDirOnce;
 static char g_diskCacheDir[MAX_PATH] = {};

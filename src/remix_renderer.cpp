@@ -2341,8 +2341,14 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     continue;
                 }
 
+                // Cap raised 24 -> 400 (2026-07-31): at 24 the log filled with
+                // whichever drawable morphs most (the head) and said nothing
+                // about the rest, which made an unlisted drawable look like it
+                // never refreshed. Distinguishing "FO4 does not rewrite this
+                // buffer" from "it scrolled off the log" needs the headroom --
+                // correlate the hashes against [Skinning] registered / HeadDiag.
                 const int fn = sFaceLogs.fetch_add(1, std::memory_order_relaxed);
-                if (fn < 24) {
+                if (fn < 400) {
                     _MESSAGE("FO4RemixPlugin: [FaceMorph] #%d refreshed hash=0x%llX "
                              "meshHash=0x%llX verts=%zu stable=%d",
                              fn, (unsigned long long)fhash,
