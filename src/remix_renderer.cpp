@@ -681,7 +681,6 @@ namespace {
     std::unordered_map<uint64_t, FaceMeshData> g_faceMeshData;
     std::mutex g_faceMorphQueueMutex;
     std::unordered_map<uint64_t, std::vector<float>> g_faceMorphQueue;
-    uint64_t g_faceMorphMeshSerial = 0;
 }
 
 void RemixRenderer::RequestDestroyDrain() {
@@ -2243,13 +2242,27 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
         drawableCount = g_drawables.size();
 
-        // ---- FaceGen morph refresh v2 ----
-        // v1 rebuilt replacement meshes with the same meshInfo.hash as the
-        // still-live handle, then destroyed the old handle; user testing made
-        // heads/mouths/hair disappear, likely because DestroyMesh unregisters
-        // by that shared hash. v2 keeps the same drawable/cache ownership but
-        // gives each replacement mesh a salted Remix hash before retiring the
-        // old handle.
+        // ---- FaceGen morph refresh v3 ----
+        // v1 re-created the mesh under the SAME hash as the still-live handle
+        // and then destroyed the old one; heads/mouths/hair vanished, because
+        // handles here are hash-valued: the runtime ignored the re-registration
+        // (so no new geometry) and the DestroyMesh then unregistered the live
+        // mesh. v2 fixed the vanishing by salting each replacement with a fresh
+        // hash -- but that traded it for ghosting. The mesh handle IS the hash,
+        // and the runtime feeds it into both ExternalDrawState::
+        // computeExternalDrawIdentityHash and the spatial-map hash, so a new
+        // hash per refresh handed the scene manager a brand-new object every
+        // couple of frames: a fresh RtInstance with no previous-frame
+        // correspondence, i.e. no motion vectors and no denoiser history.
+        //
+        // v3 keeps the hash STABLE and asks the runtime to swap the geometry
+        // underneath it (remixapi_MeshInfoRefreshGeometryEXT). The runtime
+        // carries the previous topology/layout hashes across and leaves only
+        // VertexPosition fresh, so the draw-call cache keeps the same BlasEntry
+        // and processGeometryInfo takes its kUpdateBVH path -- history-buffer
+        // ping-pong and a populated previousPositionBuffer, which is real
+        // motion vectors for the morph. Nothing to swap or destroy here: the
+        // handle, the g_meshCache entry, and the drawable all stay as they are.
         {
             static std::atomic<int> sFaceLogs{0};
             for (auto& [fhash, xyz] : faceUpdates) {
@@ -2299,44 +2312,42 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 }
                 surface.material = matIt->second.handle;
 
+                // Re-register under the EXISTING handle. Handles are hash-valued
+                // in this fork, so the handle value is the hash the runtime
+                // registered this mesh under -- reusing it verbatim is what
+                // keeps the instance identity (and therefore the temporal
+                // history) intact across the swap.
+                remixapi_MeshInfoRefreshGeometryEXT refreshExt = {};
+                refreshExt.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT;
+
                 remixapi_MeshInfo meshInfo = {};
                 meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-                meshInfo.hash = FnvHashCombine(inst.meshCacheKey.contentHash,
-                                               ++g_faceMorphMeshSerial);
+                meshInfo.pNext = &refreshExt;
+                meshInfo.hash  = (uint64_t)inst.meshHandle;
                 meshInfo.surfaces_values = &surface;
                 meshInfo.surfaces_count  = 1;
 
-                remixapi_MeshHandle newHandle = nullptr;
+                remixapi_MeshHandle sameHandle = nullptr;
                 remixapi_ErrorCode meshStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
-                RemixCallGuarded("CreateMesh(faceMorph)",
-                                 [&] { meshStatus = api->CreateMesh(&meshInfo, &newHandle); });
-                if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !newHandle) {
+                RemixCallGuarded("CreateMesh(faceMorphRefresh)",
+                                 [&] { meshStatus = api->CreateMesh(&meshInfo, &sameHandle); });
+                if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS) {
                     const int fn = sFaceLogs.fetch_add(1, std::memory_order_relaxed);
                     if (fn < 12) {
-                        _MESSAGE("FO4RemixPlugin: [FaceMorph] CreateMesh failed "
+                        _MESSAGE("FO4RemixPlugin: [FaceMorph] refresh failed "
                                  "hash=0x%llX err=%d -- keeping previous pose",
                                  (unsigned long long)fhash, (int)meshStatus);
                     }
                     continue;
                 }
 
-                remixapi_MeshHandle oldHandle = inst.meshHandle;
-                inst.meshHandle = newHandle;
-                auto cIt = g_meshCache.find(inst.meshCacheKey);
-                if (cIt != g_meshCache.end()) {
-                    cIt->second.handle = newHandle;
-                }
-                if (oldHandle) {
-                    RemixCallGuarded("DestroyMesh(faceMorph)",
-                                     [&] { api->DestroyMesh(oldHandle); });
-                }
-
                 const int fn = sFaceLogs.fetch_add(1, std::memory_order_relaxed);
                 if (fn < 24) {
                     _MESSAGE("FO4RemixPlugin: [FaceMorph] #%d refreshed hash=0x%llX "
-                             "meshHash=0x%llX verts=%zu",
+                             "meshHash=0x%llX verts=%zu stable=%d",
                              fn, (unsigned long long)fhash,
-                             (unsigned long long)meshInfo.hash, fm.vertices.size());
+                             (unsigned long long)meshInfo.hash, fm.vertices.size(),
+                             sameHandle == inst.meshHandle ? 1 : 0);
                 }
             }
         }
