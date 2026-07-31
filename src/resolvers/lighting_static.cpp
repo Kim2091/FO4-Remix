@@ -1221,11 +1221,19 @@ static bool HeadDiagMatch(BSTriShape* tri,
 // same value the power-armor stands and street lamps use, so the metal/envmap
 // conversion was treating eyeballs as painted metal. See the exclusion at the
 // kType_Envmap branch below.
+// NOTE: "BSFaceGenNiNodeSkinned" is the node's NAME (NiObjectNET::m_name), not
+// its RTTI class -- Bethesda names the node after a class. The first cut of this
+// compared it against GetLeafClassName and so returned false for every drawable,
+// silently disabling both eye fixes (2026-07-31 run: zero "GATE eye wet overlay
+// skipped" lines while FemaleEyesHumanWet kept refreshing 59 times). Match on
+// the name, and accept an RTTI leaf hit too in case a build reports it there.
 static bool IsFaceGenPart(const SemanticCapture::DrawableState& state) {
     if (!state.parent1) return false;
+    const char* p1Name = static_cast<NiAVObject*>(state.parent1)->m_name.c_str();
+    if (NameContainsCI(p1Name, "facegen")) return true;
     char p1Leaf[64] = "";
     SemanticCapture::GetLeafClassName(state.parent1, p1Leaf, sizeof(p1Leaf));
-    return std::strcmp(p1Leaf, "BSFaceGenNiNodeSkinned") == 0;
+    return NameContainsCI(p1Leaf, "facegen");
 }
 
 static void HeadDiagLog(uint64_t hash, const char* fmt, ...) {
@@ -1613,7 +1621,17 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     if (!g_config.eyeWetOverlay && isFaceGenPart &&
         NameContainsCI(tri->m_name.c_str(), "eyes") &&
         NameContainsCI(tri->m_name.c_str(), "wet")) {
-        if (headDiag) HeadDiagLog(hash, "GATE eye wet overlay skipped");
+        // Logged independently of headDiag: the previous attempt failed
+        // silently, and HeadDiagLog's shared 160-line cap can be exhausted
+        // before the eyes resolve. This one is unconditional (capped at 8) so
+        // "did the skip actually fire" is always answerable from the log.
+        static std::atomic<int> sWetSkips{0};
+        const int wn = sWetSkips.fetch_add(1, std::memory_order_relaxed);
+        if (wn < 8) {
+            _MESSAGE("FO4RemixPlugin: [EyeWet] #%d skipped \"%s\" hash=%016llX",
+                     wn, tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                     (unsigned long long)hash);
+        }
         return false;
     }
 
