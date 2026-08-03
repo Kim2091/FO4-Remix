@@ -64,14 +64,14 @@ namespace SkinnedMeshes {
     // caller wins; capped logging inside.
     void SetFaceProbe(uint64_t drawableHash);
 
-    // [EyeAnim] mark the first submitted iris mesh for live-state probing.
-    // The probe watches its skin bone, shape/parent transforms, material UV
-    // transform, shader technique, and BSEyeCenterExtraData. Diagnostics
-    // only: it never mutates engine or Remix state.
-    void SetEyeProbe(uint64_t drawableHash, BSTriShape* shape,
-                     void* shaderProperty,
-                     BSLightingShaderMaterialBase* material,
-                     uint32_t materialType);
+    // Register a human iris material as a live UV-animation source. Every
+    // changed transform is queued to RemixRenderer; when diagnostics are
+    // enabled, the first iris also gets the broader [EyeAnim] state probe.
+    void RegisterEyeAnimation(uint64_t drawableHash, BSTriShape* shape,
+                              void* shaderProperty,
+                              BSLightingShaderMaterialBase* material,
+                              uint32_t materialType,
+                              bool diagnostics);
 
     // Drop a drawable's bone tracking (wired into ReleaseDrawable).
     void OnDrawableReleased(uint64_t drawableHash);

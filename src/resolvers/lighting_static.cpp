@@ -1244,6 +1244,44 @@ static bool IsHumanIris(const BSTriShape* tri) {
            !NameContainsCI(name, "lash");
 }
 
+static void CaptureEyeBaseTexcoords(ExtractedMesh& mesh) {
+    mesh.eyeBaseTexcoords.resize(mesh.vertices.size() * 2);
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        mesh.eyeBaseTexcoords[i * 2 + 0] = mesh.vertices[i].texcoord[0];
+        mesh.eyeBaseTexcoords[i * 2 + 1] = mesh.vertices[i].texcoord[1];
+    }
+}
+
+static void ApplyEyeUvTransform(
+    ExtractedMesh& mesh, const BSLightingShaderMaterialBase* material) {
+    if (!mesh.isAnimatedEye || !material ||
+        mesh.eyeBaseTexcoords.size() != mesh.vertices.size() * 2) {
+        return;
+    }
+
+    float offset[2] = {
+        material->textCoordOffset[0].x,
+        material->textCoordOffset[0].y,
+    };
+    float scale[2] = {
+        material->textCoordScale[0].x,
+        material->textCoordScale[0].y,
+    };
+    for (int axis = 0; axis < 2; ++axis) {
+        if (!std::isfinite(offset[axis])) offset[axis] = 0.0f;
+        if (!std::isfinite(scale[axis])) scale[axis] = 1.0f;
+        mesh.eyeUvOffset[axis] = offset[axis];
+        mesh.eyeUvScale[axis] = scale[axis];
+    }
+
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        mesh.vertices[i].texcoord[0] =
+            mesh.eyeBaseTexcoords[i * 2 + 0] * scale[0] + offset[0];
+        mesh.vertices[i].texcoord[1] =
+            mesh.eyeBaseTexcoords[i * 2 + 1] * scale[1] + offset[1];
+    }
+}
+
 struct EyeRawStats {
     bool valid = false;
     uint32_t first[4]{};
@@ -1595,6 +1633,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // Face parts need to opt out of several prop-oriented material paths; see
     // IsFaceGenPart and the kType_Envmap exclusion below.
     const bool isFaceGenPart = IsFaceGenPart(state);
+    const bool isHumanIris = isFaceGenPart && IsHumanIris(tri);
     if (headDiag) {
         char leaf[64] = "?";
         SemanticCapture::GetLeafClassName(tri, leaf, sizeof(leaf));
@@ -1854,7 +1893,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         return false;
     }
 
-    if (g_config.diagEnabled && isFaceGenPart && IsHumanIris(tri)) {
+    if (g_config.diagEnabled && isHumanIris) {
         LogEyeVertexData(hash, tri, parsed, mat, state.property);
     }
 
@@ -1954,6 +1993,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     mesh.hash = hash;
     mesh.vertices = std::move(parsed.vertices);
     mesh.indices  = std::move(parsed.indices);
+    if (g_config.eyeUvAnimationEnabled && isHumanIris) {
+        mesh.isAnimatedEye = true;
+        CaptureEyeBaseTexcoords(mesh);
+    }
     // Occlusion key (engine IB identity). Merge-baked meshes take a
     // different build path (below) and never reach here, so they keep the
     // default 0 = exempt.
@@ -2036,10 +2079,6 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         if (headDiag && tri->GetAsBSDynamicTriShape()) {
             SkinnedMeshes::LogBones(hash, tri->m_name.c_str()
                                               ? tri->m_name.c_str() : "");
-        }
-        if (g_config.diagEnabled && isFaceGenPart && IsHumanIris(tri)) {
-            SkinnedMeshes::SetEyeProbe(hash, tri, state.property, mat,
-                                       mat->GetType());
         }
         // Blend indices reference the skin instance's bone array; clamp any
         // out-of-range index to bone 0 rather than letting the runtime's
@@ -3290,6 +3329,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         }
     }
 
+    // FO4's human-eye shader pans the iris texture by mutating the material's
+    // UV transform. Bake the latest value immediately before submission so a
+    // texture-readback retry cannot install the stale transform captured when
+    // the geometry was first parsed.
+    ApplyEyeUvTransform(mesh, mat);
+
     // ---- Submit to Remix ----
     ResolverTrace::g_lastStep.store(Trace::kSubmitStart, std::memory_order_relaxed);
 
@@ -3869,6 +3914,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         }
     }
     ResolverTrace::g_lastStep.store(Trace::kSubmitOK, std::memory_order_relaxed);
+
+    if (mesh.isAnimatedEye && mesh.hasSkinning) {
+        SkinnedMeshes::RegisterEyeAnimation(
+            hash, tri, state.property, mat, mat->GetType(),
+            g_config.diagEnabled);
+    }
 
     // Update DrawableState to mark submission and track refcount targets.
     state.submittedToRemix = true;

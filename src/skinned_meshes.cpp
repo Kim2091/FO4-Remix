@@ -69,6 +69,12 @@ struct Entry {
     std::vector<uint8_t>   nodeNull;    // bones[i] NiNode* was null (flattened-tree bone)
     uint32_t faults = 0;
 
+    // Human iris material UV animation. eyeMaterial is guarded on every read;
+    // the last valid transform suppresses redundant renderer refreshes.
+    bool eyeUvAnimated = false;
+    bool eyeUvValid = false;
+    RemixRenderer::EyeUvTransform eyeUvLast{};
+
     // [EyeAnim] first iris only; diagnostics never mutate these pointers.
     bool eyeProbe = false;
     uintptr_t eyeShape = 0;
@@ -101,6 +107,35 @@ bool PeekBytes(uintptr_t src, void* dst, size_t n) {
     } __except (1) {
         return false;
     }
+}
+
+bool ReadEyeUvTransform(
+    uintptr_t material, RemixRenderer::EyeUvTransform& out) {
+    float raw[8] = {};
+    if (!material || !PeekBytes(material + 0x0C, raw, sizeof(raw)))
+        return false;
+
+    out.offset[0] = raw[0];
+    out.offset[1] = raw[1];
+    out.scale[0] = raw[4];
+    out.scale[1] = raw[5];
+    for (int axis = 0; axis < 2; ++axis) {
+        if (!std::isfinite(out.offset[axis]) ||
+            !std::isfinite(out.scale[axis])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+float EyeUvTransformDelta(const RemixRenderer::EyeUvTransform& a,
+                          const RemixRenderer::EyeUvTransform& b) {
+    float delta = 0.0f;
+    for (int axis = 0; axis < 2; ++axis) {
+        delta = (std::max)(delta, std::fabs(a.offset[axis] - b.offset[axis]));
+        delta = (std::max)(delta, std::fabs(a.scale[axis] - b.scale[axis]));
+    }
+    return delta;
 }
 
 bool PeekCString(uintptr_t src, char* dst, size_t cap) {
@@ -423,10 +458,21 @@ void SkinnedMeshes::SetFaceProbe(uint64_t drawableHash) {
                                             std::memory_order_relaxed);
 }
 
-void SkinnedMeshes::SetEyeProbe(uint64_t drawableHash, BSTriShape* shape,
-                                void* shaderProperty,
-                                BSLightingShaderMaterialBase* material,
-                                uint32_t materialType) {
+void SkinnedMeshes::RegisterEyeAnimation(
+    uint64_t drawableHash, BSTriShape* shape, void* shaderProperty,
+    BSLightingShaderMaterialBase* material, uint32_t materialType,
+    bool diagnostics) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    auto it = g_entries.find(drawableHash);
+    if (it == g_entries.end()) return;
+
+    Entry& e = it->second;
+    e.eyeUvAnimated = true;
+    e.eyeMaterial = reinterpret_cast<uintptr_t>(material);
+    e.eyeUvValid = ReadEyeUvTransform(e.eyeMaterial, e.eyeUvLast);
+
+    if (!diagnostics) return;
+
     uint64_t expected = 0;
     if (!g_eyeProbeHash.compare_exchange_strong(
             expected, drawableHash, std::memory_order_relaxed) &&
@@ -434,23 +480,22 @@ void SkinnedMeshes::SetEyeProbe(uint64_t drawableHash, BSTriShape* shape,
         return;
     }
 
-    std::lock_guard<std::mutex> lk(g_mx);
-    auto it = g_entries.find(drawableHash);
-    if (it == g_entries.end()) return;
-
-    Entry& e = it->second;
     e.eyeProbe = true;
     e.eyeShape = reinterpret_cast<uintptr_t>(shape);
     e.eyeProperty = reinterpret_cast<uintptr_t>(shaderProperty);
-    e.eyeMaterial = reinterpret_cast<uintptr_t>(material);
     e.eyeMaterialType = materialType;
     e.eyeTick = 0;
     e.eyeParent = 0;
     if (e.eyeShape)
         PeekBytes(e.eyeShape + 0x28, &e.eyeParent, sizeof(e.eyeParent));
     e.eyeCenterExtra = FindEyeCenterExtra(e.eyeShape);
-    if (!PeekObjectName(e.eyeShape, e.eyeLabel, sizeof(e.eyeLabel)))
+    const char* label = shape ? shape->m_name.c_str() : nullptr;
+    if (label) {
+        std::strncpy(e.eyeLabel, label, sizeof(e.eyeLabel) - 1);
+        e.eyeLabel[sizeof(e.eyeLabel) - 1] = 0;
+    } else {
         std::strncpy(e.eyeLabel, "<unreadable>", sizeof(e.eyeLabel) - 1);
+    }
 
     if (g_eyeLogs.fetch_add(1, std::memory_order_relaxed) < 64) {
         _MESSAGE("FO4RemixPlugin: [EyeAnim] registered hash=%016llX "
@@ -504,6 +549,7 @@ void SkinnedMeshes::Reset() {
 
 void SkinnedMeshes::UpdateAndQueue(const std::unordered_set<uint64_t>* skipHidden) {
     std::unordered_map<uint64_t, std::vector<remixapi_Transform>> queued;
+    std::unordered_map<uint64_t, RemixRenderer::EyeUvTransform> eyeUvQueued;
     {
         std::lock_guard<std::mutex> lk(g_mx);
         if (g_entries.empty()) return;
@@ -584,6 +630,18 @@ void SkinnedMeshes::UpdateAndQueue(const std::unordered_set<uint64_t>* skipHidde
                 continue;
             }
             e.faults = 0;
+
+            if (e.eyeUvAnimated) {
+                RemixRenderer::EyeUvTransform current{};
+                if (ReadEyeUvTransform(e.eyeMaterial, current) &&
+                    (!e.eyeUvValid ||
+                     EyeUvTransformDelta(current, e.eyeUvLast) > 1.0e-6f)) {
+                    eyeUvQueued[it->first] = current;
+                    e.eyeUvLast = current;
+                    e.eyeUvValid = true;
+                }
+            }
+
             // [EyeAnim] Sample the original engine-side drivers at a modest
             // cadence. A changing field identifies where gaze lives; a
             // heartbeat with every field static points us at draw-time
@@ -668,5 +726,8 @@ void SkinnedMeshes::UpdateAndQueue(const std::unordered_set<uint64_t>* skipHidde
     }
     if (!queued.empty()) {
         RemixRenderer::QueueBoneTransforms(std::move(queued));
+    }
+    if (!eyeUvQueued.empty()) {
+        RemixRenderer::QueueEyeUvTransforms(std::move(eyeUvQueued));
     }
 }

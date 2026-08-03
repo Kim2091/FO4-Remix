@@ -106,6 +106,9 @@ struct PluginConfig {
     bool     faceMorphRefreshEnabled;
     uint32_t faceMorphCheckIntervalFrames;
     uint32_t faceMorphMaxPerTick;
+    // Human eye gaze is authored as a live material UV transform. Track it
+    // and refresh only the iris texcoords when the offset/scale changes.
+    bool     eyeUvAnimationEnabled;
 
     bool  viewModelEnabled;  // Render the 1st-person arms/weapon/Pip-Boy (synthetic-space remap)
     bool  viewModelBoneConventionFix;  // Camera bone is NIF-camera-convention {right,up,back} vs cameraNode {right,fwd,up}
