@@ -1236,6 +1236,111 @@ static bool IsFaceGenPart(const SemanticCapture::DrawableState& state) {
     return NameContainsCI(p1Leaf, "facegen");
 }
 
+static bool IsHumanIris(const BSTriShape* tri) {
+    if (!tri) return false;
+    const char* name = tri->m_name.c_str();
+    return NameContainsCI(name, "eyeshuman") &&
+           !NameContainsCI(name, "wet") &&
+           !NameContainsCI(name, "lash");
+}
+
+struct EyeRawStats {
+    bool valid = false;
+    uint32_t first[4]{};
+    uint32_t finiteCount = 0;
+    float minValue = 0.0f;
+    float maxValue = 0.0f;
+};
+
+static EyeRawStats ReadEyeRawStats(const ParsedGeometry& parsed,
+                                   uint32_t offset) {
+    EyeRawStats s{};
+    if (!parsed.vbData || offset + 4 > parsed.vertexSize ||
+        parsed.vbCount == 0) {
+        return s;
+    }
+    s.valid = true;
+    for (uint32_t i = 0; i < parsed.vbCount; ++i) {
+        uint32_t raw = 0;
+        std::memcpy(&raw, parsed.vbData +
+                    (size_t)i * parsed.vertexSize + offset, sizeof(raw));
+        if (i < 4) s.first[i] = raw;
+        float value = 0.0f;
+        std::memcpy(&value, &raw, sizeof(value));
+        if (std::isfinite(value)) {
+            if (s.finiteCount == 0) {
+                s.minValue = value;
+                s.maxValue = value;
+            } else {
+                s.minValue = (std::min)(s.minValue, value);
+                s.maxValue = (std::max)(s.maxValue, value);
+            }
+            ++s.finiteCount;
+        }
+    }
+    return s;
+}
+
+static void LogEyeVertexData(uint64_t hash, BSTriShape* tri,
+                             const ParsedGeometry& parsed,
+                             BSLightingShaderMaterialBase* mat,
+                             void* property) {
+    static std::mutex s_mx;
+    static std::unordered_set<uint64_t> s_logged;
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        if (!s_logged.insert(hash).second) return;
+    }
+
+    const uint64_t d = parsed.vertexDesc;
+    const uint32_t attrShift =
+        parsed.isDynamic ? 0u : (uint32_t)((d >> 4) & 0xF);
+    const uint32_t eyeNibble = (uint32_t)((d >> 36) & 0xF);
+    const uint32_t descOffset = (attrShift + eyeNibble) * 4;
+    const uint32_t tailOffset =
+        parsed.vertexSize >= 4 ? parsed.vertexSize - 4 : 0;
+    const EyeRawStats descStats = ReadEyeRawStats(parsed, descOffset);
+    const EyeRawStats tailStats = ReadEyeRawStats(parsed, tailOffset);
+    const auto* prop =
+        reinterpret_cast<const BSLightingShaderProperty*>(property);
+    const uint32_t technique = prop ? prop->uiBaseTechniqueID : 0;
+
+    _MESSAGE("FO4RemixPlugin: [EyeAnim] vertex hash=%016llX shape='%s' "
+             "dyn=%d maleFlag=%d desc=%016llX stride=%u verts=%u "
+             "eyeNibble=%u descOff=%u tailOff=%u matType=%u tech=%08X "
+             "uvOff=(%.6f,%.6f;%.6f,%.6f) "
+             "uvScale=(%.6f,%.6f;%.6f,%.6f)",
+             (unsigned long long)hash,
+             tri->m_name.c_str() ? tri->m_name.c_str() : "",
+             parsed.isDynamic ? 1 : 0,
+             (d & BSGeometry::kFlag_MaleEyes) ? 1 : 0,
+             (unsigned long long)d, (unsigned)parsed.vertexSize,
+             (unsigned)parsed.vbCount, eyeNibble, descOffset, tailOffset,
+             mat ? mat->GetType() : 0, technique,
+             mat ? mat->textCoordOffset[0].x : 0.0f,
+             mat ? mat->textCoordOffset[0].y : 0.0f,
+             mat ? mat->textCoordOffset[1].x : 0.0f,
+             mat ? mat->textCoordOffset[1].y : 0.0f,
+             mat ? mat->textCoordScale[0].x : 0.0f,
+             mat ? mat->textCoordScale[0].y : 0.0f,
+             mat ? mat->textCoordScale[1].x : 0.0f,
+             mat ? mat->textCoordScale[1].y : 0.0f);
+    _MESSAGE("FO4RemixPlugin: [EyeAnim] vertexData hash=%016llX "
+             "descValid=%d descRaw=%08X,%08X,%08X,%08X "
+             "descFinite=%u descRange=(%.8g,%.8g) "
+             "tailValid=%d tailRaw=%08X,%08X,%08X,%08X "
+             "tailFinite=%u tailRange=(%.8g,%.8g)",
+             (unsigned long long)hash,
+             descStats.valid ? 1 : 0,
+             descStats.first[0], descStats.first[1],
+             descStats.first[2], descStats.first[3],
+             descStats.finiteCount, descStats.minValue, descStats.maxValue,
+             tailStats.valid ? 1 : 0,
+             tailStats.first[0], tailStats.first[1],
+             tailStats.first[2], tailStats.first[3],
+             tailStats.finiteCount, tailStats.minValue, tailStats.maxValue);
+}
+
 static void HeadDiagLog(uint64_t hash, const char* fmt, ...) {
     char msg[448];
     va_list ap;
@@ -1749,6 +1854,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         return false;
     }
 
+    if (g_config.diagEnabled && isFaceGenPart && IsHumanIris(tri)) {
+        LogEyeVertexData(hash, tri, parsed, mat, state.property);
+    }
+
     // [HeadDiag] geometry stats, once per hash (parsed positions include the
     // dynamicVertices decode for facegen shapes; the raw first floats of the
     // dynamic buffer discriminate float3-packed real positions from
@@ -1927,6 +2036,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         if (headDiag && tri->GetAsBSDynamicTriShape()) {
             SkinnedMeshes::LogBones(hash, tri->m_name.c_str()
                                               ? tri->m_name.c_str() : "");
+        }
+        if (g_config.diagEnabled && isFaceGenPart && IsHumanIris(tri)) {
+            SkinnedMeshes::SetEyeProbe(hash, tri, state.property, mat,
+                                       mat->GetType());
         }
         // Blend indices reference the skin instance's bone array; clamp any
         // out-of-range index to bone 0 rather than letting the runtime's

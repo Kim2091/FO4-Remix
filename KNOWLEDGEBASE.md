@@ -638,6 +638,14 @@ would have started rejecting huge-local-extent LOD chunks.
   before destroying the previous handle to avoid the reverted v1 failure
   where refreshed heads, mouths, and hair disappeared. If this path regresses,
   disable `[Skinning] FaceMorphRefreshEnabled`.
+- **Eye gaze is under active diagnosis (2026-08-03).** Human irises are small
+  dynamic skinned meshes with one bone. Male irises also carry the descriptor's
+  `EyeData` vertex channel, but local shader inspection indicates that channel
+  feeds eye shading rather than vertex deformation. The `[EyeAnim]` probe logs
+  the iris bone, shape and parent world transforms, material UV transform,
+  shader technique, and `BSEyeCenterExtraData` without changing render state.
+  If those sources remain static while the native game moves an NPC's gaze,
+  the next capture target is the eye draw's transient shader constants.
 - **Precombined / merge-instanced transforms are wrong (open, 2026-07-03).**
   The resolver's model is "local-space vertices x leaf `m_worldTransform`",
   which holds for plain refs but not for precombined geometry
