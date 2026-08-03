@@ -1236,6 +1236,126 @@ static bool IsFaceGenPart(const SemanticCapture::DrawableState& state) {
     return NameContainsCI(p1Leaf, "facegen");
 }
 
+static uint32_t PackVertexColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return (uint32_t)r | ((uint32_t)g << 8) |
+           ((uint32_t)b << 16) | ((uint32_t)a << 24);
+}
+
+static float PaletteRowV(float scale, uint8_t rowByte) {
+    if (!(scale >= 0.0f && scale <= 2.0f)) scale = 1.0f;
+    float v = scale - 1.0f + std::pow(rowByte / 255.0f, 1.0f / 2.2f);
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+static bool PaletteColorOffset(const ParsedGeometry& parsed, uint32_t& oColor) {
+    const uint64_t d = parsed.vertexDesc;
+    if ((d & (1ULL << 49)) == 0 || !parsed.vbData || parsed.vertexSize == 0)
+        return false;
+    const uint32_t szV = (uint32_t)((d >> 4) & 0xF);
+    const uint32_t shift = parsed.isDynamic ? 0u : szV;
+    oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
+    return oColor + 4 <= parsed.vertexSize;
+}
+
+static uint8_t RatioToVertexByte(uint8_t target, uint8_t base, bool& clipped) {
+    if (target >= base && base > 0) {
+        clipped = clipped || target > base;
+        return 255;
+    }
+    if (base == 0) {
+        clipped = clipped || target > 0;
+        return target > 0 ? 255 : 0;
+    }
+    return (uint8_t)((uint32_t)target * 255u / (uint32_t)base);
+}
+
+static void ApplyPaletteVertexCorrection(BSTriShape* tri,
+                                         ExtractedMesh& mesh,
+                                         const ParsedGeometry& parsed,
+                                         BSLightingShaderMaterialBase* mat,
+                                         ID3D11Device* device,
+                                         uint8_t baseRow,
+                                         uint8_t rowMin,
+                                         uint8_t rowMax,
+                                         uint32_t baseRgb)
+{
+    if (!g_config.paletteVertexCorrectionEnabled || !tri || !mat || !device)
+        return;
+    if (rowMax <= rowMin + 1)
+        return;
+
+    uint32_t oColor = 0;
+    if (!PaletteColorOffset(parsed, oColor))
+        return;
+
+    const size_t nV = (std::min)(mesh.vertices.size(), (size_t)tri->numVertices);
+    if (nV == 0)
+        return;
+
+    struct RowCorrection {
+        bool valid = false;
+        uint32_t color = 0xFFFFFFFFu;
+        bool clipped = false;
+    };
+    std::array<RowCorrection, 256> rows{};
+    const uint8_t baseR = (uint8_t)((baseRgb >> 16) & 0xFF);
+    const uint8_t baseG = (uint8_t)((baseRgb >> 8) & 0xFF);
+    const uint8_t baseB = (uint8_t)(baseRgb & 0xFF);
+    const float scale = mat->fLookupScale;
+
+    auto buildRow = [&](uint8_t row) -> RowCorrection {
+        RowCorrection rc{};
+        if (row == baseRow) {
+            rc.valid = true;
+            rc.color = 0xFFFFFFFFu;
+            return rc;
+        }
+
+        uint32_t rgb = 0xFFFFFFu;
+        const int st = BsExtraction::SampleLookupColor(
+            mat->spLookupTexture, device, 0.75f, PaletteRowV(scale, row), rgb);
+        if (st != 0)
+            return rc;
+
+        const uint8_t tr = (uint8_t)((rgb >> 16) & 0xFF);
+        const uint8_t tg = (uint8_t)((rgb >> 8) & 0xFF);
+        const uint8_t tb = (uint8_t)(rgb & 0xFF);
+        bool clipped = false;
+        const uint8_t vr = RatioToVertexByte(tr, baseR, clipped);
+        const uint8_t vg = RatioToVertexByte(tg, baseG, clipped);
+        const uint8_t vb = RatioToVertexByte(tb, baseB, clipped);
+        rc.valid = true;
+        rc.clipped = clipped;
+        rc.color = PackVertexColor(vr, vg, vb, 255);
+        return rc;
+    };
+
+    uint32_t changed = 0, clipped = 0;
+    for (size_t i = 0; i < nV; ++i) {
+        const uint8_t* c = parsed.vbData + i * parsed.vertexSize + oColor;
+        const uint8_t row = c[0];
+        RowCorrection& rc = rows[row];
+        if (!rc.valid)
+            rc = buildRow(row);
+        if (!rc.valid)
+            continue;
+        if (mesh.vertices[i].color != rc.color) {
+            mesh.vertices[i].color = rc.color;
+            ++changed;
+            if (rc.clipped) ++clipped;
+        }
+    }
+
+    static std::atomic<int> sPaletteVtxLogs{0};
+    if (changed > 0 && sPaletteVtxLogs.fetch_add(1, std::memory_order_relaxed) < 32) {
+        _MESSAGE("FO4RemixPlugin: [PaletteVCorr] shape=\%s\ baseRow=%u "
+                 "spread=%u..%u baseRGB=%06X changed=%u/%zu clippedBright=%u",
+                 tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                 (unsigned)baseRow, (unsigned)rowMin, (unsigned)rowMax,
+                 baseRgb, changed, nV, clipped);
+    }
+}
+
 static void HeadDiagLog(uint64_t hash, const char* fmt, ...) {
     char msg[448];
     va_list ap;
@@ -1664,10 +1784,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             // Re-sample the palette LUT from the cached row byte (the
             // histogram over the engine VB was phase-1 work); the LUT decode
             // itself is cached inside SampleLookupColor after the first hit.
-            float scale = mat->fLookupScale;
-            if (!(scale >= 0.0f && scale <= 2.0f)) scale = 1.0f;
-            float v = scale - 1.0f + std::pow(paletteRowByte / 255.0f, 1.0f / 2.2f);
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            const float scale = mat->fLookupScale;
+            const float v = PaletteRowV(scale, (uint8_t)paletteRowByte);
             uint32_t pal = 0xFFFFFFu;
             const int st = BsExtraction::SampleLookupColor(
                 mat->spLookupTexture, device, /*u=*/0.75f, v, pal);
@@ -2279,6 +2397,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         if (histo[b] > best) { best = histo[b]; rowByte = (uint8_t)b; }
                 }
             }
+            if (rowMax < rowMin) {
+                rowMin = rowByte;
+                rowMax = rowByte;
+            }
             // GrayscaleToPaletteScale = fLookupScale (material+0xB8, F4SE
             // NiMaterials.h). The BGSM survey proves it's the load-bearing
             // row selector: every color variant of a shared LUT differs
@@ -2291,26 +2413,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             paletteBranch  = true;
             paletteRowByte = rowByte;
             float scale = mat->fLookupScale;
-            if (!(scale >= 0.0f && scale <= 2.0f)) scale = 1.0f;
-            float v = scale - 1.0f + std::pow(rowByte / 255.0f, 1.0f / 2.2f);
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            float v = PaletteRowV(scale, (uint8_t)rowByte);
             uint32_t pal = 0xFFFFFFu;
             const int st = BsExtraction::SampleLookupColor(
                 mat->spLookupTexture, device, /*u=*/0.75f, v, pal);
             if (st == 1) {
                 // LUT not read back yet -- retry like any pending texture.
-                // Stash phase-1 so the retry skips the parse (mesh is fully
-                // built at this point; diffuseTint is still the pre-palette
-                // 0xFFFFFF because the tint branches are exclusive).
-                if (state.resolveAttempts <= kResolveCacheMaxAttempts) {
-                    auto rc = std::make_shared<ResolveCache>();
-                    rc->mesh           = std::move(mesh);
-                    rc->albedoLumFloor = albedoLumFloor;
-                    rc->diffuseTint    = 0xFFFFFFu;
-                    rc->paletteBranch  = true;
-                    rc->paletteRowByte = rowByte;
-                    state.resolveCache = std::move(rc);
-                }
+                // Do not stash phase 1 here: per-vertex correction still
+                // needs the raw color stream when the LUT becomes readable.
+                // The retry reparses and may cache at a later texture gate.
                 if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending");
                 ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
                                                 std::memory_order_relaxed);
@@ -2320,6 +2431,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 diffuseTint = pal;                   // fallback (BC7 diffuse)
                 paletteLut  = mat->spLookupTexture;  // per-pixel engine remap
                 paletteRowV = v;
+                ApplyPaletteVertexCorrection(tri, mesh, parsed, mat, device,
+                                             (uint8_t)rowByte, (uint8_t)rowMin,
+                                             (uint8_t)rowMax, pal);
             }
             static std::atomic<int> sGtpLogs{0};
             if (sGtpLogs.fetch_add(1, std::memory_order_relaxed) < 24) {

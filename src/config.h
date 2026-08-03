@@ -387,6 +387,7 @@ struct PluginConfig {
     float metalMinRoughness;        // floor on (1 - fSmoothness) so metals aren't mirrors (default 0.15)
     bool  roughnessMapsEnabled;     // extract _s.dds -> per-pixel roughness maps (default true; off = roughnessConstant fallback)
     float roughnessMapFloor;        // 0..1 floor on _s.dds-derived per-pixel roughness (default 0.15; decals clamp at >= 0.3)
+    bool  paletteVertexCorrectionEnabled; // approximate per-vertex grayscale-palette row variation (default true)
     // Re-capture-on-approach (2026-07-08): FO4 streams textures progressively,
     // so an object first resolved at distance captures a reduced mip and the
     // name-keyed texture cache locks that blurry version for the session. When
