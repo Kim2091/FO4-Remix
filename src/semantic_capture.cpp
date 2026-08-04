@@ -13,6 +13,7 @@
 #include <windows.h>
 
 #include "f4se/PluginAPI.h"  // _MESSAGE
+#include "f4se/BSGeometry.h" // BSTriShape (terrain observation)
 #include "f4se/NiTypes.h"    // NiTransform, NiMatrix33, NiPoint3
 #include "f4se/NiObjects.h"  // NiAVObject (skinned-visibility name read)
 #include "MinHook.h"
@@ -951,6 +952,53 @@ bool SemanticCapture::IsViewModelGeometry(void* geometry) {
     return false;
 }
 
+bool SemanticCapture::ObserveTerrainGeometry(void* geometry) {
+    if (!geometry) return false;
+
+    NiAVObject* obj = static_cast<NiAVObject*>(geometry);
+    BSTriShape* tri = obj->GetAsBSTriShape();
+    if (!tri || !tri->shaderProperty) return false;
+
+    void* property = tri->shaderProperty;
+    void* material = *reinterpret_cast<void**>(
+        reinterpret_cast<uintptr_t>(property) + 0x58);
+    if (!material) return false;
+
+    void* parent1 = tri->m_parent;
+    void* parent2 = parent1 ? static_cast<NiAVObject*>(parent1)->m_parent : nullptr;
+    const PassKey key = ComputePassKey(tri, property, material);
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    float liveXf[3][4] = {};
+    BuildRemixTransform(tri->m_worldTransform, liveXf);
+
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    auto& state = g_drawableMap[key];
+    if (state.firstSeenFrame == 0) {
+        state.firstSeenFrame = now;
+        state.geometry = tri;
+        state.property = property;
+        state.material = material;
+        state.initialFlags = tri->flags;
+        state.parent1 = parent1;
+        state.parent2 = parent2;
+        state.resolverKind = ResolverKind::Lighting;
+    }
+    state.isTerrain = true;
+    state.lastSeenFrame = now;
+    state.lastFlags = tri->flags;
+    ++state.fireCount;
+    if (!state.liveTransformValid ||
+        std::memcmp(state.liveWorldTransform, liveXf, sizeof(liveXf)) != 0) {
+        std::memcpy(state.liveWorldTransform, liveXf, sizeof(liveXf));
+        state.liveTransformValid = true;
+        if (!state.poseDirty) {
+            state.poseDirty = true;
+            g_dirtyPoses.push_back(key);
+        }
+    }
+    return true;
+}
+
 namespace { // reopen anonymous namespace
 
 // Shared detour body. The per-target wrappers above pass their compile-time
@@ -1025,7 +1073,7 @@ static void* DetourGetRenderPassesShared(void* self,
         capturedPosX < -kFarFromOriginThreshold ||
         capturedPosY >  kFarFromOriginThreshold ||
         capturedPosY < -kFarFromOriginThreshold;
-    if (geometry && g_moduleBase && farFromOrigin &&
+    if (g_config.diagEnabled && geometry && g_moduleBase && farFromOrigin &&
         g_parentChainLogs.load(std::memory_order_relaxed) < kParentChainLogCap) {
         const uint64_t logN = g_parentChainLogs.fetch_add(1, std::memory_order_relaxed);
         // Re-check after the increment: two threads can pass the pre-check
@@ -1048,6 +1096,13 @@ static void* DetourGetRenderPassesShared(void* self,
             state.parent1 = p1;
             state.parent2 = p2;
             state.resolverKind = kind;  // tag once on first-seen
+            // First-person geometry lives in camera-local coordinates, so
+            // world-distance ranking would otherwise place it behind every
+            // world drawable. Tag it before the first resolve attempt; the
+            // resolver mirrors this into ExtractedMesh after submission.
+            state.isViewModel =
+                kind == SemanticCapture::ResolverKind::Lighting &&
+                SemanticCapture::IsViewModelGeometry(geometry);
         }
         state.lastSeenFrame      = now;
         state.lastFlags          = niFlags;
@@ -1242,39 +1297,42 @@ bool SemanticCapture::Install() {
         return false;
     }
 
-    // Diagnostic hooks (best-effort; never abort the install path).
-    g_addrSetupGeo = reinterpret_cast<LPVOID>(
-        reinterpret_cast<uintptr_t>(hMod) + kSetupGeometryRVA);
-    if (MH_CreateHook(g_addrSetupGeo,
-                      reinterpret_cast<LPVOID>(&DetourSetupGeometry_Lighting),
-                      reinterpret_cast<LPVOID*>(&g_origSetupGeo)) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo create failed (RVA 0x%llX)",
-                 (unsigned long long)kSetupGeometryRVA);
-        g_addrSetupGeo = nullptr;
-    } else if (MH_EnableHook(g_addrSetupGeo) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo enable failed");
-        MH_RemoveHook(g_addrSetupGeo);
-        g_addrSetupGeo = nullptr;
-    } else {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] installed SetupGeo diag hook at RVA 0x%llX",
-                 (unsigned long long)kSetupGeometryRVA);
-    }
+    // Diagnostic hooks are both very hot engine paths. Do not pay their
+    // trampoline, atomics, guarded reads, or startup logging in normal runs.
+    if (g_config.diagEnabled) {
+        g_addrSetupGeo = reinterpret_cast<LPVOID>(
+            reinterpret_cast<uintptr_t>(hMod) + kSetupGeometryRVA);
+        if (MH_CreateHook(g_addrSetupGeo,
+                          reinterpret_cast<LPVOID>(&DetourSetupGeometry_Lighting),
+                          reinterpret_cast<LPVOID*>(&g_origSetupGeo)) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo create failed (RVA 0x%llX)",
+                     (unsigned long long)kSetupGeometryRVA);
+            g_addrSetupGeo = nullptr;
+        } else if (MH_EnableHook(g_addrSetupGeo) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo enable failed");
+            MH_RemoveHook(g_addrSetupGeo);
+            g_addrSetupGeo = nullptr;
+        } else {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] installed SetupGeo diag hook at RVA 0x%llX",
+                     (unsigned long long)kSetupGeometryRVA);
+        }
 
-    g_addrWriteXform = reinterpret_cast<LPVOID>(
-        reinterpret_cast<uintptr_t>(hMod) + kWriteWorldXformRVA);
-    if (MH_CreateHook(g_addrWriteXform,
-                      reinterpret_cast<LPVOID>(&DetourWriteWorldXform),
-                      reinterpret_cast<LPVOID*>(&g_origWriteXform)) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite create failed (RVA 0x%llX)",
-                 (unsigned long long)kWriteWorldXformRVA);
-        g_addrWriteXform = nullptr;
-    } else if (MH_EnableHook(g_addrWriteXform) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite enable failed");
-        MH_RemoveHook(g_addrWriteXform);
-        g_addrWriteXform = nullptr;
-    } else {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] installed CBWrite diag hook at RVA 0x%llX",
-                 (unsigned long long)kWriteWorldXformRVA);
+        g_addrWriteXform = reinterpret_cast<LPVOID>(
+            reinterpret_cast<uintptr_t>(hMod) + kWriteWorldXformRVA);
+        if (MH_CreateHook(g_addrWriteXform,
+                          reinterpret_cast<LPVOID>(&DetourWriteWorldXform),
+                          reinterpret_cast<LPVOID*>(&g_origWriteXform)) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite create failed (RVA 0x%llX)",
+                     (unsigned long long)kWriteWorldXformRVA);
+            g_addrWriteXform = nullptr;
+        } else if (MH_EnableHook(g_addrWriteXform) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite enable failed");
+            MH_RemoveHook(g_addrWriteXform);
+            g_addrWriteXform = nullptr;
+        } else {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] installed CBWrite diag hook at RVA 0x%llX",
+                     (unsigned long long)kWriteWorldXformRVA);
+        }
     }
 
     g_installed.store(true);
@@ -1419,7 +1477,9 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             UpdateViewModelAnchor();
             RefreshViewModelRigidPoses();
         }
-        ViewModelDiagTick(currentFrame);
+        if (g_config.diagEnabled) {
+            ViewModelDiagTick(currentFrame);
+        }
     }
 
     // ---- Resolve loop: every call, attempt one resolve per unsubmitted drawable ----
@@ -1610,7 +1670,12 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 // always submits first; distance orders within each class;
                 // unknown transforms sort to the very back.
                 float rank = 1.0e18f;
-                if (resolveCam.valid && state.liveTransformValid) {
+                if (state.isViewModel) {
+                    // Camera-local transforms are not comparable with world
+                    // coordinates. Resolve 1P arms/weapons first so a busy
+                    // cell-attach backlog cannot make them disappear.
+                    rank = -1.0e18f;
+                } else if (resolveCam.valid && state.liveTransformValid) {
                     const float dx =
                         state.liveWorldTransform[0][3] - resolveCam.position[0];
                     const float dy =

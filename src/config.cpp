@@ -90,8 +90,8 @@ void LoadConfig() {
 
     // [Logging]
     g_config.logShapeInfo   = GetIniBool("Logging", "LogShapeInfo",   false, dllPath);
-    g_config.logLargeShapes = GetIniBool("Logging", "LogLargeShapes", true,  dllPath);
-    g_config.logRejections  = GetIniBool("Logging", "LogRejections",  true,  dllPath);
+    g_config.logLargeShapes = GetIniBool("Logging", "LogLargeShapes", false, dllPath);
+    g_config.logRejections  = GetIniBool("Logging", "LogRejections",  false, dllPath);
     g_config.logTextures    = GetIniBool("Logging", "LogTextures",    false, dllPath);
     g_config.logLights      = GetIniBool("Logging", "LogLights",      false, dllPath);
     g_config.logBoneDiag    = GetIniBool("Logging", "LogBoneDiag",    false, dllPath);
@@ -162,7 +162,7 @@ void LoadConfig() {
     g_config.logEmissive             = GetIniBool("Emissive", "LogEmissive", false, dllPath);
 
     // [Diagnostics]
-    g_config.diagEnabled = GetIniBool("Diagnostics", "Enabled", true, dllPath);
+    g_config.diagEnabled = GetIniBool("Diagnostics", "Enabled", false, dllPath);
     _MESSAGE("FO4RemixPlugin: Diagnostics - Enabled=%d", g_config.diagEnabled);
 
     // [SemanticCapture]
@@ -182,7 +182,7 @@ void LoadConfig() {
     g_config.cullingForceEvictPerSweep     = GetIniUInt("Culling", "ForceEvictPerSweep",     512, dllPath);
     g_config.cullingForceEvictViewPct      = GetIniUInt("Culling", "ForceEvictViewPct",      60,  dllPath);
     g_config.cullingForceEvictBehindDistance = GetIniFloat("Culling", "ForceEvictBehindDistance", 8000.0f, dllPath);
-    g_config.cullingForceEvictAlwaysBehindDistance = GetIniFloat("Culling", "ForceEvictAlwaysBehindDistance", 40000.0f, dllPath);
+    g_config.cullingForceEvictAlwaysBehindDistance = GetIniFloat("Culling", "ForceEvictAlwaysBehindDistance", 0.0f, dllPath);
     g_config.cullingForceEvictLodBehindDistance = GetIniFloat("Culling", "ForceEvictLodBehindDistance", 0.0f, dllPath);
     g_config.cullingFrustumEnabled      = GetIniBool("Culling",  "FrustumCull",          true,    dllPath);
     g_config.cullingFrustumKeepRadius   = GetIniFloat("Culling", "FrustumKeepRadius",    8192.0f, dllPath);

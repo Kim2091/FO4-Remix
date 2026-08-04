@@ -194,7 +194,7 @@ struct PluginConfig {
     bool  logEmissive;              // Log emissive extraction details
 
     // [Diagnostics]
-    bool diagEnabled;             // Master toggle for periodic diagnostic logging (default true)
+    bool diagEnabled;             // Master toggle for periodic diagnostic logging (default false)
 
     // [SemanticCapture]
     bool semanticCaptureEnabled;  // [Phase 1A] Install BSLightingShaderProperty event-capture hook (default false)
@@ -249,7 +249,7 @@ struct PluginConfig {
     // no VRAM threshold. Ultra-far restores are rare and visually invisible
     // (tiny on screen, horizon covered by LOD chunks), so keeping them
     // resident buys nothing. 0 = off.
-    float    cullingForceEvictAlwaysBehindDistance; // game units, default 40000 (~10 cells)
+    float    cullingForceEvictAlwaysBehindDistance; // game units, default 0 (off)
     // Worldspace LOD chunks park unconditionally when behind the camera
     // beyond THIS distance (0 = off). Chunks are multi-cell meshes with no
     // per-entry extent in the capture map, so "behind" additionally requires

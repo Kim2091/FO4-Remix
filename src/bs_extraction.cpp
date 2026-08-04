@@ -1,4 +1,5 @@
 #include "bs_extraction.h"
+#include "ba2_texture_source.h"
 #include "bcdec_bc7.h"  // vendored BC7 block decoder (bcdec, MIT/Unlicense)
 #include "config.h"
 #include "fo4_diagnostics.h"   // Diagnostics::CurrentFrameIndex for readback aging
@@ -1939,6 +1940,13 @@ struct TextureConversionJob {
     bool     palTableValid  = false;
     bool     isDiffuseSlot  = false;      // debug-dump routing only
     std::string texName;                  // logging only
+    // Authored BA2 source jobs carry only metadata across the game-thread
+    // boundary. The worker reads/inflates the mip chain directly from disk,
+    // keeping the game renderer's reduced resident texture untouched.
+    bool ba2Source = false;
+    D3D11_TEXTURE2D_DESC ba2LiveDesc = {};
+    uint32_t ba2ExpectedWidth = 0;
+    uint32_t ba2ExpectedHeight = 0;
     // Persistent disk cache (see the block comment above DiskCacheDir).
     // diskLoadKey != 0: this job LOADS the converted chain from disk
     // instead of converting (mips empty). diskWriteKey != 0: write the
@@ -1950,6 +1958,9 @@ struct TextureConversionJob {
 struct CompletedTextureConversion {
     ExtractedTexture packed;   // pixels empty => conversion dropped/failed
     uint64_t doneFrame = 0;    // for the orphan TTL sweep
+    // BA2 lookup/read failure is not a bad texture. The game thread marks the
+    // resource name unavailable for this session and retries via GPU readback.
+    bool fallbackToLive = false;
 };
 
 static std::mutex                       g_texConvMutex;
@@ -1970,6 +1981,7 @@ static bool                             g_texConvStop = false;  // guarded by g_
 // cap), so the queue self-heals once the workers catch up.
 static size_t           g_texConvJobsBytes = 0;
 static constexpr size_t kMaxTexConvJobsBytes = 256ull << 20;  // 256 MiB
+static constexpr size_t kMaxTexConvJobs = 512;
 
 static size_t TexConvJobBytes(const TextureConversionJob& job) {
     size_t n = 0;
@@ -2182,6 +2194,7 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     std::vector<ExtractedTexture>& mips = job.mips;
     const char* texName = job.texName.c_str();
     const TexturePostProcess postProcess = job.postProcess;
+    const bool textureDebug = g_config.diagEnabled && g_config.logTextures;
 
     // Per-mip pipeline: BC2 (DXT3) -> RGBA8, then any further BC decompression
     // handled by the post-process stage's BC5/BC1 decoders. Each step operates
@@ -2219,7 +2232,7 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     // See the black-merge investigation notes; fires for the first N BC3
     // diffuse extractions per process. Counters are atomics now that this
     // runs on worker threads (ticket races would at most skew a filename).
-    {
+    if (textureDebug) {
         static std::atomic<int> s_dumpBC3Alpha{0};
         static std::atomic<int> s_logDiffuseFormat{0};
         if (job.isDiffuseSlot) {
@@ -2280,7 +2293,7 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     }
 
     // --- Debug dump: diffuse control (no post-processing) ---
-    if (postProcess == TexturePostProcess::None) {
+    if (textureDebug && postProcess == TexturePostProcess::None) {
         static std::atomic<int> s_dumpDiffuse{0};
         if (s_dumpDiffuse.load(std::memory_order_relaxed) < 2) {
             const int ticket = s_dumpDiffuse.fetch_add(1, std::memory_order_relaxed);
@@ -2304,7 +2317,7 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     }
 
     // --- Debug dump: raw BC5 decode (before post-processing) ---
-    {
+    if (textureDebug) {
         static std::atomic<int> s_dumpNormalRaw{0}, s_dumpRoughnessRaw{0};
         int ticket = -1;
         const char* rawName = nullptr;
@@ -2406,7 +2419,7 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     }
 
     // --- Debug dump: after post-processing (mip 0 only) ---
-    {
+    if (textureDebug) {
         static std::atomic<int> s_dumpNormalPost{0}, s_dumpRoughnessPost{0};
         int ticket = -1;
         const char* postName = nullptr;
@@ -2481,6 +2494,98 @@ static void TextureConversionWorkerMain()
             const size_t jobBytes = TexConvJobBytes(job);
             g_texConvJobsBytes = g_texConvJobsBytes > jobBytes
                 ? g_texConvJobsBytes - jobBytes : 0;
+        }
+        // Direct authored-source job. BA2 inflation and archive I/O stay off
+        // the render thread; successful chains then use the exact same
+        // conversion/cache path as GPU readbacks and loose DDS files.
+        if (job.ba2Source) {
+            auto completeFallback = [&](Ba2TextureSource::Status status) {
+                static std::atomic<int> sBa2FallbackLogs{0};
+                const int n = sBa2FallbackLogs.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (n < 64 || (g_config.logTextures && (n % 256) == 0)) {
+                    _MESSAGE("FO4RemixPlugin: [AuthoredTex] #%d BA2 FALLBACK "
+                             "\"%s\" reason=%s live=%ux%u/%u fmt=%u rd=%ux%u",
+                             n, job.texName.c_str(),
+                             Ba2TextureSource::StatusName(status),
+                             job.ba2LiveDesc.Width, job.ba2LiveDesc.Height,
+                             job.ba2LiveDesc.MipLevels,
+                             (unsigned)job.ba2LiveDesc.Format,
+                             job.ba2ExpectedWidth, job.ba2ExpectedHeight);
+                }
+                std::lock_guard<std::mutex> lk(g_texConvMutex);
+                CompletedTextureConversion completed;
+                completed.doneFrame = Diagnostics::CurrentFrameIndex();
+                completed.fallbackToLive = true;
+                g_texConvDone[job.hash] = std::move(completed);
+                g_texConvInflight.erase(job.hash);
+            };
+
+            Ba2TextureSource::ReadInfo info;
+            Ba2TextureSource::Status status = Ba2TextureSource::Query(
+                job.texName.c_str(), job.ba2LiveDesc.Format,
+                job.ba2ExpectedWidth, job.ba2ExpectedHeight,
+                g_config.maxTextureDimension, info);
+            if (status != Ba2TextureSource::Status::Ready) {
+                completeFallback(status);
+                continue;
+            }
+
+            D3D11_TEXTURE2D_DESC authoredDesc = job.ba2LiveDesc;
+            authoredDesc.Width = info.uploadWidth;
+            authoredDesc.Height = info.uploadHeight;
+            authoredDesc.MipLevels = info.uploadMipCount;
+            authoredDesc.Format = info.format;
+            if (g_config.diskTextureCache) {
+                const uint64_t diskKey = DiskCacheKeyFold(job.hash, authoredDesc);
+                ExtractedTexture packed;
+                if (DiskCacheLoad(diskKey, job.hash, packed)) {
+                    static std::atomic<int> sBa2DiskHitLogs{0};
+                    const int n = sBa2DiskHitLogs.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (n < 8) {
+                        _MESSAGE("FO4RemixPlugin: [TexCache] authored BA2 hit #%d "
+                                 "hash=0x%016llX %ux%u mips=%u (%zu KiB)",
+                                 n, (unsigned long long)job.hash,
+                                 packed.width, packed.height, packed.mipLevels,
+                                 packed.pixels.size() >> 10);
+                    }
+                    std::lock_guard<std::mutex> lk(g_texConvMutex);
+                    g_texConvDone[job.hash] = {
+                        std::move(packed), Diagnostics::CurrentFrameIndex() };
+                    g_texConvInflight.erase(job.hash);
+                    continue;
+                }
+                job.diskWriteKey = diskKey;
+            }
+
+            // Cache miss: now pay the archive I/O + zlib cost. Read repeats
+            // the cheap metadata selection so it can own no borrowed index
+            // pointers across this call.
+            status = Ba2TextureSource::Read(
+                job.texName.c_str(), job.ba2LiveDesc.Format,
+                job.ba2ExpectedWidth, job.ba2ExpectedHeight,
+                g_config.maxTextureDimension, job.mips, info);
+            if (status != Ba2TextureSource::Status::Ready || job.mips.empty()) {
+                completeFallback(status);
+                continue;
+            }
+
+            static std::atomic<int> sBa2ReadyLogs{0};
+            const int n = sBa2ReadyLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 64 || (g_config.logTextures && (n % 256) == 0)) {
+                _MESSAGE("FO4RemixPlugin: [AuthoredTex] #%d BA2 \"%s\" "
+                         "archive=\"%s\" authored=%ux%u/%u mips "
+                         "upload=%ux%u/%zu fmt=%u live=%ux%u/%u fmt=%u",
+                         n, job.texName.c_str(), info.archiveName.c_str(),
+                         info.sourceWidth, info.sourceHeight,
+                         info.sourceMipCount, job.mips[0].width,
+                         job.mips[0].height, job.mips.size(),
+                         (unsigned)job.mips[0].dxgiFormat,
+                         job.ba2LiveDesc.Width, job.ba2LiveDesc.Height,
+                         job.ba2LiveDesc.MipLevels,
+                         (unsigned)job.ba2LiveDesc.Format);
+            }
         }
         // Disk-cache load job: no convert, just stream the chain back.
         if (job.diskLoadKey != 0) {
@@ -2575,14 +2680,15 @@ static void EnqueueTextureConversion(TextureConversionJob&& job)
     // unbounded raw chains; the caller keeps reporting pending and its
     // retry re-runs the readback once the workers have drained the queue.
     const size_t jobBytes = TexConvJobBytes(job);
-    if (g_texConvJobsBytes + jobBytes > kMaxTexConvJobsBytes) {
+    if (g_texConvJobs.size() >= kMaxTexConvJobs ||
+        g_texConvJobsBytes + jobBytes > kMaxTexConvJobsBytes) {
         static std::atomic<int> sDropLogs{0};
         const int n = sDropLogs.fetch_add(1, std::memory_order_relaxed);
         if (n < 16) {
-            _MESSAGE("FO4RemixPlugin: [TexConvert] queue full (%zu MiB), "
+            _MESSAGE("FO4RemixPlugin: [TexConvert] queue full (%zu jobs, %zu MiB), "
                      "dropping job #%d hash=0x%016llX (%zu KiB) -- retry "
                      "re-reads it back",
-                     g_texConvJobsBytes >> 20, n,
+                     g_texConvJobs.size(), g_texConvJobsBytes >> 20, n,
                      (unsigned long long)job.hash, jobBytes >> 10);
         }
         return;
@@ -2849,17 +2955,23 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     {
         ExtractedTexture packed;
         bool havePacked = false;
+        bool fallbackToLive = false;
         {
             std::lock_guard<std::mutex> lk(g_texConvMutex);
             auto dit = g_texConvDone.find(hash);
             if (dit != g_texConvDone.end()) {
                 packed = std::move(dit->second.packed);
+                fallbackToLive = dit->second.fallbackToLive;
                 g_texConvDone.erase(dit);
                 havePacked = true;
             } else if (g_texConvInflight.count(hash)) {
                 if (outPending) *outPending = true;
                 return 0;  // decode in flight; resolver retries next tick
             }
+        }
+        if (havePacked && fallbackToLive) {
+            g_authoredDdsUnavailable.insert(sourceNameHash);
+            havePacked = false;
         }
         if (havePacked) {
             if (packed.pixels.empty()) {
@@ -2924,6 +3036,28 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     tex2D->GetDesc(&srcDescForCache);
     const D3D11_TEXTURE2D_DESC liveDesc = srcDescForCache;
     bool usedAuthoredSource = false;
+    auto populateConversionJob = [&](TextureConversionJob& job,
+                                     DXGI_FORMAT sourceFormat) {
+        job.hash           = hash;
+        job.postProcess    = postProcess;
+        job.minRoughness   = minRoughness;
+        job.albedoLumFloor = albedoLumFloor;
+        job.tintRGB        = tintRGB;
+        job.isDiffuseSlot  = slotName && std::strcmp(slotName, "diffuse") == 0;
+        job.texName        = texName ? texName : "";
+
+        if (paletteLut) {
+            const char* lutName = paletteLut->name.c_str();
+            const uint64_t lutKey = FnvHashCombine(
+                FnvHash(lutName ? lutName : ""), 0x1071ULL);
+            auto lit = g_lutCache.find(lutKey);
+            if (lit != g_lutCache.end() && !lit->second.rgba.empty()) {
+                job.palTableValid = BuildPaletteRemapTable(
+                    lit->second, paletteRowV,
+                    IsSrgbColorFormat(sourceFormat), job.palTable);
+            }
+        }
+    };
     if (g_config.authoredTextureSource && !isLiveRT &&
         !g_authoredDdsUnavailable.count(sourceNameHash)) {
         AuthoredDdsInfo authoredInfo;
@@ -2957,24 +3091,20 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                          (unsigned)renderData->height);
             }
         } else {
-            g_authoredDdsUnavailable.insert(sourceNameHash);
-            static std::atomic<int> sAuthoredFallbackLogs{0};
-            const int n =
-                sAuthoredFallbackLogs.fetch_add(1, std::memory_order_relaxed);
-            if (n < 64 || (g_config.logTextures && (n % 256) == 0)) {
-                _MESSAGE("FO4RemixPlugin: [AuthoredTex] #%d FALLBACK slot=%s "
-                         "\"%s\" reason=%s magic=0x%08X live=%ux%u "
-                         "mips=%u fmt=%u rd=%ux%u",
-                         n, slotName ? slotName : "<null>",
-                         texName ? texName : "<unnamed>",
-                         AuthoredDdsStatusName(authoredStatus),
-                         authoredInfo.streamMagic,
-                         srcDescForCache.Width, srcDescForCache.Height,
-                         srcDescForCache.MipLevels,
-                         (unsigned)srcDescForCache.Format,
-                         (unsigned)renderData->width,
-                         (unsigned)renderData->height);
-            }
+            // BSResourceNiBinaryStream exposes loose/generated DDS files but
+            // not ordinary DX10 BA2 texture entries. Let a worker resolve the
+            // archive entry; on failure its completion routes this same hash
+            // back through the proven live-resource readback path.
+            TextureConversionJob job;
+            populateConversionJob(job, liveDesc.Format);
+            job.ba2Source = true;
+            job.ba2LiveDesc = liveDesc;
+            job.ba2ExpectedWidth = renderData->width;
+            job.ba2ExpectedHeight = renderData->height;
+            EnqueueTextureConversion(std::move(job));
+            tex2D->Release();
+            if (outPending) *outPending = true;
+            return 0;
         }
     }
 
@@ -3028,34 +3158,8 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // block above a tick or two later. Everything the job needs is copied or
     // moved -- no engine pointers cross the thread boundary.
     TextureConversionJob job;
-    job.hash           = hash;
-    job.postProcess    = postProcess;
-    job.minRoughness   = minRoughness;
-    job.albedoLumFloor = albedoLumFloor;
-    job.tintRGB        = tintRGB;
-    job.isDiffuseSlot  = slotName && std::strcmp(slotName, "diffuse") == 0;
-    job.texName        = texName ? texName : "";
+    populateConversionJob(job, mips[0].dxgiFormat);
     job.diskWriteKey   = diskKey;  // 0 when the disk cache is off
-
-    // Runtime gamma of the source resource, captured before any decompression
-    // (DecompressBC drops the _SRGB tag). Drives the palette remap's U decode:
-    // the engine samples the grayscale diffuse through THIS format's SRV.
-    const bool srcIsSrgb = IsSrgbColorFormat(mips[0].dxgiFormat);
-
-    // Grayscale-to-palette remap table: built here on the game thread (it
-    // reads g_lutCache, which is game-thread-only) and copied into the job.
-    // Requires the LUT to be decoded already -- the resolver's
-    // SampleLookupColor pending-gate guarantees that before the diffuse
-    // extraction runs.
-    if (paletteLut) {
-        const char* lutName = paletteLut->name.c_str();
-        const uint64_t lutKey = FnvHashCombine(FnvHash(lutName ? lutName : ""), 0x1071ULL);
-        auto lit = g_lutCache.find(lutKey);
-        if (lit != g_lutCache.end() && !lit->second.rgba.empty()) {
-            job.palTableValid = BuildPaletteRemapTable(lit->second, paletteRowV,
-                                                       srcIsSrgb, job.palTable);
-        }
-    }
 
     job.mips = std::move(mips);
     EnqueueTextureConversion(std::move(job));
@@ -4066,6 +4170,45 @@ std::vector<CellInfo> BsExtraction::GetLoadedCells()
     }
 
     return result;
+}
+
+namespace {
+
+void ObserveTerrainNode(NiAVObject* obj, uint32_t depth, uint32_t& observed)
+{
+    if (!obj || depth > 32 || (obj->flags & NiAVObject::kFlagNotVisible)) return;
+
+    if (BSTriShape* tri = obj->GetAsBSTriShape()) {
+        if (SemanticCapture::ObserveTerrainGeometry(tri)) ++observed;
+        return;
+    }
+
+    NiNode* node = obj->GetAsNiNode();
+    if (!node) return;
+    const uint16_t childCount = node->m_children.m_emptyRunStart;
+    for (uint16_t i = 0; i < childCount; ++i) {
+        if (NiAVObject* child = node->m_children.m_data[i]) {
+            ObserveTerrainNode(child, depth + 1, observed);
+        }
+    }
+}
+
+} // namespace
+
+uint32_t BsExtraction::ObserveCellTerrain(uintptr_t cellPtr)
+{
+    if (!cellPtr) return 0;
+    const uintptr_t landPtr = *reinterpret_cast<uintptr_t*>(cellPtr + OFF_CELL_LAND);
+    if (!landPtr) return 0;
+    uintptr_t* quadrants = *reinterpret_cast<uintptr_t**>(
+        landPtr + OFF_LAND_QUADRANTS);
+    if (!quadrants) return 0;
+
+    uint32_t observed = 0;
+    for (int q = 0; q < LAND_QUADRANT_COUNT; ++q) {
+        ObserveTerrainNode(reinterpret_cast<NiAVObject*>(quadrants[q]), 0, observed);
+    }
+    return observed;
 }
 
 // ---------------------------------------------------------------------------

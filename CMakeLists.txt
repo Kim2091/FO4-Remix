@@ -25,6 +25,18 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
+# Fallout 4 DX10 BA2 texture chunks use zlib compression. The authored
+# texture path reads those chunks directly instead of asking the game's
+# streamer to make every high-resolution mip resident in D3D memory.
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    zlib
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG        v1.3.1
+)
+FetchContent_MakeAvailable(zlib)
+
 # Copy remix_c.h from a dxvk-remix source. Prefer the in-source RTX Remix Plus
 # checkout (dxvk-remix/) over the legacy sibling (../dxvk-remix-gmod/). Always
 # refresh the snapshot at configure time so an upstream ABI change picked up
@@ -85,6 +97,8 @@ add_library(FO4RemixPlugin SHARED
     src/camera.cpp
     src/bs_extraction.h
     src/bs_extraction.cpp
+    src/ba2_texture_source.h
+    src/ba2_texture_source.cpp
     src/draw_capture.h
     src/draw_capture.cpp
     src/hzb_occlusion.h
@@ -119,6 +133,7 @@ target_include_directories(FO4RemixPlugin PRIVATE
 target_link_libraries(FO4RemixPlugin PRIVATE
     f4se_minimal
     minhook
+    zlibstatic
     d3d9
     d3d11
     dxgi

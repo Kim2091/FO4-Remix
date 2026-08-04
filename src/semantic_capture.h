@@ -31,6 +31,9 @@ namespace SemanticCapture {
         uint32_t fireCount           = 0;
         uint32_t lastTechniqueFlags  = 0;
         ResolverKind resolverKind = ResolverKind::Lighting;
+        // Set for TESObjectLAND shapes injected by the bounded terrain poll
+        // rather than observed through the shader render-pass hook.
+        bool     isTerrain           = false;
 
         // ---- 1B: pointers captured by the hot-path detour on first-seen ----
         void*    geometry            = nullptr;  // BSGeometry*  (rdx)
@@ -303,6 +306,10 @@ namespace SemanticCapture {
     // PlayerCharacter::firstPersonSkeleton? Guarded parent-chain walk,
     // <=64 hops; false when the player/skeleton is unavailable.
     bool IsViewModelGeometry(void* geometry);
+
+    // Register a live TESObjectLAND BSTriShape with the lighting resolver.
+    // The normal render-pass hook does not reliably fire for near terrain.
+    bool ObserveTerrainGeometry(void* geometry);
 
     // Fill `out` with submitted viewmodel drawables whose capture entry has
     // gone STALE (no GetRenderPasses fire for > maxAge frames). 1P shapes

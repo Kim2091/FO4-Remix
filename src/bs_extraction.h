@@ -291,6 +291,11 @@ namespace BsExtraction {
     // Returns all cells currently loaded by the engine (from DataHandler::cellList).
     std::vector<CellInfo> GetLoadedCells();
 
+    // Walk the four TESObjectLAND quadrant nodes for one loaded cell and
+    // register their BSTriShape leaves with semantic capture. Game thread
+    // only; returns the number of live terrain leaves observed.
+    uint32_t ObserveCellTerrain(uintptr_t cellPtr);
+
     // Extract all placed LIGH-reference lights from the given cell.
     // Game thread only (raw reads of the cell's object list).
     std::vector<ExtractedLight> ExtractCellLights(uintptr_t cellPtr);

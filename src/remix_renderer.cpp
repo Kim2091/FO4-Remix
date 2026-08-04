@@ -2689,6 +2689,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // placement), LOD chunks unless opted in (they ARE the horizon in
             // reflections and the far cull already bounds them). Both filters
             // share one world-AABB build and one keep-sphere test.
+            const bool wasFrustumCulled = inst.frustumCulled;
             inst.frustumCulled   = false;
             inst.occlusionCulled = false;
             inst.hzbCulled       = false;
@@ -2726,8 +2727,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                         // Hysteresis: currently-culled entries test against
                         // the tighter INNER set (re-enter early), visible
                         // entries against the wider OUTER set (leave late).
-                        const CullPlane* planes = inst.frustumCulled ? cullInner
-                                                                     : cullOuter;
+                        const CullPlane* planes = wasFrustumCulled ? cullInner
+                                                                   : cullOuter;
                         bool outside = false;
                         for (int p = 0; p < 5 && !outside; ++p) {
                             const float dist = planes[p].nx * wc[0] +

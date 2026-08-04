@@ -1718,11 +1718,30 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         return false;
     }
 
-    // 1B scope: skip landscape (terrain regression accepted; Phase 5 revives).
-    if (mat->GetType() == BSLightingShaderMaterialBase::kType_Landscape) {
-        ResolverTrace::g_lastStep.store(Trace::kLandscapeSkipped, std::memory_order_relaxed);
-        if (headDiag) HeadDiagLog(hash, "GATE landscape material skip");
-        return false;
+    const bool isLandscape =
+        mat->GetType() == BSLightingShaderMaterialBase::kType_Landscape;
+    NiTexture* diffuseSource = mat->spDiffuseTexture;
+    NiTexture* normalSource = mat->spNormalTexture;
+    NiTexture* roughnessSource = mat->spSmoothnessSpecMaskTexture;
+    if (isLandscape) {
+        // TESObjectLAND keeps textures in the derived layer arrays; the base
+        // material slots are empty. Remix accepts one material per mesh, so
+        // restore the first authored layer and its matching maps for now.
+        auto* land = static_cast<BSLightingShaderMaterialLandscape*>(mat);
+        const uint32_t layerCount = (std::min)(land->uiNumLandscapeTextures, 3u);
+        uint32_t layer = 0;
+        while (layer < layerCount && !land->spLandscapeDiffuseTexture[layer]) {
+            ++layer;
+        }
+        if (layer < layerCount) {
+            diffuseSource = land->spLandscapeDiffuseTexture[layer];
+            normalSource = land->spLandscapeNormalTexture[layer];
+            roughnessSource = land->spLandscapeSmoothSpecTexture[layer];
+        } else {
+            diffuseSource = nullptr;
+            normalSource = nullptr;
+            roughnessSource = nullptr;
+        }
     }
 
     // Eye "wet" overlay (2026-07-31). FemaleEyesHumanWet / MaleEyesHumanWet is
@@ -1968,6 +1987,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // default 0 = exempt.
     mesh.engineIbPtr    = parsed.engineIbPtr;
     mesh.engineIbOffset = parsed.engineIbOffset;
+    if (isLandscape) {
+        // The terrain poll is the visibility signal. Its special draw path
+        // may never populate DrawCapture's IB map, so exempt it from that
+        // heuristic rather than aging live ground out as "occluded".
+        mesh.engineIbPtr = 0;
+        mesh.engineIbOffset = 0;
+    }
     SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
     BsExtraction::ExtractAlphaState(tri, mesh);
 
@@ -2593,11 +2619,11 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // source sets the sticky flag; checked after the supply pass.
     BsExtraction::ResetLiveRTFlag();
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
+        diffuseSource, "diffuse", device, newTextures, diffusePostProcess,
         /*minRoughness=*/0, albedoLumFloor, diffuseTint, paletteLut, paletteRowV,
         &pendDiffuse, /*supplyPixels=*/false);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral,
+        normalSource, "normal", device, newTextures, TexturePostProcess::Octahedral,
         /*minRoughness=*/0, /*albedoLumFloor=*/0, /*tintRGB=*/0xFFFFFFu,
         /*paletteLut=*/nullptr, /*paletteRowV=*/0.0f,
         &pendNormal, /*supplyPixels=*/false);
@@ -2621,7 +2647,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         roughnessFloor =
             mesh.isDecal ? (std::max)(cfgFloor, (uint8_t)76) : cfgFloor;
         mesh.roughnessTextureHash = BsExtraction::ExtractMaterialTexture(
-            mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures,
+            roughnessSource, "roughness", device, newTextures,
             TexturePostProcess::InvertRGB, roughnessFloor,
             /*albedoLumFloor=*/0, /*tintRGB=*/0xFFFFFFu,
             /*paletteLut=*/nullptr, /*paletteRowV=*/0.0f,
@@ -2632,11 +2658,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             mesh.roughnessConstantOverride = -1.0f;
         }
     }
-    BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
-                                      mesh.emissiveTextureHash,
-                                      mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
-                                      mesh.emissiveIntensity,
-                                      &pendEmissive, /*supplyPixels=*/false);
+    if (!isLandscape) {
+        BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
+                                          mesh.emissiveTextureHash,
+                                          mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
+                                          mesh.emissiveIntensity,
+                                          &pendEmissive, /*supplyPixels=*/false);
+    }
 
     // Any slot still in the async pipeline: retry next tick. Cheap -- the
     // probe made no copies, and the phase-1 stash skips the re-parse.
@@ -2657,7 +2685,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     if (mesh.diffuseTextureHash == 0) {
         stashPhase1Cache();
         if (headDiag) {
-            NiTexture* dt = mat->spDiffuseTexture;
+            NiTexture* dt = diffuseSource;
             HeadDiagLog(hash,
                         "GATE noDiffuse: matType=%u tex=%p name=\"%s\" -- retry",
                         (unsigned)mat->GetType(), (void*)dt,
@@ -2672,22 +2700,24 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // into newTextures -- exactly once, on this submitting attempt. Pure
     // cache hits: no readback, no decode, identical hashes.
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
+        diffuseSource, "diffuse", device, newTextures, diffusePostProcess,
         /*minRoughness=*/0, albedoLumFloor, diffuseTint, paletteLut, paletteRowV);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
+        normalSource, "normal", device, newTextures, TexturePostProcess::Octahedral);
     if (g_config.roughnessMapsEnabled) {
         mesh.roughnessTextureHash = BsExtraction::ExtractMaterialTexture(
-            mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures,
+            roughnessSource, "roughness", device, newTextures,
             TexturePostProcess::InvertRGB, roughnessFloor);
         if (mesh.roughnessTextureHash != 0) {
             mesh.roughnessConstantOverride = -1.0f;
         }
     }
-    BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
-                                      mesh.emissiveTextureHash,
-                                      mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
-                                      mesh.emissiveIntensity);
+    if (!isLandscape) {
+        BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
+                                          mesh.emissiveTextureHash,
+                                          mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
+                                          mesh.emissiveIntensity);
+    }
 
     // ---- Pip-Boy screen feed override (2026-07-18 v2) ----
     // Replace the tagged Screen:0 drawable's diffuse AND emissive with the

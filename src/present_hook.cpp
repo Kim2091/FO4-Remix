@@ -1335,6 +1335,33 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
     // frame by the ClearRTV hook; the staging pool persists).
     g_uiLayers.ReleaseFrameLayers();
 
+    // Near terrain does not reliably traverse the hooked lighting-property
+    // render-pass path. Refresh the loaded TESObjectLAND quadrant leaves at
+    // the same modest cadence as placed lights; they enter the ordinary
+    // semantic resolver and inherit its retry, VRAM, and TTL behavior.
+    if (g_remix.ready && g_gameDataReady && g_config.semanticCaptureEnabled) {
+        static uint32_t s_terrainPollCounter = 60;
+        static uintptr_t s_lastTerrainCell = 0;
+        static uint32_t s_lastTerrainCount = UINT32_MAX;
+        const uintptr_t cellNow = BsExtraction::GetPlayerCellPtr();
+        ++s_terrainPollCounter;
+        if (cellNow &&
+            (s_terrainPollCounter >= 60 || cellNow != s_lastTerrainCell)) {
+            s_terrainPollCounter = 0;
+            const bool cellChanged = cellNow != s_lastTerrainCell;
+            s_lastTerrainCell = cellNow;
+            uint32_t observed = 0;
+            for (const auto& ci : BsExtraction::GetLoadedCells()) {
+                observed += BsExtraction::ObserveCellTerrain(ci.cellPtr);
+            }
+            if (cellChanged || observed != s_lastTerrainCount) {
+                _MESSAGE("FO4RemixPlugin: [Terrain] observed %u landscape shapes",
+                         observed);
+                s_lastTerrainCount = observed;
+            }
+        }
+    }
+
     // Phase 1B: tick the semantic-capture resolve loop + TTL sweep.
     // Called from hkPresent (game thread) so we have the D3D11 device for
     // texture readbacks. Mirrors Skyrim's EndFrame call site exactly.
@@ -1349,9 +1376,8 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         }
     }
 
-    // Phase 1B: cell orchestration retired. Geometry capture is now event-driven
-    // via semantic_capture (BSLightingShaderProperty render-pass hook). Terrain
-    // regresses until a later phase revives it on an event-driven path.
+    // General geometry capture remains event-driven. The only loaded-cell
+    // geometry walk retained above is the four-node TESObjectLAND path.
 
     // Placed lights (revived 2026-07-07; became visible the moment the
     // Vault-111 walls sealed and skybox leakage stopped lighting interiors).
