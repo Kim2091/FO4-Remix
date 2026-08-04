@@ -1348,7 +1348,7 @@ static void ApplyPaletteVertexCorrection(BSTriShape* tri,
 
     static std::atomic<int> sPaletteVtxLogs{0};
     if (changed > 0 && sPaletteVtxLogs.fetch_add(1, std::memory_order_relaxed) < 32) {
-        _MESSAGE("FO4RemixPlugin: [PaletteVCorr] shape=\%s\ baseRow=%u "
+        _MESSAGE("FO4RemixPlugin: [PaletteVCorr] shape=\"%s\" baseRow=%u "
                  "spread=%u..%u baseRGB=%06X changed=%u/%zu clippedBright=%u",
                  tri->m_name.c_str() ? tri->m_name.c_str() : "",
                  (unsigned)baseRow, (unsigned)rowMin, (unsigned)rowMax,

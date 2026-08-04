@@ -248,7 +248,7 @@ void LoadConfig() {
     g_config.paletteVertexCorrectionEnabled =
         GetIniBool("Materials", "PaletteVertexCorrectionEnabled", true, dllPath);
     g_config.textureUpgradeOnApproach = GetIniBool("Materials", "TextureUpgradeOnApproach", false, dllPath);
-    g_config.authoredTextureSource  = GetIniBool("Materials", "AuthoredTextureSource", false, dllPath);
+    g_config.authoredTextureSource  = GetIniBool("Materials", "AuthoredTextureSource", true, dllPath);
     g_config.maxTextureDimension = GetIniUInt("Materials", "MaxTextureDimension", 2048, dllPath);
     g_config.diskTextureCache    = GetIniBool("Materials", "DiskTextureCache", true, dllPath);
     g_config.diskTextureCacheGiB = GetIniUInt("Materials", "DiskTextureCacheGiB", 8, dllPath);

@@ -401,9 +401,9 @@ struct PluginConfig {
     // resource filesystem over the currently resident D3D resource. This
     // avoids locking a low streamed mip into the Remix texture cache without
     // release/re-resolve churn. Unsupported/generated/live textures retain
-    // the existing GPU-readback fallback. Experimental until BA2 coverage has
-    // been verified in-game.
-    bool  authoredTextureSource;    // default false
+    // the existing GPU-readback fallback. Direct DX10 BA2 reads were verified
+    // in-game on Fallout 4 1.11.191.
+    bool  authoredTextureSource;    // default true
 
     // [Camera]
     // FOV source for the Remix camera (2026-07-03). Default true: read the

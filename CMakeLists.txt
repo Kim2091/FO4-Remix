@@ -43,17 +43,27 @@ FetchContent_MakeAvailable(zlib)
 # via 'git pull' is reflected on the next build without manual cache deletion.
 set(REMIX_HEADER_DST "${CMAKE_CURRENT_SOURCE_DIR}/extern/remix/remix_c.h")
 set(REMIX_HEADER_SRC "")
-foreach(REMIX_CANDIDATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/dxvk-remix/public/include/remix/remix_c.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix/public/include/remix/remix_c.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../dxvk-remix/public/include/remix/remix_c.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../dxvk-remix/public/include/remix/remix_c.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix-gmod/public/include/remix/remix_c.h")
-    if(EXISTS "${REMIX_CANDIDATE}")
-        set(REMIX_HEADER_SRC "${REMIX_CANDIDATE}")
-        break()
+set(FO4REMIX_REMIX_HEADER "" CACHE FILEPATH
+    "Explicit remix_c.h from the matching dxvk-remix runtime checkout")
+if(FO4REMIX_REMIX_HEADER)
+    if(NOT EXISTS "${FO4REMIX_REMIX_HEADER}")
+        message(FATAL_ERROR
+            "FO4REMIX_REMIX_HEADER does not exist: ${FO4REMIX_REMIX_HEADER}")
     endif()
-endforeach()
+    set(REMIX_HEADER_SRC "${FO4REMIX_REMIX_HEADER}")
+else()
+    foreach(REMIX_CANDIDATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/dxvk-remix/public/include/remix/remix_c.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix/public/include/remix/remix_c.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../dxvk-remix/public/include/remix/remix_c.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../dxvk-remix/public/include/remix/remix_c.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix-gmod/public/include/remix/remix_c.h")
+        if(EXISTS "${REMIX_CANDIDATE}")
+            set(REMIX_HEADER_SRC "${REMIX_CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+endif()
 if(REMIX_HEADER_SRC)
     file(COPY "${REMIX_HEADER_SRC}" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/extern/remix/")
     message(STATUS "Refreshed remix_c.h from ${REMIX_HEADER_SRC}")

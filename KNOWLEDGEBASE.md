@@ -167,15 +167,16 @@ original `IDXGISwapChain::Present` (`present_hook.cpp:464`).
 |---------|---------------|
 | `src/main.cpp` | F4SE plugin entry. Declares `F4SEPlugin_Version`, registers the F4SE messaging listener, installs the Present hook on `kMessage_GameDataReady` / `GameLoaded` / `InputLoaded`, clears the SemanticCapture map on `kMessage_PreLoadGame`. Owns `g_gameDataReady`. |
 | `src/config.{cpp,h}` | INI loader (`LoadConfig`) backed by `GetPrivateProfileXxxA`. Defines `PluginConfig g_config` plus shared inline helpers `HalfToFloat`, `FnvHash`, `FnvHashCombine`. |
-| `src/present_hook.{cpp,h}` | DXGI Present hook (`hkPresent`) installation via MinHook on a dummy swap chain. Manages the Remix render thread, shared camera/overlay state, the UI render-target detection (`hkClearRenderTargetView` + `hkOMSetRenderTargets`), and the per-frame staging-texture copy + premultiplied-alpha unpremultiply. Calls `Diagnostics::Tick`, `WeatherBridge::PushOncePerFrame`, `SemanticCapture::Tick`, and `RemixAPI::RestoreLegacyKeyboardInput` / `RebindRawInputToGameWindow`. |
+| `src/present_hook.{cpp,h}` | DXGI Present hook (`hkPresent`) installation via MinHook on a dummy swap chain. Manages the Remix render thread, shared camera/overlay state, the UI render-target detection (`hkClearRenderTargetView` + `hkOMSetRenderTargets`), and the per-frame staging-texture copy + premultiplied-alpha unpremultiply. Polls loaded TESObjectLAND quadrants every 60 frames or on a player-cell change. Calls `Diagnostics::Tick`, `WeatherBridge::PushOncePerFrame`, `SemanticCapture::Tick`, and `RemixAPI::RestoreLegacyKeyboardInput` / `RebindRawInputToGameWindow`. |
 | `src/remix_api.{cpp,h}` | Wraps `remixapi_lib_loadRemixDllAndInitialize`, builds the dedicated Remix output window, prefers the `dxvk_CreateD3D9` / `dxvk_RegisterD3D9Device` path to bypass the runtime's default-init dev-menu overlay, and falls back to `Startup()` if the dxvk extensions are missing. Owns the singleton `remixapi_Interface`. Provides `RestoreLegacyKeyboardInput` (RIDEV_REMOVE for keyboard) and `RebindRawInputToGameWindow` (re-claims raw-input for the game HWND every frame). |
 | `src/remix_renderer.{cpp,h}` | Per-frame `OnFrame` loop, mesh/material/texture caches with refcounts, `SubmitDrawable` / `ReleaseDrawable`, LRU sweeps (`SweepStaleMaterials`, `SweepStaleTextures`), VRAM telemetry (`GetVramStats`), DXGI -> remixapi format mapping, fallback triangle, screen-overlay submission, `SetConfigVariable` wrapper. SEH + C++ exception fences around every `api->DrawInstance` / `Create*` / `Destroy*` call. |
 | `src/camera.{cpp,h}` | `Camera::Get()` reads `g_playerCamera` (F4SE RelocPtr), pulls `cameraNode->m_worldTransform`, applies the Beth -> Remix X/Y swap, and snapshots player world position for the LOD chunk spatial filter. Returns a fallback `CameraState` when the singleton is unavailable. |
-| `src/bs_extraction.{cpp,h}` | Engine-pointer reads (player, DataHandler, TES singleton, GridCellArray), `BsExtraction::GetLoadedCells`, BC1/BC2/BC3/BC5 software decompressors, smoothness-to-roughness inversion, normal-to-octahedral encoding, mip-chain readback (`ReadbackAllMips`), `ParseShapeGeometry` (BSTriShape vertex/index parse with half-float/full-precision branches and BSDynamicTriShape morphed-position handling), `GetLightingMaterial`, `ExtractMaterialTexture` (with deterministic FNV-of-name hashing + texture cache), `ExtractEmissiveData`, `ExtractAlphaState` (NiAlphaProperty -> VkBlendFactor / VkCompareOp). Also defines `TexturePostProcess` enum and `ParsedGeometry`/`ExtractedMesh`/`ExtractedTexture`/`CellInfo` structs. |
+| `src/bs_extraction.{cpp,h}` | Engine-pointer reads (player, DataHandler, TES singleton, GridCellArray), `BsExtraction::GetLoadedCells`, `ObserveCellTerrain`, BC1/BC2/BC3/BC5 software decompressors, smoothness-to-roughness inversion, normal-to-octahedral encoding, authored-DDS and live mip-chain extraction, `ParseShapeGeometry` (BSTriShape vertex/index parse with half-float/full-precision branches and BSDynamicTriShape morphed-position handling), `GetLightingMaterial`, `ExtractMaterialTexture` (with deterministic FNV-of-name hashing + memory/disk caches), `ExtractEmissiveData`, `ExtractAlphaState` (NiAlphaProperty -> VkBlendFactor / VkCompareOp). Also defines `TexturePostProcess` enum and `ParsedGeometry`/`ExtractedMesh`/`ExtractedTexture`/`CellInfo` structs. |
+| `src/ba2_texture_source.{cpp,h}` | Builds a process-lifetime index of Fallout DX10 BA2 archives and selects entries by normalized resource path, format family, and expected dimensions. Reads/inflates only the selected authored mip chunks on texture workers, respecting `MaxTextureDimension`. Supports BC1/2/3/4/5/7 and RGBA/BGRA8 families; unsupported entries fall back to live GPU readback. |
 | `src/fo4_diagnostics.{cpp,h}` | Canonical `Diagnostics::Tick` / `CurrentFrameIndex` (atomic frame counter), `ShouldEmitPeriodic` cadence (every frame for first 10 then every 300th), cumulative cell counters, `SnapshotGameState` (cell formID/interior + player position), `EmitPeriodic` (writes `[GameState]` + `[Plugin]` lines). |
 | `src/startup_diag.{cpp,h}` | One-shot `DumpEnvironment` called at plugin load: OS version via `RtlGetVersion`, working set, plugin DLL + Fallout4.exe stat, module-ownership scan for d3d9/d3d11/dxgi/dinput8, overlay detection (RTSS, Afterburner, NVIDIA, Steam, Discord, ReShade, Special K, Fraps, OBS). |
-| `src/semantic_capture.{cpp,h}` | MinHook installation of two `GetRenderPasses` detours (Lighting RVA `0x02172540`, Water RVA `0x021D15A0`) plus two diagnostic-only hooks (`SetupGeometry` `0x02233730`, CB-write `0x022347D0`). Computes the FNV PassKey from `(geometry, property, material)`, stores `DrawableState` in `g_drawableMap`, captures live `m_worldTransform` and `NiAVObject::flags` per fire. `Tick(device)` runs the per-frame resolve loop (freshness-gated, VRAM-gated), the rate-limited TTL sweep, the pending-by-gate breakdown log, and the active-set snapshot. `BuildRemixTransform` converts NiTransform to Remix row-major 3x4 with the X/Y swap. `ClearDrawableMap` is called from `kMessage_PreLoadGame`. |
-| `src/resolvers/lighting_static.{cpp,h}` | Resolver for `BSLightingShaderProperty` drawables. Parses the BSTriShape, rejects skinned and landscape materials (current scope), tags worldspace LOD chunks via `parent1.name == "chunk"` + `parent2.name in {"4","8","16","32"}` (or `parent2.name == "obj"`), pulls diffuse/normal/roughness/emissive textures with the appropriate `TexturePostProcess` (Octahedral for normals, InvertRGB for smoothness->roughness), submits to Remix. Owns the `Resolvers::Trace` step/hash trace globals consumed by the SEH handler in `semantic_capture.cpp`. |
+| `src/semantic_capture.{cpp,h}` | MinHook installation of two `GetRenderPasses` detours (Lighting RVA `0x02172540`, Water RVA `0x021D15A0`) plus two diagnostic-only hooks (`SetupGeometry` `0x02233730`, CB-write `0x022347D0`). Computes the FNV PassKey from `(geometry, property, material)`, stores `DrawableState` in `g_drawableMap`, captures live `m_worldTransform` and `NiAVObject::flags` per fire, and accepts terrain leaves injected by `ObserveTerrainGeometry`. First-person descendants are tagged before distance ranking so camera-local coordinates cannot starve them behind world geometry. `Tick(device)` runs the per-frame resolve loop (freshness-gated, VRAM-gated), the rate-limited TTL sweep, the pending-by-gate breakdown log, and the active-set snapshot. `BuildRemixTransform` converts NiTransform to Remix row-major 3x4 with the X/Y swap. `ClearDrawableMap` is called from `kMessage_PreLoadGame`. |
+| `src/resolvers/lighting_static.{cpp,h}` | Resolver for `BSLightingShaderProperty` drawables. Parses BSTriShape geometry, tags worldspace LOD chunks and first-person viewmodels, resolves ordinary material slots, and resolves the first valid diffuse/normal/smoothness layer on landscape materials. Terrain is exempt from draw-capture IB occlusion because its special engine path does not reliably populate that map. Pulls textures with the appropriate `TexturePostProcess` (Octahedral for normals, InvertRGB for smoothness->roughness), then submits to Remix. Owns the `Resolvers::Trace` step/hash trace globals consumed by the SEH handler in `semantic_capture.cpp`. |
 | `src/resolvers/water.{cpp,h}` | Resolver for `BSWaterShaderProperty` drawables. Submits as translucent with synthetic 1x1 RGBA8 blue diffuse (sentinel hash `0xFA11FA11FA11FA11`) plus the water material's `spNormalMap01` (Octahedral) and `kDeepColor` as `transmittanceColor`. Sets `mesh.isWater = true` so `SubmitDrawable` builds a `MaterialInfoTranslucentEXT` chain and `OnFrame` ORs `REMIXAPI_INSTANCE_CATEGORY_BIT_ANIMATED_WATER` into the bucket's `categoryFlags`. |
 | `src/weather_bridge.{cpp,h}` | `PushOncePerFrame()` reads the GameHour TESGlobal (formID `0x00000038`), derives `sunElevation = sin((hour-6)/12 * pi) * 90` and `sunRotation = (hour/24) * 360`, and pushes both via `RemixRenderer::SetConfigVariable("rtx.atmosphere.sunElevation", ...)` / `("rtx.atmosphere.sunRotation", ...)`. Per-key failure dedup so a missing slot in the runtime fork doesn't spam the log. Time-of-day only; storms/fog/volumetric fog/isInterior are not wired (see Known limitations). |
 | `src/f4se_compat.h` | Minimal compatibility layer that lets us avoid the full `xse-common` dependency. Provides `UInt8/16/32/64` and `SInt*` typedefs, `STATIC_ASSERT`, `_MESSAGE` / `_WARNING` / `_ERROR` macros (all funnel into a `My Games\Fallout4\F4SE\FO4RemixPlugin.log` file), `ASSERT`. Force-included via `/FI` from CMake. |
@@ -187,8 +188,9 @@ original `IDXGISwapChain::Present` (`present_hook.cpp:464`).
 - Toolchain: C++17, MSVC static runtime (`MultiThreaded`), VS 2022 generator (per `build.bat`).
 - F4SE SDK: expected as a sibling directory at `${CMAKE_CURRENT_SOURCE_DIR}/../f4se-0.7.7`. CMake adds an internal `f4se_minimal` static library that compiles only the three SDK sources we need (`Relocation.cpp`, `GameCamera.cpp`, `GameForms.cpp`) and force-includes `f4se_compat.h` via `/FI`.
 - MinHook: pulled in via `FetchContent_Declare(GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git)` at the `master` tag.
-- Link deps: `f4se_minimal`, `minhook`, `d3d9`, `d3d11`, `dxgi`, `shell32`, `psapi`.
-- `remix_c.h` refresh: `CMakeLists.txt:24-42` searches a list of candidate paths for the `dxvk-remix` checkout (`./dxvk-remix`, `../dxvk-remix`, `../../dxvk-remix`, `../../../dxvk-remix`, then the legacy `../dxvk-remix-gmod`) and copies the in-tree `public/include/remix/remix_c.h` into `extern/remix/`. If no source is found, the build falls back to the cached snapshot already at `extern/remix/remix_c.h`. The copy runs at *configure* time, so an upstream ABI change picked up by `git pull` is reflected on the next `cmake --build` without manual cache deletion.
+- zlib 1.3.1: pulled in via `FetchContent` for compressed DX10 BA2 chunks.
+- Link deps: `f4se_minimal`, `minhook`, `zlibstatic`, `d3d9`, `d3d11`, `dxgi`, `shell32`, `psapi`.
+- `remix_c.h` refresh: set `FO4REMIX_REMIX_HEADER` to the matching runtime branch's header when multiple dxvk-remix checkouts exist. Without an explicit path, CMake searches `./dxvk-remix`, `../dxvk-remix`, `../../dxvk-remix`, `../../../dxvk-remix`, then legacy `../dxvk-remix-gmod`, and finally falls back to the cached `extern/remix/remix_c.h`. The copy runs at configure time, so the plugin ABI tracks the selected runtime.
 - Runtime version macro: `RUNTIME_VERSION=RUNTIME_VERSION_1_11_191` is set as a `target_compile_definition` on both `f4se_minimal` and `FO4RemixPlugin`.
 - Build entry point: `build.bat` runs `cmake -B build -G "Visual Studio 17 2022" -A x64` then `cmake --build build --config Release`. The CLAUDE.md notes a faster incremental command using the bundled VS CMake binary directly.
 
@@ -247,8 +249,10 @@ CELL_FLAG_IS_INTERIOR = 0x0001    // bs_extraction.cpp:73
 +0x40  BSMultiBoundNode* quadrants[4]   // bs_extraction.cpp:74-75 (OFF_LAND_QUADRANTS)
 ```
 
-The land-quadrant offsets are declared but currently not consumed by the
-event-driven pipeline (terrain regression accepted; see Known limitations).
+`hkPresent` walks these four quadrant roots for every loaded cell every 60
+frames, and immediately when the player changes cell. Each live BSTriShape
+leaf enters `SemanticCapture::ObserveTerrainGeometry`, then uses the ordinary
+resolver, retry, VRAM, and TTL machinery.
 
 ### NiAVObject (geometry leaf)
 
@@ -312,7 +316,9 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
    `WeatherBridge::PushOncePerFrame`, hooks `OMSetRenderTargets` /
    `ClearRenderTargetView` on the immediate context if not yet hooked,
    captures the UI RT (when both clear + sole-bound flags fired this frame),
-   and finally calls `SemanticCapture::Tick(device)`.
+   polls the four TESObjectLAND quadrant roots in every loaded cell every 60
+   frames or on a player-cell change, and finally calls
+   `SemanticCapture::Tick(device)`.
 
 3. **`SemanticCapture::Tick`** (`semantic_capture.cpp:578`) does:
    - Load-screen gate: skip the resolve loop between PreLoadGame and
@@ -331,7 +337,9 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
      SEH-caught crashes back off a flat 120 frames rather than being
      skipped permanently (the engine reuses pointer identities when it
      rebuilds a world, so a permanent skip blanked the drawable for the
-     whole session).
+     whole session). First-person drawables are identified before this
+     ranking pass and sort ahead of world geometry; their camera-local
+     coordinates cannot be compared to world-space distance.
    - Sweep cadence: every 60 frames, evict entries whose age exceeds
      `kTTLFrames = 18000` (5 minutes at 60 fps), calling
      `RemixRenderer::ReleaseDrawable` for each submitted entry under SEH.
@@ -350,7 +358,9 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
    - Detect worldspace LOD chunks via parent NiNode names (see
      [Known limitations](#known-limitations)).
    - `BsExtraction::GetLightingMaterial` returns the
-     `BSLightingShaderMaterialBase`. Skip if the material type is `kType_Landscape`.
+     `BSLightingShaderMaterialBase`. For `kType_Landscape`, use the first
+     valid authored landscape layer's diffuse, normal, and smoothness maps;
+     one Remix material cannot yet reproduce Fallout's multi-layer blend.
    - For each texture slot — `spDiffuseTexture`, `spNormalTexture`
      (Octahedral post-process), and (via `ExtractEmissiveData`) the glow
      map from `BSLightingShaderMaterialGlowmap::spGlowMapTexture` — call
@@ -366,14 +376,16 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
         `SubmitDrawable` recreates the handle — without this, a hash-only
         hit made the drawable fail its diffuse-loaded gate silently and
         permanently (the 2026-07-02 empty-world-after-save-load bug).
-     3. With `[Materials] AuthoredTextureSource=1`, first tries to read a
-        complete 2D DDS mip chain through `BSResourceNiBinaryStream`, which
-        follows Fallout's virtual resource lookup order. Supported DDS input
-        enters the normal conversion/cache path under a separate salted hash;
-        unavailable, headerless, unsupported, generated, and live render-
-        target textures fall back to the resident D3D resource. Capped
-        `[AuthoredTex]` lines compare authored, live-resource, and
-        `BSRenderData` dimensions so BA2 behavior can be verified in-game.
+     3. With `[Materials] AuthoredTextureSource=1`, first tries a complete 2D
+        loose DDS chain through `BSResourceNiBinaryStream`. If the engine
+        stream is unavailable or exposes a headerless BA2 payload, a bounded
+        texture worker queries the direct DX10 BA2 index, checks the disk
+        conversion cache from metadata, then reads/inflates only the selected
+        mip chunks on a cache miss. Supported authored input enters the normal
+        conversion/cache path under a separate salted hash. Generated/live
+        render targets, unsupported formats, and source failures fall back to
+        the resident D3D resource. `[AuthoredTex]` lines compare authored,
+        upload, live-resource, and `BSRenderData` dimensions.
      4. On fallback, reads every mip via `ReadbackAllMips` (creates a
         per-mip staging texture, `CopySubresourceRegion`, `Map`, copies
         pixels honouring block-compressed row pitch). BC textures truncate
@@ -443,7 +455,12 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
    (`g_drawableMutex`) to gather hashes and live poses, then takes
    `g_renderStateMutex` and walks `g_drawables`. Drawables not in the
    active set, or whose chunk-coverage box contains the player, are
-   skipped. Surviving drawables are bucketed by `meshHandle`:
+   skipped. Camera-local first-person geometry is re-anchored to the live
+   viewmodel skeleton and kept ahead of world resolve backlogs. Outside the
+   configurable keep sphere, world AABBs use a margin-expanded frustum with
+   persistent inner/outer hysteresis; the previous cull state is sampled
+   before clearing the current frame's result. Surviving drawables are
+   bucketed by `meshHandle`:
    - Bucket size 1 -> simple `DrawInstance` with the member's
      `worldTransform` baked into `instance.transform`.
    - Bucket size > 1 -> identity base transform plus a
@@ -466,6 +483,23 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
    top-of-frame drain used by `ReleaseDrawable` destroys them before the next
    frame records any instances. This ordering lets the runtime invalidate and
    rebuild preserved texture-table indices before they can be sampled.
+
+### Validated visual-capture changes (2026-08-04)
+
+- Fallout 4 1.11.191 loaded direct authored DX10 BA2 textures at 2048x2048
+  where the live game resource exposed only 512x512. The bounded conversion
+  queue drained without overflow, and repeat reads hit the disk cache.
+- The terrain poll observed 100 live landscape shapes in the test scene; the
+  user confirmed that near ground rendered in Remix after it had previously
+  been absent.
+- First-person capture reported `vmDrawn=44`; the user confirmed that the
+  weapon rendered consistently and that more surrounding geometry remained
+  visible.
+- At comparable scene sizes, sampled plugin game-thread work fell from about
+  16.4 ms (`fire` + `Tick`, 7,939 drawables) to 9.6 ms (8,106 drawables), then
+  7.4 ms (8,268 drawables). These are diagnostic snapshots rather than a
+  controlled benchmark, but they support keeping diagnostic hooks opt-in and
+  disabling unconditional far-behind parking by default.
 
 ## Remix integration
 
@@ -592,11 +626,11 @@ from FO4 is outstanding.
 | Section | Key | Type | Default | Effect | Read by |
 |---------|-----|------|---------|--------|---------|
 | Logging | `LogShapeInfo` | bool | 0 | log shape name + vertex format + flags per extracted shape | (plumbed; current pipeline does not log per-shape) |
-| Logging | `LogLargeShapes` | bool | 1 | log shapes with extent > 500 | (plumbed) |
-| Logging | `LogRejections` | bool | 1 | log mesh rejections (NaN, bad indices, extent) | `bs_extraction.cpp` (`ParseShapeGeometry`), resolvers |
+| Logging | `LogLargeShapes` | bool | 0 | log shapes with extent > 500 | (plumbed) |
+| Logging | `LogRejections` | bool | 0 | log mesh rejections (NaN, bad indices, extent) | `bs_extraction.cpp` (`ParseShapeGeometry`), resolvers |
 | Logging | `LogTextures` | bool | 0 | log every extracted texture | `bs_extraction.cpp:858` (`ExtractMaterialTexture`) |
 | Logging | `LogLights` | bool | 0 | log extracted light info | (light extraction currently retired) |
-| Logging | `LogBoneDiag` | bool | 0 (INI ships 1) | one-shot bone-matrix dump | (plumbed; skinning not in current scope) |
+| Logging | `LogBoneDiag` | bool | 0 | one-shot bone-matrix dump | (plumbed; skinning not in current scope) |
 | Lights | `Enabled` | bool | 1 | master toggle for extracted lights | (plumbed) |
 | Lights | `Intensity` | float | 1.0 | radiance multiplier | (plumbed) |
 | Lights | `RadiusMultiplier` | float | 1.0 | sphere-light radius multiplier | (plumbed) |
@@ -609,19 +643,23 @@ from FO4 is outstanding.
 | Emissive | `EmissiveColorEnabled` | bool | 1 | use `pEmissiveColor` + `fEmitColorScale` | `bs_extraction.cpp` (`ExtractEmissiveData`) |
 | Emissive | `Intensity` | float | 1.0 | global multiplier on `fEmitColorScale` | `remix_renderer.cpp:787` |
 | Emissive | `LogEmissive` | bool | 0 | log emissive extraction details | `bs_extraction.cpp:926` |
-| Diagnostics | `Enabled` | bool | 1 | master toggle for periodic `[GameState]` / `[Plugin]` log lines | `fo4_diagnostics.cpp:78` |
+| Diagnostics | `Enabled` | bool | 0 | master toggle for periodic `[GameState]` / `[Plugin]` log lines and diagnostic-only capture hooks | `fo4_diagnostics.cpp`, `semantic_capture.cpp` |
 | SemanticCapture | `Enabled` | bool | 0 | install the BSLightingShaderProperty + BSWaterShaderProperty `GetRenderPasses` hooks (the entire event-driven extraction path) | `semantic_capture.cpp:460` |
 | Culling | `TextureLRUGraceFrames` | uint32 | 600 | TTL for un-drawn textures before the LRU sweep evicts them | `remix_renderer.cpp:1331` |
 | Culling | `TextureLRUSweepPeriod` | uint32 | 60 | frames between LRU sweeps in `OnFrame` | `remix_renderer.cpp:1294` |
 | Culling | `TextureBudgetMiB` | uint32 | 0 (TTL only) | soft cap on `usedMaterialTextureBytes`; non-zero enables the budget pass | `remix_renderer.cpp:1305` |
 | Culling | `MaterialLRUGraceFrames` | uint32 | 600 | TTL for un-drawn materials before refcount-zero entries are destroyed | `remix_renderer.cpp:1310` |
 | Culling | `LodChunkStaleFrames` | uint32 | 30 | frames a worldspace LOD chunk can go un-fired before OnFrame stops drawing it (0 = disabled); engine hid the chunk when its cells attached | `remix_renderer.cpp` (OnFrame stale-chunk filter) |
+| Culling | `ForceEvictAlwaysBehindDistance` | float | 0 | optional unconditional parking distance for behind-camera geometry; leave off on cards with healthy VRAM to avoid park/restore and BLAS churn | `remix_renderer.cpp` |
+| Culling | `FrustumCull` | bool | 1 | cull complete mesh buckets outside both the local keep sphere and margin-expanded camera frustum | `remix_renderer.cpp` |
+| Culling | `FrustumKeepRadius` | float | 8192 (code) / 4096 (shipped INI) | preserve nearby geometry for reflections, shadows, and indirect lighting regardless of view direction | `remix_renderer.cpp` |
+| Culling | `FrustumFovMarginDeg` | float | 12 | extra outer-frustum margin; an inner half-margin provides stable re-entry hysteresis | `remix_renderer.cpp` |
 | Overlay | `HudOverlayEnabled` | bool | 0 (code) / 1 (shipped ini) | submit the captured DX11 UI render target via `api->DrawScreenOverlay`. Requires a runtime with the rtx_fork_overlay.cpp layout fix (dxvk-remix 8990aed); the shipped ini enables it as of 2026-07-03 | `remix_renderer.cpp:1273` |
 | Overlay | `RestoreLegacyInput` | bool | 1 | issue `RIDEV_REMOVE` for keyboard so the game still receives `WM_KEYDOWN` after Remix's overlay-thread `RIDEV_NOLEGACY` registration | `remix_api.cpp:162` |
 | Performance | `GpuInstancing` | bool | 1 | share Remix mesh handles across drawables with byte-identical geometry+material and batch via `InstanceInfoGpuInstancingEXT` | `remix_renderer.cpp:820` |
 | Performance | `CpuTextureCacheMiB` | uint32 | 1024 | byte budget for the CPU-side decoded-texture cache in bs_extraction (LRU eviction past it; 0 = unbounded legacy) | `bs_extraction.cpp` (`TextureCacheEnforceBudget`) |
 | Materials | `TextureUpgradeOnApproach` | bool | 0 | legacy resident-mip poll that releases and re-resolves drawables after a sharper D3D resource appears; remains off because the churn caused hitches and resource growth | `semantic_capture.cpp`, `bs_extraction.cpp` |
-| Materials | `AuthoredTextureSource` | bool | 0 | experimental: prefer a supported authored 2D DDS chain from Fallout's virtual filesystem, then fall back to live GPU readback; avoids the resident-resolution upgrade loop | `bs_extraction.cpp` (`ReadAuthoredDdsMips`) |
+| Materials | `AuthoredTextureSource` | bool | 1 | prefer complete authored 2D mip chains from loose DDS files and DX10 BA2 archives, then fall back to live GPU readback; avoids the resident-resolution upgrade loop | `bs_extraction.cpp`, `ba2_texture_source.cpp` |
 | Precombines | `MergeTwoSided` | bool | 1 | render merge-expanded precombines double-sided (vanilla-faithful). 0 = single-sided experiment: re-enables the per-instance mirrored-record winding flip; potential path-tracing perf win if content winding holds up post-b112e08 | `lighting_static.cpp` (merge submit) |
 
 `[Limits] MaxExtent` was retired 2026-07-10: documented but never consumed
@@ -630,14 +668,12 @@ would have started rejecting huge-local-extent LOD chunks.
 
 ## Known limitations
 
-- **Authored DDS loading is experimental and opt-in.** Loose DDS input and
-  standard DDS streams are parsed directly, but Fallout's DX10 BA2 resource
-  stream must be verified in-game. A `[AuthoredTex] ... FALLBACK
-  reason=not-dds-stream` line means the engine exposed headerless archive
-  payload rather than a standard DDS; the plugin safely retains async GPU
-  readback in that case. Only 2D, single-image BC1/2/3/4/5/7 and RGBA/BGRA8
-  DDS files are accepted. Cubemaps, arrays, volumes, and unknown formats
-  deliberately fall back.
+- **Authored texture coverage is intentionally bounded.** Loose DDS files and
+  Fallout DX10 BA2 entries are supported for 2D, single-image BC1/2/3/4/5/7
+  and RGBA/BGRA8 families. Cubemaps, arrays, volumes, generated textures,
+  live render targets, and unknown formats deliberately use the live GPU
+  fallback. `MaxTextureDimension=2048` is the shipped VRAM guardrail; raising
+  it can substantially increase the runtime material-texture pool.
 - **`cell_pipeline.{cpp,h}` is paused.** The cell-granular state machine for
   per-cell extraction and Remix loading was retired with Phase 1B in favour
   of the event-driven `semantic_capture` path. The files remain in `src/`
@@ -646,11 +682,11 @@ would have started rejecting huge-local-extent LOD chunks.
 - **Light extraction is retired.** With the cell pipeline gone there is no
   per-cell `ExtractCellLights` walk. Sphere/spot lights from `LIGH` refs
   are currently absent. `[Lights]` config keys exist but have no consumer.
-- **Terrain (TESObjectLAND quadrants) is not submitted.** The land-walk
-  was tied to the cell pipeline. The lighting resolver explicitly skips
-  `BSLightingShaderMaterialBase::kType_Landscape` (`lighting_static.cpp:197-200`).
-  The path tracer renders distance via worldspace LOD chunks and falls back
-  to the atmospheric model elsewhere.
+- **Terrain currently uses one landscape layer per mesh.** TESObjectLAND
+  quadrant geometry is submitted, but Remix accepts one material for the
+  mesh while Fallout blends up to three authored layers using landscape
+  masks. The resolver currently chooses the first valid diffuse layer and
+  its matching normal/smoothness maps; multi-layer blending remains open.
 - **Face morph refresh is experimental.** Skinned meshes are submitted, and
   FaceGen dynamic meshes can be position-refreshed when FO4 rewrites their
   live `dynamicVertices` buffers. v2 salts each replacement `meshInfo.hash`
