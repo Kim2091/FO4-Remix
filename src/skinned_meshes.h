@@ -4,6 +4,7 @@
 #include <unordered_set>
 
 struct BSTriShape;
+struct BSLightingShaderMaterialBase;
 
 // ---------------------------------------------------------------------------
 // Skinned-mesh bone tracking (2026-07-08). Game-thread module: the lighting
@@ -62,6 +63,15 @@ namespace SkinnedMeshes {
     // animates faces through something other than these bone worlds. First
     // caller wins; capped logging inside.
     void SetFaceProbe(uint64_t drawableHash);
+
+    // Register a human iris material as a live UV-animation source. Every
+    // changed transform is queued to RemixRenderer; when diagnostics are
+    // enabled, the first iris also gets the broader [EyeAnim] state probe.
+    void RegisterEyeAnimation(uint64_t drawableHash, BSTriShape* shape,
+                              void* shaderProperty,
+                              BSLightingShaderMaterialBase* material,
+                              uint32_t materialType,
+                              bool diagnostics);
 
     // Drop a drawable's bone tracking (wired into ReleaseDrawable).
     void OnDrawableReleased(uint64_t drawableHash);

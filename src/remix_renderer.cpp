@@ -677,10 +677,14 @@ namespace {
         std::vector<uint32_t> indices;
         std::vector<float>    blendWeights;
         std::vector<uint32_t> blendIndices;
+        std::vector<float>    eyeBaseTexcoords;
+        bool                  isAnimatedEye = false;
     };
     std::unordered_map<uint64_t, FaceMeshData> g_faceMeshData;
     std::mutex g_faceMorphQueueMutex;
     std::unordered_map<uint64_t, std::vector<float>> g_faceMorphQueue;
+    std::mutex g_eyeUvQueueMutex;
+    std::unordered_map<uint64_t, RemixRenderer::EyeUvTransform> g_eyeUvQueue;
 }
 
 void RemixRenderer::RequestDestroyDrain() {
@@ -1670,13 +1674,16 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         ReleaseDrawableRefsLocked(hash, /*eagerPark=*/true);
     }
 
-    if (mesh.isFaceGenDynamic && mesh.hasSkinning &&
-        g_config.faceMorphRefreshEnabled) {
+    if (mesh.hasSkinning &&
+        ((mesh.isFaceGenDynamic && g_config.faceMorphRefreshEnabled) ||
+         mesh.isAnimatedEye)) {
         FaceMeshData fm;
         fm.vertices     = mesh.vertices;
         fm.indices      = mesh.indices;
         fm.blendWeights = mesh.blendWeights;
         fm.blendIndices = mesh.blendIndices;
+        fm.eyeBaseTexcoords = mesh.eyeBaseTexcoords;
+        fm.isAnimatedEye = mesh.isAnimatedEye;
         g_faceMeshData[hash] = std::move(fm);
     }
     g_drawables[hash] = std::move(inst);
@@ -2054,6 +2061,16 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         faceUpdates.swap(g_faceMorphQueue);
     }
 
+    // Drain live iris UV transforms alongside FaceGen positions. Both streams
+    // target the same private dynamic-mesh copy and are coalesced below into
+    // one stable-handle geometry refresh per drawable.
+    static std::unordered_map<uint64_t, RemixRenderer::EyeUvTransform> eyeUvUpdates;
+    eyeUvUpdates.clear();
+    {
+        std::lock_guard<std::mutex> eyeLock(g_eyeUvQueueMutex);
+        eyeUvUpdates.swap(g_eyeUvQueue);
+    }
+
     // Stale-chunk filter inputs. The engine fires GetRenderPasses every frame
     // for geometry that survives its culling and HIDES worldspace LOD chunks
     // when their cells attach at full detail -- so a chunk whose fire age
@@ -2257,14 +2274,23 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         //
         // v3 keeps the hash STABLE and asks the runtime to swap the geometry
         // underneath it (remixapi_MeshInfoRefreshGeometryEXT). The runtime
-        // carries the previous topology/layout hashes across and leaves only
+        // carries the previous topology/layout hashes across and leaves
         // VertexPosition fresh, so the draw-call cache keeps the same BlasEntry
-        // and processGeometryInfo takes its kUpdateBVH path -- history-buffer
-        // ping-pong and a populated previousPositionBuffer, which is real
-        // motion vectors for the morph. Nothing to swap or destroy here: the
-        // handle, the g_meshCache entry, and the drawable all stay as they are.
+        // and processGeometryInfo takes its kUpdateBVH path. That path copies
+        // the complete interleaved vertex payload, including changed iris UVs,
+        // while position changes get history-buffer ping-pong and real motion
+        // vectors. Nothing to swap or destroy here: the handle, g_meshCache
+        // entry, and drawable all stay as they are.
         {
             static std::atomic<int> sFaceLogs{0};
+            static std::atomic<int> sEyeLogs{0};
+            std::unordered_set<uint64_t> refreshes;
+            std::unordered_set<uint64_t> faceDirty;
+            std::unordered_set<uint64_t> eyeDirty;
+            refreshes.reserve(faceUpdates.size() + eyeUvUpdates.size());
+            faceDirty.reserve(faceUpdates.size());
+            eyeDirty.reserve(eyeUvUpdates.size());
+
             for (auto& [fhash, xyz] : faceUpdates) {
                 auto dIt = g_drawables.find(fhash);
                 auto mIt = g_faceMeshData.find(fhash);
@@ -2284,15 +2310,60 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     continue;
                 }
 
-                auto matIt = g_materialCache.find(inst.materialHash);
-                if (matIt == g_materialCache.end() || !matIt->second.handle)
-                    continue;
-
                 for (size_t i = 0; i < fm.vertices.size(); ++i) {
                     fm.vertices[i].position[0] = xyz[i * 3 + 0];
                     fm.vertices[i].position[1] = xyz[i * 3 + 1];
                     fm.vertices[i].position[2] = xyz[i * 3 + 2];
                 }
+                faceDirty.insert(fhash);
+                refreshes.insert(fhash);
+            }
+
+            for (const auto& [fhash, transform] : eyeUvUpdates) {
+                auto dIt = g_drawables.find(fhash);
+                auto mIt = g_faceMeshData.find(fhash);
+                if (dIt == g_drawables.end() || mIt == g_faceMeshData.end())
+                    continue;
+
+                DrawableInstance& inst = dIt->second;
+                FaceMeshData& fm = mIt->second;
+                if (!inst.meshHandle || !fm.isAnimatedEye ||
+                    fm.eyeBaseTexcoords.size() != fm.vertices.size() * 2) {
+                    const int en = sEyeLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (en < 12) {
+                        _MESSAGE("FO4RemixPlugin: [EyeAnim] UV drop hash=0x%llX "
+                                 "verts=%zu baseUvs=%zu handle=%p animated=%d",
+                                 (unsigned long long)fhash, fm.vertices.size(),
+                                 fm.eyeBaseTexcoords.size() / 2,
+                                 (void*)inst.meshHandle,
+                                 fm.isAnimatedEye ? 1 : 0);
+                    }
+                    continue;
+                }
+
+                for (size_t i = 0; i < fm.vertices.size(); ++i) {
+                    fm.vertices[i].texcoord[0] =
+                        fm.eyeBaseTexcoords[i * 2 + 0] * transform.scale[0] +
+                        transform.offset[0];
+                    fm.vertices[i].texcoord[1] =
+                        fm.eyeBaseTexcoords[i * 2 + 1] * transform.scale[1] +
+                        transform.offset[1];
+                }
+                eyeDirty.insert(fhash);
+                refreshes.insert(fhash);
+            }
+
+            for (uint64_t fhash : refreshes) {
+                auto dIt = g_drawables.find(fhash);
+                auto mIt = g_faceMeshData.find(fhash);
+                if (dIt == g_drawables.end() || mIt == g_faceMeshData.end())
+                    continue;
+
+                DrawableInstance& inst = dIt->second;
+                FaceMeshData& fm = mIt->second;
+                auto matIt = g_materialCache.find(inst.materialHash);
+                if (matIt == g_materialCache.end() || !matIt->second.handle)
+                    continue;
 
                 remixapi_MeshInfoSurfaceTriangles surface = {};
                 surface.vertices_values = fm.vertices.data();
@@ -2329,14 +2400,26 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
                 remixapi_MeshHandle sameHandle = nullptr;
                 remixapi_ErrorCode meshStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
-                RemixCallGuarded("CreateMesh(faceMorphRefresh)",
+                RemixCallGuarded("CreateMesh(dynamicMeshRefresh)",
                                  [&] { meshStatus = api->CreateMesh(&meshInfo, &sameHandle); });
                 if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS) {
-                    const int fn = sFaceLogs.fetch_add(1, std::memory_order_relaxed);
-                    if (fn < 12) {
-                        _MESSAGE("FO4RemixPlugin: [FaceMorph] refresh failed "
-                                 "hash=0x%llX err=%d -- keeping previous pose",
-                                 (unsigned long long)fhash, (int)meshStatus);
+                    if (faceDirty.count(fhash)) {
+                        const int fn = sFaceLogs.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (fn < 12) {
+                            _MESSAGE("FO4RemixPlugin: [FaceMorph] refresh failed "
+                                     "hash=0x%llX err=%d -- keeping previous pose",
+                                     (unsigned long long)fhash, (int)meshStatus);
+                        }
+                    }
+                    if (eyeDirty.count(fhash)) {
+                        const int en = sEyeLogs.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (en < 12) {
+                            _MESSAGE("FO4RemixPlugin: [EyeAnim] UV refresh failed "
+                                     "hash=0x%llX err=%d",
+                                     (unsigned long long)fhash, (int)meshStatus);
+                        }
                     }
                     continue;
                 }
@@ -2347,13 +2430,33 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 // never refreshed. Distinguishing "FO4 does not rewrite this
                 // buffer" from "it scrolled off the log" needs the headroom --
                 // correlate the hashes against [Skinning] registered / HeadDiag.
-                const int fn = sFaceLogs.fetch_add(1, std::memory_order_relaxed);
-                if (fn < 400) {
-                    _MESSAGE("FO4RemixPlugin: [FaceMorph] #%d refreshed hash=0x%llX "
-                             "meshHash=0x%llX verts=%zu stable=%d",
-                             fn, (unsigned long long)fhash,
-                             (unsigned long long)meshInfo.hash, fm.vertices.size(),
-                             sameHandle == inst.meshHandle ? 1 : 0);
+                if (faceDirty.count(fhash)) {
+                    const int fn = sFaceLogs.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (fn < 400) {
+                        _MESSAGE("FO4RemixPlugin: [FaceMorph] #%d refreshed hash=0x%llX "
+                                 "meshHash=0x%llX verts=%zu stable=%d",
+                                 fn, (unsigned long long)fhash,
+                                 (unsigned long long)meshInfo.hash,
+                                 fm.vertices.size(),
+                                 sameHandle == inst.meshHandle ? 1 : 0);
+                    }
+                }
+                auto eyeIt = eyeUvUpdates.find(fhash);
+                if (eyeDirty.count(fhash) && eyeIt != eyeUvUpdates.end()) {
+                    const int en = sEyeLogs.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (en < 160) {
+                        _MESSAGE("FO4RemixPlugin: [EyeAnim] UV #%d refreshed "
+                                 "hash=0x%llX off=(%.6f,%.6f) "
+                                 "scale=(%.6f,%.6f) stable=%d",
+                                 en, (unsigned long long)fhash,
+                                 eyeIt->second.offset[0],
+                                 eyeIt->second.offset[1],
+                                 eyeIt->second.scale[0],
+                                 eyeIt->second.scale[1],
+                                 sameHandle == inst.meshHandle ? 1 : 0);
+                    }
                 }
             }
         }
@@ -3644,6 +3747,10 @@ void RemixRenderer::Shutdown() {
         std::lock_guard<std::mutex> faceLock(g_faceMorphQueueMutex);
         g_faceMorphQueue.clear();
     }
+    {
+        std::lock_guard<std::mutex> eyeLock(g_eyeUvQueueMutex);
+        g_eyeUvQueue.clear();
+    }
 
     // Drop drawable entries first; their meshHandle members alias g_meshCache,
     // so we don't DestroyMesh here -- the cache loop below does that once per
@@ -3730,6 +3837,14 @@ void RemixRenderer::QueueFaceMorphPositions(uint64_t drawableHash,
                                             std::vector<float>&& xyz) {
     std::lock_guard<std::mutex> lock(g_faceMorphQueueMutex);
     g_faceMorphQueue[drawableHash] = std::move(xyz);
+}
+
+void RemixRenderer::QueueEyeUvTransforms(
+    std::unordered_map<uint64_t, EyeUvTransform>&& transforms) {
+    std::lock_guard<std::mutex> lock(g_eyeUvQueueMutex);
+    for (auto& item : transforms) {
+        g_eyeUvQueue[item.first] = item.second;
+    }
 }
 
 bool RemixRenderer::HasTextureHandle(uint64_t hash) {

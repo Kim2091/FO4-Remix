@@ -65,8 +65,21 @@ else()
     endforeach()
 endif()
 if(REMIX_HEADER_SRC)
-    file(COPY "${REMIX_HEADER_SRC}" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/extern/remix/")
-    message(STATUS "Refreshed remix_c.h from ${REMIX_HEADER_SRC}")
+    file(READ "${REMIX_HEADER_SRC}" REMIX_HEADER_CONTENT)
+    string(FIND "${REMIX_HEADER_CONTENT}"
+        "REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL" REMIX_VIEW_MODEL_CATEGORY_POS)
+    string(FIND "${REMIX_HEADER_CONTENT}"
+        "REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT"
+        REMIX_REFRESH_GEOMETRY_POS)
+    if(NOT REMIX_VIEW_MODEL_CATEGORY_POS EQUAL -1 AND
+       NOT REMIX_REFRESH_GEOMETRY_POS EQUAL -1)
+        file(COPY "${REMIX_HEADER_SRC}" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/extern/remix/")
+        message(STATUS "Refreshed remix_c.h from ${REMIX_HEADER_SRC}")
+    else()
+        message(WARNING
+            "remix_c.h at ${REMIX_HEADER_SRC} lacks required Remix Plus extensions; "
+            "using the cached Remix Plus snapshot at ${REMIX_HEADER_DST}")
+    endif()
 else()
     message(WARNING "remix_c.h source not found; using cached snapshot at ${REMIX_HEADER_DST}")
 endif()

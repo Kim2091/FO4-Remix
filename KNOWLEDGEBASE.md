@@ -693,6 +693,20 @@ would have started rejecting huge-local-extent LOD chunks.
   before destroying the previous handle to avoid the reverted v1 failure
   where refreshed heads, mouths, and hair disappeared. If this path regresses,
   disable `[Skinning] FaceMorphRefreshEnabled`.
+- **Eye UV animation is visually validated (2026-08-03).** Human irises are small
+  dynamic skinned meshes with one bone. A live dialogue capture proved that
+  FO4 drives gaze through `BSLightingShaderMaterial::textCoordOffset`: with
+  the iris shape and parent settled, its offset continued moving from
+  `(0,-0.01)` through values such as `(-0.0485,-0.0038)` and
+  `(0.0233,-0.0462)`. The plugin now bakes the current transform at first
+  submission, tracks changes for every human iris, recomputes from immutable
+  base UVs, and coalesces the result with any FaceGen position update into one
+  stable-handle geometry refresh. The validation scene produced 160 logged UV
+  refreshes, all with `stable=1`, no eye-refresh drops or failures, and the
+  user confirmed working gaze in the Remix viewport. Disable
+  `[Skinning] EyeUvAnimationEnabled` to roll back this path. Male irises also carry the
+  descriptor's `EyeData` channel, but local shader inspection indicates that
+  channel feeds shading rather than vertex deformation.
 - **Precombined / merge-instanced transforms are wrong (open, 2026-07-03).**
   The resolver's model is "local-space vertices x leaf `m_worldTransform`",
   which holds for plain refs but not for precombined geometry

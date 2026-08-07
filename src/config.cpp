@@ -122,6 +122,8 @@ void LoadConfig() {
         GetIniUInt("Skinning", "FaceMorphCheckIntervalFrames", 2, dllPath);
     g_config.faceMorphMaxPerTick =
         GetIniUInt("Skinning", "FaceMorphMaxPerTick", 8, dllPath);
+    g_config.eyeUvAnimationEnabled =
+        GetIniBool("Skinning", "EyeUvAnimationEnabled", true, dllPath);
 
     g_config.viewModelEnabled = GetIniBool("ViewModel", "Enabled", true, dllPath);
     g_config.viewModelBoneConventionFix =
@@ -336,9 +338,10 @@ void LoadConfig() {
              g_config.lightsEnabled, g_config.lightIntensity,
              g_config.lightRadius, g_config.lightColorStrength);
     _MESSAGE("FO4RemixPlugin: Skinning - Enabled=%d FaceMorphRefresh=%d "
-             "FaceMorphCheckInterval=%u FaceMorphMaxPerTick=%u",
+             "FaceMorphCheckInterval=%u FaceMorphMaxPerTick=%u EyeUvAnimation=%d",
              g_config.skinningEnabled, g_config.faceMorphRefreshEnabled,
-             g_config.faceMorphCheckIntervalFrames, g_config.faceMorphMaxPerTick);
+             g_config.faceMorphCheckIntervalFrames, g_config.faceMorphMaxPerTick,
+             g_config.eyeUvAnimationEnabled);
     _MESSAGE("FO4RemixPlugin: ViewModel - Enabled=%d BoneConventionFix=%d",
              g_config.viewModelEnabled, g_config.viewModelBoneConventionFix);
     _MESSAGE("FO4RemixPlugin: Emissive - GlowMaps=%d EmissiveColor=%d Intensity=%.2f LogEmissive=%d",

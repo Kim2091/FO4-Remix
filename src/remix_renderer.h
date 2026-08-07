@@ -160,6 +160,16 @@ namespace RemixRenderer {
     // drawable's private skinned mesh handle before drawing.
     void QueueFaceMorphPositions(uint64_t drawableHash, std::vector<float>&& xyz);
 
+    struct EyeUvTransform {
+        float offset[2] = {};
+        float scale[2] = { 1.0f, 1.0f };
+    };
+
+    // Queue changed FO4 eye-material UV transforms. OnFrame combines these
+    // with any FaceGen position update and refreshes the existing mesh handle.
+    void QueueEyeUvTransforms(
+        std::unordered_map<uint64_t, EyeUvTransform>&& transforms);
+
     // True if a Remix-side texture handle currently exists for `hash`.
     // Used by the extraction cache to decide whether a cache hit must
     // re-supply pixel data so SubmitDrawable can recreate a handle that was
