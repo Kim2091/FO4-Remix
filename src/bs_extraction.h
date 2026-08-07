@@ -158,6 +158,16 @@ struct ExtractedMesh {
     // blinks, and expressions. The renderer keeps a CPU copy so only
     // positions need to be re-uploaded when that live buffer changes.
     bool isFaceGenDynamic = false;
+
+    // Human iris animation. FO4 drives gaze through the lighting material's
+    // live texture-coordinate transform rather than rewriting the eye mesh.
+    // The resolver keeps immutable source UVs and bakes the current transform
+    // into vertices for initial submission; later changes are refreshed under
+    // the same mesh handle by RemixRenderer.
+    bool isAnimatedEye = false;
+    std::vector<float> eyeBaseTexcoords;
+    float eyeUvOffset[2] = {};
+    float eyeUvScale[2] = { 1.0f, 1.0f };
 };
 
 struct CellInfo {
