@@ -494,6 +494,11 @@ Ba2TextureSource::Status Ba2TextureSource::Read(
         if (chunk.startMip > chunk.endMip || chunk.endMip >= entry->mipCount) {
             return Status::Unsupported;
         }
+        // Chunks are independently addressed, so one holding no mip we are
+        // going to keep costs a seek + inflate for nothing. With the 2048
+        // cap that is every 4K texture's mip-0 chunk (~11 MiB inflated and
+        // discarded), and mip 0 is exactly the chunk the cap exists to skip.
+        if (chunk.endMip < firstMip || chunk.startMip >= usableEnd) continue;
         std::vector<uint8_t> raw;
         if (!InflateChunk(stream, chunk, raw)) return Status::ReadFailed;
         totalRaw += raw.size();

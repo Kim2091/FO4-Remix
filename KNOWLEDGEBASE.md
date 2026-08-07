@@ -254,6 +254,14 @@ frames, and immediately when the player changes cell. Each live BSTriShape
 leaf enters `SemanticCapture::ObserveTerrainGeometry`, then uses the ordinary
 resolver, retry, VRAM, and TTL machinery.
 
+The walk is suspended while `SemanticCapture::IsLoadingScreenActive()` — same
+gate as the resolve loop, and for the same reason. It is unguarded all the way
+down (cell -> LAND -> quadrant `NiNode` -> `m_children` -> `BSTriShape` ->
+`shaderProperty` -> material -> `m_worldTransform`) and `hkPresent` carries no
+SEH frame, so walking a world the loader thread is still building or freeing
+is a hard access violation, not a caught one. The placed-lights poll beside it
+needs no such gate: it only reads stable `TESForm` / `TESObjectREFR` data.
+
 ### NiAVObject (geometry leaf)
 
 Read in the `GetRenderPasses` detour (`semantic_capture.cpp:280-298`):
@@ -500,6 +508,18 @@ A frame's path from "engine called us" to "Remix DrawInstance issued":
   7.4 ms (8,268 drawables). These are diagnostic snapshots rather than a
   controlled benchmark, but they support keeping diagnostic hooks opt-in and
   disabling unconditional far-behind parking by default.
+
+**Upgrade note.** `AuthoredTextureSource` salts the texture hash
+(`FnvHashCombine(hash, 12)` in `ExtractMaterialTexture`), so every
+`%LOCALAPPDATA%\FO4Remix\texcache` entry written by an earlier build is a miss
+on the first run with this change — deliberately, so a transient source failure
+can never serve a stale low-mip chain. Expect one session of full re-decode;
+the orphaned files age out under the `DiskTextureCacheGiB` cap rather than
+being deleted eagerly. The same applies in reverse if the option is turned off.
+
+`TextureUpgradeOnApproach` is inert while `AuthoredTextureSource=1` (the
+resolution-variant salt is skipped): the authored chain is already the
+full-resolution one, so there is no reduced mip to upgrade away from.
 
 ## Remix integration
 

@@ -1343,7 +1343,17 @@ static HRESULT STDMETHODCALLTYPE hkPresent(IDXGISwapChain* swapChain, UINT syncI
         static uint32_t s_terrainPollCounter = 60;
         static uintptr_t s_lastTerrainCell = 0;
         static uint32_t s_lastTerrainCount = UINT32_MAX;
-        const uintptr_t cellNow = BsExtraction::GetPlayerCellPtr();
+        // Load-screen gate, for the same reason Tick's resolve loop has one:
+        // this walk is unguarded (cell -> LAND -> quadrant NiNode -> children
+        // -> BSTriShape -> property -> material -> m_worldTransform) and
+        // hkPresent has no SEH frame, so touching a world the loader thread
+        // is still building/freeing is a hard AV. Deeper than the lights poll
+        // below, which only reads stable TESForm data. Re-arm the counter so
+        // terrain re-observes on the first frame after the gate lifts.
+        const bool terrainGated = SemanticCapture::IsLoadingScreenActive();
+        if (terrainGated) s_terrainPollCounter = 60;
+        const uintptr_t cellNow =
+            terrainGated ? 0 : BsExtraction::GetPlayerCellPtr();
         ++s_terrainPollCounter;
         if (cellNow &&
             (s_terrainPollCounter >= 60 || cellNow != s_lastTerrainCell)) {

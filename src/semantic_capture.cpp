@@ -983,7 +983,9 @@ bool SemanticCapture::ObserveTerrainGeometry(void* geometry) {
         state.parent2 = parent2;
         state.resolverKind = ResolverKind::Lighting;
     }
-    state.isTerrain = true;
+    // No isTerrain tag: the resolver keys every terrain-specific decision off
+    // the material type (kType_Landscape), which is authoritative and covers
+    // shapes that reach the resolver through the render-pass hook too.
     state.lastSeenFrame = now;
     state.lastFlags = tri->flags;
     ++state.fireCount;
@@ -2592,6 +2594,10 @@ void SemanticCapture::SetLoadingScreenActive(bool active) {
     g_loadingScreenActive.store(active, std::memory_order_relaxed);
     _MESSAGE("FO4RemixPlugin: [SemCapture] loading gate %s",
              active ? "ON (resolves suspended)" : "OFF (resolves resumed)");
+}
+
+bool SemanticCapture::IsLoadingScreenActive() {
+    return g_loadingScreenActive.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------

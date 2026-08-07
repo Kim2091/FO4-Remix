@@ -2521,6 +2521,16 @@ static void TextureConversionWorkerMain()
                 g_texConvInflight.erase(job.hash);
             };
 
+            // Exception fence. The archive index (up to 1M pending records
+            // + every DX10 resource path) and the per-chunk inflate buffers
+            // (bounded at 256 MiB) are the largest allocations this plugin
+            // makes, and they run ABOVE the conversion fence below -- a bare
+            // bad_alloc/length_error here would escape the thread proc into
+            // std::terminate and fast-fail the process (the same 2026-07-12
+            // WER 0xc0000409 class the convert fence was added for). A throw
+            // is just a source failure: fall back to the live resource.
+            try {
+
             Ba2TextureSource::ReadInfo info;
             Ba2TextureSource::Status status = Ba2TextureSource::Query(
                 job.texName.c_str(), job.ba2LiveDesc.Format,
@@ -2585,6 +2595,27 @@ static void TextureConversionWorkerMain()
                          job.ba2LiveDesc.Width, job.ba2LiveDesc.Height,
                          job.ba2LiveDesc.MipLevels,
                          (unsigned)job.ba2LiveDesc.Format);
+            }
+
+            } catch (...) {
+                static std::atomic<int> sBa2Throw{0};
+                const int n = sBa2Throw.fetch_add(1, std::memory_order_relaxed);
+                if (n < 16) {
+                    _MESSAGE("FO4RemixPlugin: [AuthoredTex] BA2 C++ exception #%d "
+                             "hash=0x%016llX \"%s\" -- falling back to live",
+                             n, (unsigned long long)job.hash,
+                             job.texName.c_str());
+                }
+                // completeFallback allocates too (map insert). If even that
+                // throws, drop the inflight marker so the hash isn't stranded
+                // pending forever -- the resolver then re-enqueues it.
+                try {
+                    completeFallback(Ba2TextureSource::Status::ReadFailed);
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(g_texConvMutex);
+                    g_texConvInflight.erase(job.hash);
+                }
+                continue;
             }
         }
         // Disk-cache load job: no convert, just stream the chain back.

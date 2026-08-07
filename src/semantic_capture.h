@@ -31,9 +31,6 @@ namespace SemanticCapture {
         uint32_t fireCount           = 0;
         uint32_t lastTechniqueFlags  = 0;
         ResolverKind resolverKind = ResolverKind::Lighting;
-        // Set for TESObjectLAND shapes injected by the bounded terrain poll
-        // rather than observed through the shader render-pass hook.
-        bool     isTerrain           = false;
 
         // ---- 1B: pointers captured by the hot-path detour on first-seen ----
         void*    geometry            = nullptr;  // BSGeometry*  (rdx)
@@ -397,6 +394,14 @@ namespace SemanticCapture {
     // 3600-frame failsafe clears a stuck flag (PostLoadGame never firing,
     // e.g. load aborted to main menu) so the world can't stay empty.
     void SetLoadingScreenActive(bool active);
+
+    // True while the gate above is up. Any caller that walks live engine
+    // pointers on the game thread (the hkPresent terrain poll) must check
+    // this for the same reason the resolve loop does: the world is being
+    // built/freed on the loader thread, and those walks are unguarded.
+    // Does NOT apply the Tick failsafe -- a stuck flag only suppresses
+    // polling, and Tick clears it within 3600 frames either way.
+    bool IsLoadingScreenActive();
 
     // Aggregate flag-bit counters over the set of drawables that pass the
     // active filter in SnapshotActiveDrawables. Diagnostic-only -- helps
