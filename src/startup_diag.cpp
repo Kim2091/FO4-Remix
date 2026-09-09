@@ -208,6 +208,9 @@ void LogOverlayDetection() {
         _MESSAGE("FO4RemixPlugin: [StartupDiag] EnumProcessModules failed");
         return;
     }
+    // `needed` reports the FULL module count even when it exceeds the
+    // buffer; iterating past sizeof(mods) reads uninitialized stack.
+    if (needed > sizeof(mods)) needed = sizeof(mods);
     const DWORD count = needed / sizeof(HMODULE);
     std::vector<std::string> hits;
     for (DWORD i = 0; i < count; ++i) {

@@ -146,18 +146,160 @@ static int QiGuarded(void* obj, const GUID* iid, void** out) {
     }
 }
 
+// ---- Async buffer-slice readback (2026-07-13 pop-in fix) ----
+// The old synchronous version Map(READ)-blocked on a just-issued staging
+// copy, forcing a full GPU pipeline sync on the game thread PER slice --
+// log-measured 9-45ms per merge-instanced resolve (t7 read + record read +
+// up to 2 syncs per captured chunk), which blew the 3ms resolve budget with
+// attempted=1 and set the ~1-drawable-per-tick drain rate behind "a 360 in
+// Sanctuary takes a minute to finish loading" (the same stalls were the
+// streaming hitches). Two-phase instead: the first request issues the
+// staging copy and reports pending; later attempts poll with
+// D3D11_MAP_FLAG_DO_NOT_WAIT. Callers defer the whole resolve exactly like
+// a not-yet-decoded texture and re-enter on the retry tick.
+//
+// Ready slices KEEP their bytes cached (not consumed on read): one chunk
+// bake walks many chunks across attempts, and the IB slices must survive
+// while the VB slices they gate are still in flight. Keyed by (identity
+// pointer, offset, bytes); a recycled buffer address with identical
+// offset+size could serve stale-world bytes, so entries are TTL'd short,
+// the whole cache drops on world swap (ResetTransientCaches), and -- same
+// as the sync path -- the bake-time bound/record-anchor gates catch what
+// slips through. Single-threaded: only the resolver (game thread) touches
+// this.
+enum class SliceStatus { kReady, kPending, kFailed };
+
+struct PendingSlice {
+    ID3D11Buffer*        staging = nullptr;  // non-null while the copy is in flight
+    std::vector<uint8_t> data;               // filled once the Map lands
+    uint32_t             bytes = 0;
+    uint64_t             lastTouchMs = 0;
+};
+static std::unordered_map<uint64_t, PendingSlice> g_sliceCache;
+static size_t   g_sliceCacheBytes = 0;
+static uint64_t g_sliceLastSweepMs = 0;
+constexpr uint64_t kSliceTTLMs       = 5000;      // consumers finish in ~2-3 ticks
+constexpr size_t   kSliceCacheMaxBytes = 64u << 20;
+
+static uint64_t SliceKey(const void* identity, uint32_t srcOff, uint32_t bytes) {
+    uint64_t h = 0xCBF29CE484222325ULL ^ reinterpret_cast<uintptr_t>(identity);
+    h *= 0x100000001B3ULL;
+    h ^= srcOff;
+    h *= 0x100000001B3ULL;
+    h ^= bytes;
+    h *= 0x100000001B3ULL;
+    return h;
+}
+
+static void EraseSlice(std::unordered_map<uint64_t, PendingSlice>::iterator it) {
+    if (it->second.staging) it->second.staging->Release();
+    g_sliceCacheBytes -= (std::min)((size_t)it->second.bytes, g_sliceCacheBytes);
+    g_sliceCache.erase(it);
+}
+
+static void SweepSliceCache(uint64_t nowMs) {
+    if (nowMs - g_sliceLastSweepMs < 1000 &&
+        g_sliceCacheBytes <= kSliceCacheMaxBytes) {
+        return;
+    }
+    g_sliceLastSweepMs = nowMs;
+    for (auto it = g_sliceCache.begin(); it != g_sliceCache.end();) {
+        if (nowMs - it->second.lastTouchMs > kSliceTTLMs) {
+            auto victim = it++;
+            EraseSlice(victim);
+        } else {
+            ++it;
+        }
+    }
+    // Byte-cap backstop: evict least-recently-touched until under budget.
+    // Entries touched within the last 100ms belong to the attempt in
+    // progress -- evicting those would make the retry reissue them and
+    // thrash; leave them for the TTL instead.
+    while (g_sliceCacheBytes > kSliceCacheMaxBytes && !g_sliceCache.empty()) {
+        auto oldest = g_sliceCache.end();
+        for (auto it = g_sliceCache.begin(); it != g_sliceCache.end(); ++it) {
+            if (nowMs - it->second.lastTouchMs < 100) continue;
+            if (oldest == g_sliceCache.end() ||
+                it->second.lastTouchMs < oldest->second.lastTouchMs) {
+                oldest = it;
+            }
+        }
+        if (oldest == g_sliceCache.end()) break;
+        EraseSlice(oldest);
+    }
+}
+
 // Copy `bytes` at `srcOff` of a buffer through a staging buffer created on
 // the buffer's OWN device (which may differ from the resolver's device).
-// Blocking Map -- acceptable because it runs at most once per merge-
-// instanced shape at resolve time (the result is baked into the submitted
-// drawables); the texture readback in bs_extraction does the same on this
-// thread.
-static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t bytes,
-                                    std::vector<uint8_t>& out) {
+// `identity` is the stable cache identity for this source (the DrawCapture
+// identity pointer for chunk buffers; the live buffer pointer elsewhere).
+// kReady fills `out`; kPending means poll again next tick; kFailed means
+// the slice can't be read (out of range, create/copy/map failure).
+static SliceStatus ReadbackBufferSliceAsync(ID3D11Buffer* buf, const void* identity,
+                                            uint32_t srcOff, uint32_t bytes,
+                                            std::vector<uint8_t>& out) {
+    const uint64_t nowMs = GetTickCount64();
+    SweepSliceCache(nowMs);
+    const uint64_t key = SliceKey(identity, srcOff, bytes);
+    auto it = g_sliceCache.find(key);
+    if (it != g_sliceCache.end() && it->second.bytes != bytes) {
+        // 64-bit key collision or aliased identity: drop and reissue.
+        EraseSlice(it);
+        it = g_sliceCache.end();
+    }
+    if (it != g_sliceCache.end()) {
+        PendingSlice& s = it->second;
+        s.lastTouchMs = nowMs;
+        if (!s.staging) {
+            out = s.data;   // stays cached for other consumers of this bake
+            return SliceStatus::kReady;
+        }
+        // Poll the in-flight copy without stalling the pipeline.
+        SliceStatus status = SliceStatus::kFailed;
+        ID3D11Device* dev = nullptr;
+        s.staging->GetDevice(&dev);
+        if (dev) {
+            ID3D11DeviceContext* ctx = nullptr;
+            dev->GetImmediateContext(&ctx);
+            if (ctx) {
+                D3D11_MAPPED_SUBRESOURCE ms = {};
+                const HRESULT hr = ctx->Map(s.staging, 0, D3D11_MAP_READ,
+                                            D3D11_MAP_FLAG_DO_NOT_WAIT, &ms);
+                if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+                    status = SliceStatus::kPending;
+                } else if (SUCCEEDED(hr)) {
+                    s.data.assign(static_cast<const uint8_t*>(ms.pData),
+                                  static_cast<const uint8_t*>(ms.pData) + bytes);
+                    ctx->Unmap(s.staging, 0);
+                    s.staging->Release();
+                    s.staging = nullptr;
+                    out = s.data;
+                    status = SliceStatus::kReady;
+                }
+                ctx->Release();
+            }
+            dev->Release();
+        }
+        if (status == SliceStatus::kFailed) EraseSlice(it);
+        return status;
+    }
+    // New request: range-check against the LIVE buffer first. An
+    // out-of-range CopySubresourceRegion is silently dropped by the D3D11
+    // runtime (void return, no-op in release) but the Map still succeeds --
+    // never-written staging memory (typically zeros) would come back as
+    // "successful" readback data. Chunk offsets are snapshotted identities;
+    // a pool buffer reallocated smaller at the same address passes the
+    // pointer/QI checks and lands here out of range.
+    D3D11_BUFFER_DESC srcDesc = {};
+    buf->GetDesc(&srcDesc);
+    if (bytes == 0 || srcOff > srcDesc.ByteWidth ||
+        bytes > srcDesc.ByteWidth - srcOff) {
+        return SliceStatus::kFailed;
+    }
     ID3D11Device* dev = nullptr;
     buf->GetDevice(&dev);
-    if (!dev) return 0;
-    uint32_t got = 0;
+    if (!dev) return SliceStatus::kFailed;
+    SliceStatus status = SliceStatus::kFailed;
     D3D11_BUFFER_DESC sd = {};
     sd.ByteWidth      = bytes;
     sd.Usage          = D3D11_USAGE_STAGING;
@@ -169,19 +311,27 @@ static uint32_t ReadbackBufferSlice(ID3D11Buffer* buf, uint32_t srcOff, uint32_t
         if (ctx) {
             D3D11_BOX box = { srcOff, 0, 0, srcOff + bytes, 1, 1 };
             ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, buf, 0, &box);
-            D3D11_MAPPED_SUBRESOURCE ms = {};
-            if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &ms))) {
-                out.resize(bytes);
-                std::memcpy(out.data(), ms.pData, bytes);
-                ctx->Unmap(staging, 0);
-                got = bytes;
-            }
+            PendingSlice s;
+            s.staging = staging;   // ownership moves to the cache
+            s.bytes = bytes;
+            s.lastTouchMs = nowMs;
+            g_sliceCache.emplace(key, std::move(s));
+            g_sliceCacheBytes += bytes;
+            staging = nullptr;
+            status = SliceStatus::kPending;
             ctx->Release();
         }
-        staging->Release();
     }
+    if (staging) staging->Release();
     dev->Release();
-    return got;
+    return status;
+}
+
+void ResetSliceCache() {
+    for (auto it = g_sliceCache.begin(); it != g_sliceCache.end();) {
+        auto victim = it++;
+        EraseSlice(victim);
+    }
 }
 
 static bool HeapLikePtr(uint64_t q);
@@ -485,21 +635,9 @@ static bool PeekBytesGuarded(const void* src, void* dst, size_t bytes) {
     }
 }
 
-// Enough of IEEE half for diagnostics (denorms flushed to zero).
-static float HalfToFloat(uint16_t h) {
-    const uint32_t s = (h >> 15) & 1u, e = (h >> 10) & 0x1Fu, m = h & 0x3FFu;
-    uint32_t f;
-    if (e == 0) {
-        f = s << 31;
-    } else if (e == 31) {
-        f = (s << 31) | 0x7F800000u;
-    } else {
-        f = (s << 31) | ((e + 112u) << 23) | (m << 13);
-    }
-    float out;
-    std::memcpy(&out, &f, 4);
-    return out;
-}
+// Half-float decode comes from config.h's shared HalfToFloat (a local copy
+// here used to shadow it with divergent denormal handling -- a silent trap
+// for anyone fixing the shared one; removed 2026-07-10).
 
 // ---- Take 11 (scene-graph baked-chunk walk) REMOVED (2026-07-04) ----
 // Live re-verification (frida, same save/binary) disproved every premise:
@@ -532,7 +670,160 @@ static float HalfToFloat(uint16_t h) {
 // every sampled position inside the shape's world bound (leaf rotations
 // are identity on every sampled merged shape, so the local-space bound is
 // just the world bound recentered on the leaf position).
-static bool BuildMeshFromChunks(BSTriShape* tri,
+enum class BakeStatus { kOk, kPending, kFailed };
+
+// ---- Async chunk bake (2026-07-21) ----
+// The bake's build pass is the merge path's 35ms monster: per-vertex
+// inside-bound tests nested over up to ~1700 record anchors, then a full
+// per-vertex format conversion. The gather pass (D3D11 readback polling)
+// stays on the game thread; once every slice is in hand the build inputs
+// are all plugin-owned copies, so the build runs on the mesh worker pool
+// and the resolver re-enters through the same kPendingDefer fast-poll it
+// already uses while slices are in flight. Same generation discipline as
+// the async parse: PassKeys are pointer-derived, results from the outgoing
+// world are discarded after a world swap.
+struct BakeChunkSlices {
+    std::vector<uint8_t> ib;
+    std::vector<uint8_t> vb;
+    uint32_t             mn = 0;
+    bool                 usable = false;
+};
+struct BakeRecAnchor { float x, y, z, reach2; };
+
+struct BakeBuildInputs {
+    std::vector<DrawCapture::ChunkDraw> chunks;
+    std::vector<BakeChunkSlices>        gathered;
+    std::vector<BakeRecAnchor>          anchors;
+    float    cx = 0, cy = 0, cz = 0, radSq = 0, rad = 0, rSrc = 0;
+    size_t   recCount = 0;
+    uint64_t hash = 0;
+    int      dFmt = 0, dIb = 0, dWin = 0, dVb = 0;  // gather-side drop counts
+};
+
+struct BakeResult {
+    BakeStatus status = BakeStatus::kFailed;
+    std::vector<remixapi_HardcodedVertex> verts;
+    std::vector<uint32_t> indices;
+    int      keptChunks = 0;
+    uint64_t doneFrame = 0;
+};
+
+static std::mutex g_bakeMutex;
+static std::unordered_map<uint64_t, BakeResult> g_bakeDone;
+static std::unordered_set<uint64_t> g_bakeInflight;   // queued or building
+static uint64_t g_bakeGen = 0;                         // guarded by g_bakeMutex
+constexpr uint64_t kBakeDoneTTLFrames = 600;
+
+// Build pass. Pure function of `in` -- safe on the mesh worker pool.
+static void RunBakeBuildPass(BakeBuildInputs& in, BakeResult& out)
+{
+    out.keptChunks = 0;
+    int dBound = 0, dRec = 0;
+    const int nChunks = (int)in.chunks.size();
+    for (int c = 0; c < nChunks; ++c) {
+        const DrawCapture::ChunkDraw& ch = in.chunks[(size_t)c];
+        const BakeChunkSlices& cs = in.gathered[(size_t)c];
+        if (!cs.usable) continue;
+        const uint16_t* idx = reinterpret_cast<const uint16_t*>(cs.ib.data());
+        const uint32_t mn = cs.mn;
+        const uint32_t nVerts = (uint32_t)(cs.vb.size() / 32u);
+        const std::vector<uint8_t>& vbytes = cs.vb;
+        // Every vertex must (a) land inside the cluster bound and (b) lie
+        // within source-extent of SOME record translation. (a) kills
+        // NaN/garbage from repacked pool slices (comparisons with NaN are
+        // false); (b) kills in-radius NEIGHBOR geometry drawn under the
+        // sticky t8 binding. One bad vertex disqualifies the whole chunk.
+        bool inside = true;
+        bool anchored = true;
+        for (uint32_t v = 0; v < nVerts && inside && anchored; ++v) {
+            float p[3];
+            std::memcpy(p, vbytes.data() + v * 32u, 12);
+            const float dx = p[0] - in.cx, dy = p[1] - in.cy, dz = p[2] - in.cz;
+            inside = (dx * dx + dy * dy + dz * dz) <= in.radSq;
+            if (!inside) break;
+            bool nearRec = false;
+            for (const BakeRecAnchor& a : in.anchors) {
+                const float ax = p[0] - a.x, ay = p[1] - a.y, az = p[2] - a.z;
+                if (ax * ax + ay * ay + az * az <= a.reach2) { nearRec = true; break; }
+            }
+            anchored = nearRec;
+        }
+        if (!inside) { ++dBound; continue; }
+        if (!anchored) { ++dRec; continue; }
+        // append: positions float3@0, UV half2@16, normal biased-ubyte@20
+        const uint32_t vbase = (uint32_t)out.verts.size();
+        out.verts.resize(vbase + nVerts);
+        for (uint32_t v = 0; v < nVerts; ++v) {
+            const uint8_t* p = vbytes.data() + v * 32u;
+            remixapi_HardcodedVertex& hv = out.verts[vbase + v];
+            std::memset(&hv, 0, sizeof(hv));
+            std::memcpy(hv.position, p, 12);
+            uint16_t uvh[2];
+            std::memcpy(uvh, p + 16, 4);
+            hv.texcoord[0] = HalfToFloat(uvh[0]);
+            hv.texcoord[1] = HalfToFloat(uvh[1]);
+            float nx = (p[20] / 255.0f) * 2.0f - 1.0f;
+            float ny = (p[21] / 255.0f) * 2.0f - 1.0f;
+            float nz = (p[22] / 255.0f) * 2.0f - 1.0f;
+            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
+            if (nl > 0.25f) {
+                nx /= nl; ny /= nl; nz /= nl;
+            } else {
+                nx = 0.0f; ny = 0.0f; nz = 1.0f;
+            }
+            hv.normal[0] = nx;
+            hv.normal[1] = ny;
+            hv.normal[2] = nz;
+            hv.color = 0xFFFFFFFF;
+        }
+        // same per-triangle 1<->2 winding flip the parser applies
+        const size_t ibase = out.indices.size();
+        out.indices.resize(ibase + ch.idxCount);
+        for (uint32_t t = 0; t + 2 < ch.idxCount; t += 3) {
+            out.indices[ibase + t]     = vbase + (uint32_t)(idx[t] - mn);
+            out.indices[ibase + t + 1] = vbase + (uint32_t)(idx[t + 2] - mn);
+            out.indices[ibase + t + 2] = vbase + (uint32_t)(idx[t + 1] - mn);
+        }
+        ++out.keptChunks;
+    }
+    const bool ok = out.keptChunks > 0 && out.indices.size() >= 48;
+    static std::atomic<int> sBakeLogs{0};
+    const int bl = sBakeLogs.fetch_add(1, std::memory_order_relaxed);
+    if (bl < 48) {
+        _MESSAGE("FO4RemixPlugin: [MergeBake] hash=0x%llX %s chunks=%d/%d tris=%zu "
+                 "verts=%zu rSrc=%.0f recs=%zu drop=[fmt%d ib%d win%d vb%d bnd%d rec%d] "
+                 "bound=(%.0f,%.0f,%.0f r=%.0f)",
+                 (unsigned long long)in.hash, ok ? "OK" : "REJECT",
+                 out.keptChunks, nChunks,
+                 out.indices.size() / 3, out.verts.size(), in.rSrc, in.recCount,
+                 in.dFmt, in.dIb, in.dWin, in.dVb, dBound, dRec,
+                 in.cx, in.cy, in.cz, in.rad);
+    }
+    out.status = ok ? BakeStatus::kOk : BakeStatus::kFailed;
+}
+
+void SweepAsyncBakes(uint64_t currentFrame)
+{
+    std::lock_guard<std::mutex> lk(g_bakeMutex);
+    for (auto it = g_bakeDone.begin(); it != g_bakeDone.end();) {
+        if (currentFrame > it->second.doneFrame &&
+            currentFrame - it->second.doneFrame > kBakeDoneTTLFrames) {
+            it = g_bakeDone.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+void ResetAsyncBakes()
+{
+    std::lock_guard<std::mutex> lk(g_bakeMutex);
+    ++g_bakeGen;
+    g_bakeDone.clear();
+    // Inflight jobs publish under the old generation and are discarded.
+}
+
+static BakeStatus BuildMeshFromChunks(BSTriShape* tri,
                                 const DrawCapture::ChunkDraw* chunks, int nChunks,
                                 uint64_t hash,
                                 const std::vector<std::array<float, 20>>& recs,
@@ -541,6 +832,22 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
                                 std::vector<uint32_t>& outIndices,
                                 int& keptChunks) {
     keptChunks = 0;
+    // Async rendezvous: a finished worker build is consumed exactly once;
+    // an in-flight build keeps reporting pending (same caller behavior as
+    // slices still in flight).
+    if (g_config.asyncMeshParse) {
+        std::lock_guard<std::mutex> lk(g_bakeMutex);
+        auto it = g_bakeDone.find(hash);
+        if (it != g_bakeDone.end()) {
+            BakeResult r = std::move(it->second);
+            g_bakeDone.erase(it);
+            outVerts   = std::move(r.verts);
+            outIndices = std::move(r.indices);
+            keptChunks = r.keptChunks;
+            return r.status;
+        }
+        if (g_bakeInflight.count(hash)) return BakeStatus::kPending;
+    }
     const NiTransform& W = tri->m_worldTransform;
     const NiBound& B = tri->m_worldBound;
     const float cx = B.m_kCenter.x - W.pos.x;
@@ -566,8 +873,7 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
     }
     float rSrc = std::sqrt(rSrcSq);
     if (rSrc < 64.0f) rSrc = 64.0f;
-    struct RecAnchor { float x, y, z, reach2; };
-    std::vector<RecAnchor> anchors;
+    std::vector<BakeRecAnchor> anchors;
     anchors.reserve(recs.size());
     for (const auto& r : recs) {
         const float* f = r.data();
@@ -575,8 +881,15 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
         const float reach = rSrc * s + 96.0f;
         anchors.push_back({ f[12], f[13], f[14], reach * reach });
     }
-    int dFmt = 0, dIb = 0, dWin = 0, dVb = 0, dBound = 0, dRec = 0;
+    int dFmt = 0, dIb = 0, dWin = 0, dVb = 0;  // bound/rec drops counted in the build pass
 
+    // ---- Gather pass: request/poll every chunk's slices (async). ----
+    // All copies for all chunks get ISSUED on the first attempt (they fly in
+    // parallel); nothing is appended until every non-dropped chunk has both
+    // slices in hand, so a pending return leaves no partial output and the
+    // retry rebuilds from the still-cached slices.
+    std::vector<BakeChunkSlices> gathered((size_t)nChunks);
+    bool anyPending = false;
     for (int c = 0; c < nChunks; ++c) {
         const DrawCapture::ChunkDraw& ch = chunks[c];
         if (ch.ibFormat != 57 /*R16_UINT*/ || ch.vbStride != 32 ||
@@ -586,12 +899,13 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
         }
         ID3D11Buffer* ibb = SafeBufferFromIdentity(ch.ib);
         if (!ibb) { ++dIb; continue; }
-        std::vector<uint8_t> ibBytes;
-        const bool ibOk = ReadbackBufferSlice(ibb, ch.ibOffset, ch.idxCount * 2,
-                                              ibBytes) == ch.idxCount * 2;
+        BakeChunkSlices& cs = gathered[(size_t)c];
+        const SliceStatus ibSt = ReadbackBufferSliceAsync(
+            ibb, ch.ib, ch.ibOffset, ch.idxCount * 2, cs.ib);
         ibb->Release();
-        if (!ibOk) { ++dIb; continue; }
-        const uint16_t* idx = reinterpret_cast<const uint16_t*>(ibBytes.data());
+        if (ibSt == SliceStatus::kPending) { anyPending = true; continue; }
+        if (ibSt != SliceStatus::kReady) { ++dIb; continue; }
+        const uint16_t* idx = reinterpret_cast<const uint16_t*>(cs.ib.data());
         uint16_t mn = 0xFFFF, mx = 0;
         for (uint32_t i = 0; i < ch.idxCount; ++i) {
             if (idx[i] < mn) mn = idx[i];
@@ -601,81 +915,60 @@ static bool BuildMeshFromChunks(BSTriShape* tri,
         if (nVerts > 70000) { ++dWin; continue; }
         ID3D11Buffer* vbb = SafeBufferFromIdentity(ch.vb);
         if (!vbb) { ++dVb; continue; }
-        std::vector<uint8_t> vbytes;
-        const bool vbOk = ReadbackBufferSlice(vbb, ch.vbOffset + (uint32_t)mn * 32u,
-                                              nVerts * 32u, vbytes) == nVerts * 32u;
+        const SliceStatus vbSt = ReadbackBufferSliceAsync(
+            vbb, ch.vb, ch.vbOffset + (uint32_t)mn * 32u, nVerts * 32u, cs.vb);
         vbb->Release();
-        if (!vbOk) { ++dVb; continue; }
-        // Every vertex must (a) land inside the cluster bound and (b) lie
-        // within source-extent of SOME record translation. (a) kills
-        // NaN/garbage from repacked pool slices (comparisons with NaN are
-        // false); (b) kills in-radius NEIGHBOR geometry drawn under the
-        // sticky t8 binding. One bad vertex disqualifies the whole chunk.
-        bool inside = true;
-        bool anchored = true;
-        for (uint32_t v = 0; v < nVerts && inside && anchored; ++v) {
-            float p[3];
-            std::memcpy(p, vbytes.data() + v * 32u, 12);
-            const float dx = p[0] - cx, dy = p[1] - cy, dz = p[2] - cz;
-            inside = (dx * dx + dy * dy + dz * dz) <= radSq;
-            if (!inside) break;
-            bool nearRec = false;
-            for (const RecAnchor& a : anchors) {
-                const float ax = p[0] - a.x, ay = p[1] - a.y, az = p[2] - a.z;
-                if (ax * ax + ay * ay + az * az <= a.reach2) { nearRec = true; break; }
-            }
-            anchored = nearRec;
-        }
-        if (!inside) { ++dBound; continue; }
-        if (!anchored) { ++dRec; continue; }
-        // append: positions float3@0, UV half2@16, normal biased-ubyte@20
-        const uint32_t vbase = (uint32_t)outVerts.size();
-        outVerts.resize(vbase + nVerts);
-        for (uint32_t v = 0; v < nVerts; ++v) {
-            const uint8_t* p = vbytes.data() + v * 32u;
-            remixapi_HardcodedVertex& hv = outVerts[vbase + v];
-            std::memset(&hv, 0, sizeof(hv));
-            std::memcpy(hv.position, p, 12);
-            uint16_t uvh[2];
-            std::memcpy(uvh, p + 16, 4);
-            hv.texcoord[0] = HalfToFloat(uvh[0]);
-            hv.texcoord[1] = HalfToFloat(uvh[1]);
-            float nx = (p[20] / 255.0f) * 2.0f - 1.0f;
-            float ny = (p[21] / 255.0f) * 2.0f - 1.0f;
-            float nz = (p[22] / 255.0f) * 2.0f - 1.0f;
-            const float nl = std::sqrt(nx * nx + ny * ny + nz * nz);
-            if (nl > 0.25f) {
-                nx /= nl; ny /= nl; nz /= nl;
-            } else {
-                nx = 0.0f; ny = 0.0f; nz = 1.0f;
-            }
-            hv.normal[0] = nx;
-            hv.normal[1] = ny;
-            hv.normal[2] = nz;
-            hv.color = 0xFFFFFFFF;
-        }
-        // same per-triangle 1<->2 winding flip the parser applies
-        const size_t ibase = outIndices.size();
-        outIndices.resize(ibase + ch.idxCount);
-        for (uint32_t t = 0; t + 2 < ch.idxCount; t += 3) {
-            outIndices[ibase + t]     = vbase + (uint32_t)(idx[t] - mn);
-            outIndices[ibase + t + 1] = vbase + (uint32_t)(idx[t + 2] - mn);
-            outIndices[ibase + t + 2] = vbase + (uint32_t)(idx[t + 1] - mn);
-        }
-        ++keptChunks;
+        if (vbSt == SliceStatus::kPending) { anyPending = true; continue; }
+        if (vbSt != SliceStatus::kReady) { ++dVb; continue; }
+        cs.mn = mn;
+        cs.usable = true;
     }
-    const bool ok = keptChunks > 0 && outIndices.size() >= 48;
-    static std::atomic<int> sBakeLogs{0};
-    const int bl = sBakeLogs.fetch_add(1, std::memory_order_relaxed);
-    if (bl < 48) {
-        _MESSAGE("FO4RemixPlugin: [MergeBake] hash=0x%llX %s chunks=%d/%d tris=%zu "
-                 "verts=%zu rSrc=%.0f recs=%zu drop=[fmt%d ib%d win%d vb%d bnd%d rec%d] "
-                 "bound=(%.0f,%.0f,%.0f r=%.0f)",
-                 (unsigned long long)hash, ok ? "OK" : "REJECT", keptChunks, nChunks,
-                 outIndices.size() / 3, outVerts.size(), rSrc, recs.size(),
-                 dFmt, dIb, dWin, dVb, dBound, dRec, cx, cy, cz, rad);
+    if (anyPending) return BakeStatus::kPending;
+
+    // ---- Build inputs are all plugin-owned now: run the build pass on a
+    // worker (async) or inline (sync fallback). ----
+    BakeBuildInputs in;
+    in.chunks.assign(chunks, chunks + nChunks);
+    in.gathered = std::move(gathered);
+    in.anchors  = std::move(anchors);
+    in.cx = cx; in.cy = cy; in.cz = cz;
+    in.radSq = radSq; in.rad = rad; in.rSrc = rSrc;
+    in.recCount = recs.size();
+    in.hash = hash;
+    in.dFmt = dFmt; in.dIb = dIb; in.dWin = dWin; in.dVb = dVb;
+
+    if (g_config.asyncMeshParse) {
+        if (BsExtraction::MeshWorkQueueSaturated()) return BakeStatus::kPending;
+        uint64_t gen;
+        {
+            std::lock_guard<std::mutex> lk(g_bakeMutex);
+            gen = g_bakeGen;
+            g_bakeInflight.insert(hash);
+        }
+        // MSVC's std::function requires copyable closures; share the inputs.
+        auto holder = std::make_shared<BakeBuildInputs>(std::move(in));
+        const bool queued = BsExtraction::EnqueueMeshWork([holder, gen, hash] {
+            BakeResult r;
+            RunBakeBuildPass(*holder, r);
+            r.doneFrame = Diagnostics::CurrentFrameIndex();
+            std::lock_guard<std::mutex> lk(g_bakeMutex);
+            g_bakeInflight.erase(hash);
+            if (gen != g_bakeGen) return;  // world swapped mid-build
+            g_bakeDone[hash] = std::move(r);
+        });
+        if (!queued) {
+            std::lock_guard<std::mutex> lk(g_bakeMutex);
+            g_bakeInflight.erase(hash);
+        }
+        return BakeStatus::kPending;
     }
-    return ok;
+
+    BakeResult r;
+    RunBakeBuildPass(in, r);
+    outVerts   = std::move(r.verts);
+    outIndices = std::move(r.indices);
+    keptChunks = r.keptChunks;
+    return r.status;
 }
 
 static inline int PermXY(int i) { return i == 0 ? 1 : (i == 1 ? 0 : 2); }
@@ -736,10 +1029,14 @@ static bool HeapLikePtr(uint64_t q) {
 // pointer IDENTITIES of the instance buffer and its paired SRV (wrapper
 // qwords 0 and 1) for DrawCapture matching -- no references are held.
 // Returns false (out untouched) on ANY validation miss, and the caller
-// falls back to the pre-existing single-draw path.
+// falls back to the pre-existing single-draw path. *outPending is set when
+// the record readback is still in flight (async slice) -- the caller must
+// defer the whole resolve and retry, NOT fall back.
 static bool ReadMergeInstanceRecords(BSTriShape* tri,
                                      std::vector<std::array<float, 20>>& out,
-                                     void** outBufPtr, void** outSrvPtr) {
+                                     void** outBufPtr, void** outSrvPtr,
+                                     bool* outPending) {
+    *outPending = false;
     const auto heapLike = HeapLikePtr;
     // shape+0x170 -> wrapper; wrapper qword 0 -> structured instance buffer.
     uint64_t wrapPtr = 0;
@@ -781,7 +1078,10 @@ static bool ReadMergeInstanceRecords(BSTriShape* tri,
         if (count > 4096) break;  // sanity bound; samples were 2..15
 
         std::vector<uint8_t> bytes;
-        if (ReadbackBufferSlice(buf, 0, bd.ByteWidth, bytes) != bd.ByteWidth) break;
+        const SliceStatus st = ReadbackBufferSliceAsync(
+            buf, reinterpret_cast<void*>(bufObj), 0, bd.ByteWidth, bytes);
+        if (st == SliceStatus::kPending) { *outPending = true; break; }
+        if (st != SliceStatus::kReady) break;
 
         std::vector<std::array<float, 20>> recs(count);
         bool valid = true;
@@ -838,6 +1138,7 @@ namespace ResolverTrace {
             case Trace::kLODSkipped:                  return "lod_skipped";
             case Trace::kTopFadeNodeSkipped:          return "topfadenode_skipped";
             case Trace::kWorldLODChunkSkipped:        return "world_lod_chunk_skipped";
+            case Trace::kPendingDefer:                return "pending_defer";
             default: return "unknown";
         }
     }
@@ -909,6 +1210,293 @@ static bool HeadDiagMatch(BSTriShape* tri,
         HeadDiagNameMatch(static_cast<NiAVObject*>(state.parent2)->m_name.c_str()))
         return true;
     return false;
+}
+
+// True when this drawable hangs off a FaceGen head node -- eyes, lashes,
+// brows, mouth, the head itself. Structural, not name-based: every facegen
+// part logs p1="BSFaceGenNiNodeSkinned" (2026-07-31 [HeadDiag] run).
+//
+// Needed because GetType() cannot separate face parts from props in this
+// build: the eyeball and its wet overlay both report kType_Envmap (==1), the
+// same value the power-armor stands and street lamps use, so the metal/envmap
+// conversion was treating eyeballs as painted metal. See the exclusion at the
+// kType_Envmap branch below.
+// NOTE: "BSFaceGenNiNodeSkinned" is the node's NAME (NiObjectNET::m_name), not
+// its RTTI class -- Bethesda names the node after a class. The first cut of this
+// compared it against GetLeafClassName and so returned false for every drawable,
+// silently disabling both eye fixes (2026-07-31 run: zero "GATE eye wet overlay
+// skipped" lines while FemaleEyesHumanWet kept refreshing 59 times). Match on
+// the name, and accept an RTTI leaf hit too in case a build reports it there.
+static bool IsFaceGenPart(const SemanticCapture::DrawableState& state) {
+    if (!state.parent1) return false;
+    const char* p1Name = static_cast<NiAVObject*>(state.parent1)->m_name.c_str();
+    if (NameContainsCI(p1Name, "facegen")) return true;
+    char p1Leaf[64] = "";
+    SemanticCapture::GetLeafClassName(state.parent1, p1Leaf, sizeof(p1Leaf));
+    return NameContainsCI(p1Leaf, "facegen");
+}
+
+static uint32_t PackVertexColor(uint8_t r, uint8_t g, uint8_t b, uint8_t a) {
+    return (uint32_t)r | ((uint32_t)g << 8) |
+           ((uint32_t)b << 16) | ((uint32_t)a << 24);
+}
+
+static float PaletteRowV(float scale, uint8_t rowByte) {
+    if (!(scale >= 0.0f && scale <= 2.0f)) scale = 1.0f;
+    float v = scale - 1.0f + std::pow(rowByte / 255.0f, 1.0f / 2.2f);
+    return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+static bool PaletteColorOffset(const ParsedGeometry& parsed, uint32_t& oColor) {
+    const uint64_t d = parsed.vertexDesc;
+    if ((d & (1ULL << 49)) == 0 || !parsed.vbData || parsed.vertexSize == 0)
+        return false;
+    const uint32_t szV = (uint32_t)((d >> 4) & 0xF);
+    const uint32_t shift = parsed.isDynamic ? 0u : szV;
+    oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
+    return oColor + 4 <= parsed.vertexSize;
+}
+
+static uint8_t RatioToVertexByte(uint8_t target, uint8_t base, bool& clipped) {
+    if (target >= base && base > 0) {
+        clipped = clipped || target > base;
+        return 255;
+    }
+    if (base == 0) {
+        clipped = clipped || target > 0;
+        return target > 0 ? 255 : 0;
+    }
+    return (uint8_t)((uint32_t)target * 255u / (uint32_t)base);
+}
+
+static void ApplyPaletteVertexCorrection(BSTriShape* tri,
+                                         ExtractedMesh& mesh,
+                                         const ParsedGeometry& parsed,
+                                         BSLightingShaderMaterialBase* mat,
+                                         ID3D11Device* device,
+                                         uint8_t baseRow,
+                                         uint8_t rowMin,
+                                         uint8_t rowMax,
+                                         uint32_t baseRgb)
+{
+    if (!g_config.paletteVertexCorrectionEnabled || !tri || !mat || !device)
+        return;
+    if (rowMax <= rowMin + 1)
+        return;
+
+    uint32_t oColor = 0;
+    if (!PaletteColorOffset(parsed, oColor))
+        return;
+
+    const size_t nV = (std::min)(mesh.vertices.size(), (size_t)tri->numVertices);
+    if (nV == 0)
+        return;
+
+    struct RowCorrection {
+        bool valid = false;
+        uint32_t color = 0xFFFFFFFFu;
+        bool clipped = false;
+    };
+    std::array<RowCorrection, 256> rows{};
+    const uint8_t baseR = (uint8_t)((baseRgb >> 16) & 0xFF);
+    const uint8_t baseG = (uint8_t)((baseRgb >> 8) & 0xFF);
+    const uint8_t baseB = (uint8_t)(baseRgb & 0xFF);
+    const float scale = mat->fLookupScale;
+
+    auto buildRow = [&](uint8_t row) -> RowCorrection {
+        RowCorrection rc{};
+        if (row == baseRow) {
+            rc.valid = true;
+            rc.color = 0xFFFFFFFFu;
+            return rc;
+        }
+
+        uint32_t rgb = 0xFFFFFFu;
+        const int st = BsExtraction::SampleLookupColor(
+            mat->spLookupTexture, device, 0.75f, PaletteRowV(scale, row), rgb);
+        if (st != 0)
+            return rc;
+
+        const uint8_t tr = (uint8_t)((rgb >> 16) & 0xFF);
+        const uint8_t tg = (uint8_t)((rgb >> 8) & 0xFF);
+        const uint8_t tb = (uint8_t)(rgb & 0xFF);
+        bool clipped = false;
+        const uint8_t vr = RatioToVertexByte(tr, baseR, clipped);
+        const uint8_t vg = RatioToVertexByte(tg, baseG, clipped);
+        const uint8_t vb = RatioToVertexByte(tb, baseB, clipped);
+        rc.valid = true;
+        rc.clipped = clipped;
+        rc.color = PackVertexColor(vr, vg, vb, 255);
+        return rc;
+    };
+
+    uint32_t changed = 0, clipped = 0;
+    for (size_t i = 0; i < nV; ++i) {
+        const uint8_t* c = parsed.vbData + i * parsed.vertexSize + oColor;
+        const uint8_t row = c[0];
+        RowCorrection& rc = rows[row];
+        if (!rc.valid)
+            rc = buildRow(row);
+        if (!rc.valid)
+            continue;
+        if (mesh.vertices[i].color != rc.color) {
+            mesh.vertices[i].color = rc.color;
+            ++changed;
+            if (rc.clipped) ++clipped;
+        }
+    }
+
+    static std::atomic<int> sPaletteVtxLogs{0};
+    if (changed > 0 && sPaletteVtxLogs.fetch_add(1, std::memory_order_relaxed) < 32) {
+        _MESSAGE("FO4RemixPlugin: [PaletteVCorr] shape=\"%s\" baseRow=%u "
+                 "spread=%u..%u baseRGB=%06X changed=%u/%zu clippedBright=%u",
+                 tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                 (unsigned)baseRow, (unsigned)rowMin, (unsigned)rowMax,
+                 baseRgb, changed, nV, clipped);
+    }
+}
+
+static bool IsHumanIris(const BSTriShape* tri) {
+    if (!tri) return false;
+    const char* name = tri->m_name.c_str();
+    return NameContainsCI(name, "eyeshuman") &&
+           !NameContainsCI(name, "wet") &&
+           !NameContainsCI(name, "lash");
+}
+
+static void CaptureEyeBaseTexcoords(ExtractedMesh& mesh) {
+    mesh.eyeBaseTexcoords.resize(mesh.vertices.size() * 2);
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        mesh.eyeBaseTexcoords[i * 2 + 0] = mesh.vertices[i].texcoord[0];
+        mesh.eyeBaseTexcoords[i * 2 + 1] = mesh.vertices[i].texcoord[1];
+    }
+}
+
+static void ApplyEyeUvTransform(
+    ExtractedMesh& mesh, const BSLightingShaderMaterialBase* material) {
+    if (!mesh.isAnimatedEye || !material ||
+        mesh.eyeBaseTexcoords.size() != mesh.vertices.size() * 2) {
+        return;
+    }
+
+    float offset[2] = {
+        material->textCoordOffset[0].x,
+        material->textCoordOffset[0].y,
+    };
+    float scale[2] = {
+        material->textCoordScale[0].x,
+        material->textCoordScale[0].y,
+    };
+    for (int axis = 0; axis < 2; ++axis) {
+        if (!std::isfinite(offset[axis])) offset[axis] = 0.0f;
+        if (!std::isfinite(scale[axis])) scale[axis] = 1.0f;
+        mesh.eyeUvOffset[axis] = offset[axis];
+        mesh.eyeUvScale[axis] = scale[axis];
+    }
+
+    for (size_t i = 0; i < mesh.vertices.size(); ++i) {
+        mesh.vertices[i].texcoord[0] =
+            mesh.eyeBaseTexcoords[i * 2 + 0] * scale[0] + offset[0];
+        mesh.vertices[i].texcoord[1] =
+            mesh.eyeBaseTexcoords[i * 2 + 1] * scale[1] + offset[1];
+    }
+}
+
+struct EyeRawStats {
+    bool valid = false;
+    uint32_t first[4]{};
+    uint32_t finiteCount = 0;
+    float minValue = 0.0f;
+    float maxValue = 0.0f;
+};
+
+static EyeRawStats ReadEyeRawStats(const ParsedGeometry& parsed,
+                                   uint32_t offset) {
+    EyeRawStats s{};
+    if (!parsed.vbData || offset + 4 > parsed.vertexSize ||
+        parsed.vbCount == 0) {
+        return s;
+    }
+    s.valid = true;
+    for (uint32_t i = 0; i < parsed.vbCount; ++i) {
+        uint32_t raw = 0;
+        std::memcpy(&raw, parsed.vbData +
+                    (size_t)i * parsed.vertexSize + offset, sizeof(raw));
+        if (i < 4) s.first[i] = raw;
+        float value = 0.0f;
+        std::memcpy(&value, &raw, sizeof(value));
+        if (std::isfinite(value)) {
+            if (s.finiteCount == 0) {
+                s.minValue = value;
+                s.maxValue = value;
+            } else {
+                s.minValue = (std::min)(s.minValue, value);
+                s.maxValue = (std::max)(s.maxValue, value);
+            }
+            ++s.finiteCount;
+        }
+    }
+    return s;
+}
+
+static void LogEyeVertexData(uint64_t hash, BSTriShape* tri,
+                             const ParsedGeometry& parsed,
+                             BSLightingShaderMaterialBase* mat,
+                             void* property) {
+    static std::mutex s_mx;
+    static std::unordered_set<uint64_t> s_logged;
+    {
+        std::lock_guard<std::mutex> lk(s_mx);
+        if (!s_logged.insert(hash).second) return;
+    }
+
+    const uint64_t d = parsed.vertexDesc;
+    const uint32_t attrShift =
+        parsed.isDynamic ? 0u : (uint32_t)((d >> 4) & 0xF);
+    const uint32_t eyeNibble = (uint32_t)((d >> 36) & 0xF);
+    const uint32_t descOffset = (attrShift + eyeNibble) * 4;
+    const uint32_t tailOffset =
+        parsed.vertexSize >= 4 ? parsed.vertexSize - 4 : 0;
+    const EyeRawStats descStats = ReadEyeRawStats(parsed, descOffset);
+    const EyeRawStats tailStats = ReadEyeRawStats(parsed, tailOffset);
+    const auto* prop =
+        reinterpret_cast<const BSLightingShaderProperty*>(property);
+    const uint32_t technique = prop ? prop->uiBaseTechniqueID : 0;
+
+    _MESSAGE("FO4RemixPlugin: [EyeAnim] vertex hash=%016llX shape='%s' "
+             "dyn=%d maleFlag=%d desc=%016llX stride=%u verts=%u "
+             "eyeNibble=%u descOff=%u tailOff=%u matType=%u tech=%08X "
+             "uvOff=(%.6f,%.6f;%.6f,%.6f) "
+             "uvScale=(%.6f,%.6f;%.6f,%.6f)",
+             (unsigned long long)hash,
+             tri->m_name.c_str() ? tri->m_name.c_str() : "",
+             parsed.isDynamic ? 1 : 0,
+             (d & BSGeometry::kFlag_MaleEyes) ? 1 : 0,
+             (unsigned long long)d, (unsigned)parsed.vertexSize,
+             (unsigned)parsed.vbCount, eyeNibble, descOffset, tailOffset,
+             mat ? mat->GetType() : 0, technique,
+             mat ? mat->textCoordOffset[0].x : 0.0f,
+             mat ? mat->textCoordOffset[0].y : 0.0f,
+             mat ? mat->textCoordOffset[1].x : 0.0f,
+             mat ? mat->textCoordOffset[1].y : 0.0f,
+             mat ? mat->textCoordScale[0].x : 0.0f,
+             mat ? mat->textCoordScale[0].y : 0.0f,
+             mat ? mat->textCoordScale[1].x : 0.0f,
+             mat ? mat->textCoordScale[1].y : 0.0f);
+    _MESSAGE("FO4RemixPlugin: [EyeAnim] vertexData hash=%016llX "
+             "descValid=%d descRaw=%08X,%08X,%08X,%08X "
+             "descFinite=%u descRange=(%.8g,%.8g) "
+             "tailValid=%d tailRaw=%08X,%08X,%08X,%08X "
+             "tailFinite=%u tailRange=(%.8g,%.8g)",
+             (unsigned long long)hash,
+             descStats.valid ? 1 : 0,
+             descStats.first[0], descStats.first[1],
+             descStats.first[2], descStats.first[3],
+             descStats.finiteCount, descStats.minValue, descStats.maxValue,
+             tailStats.valid ? 1 : 0,
+             tailStats.first[0], tailStats.first[1],
+             tailStats.first[2], tailStats.first[3],
+             tailStats.finiteCount, tailStats.minValue, tailStats.maxValue);
 }
 
 static void HeadDiagLog(uint64_t hash, const char* fmt, ...) {
@@ -1125,7 +1713,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                       ID3D11Device* device) {
     Resolvers::MergeProbe::Pump();  // delayed hdr re-reads; no-op when none pending
 
-    if (state.submittedToRemix) return true;
+    // Shadow-resolve door (2026-07-18 v2): the shadow-refresh polls (live-RT
+    // textures, Pip-Boy screen feed) re-run the resolver on a SUBMITTED
+    // drawable so SubmitDrawable can swap its handles in place. Without the
+    // flag this early-return made every shadow attempt a silent no-op -- the
+    // 0c0c9e7 live-refresh machinery never actually executed.
+    const bool shadowResolve =
+        state.submittedToRemix && state.shadowResolveRequested;
+    state.shadowResolveRequested = false;
+    if (state.submittedToRemix && !shadowResolve) return true;
 
     // Mark in-flight immediately so an SEH catch on an early-step crash
     // still reports the right hash.
@@ -1149,8 +1745,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     const bool isSkinned = (tri->vertexDesc & BSGeometry::kFlag_Skinned) != 0;
 
     // [HeadDiag]: identity line fires once per hash (dedup on content), then
-    // each gate below reports the first time this shape fails it.
-    const bool headDiag = HeadDiagMatch(tri, state);
+    // each gate below reports the first time this shape fails it. Gated on
+    // Diagnostics.Enabled -- the match itself is up to 3x8 case-insensitive
+    // substring scans per drawable per attempt, pure scaffolding from the
+    // (resolved) missing-FaceGen-heads investigation.
+    const bool headDiag = g_config.diagEnabled && HeadDiagMatch(tri, state);
+    // Face parts need to opt out of several prop-oriented material paths; see
+    // IsFaceGenPart and the kType_Envmap exclusion below.
+    const bool isFaceGenPart = IsFaceGenPart(state);
+    const bool isHumanIris = isFaceGenPart && IsHumanIris(tri);
     if (headDiag) {
         char leaf[64] = "?";
         SemanticCapture::GetLeafClassName(tri, leaf, sizeof(leaf));
@@ -1259,10 +1862,59 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         return false;
     }
 
-    // 1B scope: skip landscape (terrain regression accepted; Phase 5 revives).
-    if (mat->GetType() == BSLightingShaderMaterialBase::kType_Landscape) {
-        ResolverTrace::g_lastStep.store(Trace::kLandscapeSkipped, std::memory_order_relaxed);
-        if (headDiag) HeadDiagLog(hash, "GATE landscape material skip");
+    const bool isLandscape =
+        mat->GetType() == BSLightingShaderMaterialBase::kType_Landscape;
+    NiTexture* diffuseSource = mat->spDiffuseTexture;
+    NiTexture* normalSource = mat->spNormalTexture;
+    NiTexture* roughnessSource = mat->spSmoothnessSpecMaskTexture;
+    if (isLandscape) {
+        // TESObjectLAND keeps textures in the derived layer arrays; the base
+        // material slots are empty. Remix accepts one material per mesh, so
+        // restore the first authored layer and its matching maps for now.
+        auto* land = static_cast<BSLightingShaderMaterialLandscape*>(mat);
+        const uint32_t layerCount = (std::min)(land->uiNumLandscapeTextures, 3u);
+        uint32_t layer = 0;
+        while (layer < layerCount && !land->spLandscapeDiffuseTexture[layer]) {
+            ++layer;
+        }
+        if (layer < layerCount) {
+            diffuseSource = land->spLandscapeDiffuseTexture[layer];
+            normalSource = land->spLandscapeNormalTexture[layer];
+            roughnessSource = land->spLandscapeSmoothSpecTexture[layer];
+        } else {
+            diffuseSource = nullptr;
+            normalSource = nullptr;
+            roughnessSource = nullptr;
+        }
+    }
+
+    // Eye "wet" overlay (2026-07-31). FemaleEyesHumanWet / MaleEyesHumanWet is
+    // a raster-era trick: a 36-vertex shell over the eyeball carrying
+    // BSLightingShaderMaterialEnvmap with diffuse "Textures\Shared\
+    // FlatGray01_d.DDS" and vertex alpha ~50/255, which the engine draws as a
+    // near-transparent environment-mapped highlight. Submitted to a path tracer
+    // as an ordinary surface it is just a grey disc laid over the iris -- the
+    // milky, washed-out eyes reported 2026-07-31. Remix derives a corneal
+    // highlight from the eyeball's own smoothness/specular, so the shell is
+    // redundant here rather than merely mis-shaded.
+    //
+    // Off by default via [Materials] EyeWetOverlay=0. Set it to 1 to submit the
+    // shell anyway (it will read as a grey film until it is given a genuinely
+    // translucent material).
+    if (!g_config.eyeWetOverlay && isFaceGenPart &&
+        NameContainsCI(tri->m_name.c_str(), "eyes") &&
+        NameContainsCI(tri->m_name.c_str(), "wet")) {
+        // Logged independently of headDiag: the previous attempt failed
+        // silently, and HeadDiagLog's shared 160-line cap can be exhausted
+        // before the eyes resolve. This one is unconditional (capped at 8) so
+        // "did the skip actually fire" is always answerable from the log.
+        static std::atomic<int> sWetSkips{0};
+        const int wn = sWetSkips.fetch_add(1, std::memory_order_relaxed);
+        if (wn < 8) {
+            _MESSAGE("FO4RemixPlugin: [EyeWet] #%d skipped \"%s\" hash=%016llX",
+                     wn, tri->m_name.c_str() ? tri->m_name.c_str() : "",
+                     (unsigned long long)hash);
+        }
         return false;
     }
 
@@ -1295,17 +1947,22 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             // Re-sample the palette LUT from the cached row byte (the
             // histogram over the engine VB was phase-1 work); the LUT decode
             // itself is cached inside SampleLookupColor after the first hit.
-            float scale = mat->fLookupScale;
-            if (!(scale >= 0.0f && scale <= 2.0f)) scale = 1.0f;
-            float v = scale - 1.0f + std::pow(paletteRowByte / 255.0f, 1.0f / 2.2f);
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            const float scale = mat->fLookupScale;
+            const float v = PaletteRowV(scale, (uint8_t)paletteRowByte);
             uint32_t pal = 0xFFFFFFu;
             const int st = BsExtraction::SampleLookupColor(
                 mat->spLookupTexture, device, /*u=*/0.75f, v, pal);
             if (st == 1) {
-                cached->mesh = std::move(mesh);
-                state.resolveCache = std::move(cacheHolder);
+                // Same attempt cap as stashPhase1Cache: without it a LUT
+                // that never reads back keeps a full vertex copy pinned in
+                // the cache for this drawable indefinitely.
+                if (state.resolveAttempts <= kResolveCacheMaxAttempts) {
+                    cached->mesh = std::move(mesh);
+                    state.resolveCache = std::move(cacheHolder);
+                }
                 if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending (cached)");
+                ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                std::memory_order_relaxed);
                 return false;
             }
             if (st == 0) {
@@ -1324,10 +1981,33 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // ==================================================================
 
     // ---- Parse vertex / index data ----
+    // Async by default (2026-07-21, [Performance] AsyncMeshParse): the
+    // per-vertex decode was the dominant always-on game-thread cost of a
+    // resolve (the [ResolveBudget] 35ms single-item hitches). First attempt
+    // snapshots the raw VB/IB bytes here (bounded memcpy, still under the
+    // caller's SEH frame -- the only step that touches engine memory) and
+    // decodes on the mesh worker pool; the kPendingDefer fast-poll
+    // rendezvouses the finished ParsedGeometry by PassKey a tick or two
+    // later, exactly like an in-flight texture decode.
     ResolverTrace::g_lastStep.store(Trace::kParseStart, std::memory_order_relaxed);
     ParsedGeometry parsed;
-    if (!BsExtraction::ParseShapeGeometry(tri, parsed, /*logRejections=*/g_config.logRejections,
-                                          applyVertexColors, /*parseSkinning=*/isSkinned)) {
+    if (g_config.asyncMeshParse) {
+        const auto ps = BsExtraction::ParseShapeGeometryAsync(
+            tri, hash, parsed, /*logRejections=*/g_config.logRejections,
+            applyVertexColors, /*parseSkinning=*/isSkinned);
+        if (ps == BsExtraction::MeshParseStatus::kPending) {
+            ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                            std::memory_order_relaxed);
+            return false;
+        }
+        if (ps == BsExtraction::MeshParseStatus::kFailed) {
+            if (headDiag) HeadDiagLog(hash, "GATE parse FAILED (see [ParseBail])");
+            return false;
+        }
+    } else if (!BsExtraction::ParseShapeGeometry(tri, parsed,
+                                          /*logRejections=*/g_config.logRejections,
+                                          applyVertexColors,
+                                          /*parseSkinning=*/isSkinned)) {
         if (headDiag) HeadDiagLog(hash, "GATE parse FAILED (see [ParseBail])");
         return false;
     }
@@ -1348,6 +2028,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         (unsigned long long)d);
         }
         return false;
+    }
+
+    if (g_config.diagEnabled && isHumanIris) {
+        LogEyeVertexData(hash, tri, parsed, mat, state.property);
     }
 
     // [HeadDiag] geometry stats, once per hash (parsed positions include the
@@ -1446,6 +2130,22 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     mesh.hash = hash;
     mesh.vertices = std::move(parsed.vertices);
     mesh.indices  = std::move(parsed.indices);
+    if (g_config.eyeUvAnimationEnabled && isHumanIris) {
+        mesh.isAnimatedEye = true;
+        CaptureEyeBaseTexcoords(mesh);
+    }
+    // Occlusion key (engine IB identity). Merge-baked meshes take a
+    // different build path (below) and never reach here, so they keep the
+    // default 0 = exempt.
+    mesh.engineIbPtr    = parsed.engineIbPtr;
+    mesh.engineIbOffset = parsed.engineIbOffset;
+    if (isLandscape) {
+        // The terrain poll is the visibility signal. Its special draw path
+        // may never populate DrawCapture's IB map, so exempt it from that
+        // heuristic rather than aging live ground out as "occluded".
+        mesh.engineIbPtr = 0;
+        mesh.engineIbOffset = 0;
+    }
     SemanticCapture::BuildRemixTransform(tri->m_worldTransform, mesh.worldTransform);
     BsExtraction::ExtractAlphaState(tri, mesh);
 
@@ -1474,6 +2174,33 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         }
         if (propFlagsEarly & kFlag_TwoSided) {
             mesh.isTwoSided = true;
+        }
+    }
+
+    // ---- 1st-person viewmodel tag (2026-07-18) ----
+    // Descendants of PlayerCharacter::firstPersonSkeleton live in the
+    // engine's synthetic origin-local 1P space; OnFrame re-anchors them to
+    // the live camera every frame and hides them while the engine has the
+    // 1P root culled (see ExtractedMesh::isViewModel). Positive result is
+    // cached on the DrawableState -- a live geometry can't migrate between
+    // skeletons (despawn/reload replaces the pointers and the map entry).
+    if (g_config.viewModelEnabled) {
+        if (!state.isViewModel && SemanticCapture::IsViewModelGeometry(tri)) {
+            state.isViewModel = true;
+        }
+        mesh.isViewModel = state.isViewModel;
+        // Pip-Boy screen feed target (2026-07-18 v2): the 1P "Screen:0"
+        // leaf is the display surface the engine paints the Scaleform UI
+        // onto via a draw the capture pipeline never sees ([LiveTex]
+        // silent). Tag it so the feed override below can replace its
+        // textures with the captured UI layer.
+        if (g_config.pipboyScreenFeed && state.isViewModel &&
+            !state.isPipboyScreen) {
+            const char* nm = tri->m_name.c_str();
+            if (nm && strcmp(nm, "Screen:0") == 0) {
+                state.isPipboyScreen = true;
+                SemanticCapture::RegisterPipboyScreenDrawable(hash);
+            }
         }
     }
 
@@ -1552,6 +2279,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // Skinned-key side index (Tick's live app-culled refresh + OnFrame's
         // hidden-geometry skip -- hair-under-hats, 2026-07-08).
         state.isSkinnedActor = true;
+        state.faceMorphWatch = tri->GetAsBSDynamicTriShape() != nullptr;
+        mesh.isFaceGenDynamic = state.faceMorphWatch;
         // [FaceAnim] expressions probe: track the first facegen head's bone
         // motion (heads carry ~10 bones; eyes/mouths only 1).
         if (headDiag && tri->GetAsBSDynamicTriShape() && boneCount >= 8) {
@@ -1645,7 +2374,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // [Materials] MetalMetallicEnabled / MetalRoughnessEnabled, default OFF;
     // when off, materials keep the legacy constants (metallic 0, rough 0.8).
     // (albedoLumFloor is declared at function scope for the retry cache.)
-    if (g_config.metalConversionEnabled &&
+    // FaceGen parts are excluded: eyeballs and their wet overlay report
+    // kType_Envmap (==1) exactly like a power-armor stand, so they were being
+    // run through a conversion meant for painted metal. The damage was the
+    // albedo luminance floor -- AlbedoLumFloor_Apply multiplies sub-floor
+    // pixels by up to 6x with per-channel clamping, then neutral-fills what is
+    // still too dark. On an iris that blows the saturated darks toward white
+    // (the brightest channel clamps first, destroying the hue ratio) and turns
+    // the pupil flat grey: the "white iris" symptom, 2026-07-31.
+    if (g_config.metalConversionEnabled && !isFaceGenPart &&
         mat->GetType() == BSLightingShaderMaterialBase::kType_Envmap) {
         float smooth = mat->fSmoothness;
         if (smooth < 0.0f) smooth = 0.0f;
@@ -1684,7 +2421,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     }
 
     // ---- [WindDiag] inside-out investigation (2026-07-08) ----
-    LogWindingDiag(tri, mesh, parsed, mat, propFlagsEarly, state);
+    // Gated on Diagnostics.Enabled: the parity pass inside walks every
+    // triangle of the first N shapes, all during the heaviest cell load
+    // (and the inside-out root cause was found -- b112e08).
+    if (g_config.diagEnabled) {
+        LogWindingDiag(tri, mesh, parsed, mat, propFlagsEarly, state);
+    }
 
     // ---- Skin / hair tint (2026-07-08 broken-NPC-colors fix) ----
     // FO4 authors unpigmented/grayscale diffuse maps for tinted body parts and
@@ -1819,7 +2561,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 const uint32_t oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
                 if (oColor + 4 <= parsed.vertexSize) {
                     uint32_t histo[256] = {};
-                    const size_t nV = tri->numVertices;
+                    // vbCount, not tri->numVertices: vbData is the parse-time
+                    // COPY (async parse), sized for the snapshot's count.
+                    const size_t nV = parsed.vbCount;
                     for (size_t i = 0; i < nV; ++i) {
                         const uint8_t r = parsed.vbData[i * parsed.vertexSize + oColor];
                         ++histo[r];
@@ -1830,6 +2574,10 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                     for (uint32_t b = 0; b < 256; ++b)
                         if (histo[b] > best) { best = histo[b]; rowByte = (uint8_t)b; }
                 }
+            }
+            if (rowMax < rowMin) {
+                rowMin = rowByte;
+                rowMax = rowByte;
             }
             // GrayscaleToPaletteScale = fLookupScale (material+0xB8, F4SE
             // NiMaterials.h). The BGSM survey proves it's the load-bearing
@@ -1843,33 +2591,27 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             paletteBranch  = true;
             paletteRowByte = rowByte;
             float scale = mat->fLookupScale;
-            if (!(scale >= 0.0f && scale <= 2.0f)) scale = 1.0f;
-            float v = scale - 1.0f + std::pow(rowByte / 255.0f, 1.0f / 2.2f);
-            v = v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+            float v = PaletteRowV(scale, (uint8_t)rowByte);
             uint32_t pal = 0xFFFFFFu;
             const int st = BsExtraction::SampleLookupColor(
                 mat->spLookupTexture, device, /*u=*/0.75f, v, pal);
             if (st == 1) {
                 // LUT not read back yet -- retry like any pending texture.
-                // Stash phase-1 so the retry skips the parse (mesh is fully
-                // built at this point; diffuseTint is still the pre-palette
-                // 0xFFFFFF because the tint branches are exclusive).
-                if (state.resolveAttempts <= kResolveCacheMaxAttempts) {
-                    auto rc = std::make_shared<ResolveCache>();
-                    rc->mesh           = std::move(mesh);
-                    rc->albedoLumFloor = albedoLumFloor;
-                    rc->diffuseTint    = 0xFFFFFFu;
-                    rc->paletteBranch  = true;
-                    rc->paletteRowByte = rowByte;
-                    state.resolveCache = std::move(rc);
-                }
+                // Do not stash phase 1 here: per-vertex correction still
+                // needs the raw color stream when the LUT becomes readable.
+                // The retry reparses and may cache at a later texture gate.
                 if (headDiag) HeadDiagLog(hash, "GATE palette LUT pending");
+                ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                std::memory_order_relaxed);
                 return false;
             }
             if (st == 0) {
                 diffuseTint = pal;                   // fallback (BC7 diffuse)
                 paletteLut  = mat->spLookupTexture;  // per-pixel engine remap
                 paletteRowV = v;
+                ApplyPaletteVertexCorrection(tri, mesh, parsed, mat, device,
+                                             (uint8_t)rowByte, (uint8_t)rowMin,
+                                             (uint8_t)rowMax, pal);
             }
             static std::atomic<int> sGtpLogs{0};
             if (sGtpLogs.fetch_add(1, std::memory_order_relaxed) < 24) {
@@ -1901,7 +2643,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     {
         const uint64_t d = parsed.vertexDesc;
         const bool hasColorStream = (d & (1ULL << 49)) != 0;
-        if (hasColorStream && parsed.vbData && parsed.vertexSize > 0) {
+        if (g_config.diagEnabled &&
+            hasColorStream && parsed.vbData && parsed.vertexSize > 0) {
             const uint32_t szV = (uint32_t)((d >> 4) & 0xF);
             const uint32_t shift = parsed.isDynamic ? 0u : szV;
             const uint32_t oColor = (shift + (uint32_t)((d >> 24) & 0xF)) * 4;
@@ -1918,9 +2661,9 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 }
                 if (first) {
                     // parsed.vertices was std::move'd into mesh.vertices
-                    // above -- use the shape's own count and read raw colors
-                    // straight from the (still-valid) engine VB pointer.
-                    const size_t nV = tri->numVertices;
+                    // above -- vbCount is the count vbData (the parse-time
+                    // copy, async-parse safe) was sized for.
+                    const size_t nV = parsed.vbCount;
                     uint32_t sr = 0, sg = 0, sb = 0, sa = 0;
                     uint8_t mnr = 255, mng = 255, mnb = 255;
                     for (size_t i = 0; i < nV; ++i) {
@@ -1955,7 +2698,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // ==================================================================
     }
 
-    std::vector<ExtractedTexture> newTextures;
+    TextureSupply newTextures;
     // For alpha-tested or alpha-blended geometry: synthesize alpha from RGB
     // luminance if the diffuse is BC1 (no alpha channel). BGS LOD foliage
     // atlases are stored as BC1; vanilla DX11's rasterizer hides the lack of
@@ -2024,12 +2767,15 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // below runs only on the attempt that submits.
     bool pendDiffuse = false, pendNormal = false, pendRough = false,
          pendEmissive = false;
+    // Live-RT detection window: any extraction below that sees an RT-backed
+    // source sets the sticky flag; checked after the supply pass.
+    BsExtraction::ResetLiveRTFlag();
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
+        diffuseSource, "diffuse", device, newTextures, diffusePostProcess,
         /*minRoughness=*/0, albedoLumFloor, diffuseTint, paletteLut, paletteRowV,
         &pendDiffuse, /*supplyPixels=*/false);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral,
+        normalSource, "normal", device, newTextures, TexturePostProcess::Octahedral,
         /*minRoughness=*/0, /*albedoLumFloor=*/0, /*tintRGB=*/0xFFFFFFu,
         /*paletteLut=*/nullptr, /*paletteRowV=*/0.0f,
         &pendNormal, /*supplyPixels=*/false);
@@ -2053,7 +2799,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         roughnessFloor =
             mesh.isDecal ? (std::max)(cfgFloor, (uint8_t)76) : cfgFloor;
         mesh.roughnessTextureHash = BsExtraction::ExtractMaterialTexture(
-            mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures,
+            roughnessSource, "roughness", device, newTextures,
             TexturePostProcess::InvertRGB, roughnessFloor,
             /*albedoLumFloor=*/0, /*tintRGB=*/0xFFFFFFu,
             /*paletteLut=*/nullptr, /*paletteRowV=*/0.0f,
@@ -2064,11 +2810,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             mesh.roughnessConstantOverride = -1.0f;
         }
     }
-    BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
-                                      mesh.emissiveTextureHash,
-                                      mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
-                                      mesh.emissiveIntensity,
-                                      &pendEmissive, /*supplyPixels=*/false);
+    if (!isLandscape) {
+        BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
+                                          mesh.emissiveTextureHash,
+                                          mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
+                                          mesh.emissiveIntensity,
+                                          &pendEmissive, /*supplyPixels=*/false);
+    }
 
     // Any slot still in the async pipeline: retry next tick. Cheap -- the
     // probe made no copies, and the phase-1 stash skips the re-parse.
@@ -2079,6 +2827,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         pendDiffuse ? 1 : 0, pendNormal ? 1 : 0,
                         pendRough ? 1 : 0, pendEmissive ? 1 : 0);
         }
+        ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                        std::memory_order_relaxed);
         return false;
     }
 
@@ -2087,7 +2837,7 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     if (mesh.diffuseTextureHash == 0) {
         stashPhase1Cache();
         if (headDiag) {
-            NiTexture* dt = mat->spDiffuseTexture;
+            NiTexture* dt = diffuseSource;
             HeadDiagLog(hash,
                         "GATE noDiffuse: matType=%u tex=%p name=\"%s\" -- retry",
                         (unsigned)mat->GetType(), (void*)dt,
@@ -2102,25 +2852,78 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // into newTextures -- exactly once, on this submitting attempt. Pure
     // cache hits: no readback, no decode, identical hashes.
     mesh.diffuseTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spDiffuseTexture, "diffuse", device, newTextures, diffusePostProcess,
+        diffuseSource, "diffuse", device, newTextures, diffusePostProcess,
         /*minRoughness=*/0, albedoLumFloor, diffuseTint, paletteLut, paletteRowV);
     mesh.normalTextureHash = BsExtraction::ExtractMaterialTexture(
-        mat->spNormalTexture, "normal", device, newTextures, TexturePostProcess::Octahedral);
+        normalSource, "normal", device, newTextures, TexturePostProcess::Octahedral);
     if (g_config.roughnessMapsEnabled) {
         mesh.roughnessTextureHash = BsExtraction::ExtractMaterialTexture(
-            mat->spSmoothnessSpecMaskTexture, "roughness", device, newTextures,
+            roughnessSource, "roughness", device, newTextures,
             TexturePostProcess::InvertRGB, roughnessFloor);
         if (mesh.roughnessTextureHash != 0) {
             mesh.roughnessConstantOverride = -1.0f;
         }
     }
-    BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
-                                      mesh.emissiveTextureHash,
-                                      mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
-                                      mesh.emissiveIntensity);
+    if (!isLandscape) {
+        BsExtraction::ExtractEmissiveData(tri, mat, device, newTextures,
+                                          mesh.emissiveTextureHash,
+                                          mesh.emissiveColorR, mesh.emissiveColorG, mesh.emissiveColorB,
+                                          mesh.emissiveIntensity);
+    }
+
+    // ---- Pip-Boy screen feed override (2026-07-18 v2) ----
+    // Replace the tagged Screen:0 drawable's diffuse AND emissive with the
+    // captured Scaleform UI layer (display-ready: tinted, composited over
+    // black). The mesh's own UVs are the engine's mapping for exactly this
+    // content, so no geometry work is needed. Forced opaque + emissive so
+    // the UI reads like a lit screen instead of dark glass. The fed seq is
+    // recorded on the DrawableState only at submit success (below) so a
+    // failed submit retries on the next refresh tick.
+    uint64_t pipboyFeedSeqUsed = 0;
+    if (state.isPipboyScreen && g_config.pipboyScreenFeed) {
+        auto feed = SemanticCapture::GetPipboyScreenFeedTexture();
+        if (feed) {
+            mesh.diffuseTextureHash  = feed->hash;
+            mesh.emissiveTextureHash = feed->hash;
+            mesh.emissiveColorR = 1.0f;
+            mesh.emissiveColorG = 1.0f;
+            mesh.emissiveColorB = 1.0f;
+            mesh.emissiveIntensity = g_config.pipboyScreenEmissiveScale;
+            mesh.alphaBlendEnabled = false;
+            mesh.alphaTestEnabled  = false;
+            newTextures.push_back(feed);
+            pipboyFeedSeqUsed = SemanticCapture::PipboyScreenFeedSeq();
+            static std::atomic<int> sPipFeedLogs{0};
+            if (sPipFeedLogs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                _MESSAGE("FO4RemixPlugin: [PipFeed] feeding UI %ux%u seq=%llu "
+                         "onto Screen:0 (shadow=%d)",
+                         feed->width, feed->height,
+                         (unsigned long long)pipboyFeedSeqUsed,
+                         shadowResolve ? 1 : 0);
+            }
+        }
+    }
 
     // Textures resolved: the phase-1 cache (if any) is consumed by this
     // attempt; cacheHolder frees it at return.
+
+    // Live-RT texture tag (2026-07-18 Pip-Boy screen): the Tick poll
+    // shadow-refreshes this drawable so the runtime texture tracks the
+    // engine's compositing target instead of freezing the first capture.
+    // (Plain shapes only: a merge-instanced drawable's re-submit path
+    // appends instance extras, which the in-place replace doesn't reconcile
+    // -- and no precombine cluster has an RT-backed texture anyway.)
+    if (BsExtraction::LastExtractionSawLiveRT() && !state.hasLiveTexture &&
+        state.mergeLeafKind != 1) {
+        state.hasLiveTexture = true;
+        static std::atomic<int> sLiveTexTagLogs{0};
+        if (sLiveTexTagLogs.fetch_add(1, std::memory_order_relaxed) < 8) {
+            _MESSAGE("FO4RemixPlugin: [LiveTex] drawable hash=%016llX \"%s\" "
+                     "has a live RT texture -- shadow refresh armed",
+                     (unsigned long long)hash,
+                     tri->m_name.c_str() ? tri->m_name.c_str() : "");
+        }
+    }
 
     ResolverTrace::g_lastStep.store(Trace::kTexturesExtracted, std::memory_order_relaxed);
 
@@ -2175,12 +2978,31 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     uint32_t t7GS = 0;
     bool t7Valid = false;
     if (g_config.mergeInstanceExpansion && g_config.gpuInstancingEnabled) {
-        char instLeaf[64] = "";
-        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
-                                          instLeaf, sizeof(instLeaf));
-        if (std::strstr(instLeaf, "MergeInstanced") != nullptr) {
+        // Classify once per drawable (state.mergeLeafKind caches the RTTI
+        // walk + substring scan; retrying drawables used to re-pay it every
+        // attempt).
+        if (state.mergeLeafKind < 0) {
+            char instLeaf[64] = "";
+            SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
+                                              instLeaf, sizeof(instLeaf));
+            state.mergeLeafKind =
+                (std::strstr(instLeaf, "MergeInstanced") != nullptr) ? 1 : 0;
+        }
+        if (state.mergeLeafKind == 1) {
+            bool recPending = false;
             const bool got = ReadMergeInstanceRecords(tri, instRecords,
-                                                      &instBufPtr, &instSrvPtr);
+                                                      &instBufPtr, &instSrvPtr,
+                                                      &recPending);
+            if (recPending) {
+                // Record readback in flight (async slice): defer the whole
+                // resolve like a not-yet-decoded texture. Falling back here
+                // instead would submit the single-draw path and lose the
+                // instance expansion permanently.
+                stashPhase1Cache();
+                ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                std::memory_order_relaxed);
+                return false;
+            }
             if (got) {
                 uint64_t segQ[2] = {};
                 if (PeekQwordsGuarded(reinterpret_cast<const void*>(
@@ -2384,11 +3206,13 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             }
                             std::vector<uint8_t> tBytes;
                             const uint32_t want = nGroups * 2;
-                            const bool readOk =
-                                ReadbackBufferSlice(tBuf, tFE * elemSize,
-                                                    want, tBytes) == want;
+                            const SliceStatus tSt = ReadbackBufferSliceAsync(
+                                tBuf, tBuf, tFE * elemSize, want, tBytes);
                             tBuf->Release();
-                            if (!readOk) { rej = "tReadback"; break; }
+                            if (tSt == SliceStatus::kPending) {
+                                t7Defer = true; rej = "tReadPend"; break;
+                            }
+                            if (tSt != SliceStatus::kReady) { rej = "tReadback"; break; }
                             T.resize(nGroups);
                             std::memcpy(T.data(), tBytes.data(), want);
                             haveT = true;
@@ -2440,15 +3264,21 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                         t7Valid = true;
                     } while (false);
                     if (t7Defer && state.mergeT7Deferrals < 240) {
-                        // Transient by definition (pending-upload counter);
-                        // retry the whole resolve next tick. No log line:
-                        // deferrals would burn the capped counters and hide
-                        // the real OK/REJECT population. Bounded (~4s of
-                        // ticks) because +0x44 is only proven for the
-                        // bake-path wrapper -- junk that never clears must
-                        // fall through to the capture/fallback chain, not
-                        // hide the shape forever.
+                        // Transient by definition (pending-upload counter or
+                        // an async table readback in flight); retry the
+                        // whole resolve next tick. No log line: deferrals
+                        // would burn the capped counters and hide the real
+                        // OK/REJECT population. Bounded (~4s of ticks)
+                        // because +0x44 is only proven for the bake-path
+                        // wrapper -- junk that never clears must fall
+                        // through to the capture/fallback chain, not hide
+                        // the shape forever. Stash phase-1 so each deferral
+                        // tick skips the re-parse (pre-2026-07-13 this
+                        // burned a full parse per deferred tick).
                         ++state.mergeT7Deferrals;
+                        stashPhase1Cache();
+                        ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                        std::memory_order_relaxed);
                         return false;
                     }
                     static std::atomic<int> sT7Logs{0};
@@ -2502,6 +3332,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                            (uint32_t)instRecords.size(),
                                            instSegTris, capPeek) ==
                         DrawCapture::kCapturing) {
+                        // Stash phase-1 so the per-tick capture polls skip
+                        // the re-parse (pre-2026-07-13 every kCapturing
+                        // deferral re-paid the full parse).
+                        stashPhase1Cache();
+                        ResolverTrace::g_lastStep.store(Trace::kPendingDefer,
+                                                        std::memory_order_relaxed);
                         return false;
                     }
                 }
@@ -2587,7 +3423,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             // or wild UVs -> (b).
             {
                 static std::atomic<int> sVtxLogs{0};
-                const int vn = sVtxLogs.fetch_add(1, std::memory_order_relaxed);
+                const int vn = g_config.diagEnabled
+                    ? sVtxLogs.fetch_add(1, std::memory_order_relaxed) : 150;
                 if (vn < 150 && !mesh.vertices.empty()) {
                     uint32_t rMin = 255, rMax = 0;
                     uint64_t rSum = 0, gSum = 0, bSum = 0, aSum = 0;
@@ -2635,6 +3472,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
             }
         }
     }
+
+    // FO4's human-eye shader pans the iris texture by mutating the material's
+    // UV transform. Bake the latest value immediately before submission so a
+    // texture-readback retry cannot install the stale transform captured when
+    // the geometry was first parsed.
+    ApplyEyeUvTransform(mesh, mat);
 
     // ---- Submit to Remix ----
     ResolverTrace::g_lastStep.store(Trace::kSubmitStart, std::memory_order_relaxed);
@@ -2845,7 +3688,6 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                                            (uint32_t)instRecords.size(),
                                            instSegTris, cap) ==
                         DrawCapture::kReady) {
-                        const uint32_t rc = (uint32_t)instRecords.size();
                         // ---- Baked-mesh rebuild (take 10) ----
                         // Preferred: replace our parsed source mesh with
                         // the engine's own baked expanded geometry (see
@@ -2859,9 +3701,21 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             std::vector<remixapi_HardcodedVertex> bv;
                             std::vector<uint32_t> bi;
                             int keptChunks = 0;
-                            if (BuildMeshFromChunks(tri, chunks, nChunks, hash,
-                                                    instRecords, mesh.vertices,
-                                                    bv, bi, keptChunks)) {
+                            const BakeStatus bs = BuildMeshFromChunks(
+                                tri, chunks, nChunks, hash,
+                                instRecords, mesh.vertices,
+                                bv, bi, keptChunks);
+                            if (bs == BakeStatus::kPending) {
+                                // Slice copies issued/in flight; re-enter
+                                // next tick with the phase-1 cache so the
+                                // retry skips the parse.
+                                stashPhase1Cache();
+                                ResolverTrace::g_lastStep.store(
+                                    Trace::kPendingDefer,
+                                    std::memory_order_relaxed);
+                                return false;
+                            }
+                            if (bs == BakeStatus::kOk) {
                                 mesh.vertices = std::move(bv);
                                 mesh.indices = std::move(bi);
                                 instRecords.clear();
@@ -2884,80 +3738,41 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                             }
                         }
                         if (!bakedMesh) {
-                        // Only the DrawIndexed capture is trusted; kind-0
-                        // (DrawIndexedInstanced) entries were only ever
-                        // stray leftover-binding draws.
-                        std::vector<DrawCapture::SegDraw> uniq;
-                        for (const auto& d : cap) {
-                            if (d.kind == 1) uniq.push_back(d);
-                        }
-                        bool ok = !uniq.empty() && uniq.size() <= 8;
-                        uint32_t base = UINT32_MAX;
-                        uint64_t total = 0;
-                        for (const auto& d : uniq) {
-                            if (d.startIndex < base) base = d.startIndex;
-                            total += d.instanceCount;
-                        }
-                        const uint32_t k =
-                            (ok && rc && total % rc == 0) ? (uint32_t)(total / rc) : 0;
-                        ok = ok && k >= 1;
-                        SegDraw capSegs[8];
-                        int nCapSegs = 0;
-                        if (ok) {
-                            std::sort(uniq.begin(), uniq.end(),
-                                      [](const DrawCapture::SegDraw& a,
-                                         const DrawCapture::SegDraw& b) {
-                                          return a.order < b.order;
-                                      });
-                            uint32_t recCursor = 0;
-                            for (const auto& d : uniq) {
-                                const uint32_t rel = d.startIndex - base;
-                                if (d.instanceCount % k != 0 ||
-                                    rel % 3 != 0 || d.indexCount == 0 ||
-                                    d.indexCount % 3 != 0 ||
-                                    (uint64_t)rel + d.indexCount >
-                                        mesh.indices.size()) {
-                                    ok = false;
-                                    break;
-                                }
-                                const uint32_t recCount = d.instanceCount / k;
-                                capSegs[nCapSegs++] = { rel / 3, d.indexCount / 3,
-                                                        recCursor, recCount };
-                                recCursor += recCount;
+                            // Chunk bake failed validation. The SegDraw
+                            // partition rebuild that used to run here was
+                            // dead code: draw-time SegDraw sampling was
+                            // removed 2026-07-04, so Query's out is always
+                            // empty and the path could never validate -- it
+                            // only ever routed into Rearm. Rearm wipes the
+                            // accumulated union (a failed bake means it held
+                            // garbage) and re-arms for a fresh capture, up
+                            // to its budget; past the budget it poisons the
+                            // watch so the fallback below stops the
+                            // release/re-resolve churn.
+                            static std::atomic<int> sBakeRearmLogs{0};
+                            const int brn = sBakeRearmLogs.fetch_add(
+                                1, std::memory_order_relaxed);
+                            if (brn < 24) {
+                                _MESSAGE("FO4RemixPlugin: [MergeBake] REARM #%d "
+                                         "hash=0x%llX chunks=%d failed "
+                                         "validation -- recapturing",
+                                         brn, (unsigned long long)hash, nChunks);
                             }
-                            ok = ok && recCursor == rc;
-                        }
-                        static std::atomic<int> sDrawLogs{0};
-                        const int dn = sDrawLogs.fetch_add(1, std::memory_order_relaxed);
-                        if (dn < 24) {
-                            char list[512];
-                            size_t pos = 0;
-                            list[0] = 0;
-                            for (size_t i = 0; i < cap.size() && i < 10; ++i) {
-                                const auto& d = cap[i];
-                                const int wln = snprintf(list + pos, sizeof(list) - pos,
-                                    "%s[k%u idx %u+%u n%u bv%d]", i ? " " : "",
-                                    d.kind, d.startIndex, d.indexCount,
-                                    d.instanceCount, d.baseVertex);
-                                if (wln <= 0 || (size_t)wln >= sizeof(list) - pos) break;
-                                pos += (size_t)wln;
+                            // Drop the slice cache: the failed bake's bytes
+                            // are cached by identity, and the recaptured
+                            // chunks usually carry the SAME identities -- a
+                            // retry must re-read the live pool (the failure
+                            // may be stale pool content), not be re-fed the
+                            // cached garbage. Other in-flight shapes just
+                            // reissue their copies next tick.
+                            ResetSliceCache();
+                            if (DrawCapture::Rearm(hash)) {
+                                stashPhase1Cache();
+                                ResolverTrace::g_lastStep.store(
+                                    Trace::kPendingDefer,
+                                    std::memory_order_relaxed);
+                                return false;
                             }
-                            _MESSAGE("FO4RemixPlugin: [MergeDraw] #%d hash=0x%llX "
-                                     "raw=%zu uniq=%zu rc=%u meshTris=%u base=%u "
-                                     "passes=%u ok=%d %s",
-                                     dn, (unsigned long long)hash, cap.size(),
-                                     uniq.size(), rc, meshTris, base, k,
-                                     ok ? 1 : 0, list);
-                        }
-                        if (ok) {
-                            for (int c = 0; c < nCapSegs; ++c) {
-                                segs[nSegs++] = capSegs[c];
-                            }
-                        } else if (DrawCapture::Rearm(hash)) {
-                            // Bad frame (partial shadow set, LOD mix):
-                            // capture another one before giving up.
-                            return false;
-                        }
                         }
                     }
                 }
@@ -3070,7 +3885,12 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // on backface culling for these). Until the [MergeWind] stats below
         // justify a per-triangle normal-matched re-flip, double-sided is
         // the vanilla-faithful choice; scope is merge shapes only.
-        mesh.isTwoSided = true;
+        // [Performance] MergeTwoSided=0 is the single-sided experiment: the
+        // 2026-07-07 inside-out evidence predated the b112e08 batched-base
+        // mirror fix, which may have been the real culprit -- single-sided
+        // merges (with the per-instance det flip below re-enabled) would be
+        // a real path-tracing perf win if the content winding holds up.
+        mesh.isTwoSided = g_config.mergeTwoSided;
         // [MergeWind] winding-vs-normals stats: fraction of sampled
         // triangles whose geometric normal (current winding) OPPOSES the
         // authored vertex normals. ~0 or ~1 per shape = consistent content
@@ -3078,7 +3898,8 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
         // mid-range = mixed within one mesh.
         {
             static std::atomic<int> sWindLogs{0};
-            if (sWindLogs.load(std::memory_order_relaxed) < 40 &&
+            if (g_config.diagEnabled &&
+                sWindLogs.load(std::memory_order_relaxed) < 40 &&
                 !mesh.indices.empty()) {
                 const size_t nTri = mesh.indices.size() / 3;
                 const size_t step = nTri > 200 ? nTri / 200 : 1;
@@ -3173,17 +3994,24 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
                 // triangles re-flipped or its single-sided faces cull
                 // inward (Vault 111 walls). Toggle in place; the content
                 // hash covers indices, so flipped instances get their own
-                // mesh/BLAS bucket.
-                const float detC =
-                    comp[0] * (comp[5] * comp[10] - comp[6] * comp[9]) -
-                    comp[1] * (comp[4] * comp[10] - comp[6] * comp[8]) +
-                    comp[2] * (comp[4] * comp[9]  - comp[5] * comp[8]);
-                const bool needFlip = detC < 0.0f;
-                if (needFlip != meshWindingFlipped) {
-                    for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
-                        std::swap(mesh.indices[t + 1], mesh.indices[t + 2]);
+                // mesh/BLAS bucket. SKIPPED while the merge renders two-
+                // sided (2026-07-10): under double-sided rendering the flip
+                // is visually a no-op, but it still burned O(indices) swaps
+                // per det-sign change and split otherwise-identical
+                // instances into two BLAS/instancing buckets -- defeating
+                // the sharing the merge path exists to provide.
+                if (!mesh.isTwoSided) {
+                    const float detC =
+                        comp[0] * (comp[5] * comp[10] - comp[6] * comp[9]) -
+                        comp[1] * (comp[4] * comp[10] - comp[6] * comp[8]) +
+                        comp[2] * (comp[4] * comp[9]  - comp[5] * comp[8]);
+                    const bool needFlip = detC < 0.0f;
+                    if (needFlip != meshWindingFlipped) {
+                        for (size_t t = 0; t + 2 < mesh.indices.size(); t += 3) {
+                            std::swap(mesh.indices[t + 1], mesh.indices[t + 2]);
+                        }
+                        meshWindingFlipped = needFlip;
                     }
-                    meshWindingFlipped = needFlip;
                 }
                 // Raw buffer instead of `NiTransform xf;`: f4se_minimal
                 // declares but does not define NiPoint3's default ctor, so
@@ -3231,8 +4059,23 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     }
     ResolverTrace::g_lastStep.store(Trace::kSubmitOK, std::memory_order_relaxed);
 
+    if (mesh.isAnimatedEye && mesh.hasSkinning) {
+        SkinnedMeshes::RegisterEyeAnimation(
+            hash, tri, state.property, mat, mat->GetType(),
+            g_config.diagEnabled);
+    }
+
     // Update DrawableState to mark submission and track refcount targets.
     state.submittedToRemix = true;
+    // A completed submit finishes any live-texture shadow refresh cycle
+    // (in-place handle swap already happened inside SubmitDrawable).
+    state.liveTexRefreshInFlight = false;
+    state.liveTexRefreshAttempts = 0;
+    // Pip-Boy screen feed: this submit carries the fed UI frame; stop the
+    // refresh polls until a newer feed arrives.
+    if (pipboyFeedSeqUsed != 0) {
+        state.pipboyFeedSeqSubmitted = pipboyFeedSeqUsed;
+    }
     state.meshHash = hash;
     if (headDiag) {
         HeadDiagLog(hash, "SUBMITTED skinned=%d bones=%u diffuse=%016llX matType=%u",
@@ -3246,99 +4089,109 @@ bool TryResolveStatic(SemanticCapture::DrawableState& state,
     // For 1B, ReleaseDrawable looks up by `hash` and finds the materialHash
     // via g_drawables, so leaving state.materialHash at 0 is fine -- the
     // refcount cleanup goes through g_drawables anyway.
-    // LOD-overlap diagnostic (2026-04-28): include geometry name, the
-    // static IsMeshLOD bit (from initialFlags captured on first-seen),
-    // the live flag word at submit time, technique flag from the hook
-    // arg, world position, and the parent NiNode chain (2 levels up,
-    // captured in the detour). Parent reads are guarded by null checks;
-    // the resolver is wrapped in SEH at the caller, so a stale parent
-    // pointer that survived freshness gating gets caught upstream.
-    const char* meshName = obj->m_name.c_str();
-    const bool  isLOD = ((state.initialFlags >> 12) & 1ULL) != 0;
+    // Per-submission diagnostic, gated on [Logging] LogShapeInfo (2026-07-10;
+    // it was unconditional -- the one hot-path log with no throttle. A cell
+    // attach resolves hundreds of statics in one burst on the game thread,
+    // each paying an RTTI walk + raw engine reads + a ~30-arg _MESSAGE, all
+    // competing with the resolve time budget).
+    if (g_config.logShapeInfo) {
+        // LOD-overlap diagnostic (2026-04-28): include geometry name, the
+        // static IsMeshLOD bit (from initialFlags captured on first-seen),
+        // the live flag word at submit time, technique flag from the hook
+        // arg, world position, and the parent NiNode chain (2 levels up,
+        // captured in the detour). Parent reads are guarded by null checks;
+        // the resolver is wrapped in SEH at the caller, so a stale parent
+        // pointer that survived freshness gating gets caught upstream.
+        const char* meshName = obj->m_name.c_str();
+        const bool  isLOD = ((state.initialFlags >> 12) & 1ULL) != 0;
 
-    const char* p1Name = "";
-    uint64_t    p1Flags = 0;
-    const char* p2Name = "";
-    uint64_t    p2Flags = 0;
-    if (state.parent1) {
-        auto* pn = static_cast<NiAVObject*>(state.parent1);
-        const char* n = pn->m_name.c_str();
-        p1Name = n ? n : "";
-        p1Flags = pn->flags;
-    }
-    if (state.parent2) {
-        auto* pn = static_cast<NiAVObject*>(state.parent2);
-        const char* n = pn->m_name.c_str();
-        p2Name = n ? n : "";
-        p2Flags = pn->flags;
-    }
+        const char* p1Name = "";
+        uint64_t    p1Flags = 0;
+        const char* p2Name = "";
+        uint64_t    p2Flags = 0;
+        if (state.parent1) {
+            auto* pn = static_cast<NiAVObject*>(state.parent1);
+            const char* n = pn->m_name.c_str();
+            p1Name = n ? n : "";
+            p1Flags = pn->flags;
+        }
+        if (state.parent2) {
+            auto* pn = static_cast<NiAVObject*>(state.parent2);
+            const char* n = pn->m_name.c_str();
+            p2Name = n ? n : "";
+            p2Flags = pn->flags;
+        }
 
-    // Alpha-test diagnostic (2026-04-29): emit material type, BSShaderProperty
-    // shader-flags, and the contents of geo->effectState (the NiAlphaProperty
-    // slot at offset 0x130 on BSGeometry per f4se BSGeometry.h). For foliage
-    // drawables that render as solid alpha cards, we want to know which
-    // alpha-test signal source the engine is using -- NiAlphaProperty (geo
-    // level), BSLightingShaderProperty::flags (shader level), or BSLighting-
-    // ShaderMaterialBase fields (material level, requires GetType discriminator).
-    const uint32_t matType = mat ? mat->GetType() : 0xFFFFFFFFu;
-    uint64_t       propFlags = 0;
-    if (state.property) {
-        propFlags = *reinterpret_cast<uint64_t*>(
-            reinterpret_cast<uintptr_t>(state.property) + 0x30);
-    }
-    void*    effectState     = *reinterpret_cast<void**>(
-        reinterpret_cast<uintptr_t>(tri) + 0x130);
-    uint16_t alphaFlags      = 0;
-    uint8_t  alphaThreshold  = 0;
-    if (effectState) {
-        alphaFlags     = *reinterpret_cast<uint16_t*>(
-            reinterpret_cast<uintptr_t>(effectState) + 0x28);
-        alphaThreshold = *reinterpret_cast<uint8_t*>(
-            reinterpret_cast<uintptr_t>(effectState) + 0x2A);
-    }
+        // Alpha-test diagnostic (2026-04-29): emit material type,
+        // BSShaderProperty shader-flags, and the contents of geo->effectState
+        // (the NiAlphaProperty slot at offset 0x130 on BSGeometry per f4se
+        // BSGeometry.h). For foliage drawables that render as solid alpha
+        // cards, we want to know which alpha-test signal source the engine is
+        // using -- NiAlphaProperty (geo level), BSLightingShaderProperty::
+        // flags (shader level), or BSLightingShaderMaterialBase fields
+        // (material level, requires GetType discriminator).
+        const uint32_t matType = mat ? mat->GetType() : 0xFFFFFFFFu;
+        uint64_t       propFlags = 0;
+        if (state.property) {
+            propFlags = *reinterpret_cast<uint64_t*>(
+                reinterpret_cast<uintptr_t>(state.property) + 0x30);
+        }
+        void*    effectState     = *reinterpret_cast<void**>(
+            reinterpret_cast<uintptr_t>(tri) + 0x130);
+        uint16_t alphaFlags      = 0;
+        uint8_t  alphaThreshold  = 0;
+        if (effectState) {
+            alphaFlags     = *reinterpret_cast<uint16_t*>(
+                reinterpret_cast<uintptr_t>(effectState) + 0x28);
+            alphaThreshold = *reinterpret_cast<uint8_t*>(
+                reinterpret_cast<uintptr_t>(effectState) + 0x2A);
+        }
 
-    // Rotation+scale dump (PROBE 2026-05-03): roads/statics rendering flat
-    // when bUsePreCombines=0; need to see whether m_worldTransform.rot
-    // arrives as identity (rotation lost upstream) or with the slope intact
-    // (then BuildRemixTransform / Remix submission is the leak).
-    const auto& rot = tri->m_worldTransform.rot;
-    const float scale = tri->m_worldTransform.scale;
-    // Leaf RTTI class name (PROBE 2026-05-03): identify whether road/static
-    // sub-meshes are plain BSTriShape vs BSMergeInstancedTriShape vs another
-    // subclass with per-instance transform attributes we don't handle.
-    char leafClass[64] = "";
-    SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
-                                      leafClass, sizeof(leafClass));
-    _MESSAGE("FO4RemixPlugin: [Resolver] submitted hash=0x%llX name=\"%s\" "
-             "leafClass=\"%s\" "
-             "isLOD=%d isDecal=%d flags=0x%016llX tech=0x%08X pos=(%.1f,%.1f,%.1f) "
-             "p1=\"%s\"(0x%016llX) p2=\"%s\"(0x%016llX) "
-             "matType=%u propFlags=0x%016llX effectState=%p "
-             "alphaFlags=0x%04X alphaThreshold=%u alphaTestEnabled=%d "
-             "alphaBlendEnabled=%d srcFactor=%u dstFactor=%u "
-             "rot=[%.3f,%.3f,%.3f|%.3f,%.3f,%.3f|%.3f,%.3f,%.3f] scale=%.3f",
-             (unsigned long long)hash,
-             meshName ? meshName : "(null)",
-             leafClass[0] ? leafClass : "(unknown)",
-             isLOD ? 1 : 0,
-             mesh.isDecal ? 1 : 0,
-             (unsigned long long)state.lastFlags,
-             state.lastTechniqueFlags,
-             tri->m_worldTransform.pos.x,
-             tri->m_worldTransform.pos.y,
-             tri->m_worldTransform.pos.z,
-             p1Name, (unsigned long long)p1Flags,
-             p2Name, (unsigned long long)p2Flags,
-             matType, (unsigned long long)propFlags, effectState,
-             alphaFlags, alphaThreshold, mesh.alphaTestEnabled ? 1 : 0,
-             mesh.alphaBlendEnabled ? 1 : 0,
-             mesh.srcColorBlendFactor, mesh.dstColorBlendFactor,
-             rot.data[0][0], rot.data[0][1], rot.data[0][2],
-             rot.data[1][0], rot.data[1][1], rot.data[1][2],
-             rot.data[2][0], rot.data[2][1], rot.data[2][2],
-             scale);
+        // Rotation+scale dump (PROBE 2026-05-03): roads/statics rendering
+        // flat when bUsePreCombines=0; need to see whether
+        // m_worldTransform.rot arrives as identity (rotation lost upstream)
+        // or with the slope intact (then BuildRemixTransform / Remix
+        // submission is the leak).
+        const auto& rot = tri->m_worldTransform.rot;
+        const float scale = tri->m_worldTransform.scale;
+        // Leaf RTTI class name (PROBE 2026-05-03): identify whether
+        // road/static sub-meshes are plain BSTriShape vs
+        // BSMergeInstancedTriShape vs another subclass with per-instance
+        // transform attributes we don't handle.
+        char leafClass[64] = "";
+        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(tri),
+                                          leafClass, sizeof(leafClass));
+        _MESSAGE("FO4RemixPlugin: [Resolver] submitted hash=0x%llX name=\"%s\" "
+                 "leafClass=\"%s\" "
+                 "isLOD=%d isDecal=%d flags=0x%016llX tech=0x%08X pos=(%.1f,%.1f,%.1f) "
+                 "p1=\"%s\"(0x%016llX) p2=\"%s\"(0x%016llX) "
+                 "matType=%u propFlags=0x%016llX effectState=%p "
+                 "alphaFlags=0x%04X alphaThreshold=%u alphaTestEnabled=%d "
+                 "alphaBlendEnabled=%d srcFactor=%u dstFactor=%u "
+                 "rot=[%.3f,%.3f,%.3f|%.3f,%.3f,%.3f|%.3f,%.3f,%.3f] scale=%.3f",
+                 (unsigned long long)hash,
+                 meshName ? meshName : "(null)",
+                 leafClass[0] ? leafClass : "(unknown)",
+                 isLOD ? 1 : 0,
+                 mesh.isDecal ? 1 : 0,
+                 (unsigned long long)state.lastFlags,
+                 state.lastTechniqueFlags,
+                 tri->m_worldTransform.pos.x,
+                 tri->m_worldTransform.pos.y,
+                 tri->m_worldTransform.pos.z,
+                 p1Name, (unsigned long long)p1Flags,
+                 p2Name, (unsigned long long)p2Flags,
+                 matType, (unsigned long long)propFlags, effectState,
+                 alphaFlags, alphaThreshold, mesh.alphaTestEnabled ? 1 : 0,
+                 mesh.alphaBlendEnabled ? 1 : 0,
+                 mesh.srcColorBlendFactor, mesh.dstColorBlendFactor,
+                 rot.data[0][0], rot.data[0][1], rot.data[0][2],
+                 rot.data[1][0], rot.data[1][1], rot.data[1][2],
+                 rot.data[2][0], rot.data[2][1], rot.data[2][2],
+                 scale);
+    }
     for (const auto& t : newTextures) {
-        state.textureHashes.insert(t.hash);
+        state.textureHashes.insert(t->hash);
     }
 
     // Reset trace so we can tell when we're between resolver calls.

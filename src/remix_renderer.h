@@ -68,17 +68,52 @@ namespace RemixRenderer {
     // g_materialCache (creating cache entries as needed). Stores the resulting
     // mesh handle + material refcount in g_drawables.
     //
-    // Called from semantic_capture's resolve loop on the Remix thread.
+    // Called from semantic_capture's resolve loop on the GAME thread (via
+    // SemanticCapture::Tick from hkPresent). Handle creation is safe there
+    // (the runtime serializes each API call internally).
     SubmitStatus SubmitDrawable(uint64_t hash,
                                 const ExtractedMesh& mesh,
-                                const std::vector<ExtractedTexture>& newTextures);
+                                const TextureSupply& newTextures);
 
-    // Release the drawable identified by hash: destroy its mesh handle,
-    // decrement material refcount (destroy when 0, cascading texture refcount
-    // decrements). Idempotent on missing hash.
-    //
-    // Called from semantic_capture's TTL eviction path on the Remix thread.
+    // Release the drawable identified by hash: drop its mesh-cache refcount,
+    // decrement material refcount (cascading texture refcount decrements).
+    // Handles whose refcount reaches zero are erased from the caches and
+    // parked for deferred destruction at the top of the next OnFrame -- this
+    // runs on the GAME thread (Tick TTL eviction, reload waves, merge
+    // upgrades), where an inline Destroy* can invalidate a handle the Remix
+    // thread's frame in flight still references. Idempotent on missing hash.
     void ReleaseDrawable(uint64_t hash);
+
+    // Ask the next OnFrame to destroy every parked handle. Called from the
+    // PreLoadGame message and -- since 2026-07-20 -- from the VRAM-pressure
+    // sweep: under [Performance] DeferHandleDestroyToLoad parked destroys
+    // normally wait for a load screen (the runtime is quiescent there;
+    // mid-gameplay destroys are the live suspect for the AV-inside-
+    // CreateMesh session killer), but parked handles HOLD their VRAM, so on
+    // a long no-load wander the pressure tiers were releasing thousands of
+    // drawables without returning a byte -- the driver budget ratcheted to
+    // the ceiling and the 90% resolve gate shut new geometry off for the
+    // rest of the session. The drain itself always executes at OnFrame's
+    // top-of-frame safe point (both locks held, previous Present returned)
+    // regardless of who requested it. Thread-safe, callable from the game
+    // thread.
+    void RequestDestroyDrain();
+
+    // Current parked-destroy handle count (atomic mirror; approximate).
+    // Lets the pressure sweep skip pointless drain requests.
+    size_t PendingDestroyCount();
+
+    // Bytes handed to the runtime by SubmitDrawable since the last reset:
+    // CreateTexture pixel chains + CreateMesh vertex/index data. Every one
+    // of those bytes becomes CS-chunk payload the runtime's CS thread has
+    // to drain; the 2026-07-17 hang dump proved what happens when the game
+    // thread outruns that drain during a burst (CS queue backpressure ->
+    // present thread blocks in FlushCsChunk HOLDING the device spinlock ->
+    // game thread spins forever entering its next CreateTexture). The
+    // resolve loop resets this each tick and stops resolving once the
+    // [Performance] MaxUploadMiBPerTick cap is reached.
+    void   ResetUploadBytesTick();
+    size_t UploadBytesTick();
 
     // Forward a key/value to Remix's runtime config registry. Takes the
     // recursive Remix-API mutex so concurrent OnFrame draw submissions
@@ -113,6 +148,27 @@ namespace RemixRenderer {
     // remixapi_InstanceInfoBoneTransformsEXT on their draws.
     void QueueBoneTransforms(
         std::unordered_map<uint64_t, std::vector<remixapi_Transform>>&& bones);
+
+    // Write a diagnostic minidump (all current thread stacks) to
+    // %LOCALAPPDATA%\CrashDumps\FO4Remix_<tag>_<pid>.dmp. Used by the
+    // std::terminate handler installed at plugin load; safe to call from
+    // any thread.
+    void WriteDiagDump(const char* tag);
+
+    // Queue decoded model-space float3 positions for a facegen dynamic
+    // drawable whose live dynamicVertices changed. OnFrame rebuilds that
+    // drawable's private skinned mesh handle before drawing.
+    void QueueFaceMorphPositions(uint64_t drawableHash, std::vector<float>&& xyz);
+
+    struct EyeUvTransform {
+        float offset[2] = {};
+        float scale[2] = { 1.0f, 1.0f };
+    };
+
+    // Queue changed FO4 eye-material UV transforms. OnFrame combines these
+    // with any FaceGen position update and refreshes the existing mesh handle.
+    void QueueEyeUvTransforms(
+        std::unordered_map<uint64_t, EyeUvTransform>&& transforms);
 
     // True if a Remix-side texture handle currently exists for `hash`.
     // Used by the extraction cache to decide whether a cache hit must

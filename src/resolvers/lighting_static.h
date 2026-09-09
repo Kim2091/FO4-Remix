@@ -49,6 +49,15 @@ namespace Resolvers {
             kLODSkipped                  = 23,  // dropped: NiAVObject::kFlagIsMeshLOD set
             kTopFadeNodeSkipped          = 24,  // dropped: parent1 is kFlagTopFadeNode (LOD-fade group)
             kWorldLODChunkSkipped        = 25,  // dropped: parent chain identifies WRLD LOD chunk
+
+            // Deferred on ASYNC work in flight (texture decode, slice
+            // readback, draw capture): completion is expected, so Tick's
+            // retry bookkeeping polls fast (2 frames) instead of climbing
+            // the exponential backoff. Every pending source has its own
+            // bound (readback/decode TTLs, t7 deferral cap, capture
+            // deadline, rearm budget) that re-classes a stuck wait into a
+            // normal gate, resuming the backoff.
+            kPendingDefer                = 26,
         };
 
         int LastStep();
@@ -59,6 +68,21 @@ namespace Resolvers {
         // without needing a back-channel into the resolver TU.
         void SetStep(int s);
     }
+
+    // Drop the async buffer-slice readback cache (staging copies + cached
+    // bytes keyed by buffer identity). MUST run on world swap
+    // (PreLoadGame/NewGame, via SemanticCapture::ClearDrawableMap): the
+    // destination world recycles buffer addresses, and a recycled identity
+    // with matching offset+size would serve stale-world bytes.
+    void ResetSliceCache();
+
+    // Async merge-chunk bakes (2026-07-21, mesh worker pool). Sweep drops
+    // finished-but-unconsumed builds (drawable evicted mid-build); called
+    // from the Tick sweep cadence. Reset bumps the bake generation and MUST
+    // run on world swap alongside ResetSliceCache -- PassKeys are pointer-
+    // derived, so a stale-world build could rendezvous with a new-world key.
+    void SweepAsyncBakes(uint64_t currentFrame);
+    void ResetAsyncBakes();
 
     namespace Lighting {
 

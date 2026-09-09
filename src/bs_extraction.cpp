@@ -1,4 +1,6 @@
 #include "bs_extraction.h"
+#include "ba2_texture_source.h"
+#include "bcdec_bc7.h"  // vendored BC7 block decoder (bcdec, MIT/Unlicense)
 #include "config.h"
 #include "fo4_diagnostics.h"   // Diagnostics::CurrentFrameIndex for readback aging
 #include "remix_renderer.h"    // HasTextureHandle for cache-hit handle recreation
@@ -7,6 +9,7 @@
 #include "f4se_common/f4se_version.h"
 #include "f4se_common/Relocation.h"
 #include "f4se/PluginAPI.h"
+#include "f4se/GameStreams.h"
 #include "f4se/NiNodes.h"
 #include "f4se/NiObjects.h"
 #include "f4se/NiTypes.h"
@@ -80,6 +83,9 @@ static constexpr uintptr_t OFF_CELL_OBJECT_LIST = 0x70;
 static constexpr uintptr_t OFF_CELL_FLAGS       = 0x40;
 static constexpr uintptr_t OFF_CELL_LAND        = 0x58;  // TESObjectLAND*
 static constexpr uintptr_t OFF_CELL_WORLD_SPACE = 0xC8;
+// PlayerCharacter::firstPersonSkeleton (NiNode*). F4SE GameReferences.h
+// pins the neighbors: playerEquipData 0xB70 / tints 0xD00 STATIC_ASSERTs.
+static constexpr uintptr_t OFF_PLAYER_FP_SKELETON = 0xB78;
 static constexpr uint16_t  CELL_FLAG_IS_INTERIOR = 0x0001;
 static constexpr uintptr_t OFF_LAND_QUADRANTS   = 0x40;  // BSMultiBoundNode*[4]
 static constexpr int       LAND_QUADRANT_COUNT  = 4;
@@ -93,14 +99,38 @@ static constexpr uintptr_t OFF_GRID_CELL_ARRAY   = 0x18;  // TESObjectCELL** (fl
 
 
 // Packed unsigned byte -> [-1, 1]
+// Upload-resolution cap ([Materials] MaxTextureDimension). Applied at every
+// point that reads a resident texture dimension -- the resolution hash fold,
+// the readback mip selection, and GetMaterialDiffuseResidentWidth (which
+// feeds both the upgrade poll and the submitted-width record) -- so all of
+// them agree on the capped value and upgrade polling converges instead of
+// endlessly re-extracting identical capped pixels from a larger resident.
+static uint32_t CapDim(uint32_t v) {
+    const uint32_t cap = g_config.maxTextureDimension;
+    return (cap > 0 && v > cap) ? cap : v;
+}
+
 static float UnpackByte(uint8_t b) {
     return (b / 255.0f) * 2.0f - 1.0f;
 }
 
 // ---------------------------------------------------------------------------
-// Texture cache — keyed by hash derived from ID3D11Resource pointer
+// Texture cache — keyed by hash derived from ID3D11Resource pointer.
+// `touch` is a monotonic use-stamp (NOT a frame index: a cell-load burst
+// decodes dozens of textures in one frame, and frame-granular stamps tie,
+// degrading eviction to arbitrary-victim under exactly the burst the budget
+// exists to bound).
 // ---------------------------------------------------------------------------
-static std::unordered_map<uint64_t, ExtractedTexture> g_textureCache;
+struct CachedTexture {
+    // Shared with in-flight TextureSupply lists (see bs_extraction.h): the
+    // supply pass hands SubmitDrawable a refcounted view of this chain
+    // instead of a ~22MB copy. Never null for a live entry.
+    std::shared_ptr<const ExtractedTexture> tex;
+    uint64_t         touch = 0;       // monotonic use-stamp (LRU order)
+    uint64_t         touchFrame = 0;  // frame of last use (cold gating)
+};
+static std::unordered_map<uint64_t, CachedTexture> g_textureCache;
+static uint64_t g_textureCacheTouchCounter = 0;
 // Resolution-variant index (TextureUpgradeOnApproach): pre-resolution-fold
 // hash -> (full cache key, mip0 width) of the LARGEST variant extracted so
 // far. When a strictly larger variant lands, the superseded entry's pixels
@@ -113,6 +143,129 @@ static std::unordered_map<uint64_t, ExtractedTexture> g_textureCache;
 // need nothing here: they are refcounted per drawable and destroyed on
 // ReleaseDrawable.
 static std::unordered_map<uint64_t, std::pair<uint64_t, uint32_t>> g_texResVariantIndex;
+
+// CPU-side cache budget (2026-07-10). Decoded RGBA chains are ~22 MiB per
+// 2048^2 texture and the cache previously grew unbounded for the whole
+// session (the variant eviction above only bounds the upgrade path). A
+// running byte total is kept; past the configured budget ([Performance]
+// CpuTextureCacheMiB) the least-recently-touched entries are evicted down
+// to a low-water mark -- a later need re-runs the readback+decode, which
+// the async pipeline tolerates. Game-thread-only, like the cache itself.
+static size_t g_textureCacheBytes = 0;
+
+// Negative cache: hashes whose decode DROPPED (mip-format mismatch -- a
+// deterministic property of the content; transient readback failures never
+// reach the drop site). Without it every resolver retry re-ran the full GPU
+// readback + worker decode for a texture that can never succeed. Cleared
+// with the cache.
+static std::unordered_set<uint64_t> g_texKnownBad;
+
+// ---- Live render-target textures (2026-07-18 Pip-Boy screen) ----
+// Sources with D3D11_BIND_RENDER_TARGET are engine compositing targets
+// (Scaleform UI on the Pip-Boy screen); their pixels change every frame,
+// so their cache identity folds this generation counter -- bumping it
+// makes the next extraction a cache miss that re-captures live content.
+// Game thread only (resolver + Tick), plain statics suffice.
+static uint32_t g_liveTexGeneration = 1;
+static bool     g_liveRTFlagSticky  = false;
+// baseHash (pre-generation fold) -> last generation's folded hash, for
+// evicting the superseded CPU-cache entry (one live entry per RT).
+static std::unordered_map<uint64_t, uint64_t> g_liveTexLastVariant;
+// D3D11 texture identities of every RT-backed MATERIAL source seen (Pip-Boy
+// screen, terminal screens, scopes). The screen-overlay compositor excludes
+// these from its full-screen composite: the mesh IS their presentation
+// surface, and compositing the same Scaleform target on screen drew the
+// Pip-Boy UI huge over the world (2026-07-18). Pointer values are identity
+// tokens only -- never dereferenced, no refs held; cleared on load resets
+// so a recycled allocation can't shadow a legit full-screen layer.
+static std::unordered_set<void*> g_liveRTScreenSources;
+
+static void TextureCacheErase(uint64_t key)
+{
+    auto it = g_textureCache.find(key);
+    if (it == g_textureCache.end()) return;
+    if (it->second.tex) g_textureCacheBytes -= it->second.tex->pixels.size();
+    g_textureCache.erase(it);
+}
+
+// Returns the stored shared chain so a supplying caller can alias it into
+// its TextureSupply without another copy. Reference stays valid across other
+// entries' erasure (unordered_map node stability).
+static const std::shared_ptr<const ExtractedTexture>&
+TextureCacheInsert(uint64_t key, ExtractedTexture&& t)
+{
+    CachedTexture& slot = g_textureCache[key];
+    if (slot.tex) g_textureCacheBytes -= slot.tex->pixels.size();
+    g_textureCacheBytes += t.pixels.size();
+    slot.tex        = std::make_shared<const ExtractedTexture>(std::move(t));
+    slot.touch      = ++g_textureCacheTouchCounter;
+    slot.touchFrame = Diagnostics::CurrentFrameIndex();
+    return slot.tex;
+}
+
+// Entries younger than this many frames are HOT and never evicted, no
+// matter the budget. This cache is the working set that re-supplies Remix
+// handles: the 2026-07-10 deployment proved that budget-only eviction of
+// hot entries melts down -- every evicted texture immediately re-readbacks
+// and re-decodes (its drawable is still resolving), which re-inserts and
+// evicts others, a feedback loop that saturated the decode pool and the
+// allocator until the process died. 600 frames ~= 10s, matching the
+// Remix-side TTL grace.
+constexpr uint64_t kTexCacheColdFrames = 600;
+
+static void TextureCacheEnforceBudget()
+{
+    const uint64_t budgetMiB = g_config.cpuTextureCacheMiB;
+    if (budgetMiB == 0) return;  // unbounded (legacy)
+    const size_t budget = (size_t)budgetMiB * 1024u * 1024u;
+    if (g_textureCacheBytes <= budget) return;
+
+    // SOFT cap: evict COLD entries (untouched for kTexCacheColdFrames)
+    // oldest-first down to a low-water mark. If the whole working set is
+    // hot, the cache is allowed to exceed the budget -- unbounded growth
+    // was the pre-budget status quo and is strictly safer than thrashing
+    // the live set.
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    std::vector<std::pair<uint64_t, uint64_t>> coldByAge;  // (touch, key)
+    coldByAge.reserve(g_textureCache.size());
+    for (const auto& [k, c] : g_textureCache) {
+        const uint64_t age = now > c.touchFrame ? now - c.touchFrame : 0;
+        if (age > kTexCacheColdFrames) {
+            coldByAge.emplace_back(c.touch, k);
+        }
+    }
+
+    static std::atomic<int> sEvictLogs{0};
+    if (coldByAge.empty()) {
+        const int n = sEvictLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 24) {
+            _MESSAGE("FO4RemixPlugin: [TexCache] over budget (%zu MiB > %llu MiB) "
+                     "but all %zu entries are hot -- not evicting",
+                     g_textureCacheBytes / (1024u * 1024u),
+                     (unsigned long long)budgetMiB, g_textureCache.size());
+        }
+        return;
+    }
+    std::sort(coldByAge.begin(), coldByAge.end());
+
+    const size_t lowWater = budget - budget / 10;
+    uint32_t evicted = 0;
+    for (const auto& [touch, key] : coldByAge) {
+        if (g_textureCacheBytes <= lowWater) break;
+        TextureCacheErase(key);
+        ++evicted;
+    }
+    if (evicted) {
+        const int n = sEvictLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 24) {
+            _MESSAGE("FO4RemixPlugin: [TexCache] budget %llu MiB exceeded: "
+                     "evicted %u cold entries, now %zu entries / %zu MiB",
+                     (unsigned long long)budgetMiB, evicted,
+                     g_textureCache.size(),
+                     g_textureCacheBytes / (1024u * 1024u));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Compute mip-0 byte size for a given DXGI_FORMAT, width, height.
@@ -145,6 +298,14 @@ static uint32_t ComputeMip0Size(uint32_t width, uint32_t height, DXGI_FORMAT fmt
             bw = (width + 3) / 4;  if (bw < 1) bw = 1;
             bh = (height + 3) / 4; if (bh < 1) bh = 1;
             return bw * bh * 16;
+
+        // BC4 (single-channel masks; decoded to RGBA8 grayscale in
+        // ConvertReadbackMips -- remixapi has no BC4 format)
+        case DXGI_FORMAT_BC4_TYPELESS:      // 79
+        case DXGI_FORMAT_BC4_UNORM:         // 80
+            bw = (width + 3) / 4;  if (bw < 1) bw = 1;
+            bh = (height + 3) / 4; if (bh < 1) bh = 1;
+            return bw * bh * 8;
 
         // BC5
         case DXGI_FORMAT_BC5_TYPELESS:      // 82
@@ -187,6 +348,8 @@ static bool IsBlockCompressed(DXGI_FORMAT fmt, uint32_t& blockSize)
         case DXGI_FORMAT_BC1_TYPELESS:
         case DXGI_FORMAT_BC1_UNORM:
         case DXGI_FORMAT_BC1_UNORM_SRGB:
+        case DXGI_FORMAT_BC4_TYPELESS:
+        case DXGI_FORMAT_BC4_UNORM:
             blockSize = 8;
             return true;
 
@@ -210,6 +373,346 @@ static bool IsBlockCompressed(DXGI_FORMAT fmt, uint32_t& blockSize)
             return false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Authored DDS source (experimental).
+//
+// FO4's texture streamer can replace a material's D3D resource with a
+// reduced-resolution resource while the object is distant. Capturing that
+// resource by name permanently locks the reduced mip into our cache. When
+// enabled, this path asks Fallout's own virtual filesystem for the named DDS
+// instead, preserving loose-file override and BA2 lookup order. Only ordinary
+// 2D DDS files in formats already supported by the conversion pipeline are
+// accepted; every other case retains the existing GPU-readback path.
+// ---------------------------------------------------------------------------
+namespace {
+
+constexpr uint32_t MakeFourCC(char a, char b, char c, char d)
+{
+    return static_cast<uint32_t>(static_cast<uint8_t>(a)) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(b)) << 8) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(c)) << 16) |
+           (static_cast<uint32_t>(static_cast<uint8_t>(d)) << 24);
+}
+
+#pragma pack(push, 1)
+struct DdsPixelFormat {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t fourCC;
+    uint32_t rgbBitCount;
+    uint32_t rMask;
+    uint32_t gMask;
+    uint32_t bMask;
+    uint32_t aMask;
+};
+
+struct DdsHeader {
+    uint32_t size;
+    uint32_t flags;
+    uint32_t height;
+    uint32_t width;
+    uint32_t pitchOrLinearSize;
+    uint32_t depth;
+    uint32_t mipMapCount;
+    uint32_t reserved1[11];
+    DdsPixelFormat pixelFormat;
+    uint32_t caps;
+    uint32_t caps2;
+    uint32_t caps3;
+    uint32_t caps4;
+    uint32_t reserved2;
+};
+
+struct DdsHeaderDx10 {
+    uint32_t dxgiFormat;
+    uint32_t resourceDimension;
+    uint32_t miscFlag;
+    uint32_t arraySize;
+    uint32_t miscFlags2;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(DdsPixelFormat) == 32, "DDS pixel format layout");
+static_assert(sizeof(DdsHeader) == 124, "DDS header layout");
+static_assert(sizeof(DdsHeaderDx10) == 20, "DDS DX10 header layout");
+
+enum class AuthoredDdsStatus {
+    Ready,
+    Unavailable,
+    NotDds,
+    Unsupported,
+    ReadFailed,
+};
+
+struct AuthoredDdsInfo {
+    uint32_t sourceWidth = 0;
+    uint32_t sourceHeight = 0;
+    uint32_t sourceMipCount = 0;
+    uint32_t streamMagic = 0;
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+};
+
+static std::unordered_set<uint64_t> g_authoredDdsUnavailable;
+
+static bool HasDdsExtension(const char* path)
+{
+    if (!path) return false;
+    const size_t n = std::strlen(path);
+    return n >= 4 && _stricmp(path + n - 4, ".dds") == 0;
+}
+
+static bool ResourceReadExact(BSResourceNiBinaryStream& stream, void* dst,
+                              size_t byteCount)
+{
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    while (byteCount > 0) {
+        const UInt64 request = static_cast<UInt64>(
+            std::min<size_t>(byteCount, static_cast<size_t>(UINT32_MAX)));
+        const UInt32 got = stream.Read(out, request);
+        if (got == 0 || got > request) return false;
+        out += got;
+        byteCount -= got;
+    }
+    return true;
+}
+
+static bool ResourceSkipExact(BSResourceNiBinaryStream& stream, uint64_t byteCount)
+{
+    if (byteCount == 0) return true;
+    if (byteCount > static_cast<uint64_t>(INT64_MAX)) return false;
+    const uint64_t before = stream.GetOffset();
+    stream.Seek(static_cast<SInt64>(byteCount));
+    return stream.GetOffset() == before + byteCount;
+}
+
+static uint32_t DdsMipDimension(uint32_t base, uint32_t mip)
+{
+    const uint32_t value = base >> mip;
+    return value ? value : 1;
+}
+
+static uint32_t FormatFamily(DXGI_FORMAT fmt)
+{
+    switch (fmt) {
+        case DXGI_FORMAT_BC1_TYPELESS:
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC1_UNORM_SRGB: return 1;
+        case DXGI_FORMAT_BC2_TYPELESS:
+        case DXGI_FORMAT_BC2_UNORM:
+        case DXGI_FORMAT_BC2_UNORM_SRGB: return 2;
+        case DXGI_FORMAT_BC3_TYPELESS:
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_BC3_UNORM_SRGB: return 3;
+        case DXGI_FORMAT_BC4_TYPELESS:
+        case DXGI_FORMAT_BC4_UNORM: return 4;
+        case DXGI_FORMAT_BC5_TYPELESS:
+        case DXGI_FORMAT_BC5_UNORM:
+        case DXGI_FORMAT_BC5_SNORM: return 5;
+        case DXGI_FORMAT_BC7_TYPELESS:
+        case DXGI_FORMAT_BC7_UNORM:
+        case DXGI_FORMAT_BC7_UNORM_SRGB: return 7;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB: return 8;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return 9;
+        default: return 0;
+    }
+}
+
+static DXGI_FORMAT NormalizeDdsFormat(DXGI_FORMAT parsed, DXGI_FORMAT live)
+{
+    const uint32_t parsedFamily = FormatFamily(parsed);
+    if (parsedFamily != 0 && parsedFamily == FormatFamily(live) &&
+        ComputeMip0Size(4, 4, live) != 0) {
+        return live;
+    }
+    switch (parsed) {
+        case DXGI_FORMAT_BC1_TYPELESS: return DXGI_FORMAT_BC1_UNORM;
+        case DXGI_FORMAT_BC2_TYPELESS: return DXGI_FORMAT_BC2_UNORM;
+        case DXGI_FORMAT_BC3_TYPELESS: return DXGI_FORMAT_BC3_UNORM;
+        case DXGI_FORMAT_BC4_TYPELESS: return DXGI_FORMAT_BC4_UNORM;
+        case DXGI_FORMAT_BC5_TYPELESS: return DXGI_FORMAT_BC5_UNORM;
+        case DXGI_FORMAT_BC7_TYPELESS: return DXGI_FORMAT_BC7_UNORM;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS: return DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS: return DXGI_FORMAT_B8G8R8A8_UNORM;
+        default: return parsed;
+    }
+}
+
+static DXGI_FORMAT LegacyDdsFormat(const DdsPixelFormat& pf)
+{
+    constexpr uint32_t kDdsPfFourCC = 0x4;
+    constexpr uint32_t kDdsPfRgb = 0x40;
+    if (pf.flags & kDdsPfFourCC) {
+        switch (pf.fourCC) {
+            case MakeFourCC('D', 'X', 'T', '1'): return DXGI_FORMAT_BC1_UNORM;
+            case MakeFourCC('D', 'X', 'T', '3'): return DXGI_FORMAT_BC2_UNORM;
+            case MakeFourCC('D', 'X', 'T', '5'): return DXGI_FORMAT_BC3_UNORM;
+            case MakeFourCC('A', 'T', 'I', '1'):
+            case MakeFourCC('B', 'C', '4', 'U'): return DXGI_FORMAT_BC4_UNORM;
+            case MakeFourCC('A', 'T', 'I', '2'):
+            case MakeFourCC('B', 'C', '5', 'U'): return DXGI_FORMAT_BC5_UNORM;
+            case MakeFourCC('B', 'C', '5', 'S'): return DXGI_FORMAT_BC5_SNORM;
+            default: return DXGI_FORMAT_UNKNOWN;
+        }
+    }
+    if ((pf.flags & kDdsPfRgb) && pf.rgbBitCount == 32) {
+        if (pf.rMask == 0x000000FF && pf.gMask == 0x0000FF00 &&
+            pf.bMask == 0x00FF0000 && pf.aMask == 0xFF000000) {
+            return DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+        if (pf.rMask == 0x00FF0000 && pf.gMask == 0x0000FF00 &&
+            pf.bMask == 0x000000FF && pf.aMask == 0xFF000000) {
+            return DXGI_FORMAT_B8G8R8A8_UNORM;
+        }
+    }
+    return DXGI_FORMAT_UNKNOWN;
+}
+
+static AuthoredDdsStatus ReadAuthoredDdsMips(
+    const char* path, DXGI_FORMAT liveFormat,
+    std::vector<ExtractedTexture>& outMips, AuthoredDdsInfo& outInfo)
+{
+    constexpr uint32_t kDdsMagic = MakeFourCC('D', 'D', 'S', ' ');
+    constexpr uint32_t kDx10FourCC = MakeFourCC('D', 'X', '1', '0');
+    constexpr uint32_t kDdsCaps2Cubemap = 0x200;
+    constexpr uint32_t kDdsCaps2Volume = 0x200000;
+    constexpr uint64_t kMaxRawBytes = 256ull << 20;
+
+    outMips.clear();
+    outInfo = {};
+    if (!HasDdsExtension(path)) return AuthoredDdsStatus::Unavailable;
+
+    BSResourceNiBinaryStream stream(path);
+    if (!stream.IsValid()) return AuthoredDdsStatus::Unavailable;
+
+    uint32_t magic = 0;
+    DdsHeader header = {};
+    if (!ResourceReadExact(stream, &magic, sizeof(magic)) ||
+        !ResourceReadExact(stream, &header, sizeof(header))) {
+        return AuthoredDdsStatus::ReadFailed;
+    }
+    outInfo.streamMagic = magic;
+    if (magic != kDdsMagic) return AuthoredDdsStatus::NotDds;
+    if (header.size != sizeof(DdsHeader) ||
+        header.pixelFormat.size != sizeof(DdsPixelFormat) ||
+        header.width == 0 || header.height == 0 ||
+        header.width > 32768 || header.height > 32768 ||
+        (header.caps2 & (kDdsCaps2Cubemap | kDdsCaps2Volume)) != 0) {
+        return AuthoredDdsStatus::Unsupported;
+    }
+
+    DXGI_FORMAT parsedFormat = DXGI_FORMAT_UNKNOWN;
+    if (header.pixelFormat.fourCC == kDx10FourCC) {
+        DdsHeaderDx10 dx10 = {};
+        if (!ResourceReadExact(stream, &dx10, sizeof(dx10))) {
+            return AuthoredDdsStatus::ReadFailed;
+        }
+        if (dx10.resourceDimension != D3D11_RESOURCE_DIMENSION_TEXTURE2D ||
+            dx10.arraySize != 1 ||
+            (dx10.miscFlag & D3D11_RESOURCE_MISC_TEXTURECUBE) != 0) {
+            return AuthoredDdsStatus::Unsupported;
+        }
+        parsedFormat = static_cast<DXGI_FORMAT>(dx10.dxgiFormat);
+    } else {
+        parsedFormat = LegacyDdsFormat(header.pixelFormat);
+    }
+
+    const DXGI_FORMAT format = NormalizeDdsFormat(parsedFormat, liveFormat);
+    if (FormatFamily(format) == 0 ||
+        ComputeMip0Size(header.width, header.height, format) == 0) {
+        return AuthoredDdsStatus::Unsupported;
+    }
+
+    uint32_t maxMipCount = 1;
+    for (uint32_t edge =
+             header.width > header.height ? header.width : header.height;
+         edge > 1; edge >>= 1) {
+        ++maxMipCount;
+    }
+    uint32_t sourceMipCount = header.mipMapCount ? header.mipMapCount : 1;
+    if (sourceMipCount > maxMipCount) return AuthoredDdsStatus::Unsupported;
+
+    uint32_t firstMip = 0;
+    if (g_config.maxTextureDimension > 0) {
+        while (firstMip + 1 < sourceMipCount) {
+            const uint32_t w = DdsMipDimension(header.width, firstMip);
+            const uint32_t h = DdsMipDimension(header.height, firstMip);
+            if (w <= g_config.maxTextureDimension &&
+                h <= g_config.maxTextureDimension) {
+                break;
+            }
+            ++firstMip;
+        }
+    }
+
+    uint64_t skipBytes = 0;
+    for (uint32_t mip = 0; mip < firstMip; ++mip) {
+        const uint32_t w = DdsMipDimension(header.width, mip);
+        const uint32_t h = DdsMipDimension(header.height, mip);
+        const uint32_t bytes = ComputeMip0Size(w, h, format);
+        if (bytes == 0 || skipBytes > UINT64_MAX - bytes) {
+            return AuthoredDdsStatus::Unsupported;
+        }
+        skipBytes += bytes;
+    }
+    if (!ResourceSkipExact(stream, skipBytes)) {
+        return AuthoredDdsStatus::ReadFailed;
+    }
+
+    uint32_t blockSize = 0;
+    const bool isBC = IsBlockCompressed(format, blockSize);
+    uint64_t rawBytes = 0;
+    outMips.reserve(sourceMipCount - firstMip);
+    for (uint32_t mip = firstMip; mip < sourceMipCount; ++mip) {
+        const uint32_t w = DdsMipDimension(header.width, mip);
+        const uint32_t h = DdsMipDimension(header.height, mip);
+        if (isBC && (w < 4 || h < 4)) break;
+
+        const uint32_t bytes = ComputeMip0Size(w, h, format);
+        if (bytes == 0 || rawBytes + bytes > kMaxRawBytes) {
+            outMips.clear();
+            return AuthoredDdsStatus::Unsupported;
+        }
+
+        ExtractedTexture extractedMip;
+        extractedMip.width = w;
+        extractedMip.height = h;
+        extractedMip.dxgiFormat = format;
+        extractedMip.mipLevels = 1;
+        extractedMip.pixels.resize(bytes);
+        if (!ResourceReadExact(stream, extractedMip.pixels.data(), bytes)) {
+            outMips.clear();
+            return AuthoredDdsStatus::ReadFailed;
+        }
+        rawBytes += bytes;
+        outMips.push_back(std::move(extractedMip));
+    }
+    if (outMips.empty()) return AuthoredDdsStatus::Unsupported;
+
+    outInfo.sourceWidth = header.width;
+    outInfo.sourceHeight = header.height;
+    outInfo.sourceMipCount = sourceMipCount;
+    outInfo.format = format;
+    return AuthoredDdsStatus::Ready;
+}
+
+static const char* AuthoredDdsStatusName(AuthoredDdsStatus status)
+{
+    switch (status) {
+        case AuthoredDdsStatus::Ready: return "ready";
+        case AuthoredDdsStatus::Unavailable: return "unavailable";
+        case AuthoredDdsStatus::NotDds: return "not-dds-stream";
+        case AuthoredDdsStatus::Unsupported: return "unsupported";
+        case AuthoredDdsStatus::ReadFailed: return "read-failed";
+        default: return "unknown";
+    }
+}
+
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Async GPU readback (2026-07-02): read every mip level of a texture into CPU
@@ -324,8 +827,29 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
         uint32_t blockSize = 0;
         const bool isBC = IsBlockCompressed(desc.Format, blockSize);
 
+        // Upload-resolution cap: skip the leading mips that exceed
+        // [Materials] MaxTextureDimension. With 4K texture mods resident at
+        // load, full-chain uploads put ~4x the intended bytes in the Remix
+        // material-texture pool (2026-07-11: materialTex hit 11.4 GiB and
+        // paged the whole process out of the adapter budget). The engine's
+        // own chain already contains the smaller mips -- no resampling, the
+        // readback simply starts lower. Also 4x less readback bandwidth,
+        // decode work, and CPU cache per capped texture.
+        uint32_t firstMip = 0;
+        if (g_config.maxTextureDimension > 0) {
+            while (firstMip + 1 < srcMipCount) {
+                uint32_t w = desc.Width  >> firstMip; if (w == 0) w = 1;
+                uint32_t h = desc.Height >> firstMip; if (h == 0) h = 1;
+                if (w <= g_config.maxTextureDimension &&
+                    h <= g_config.maxTextureDimension) break;
+                ++firstMip;
+            }
+        }
+        uint32_t topW = desc.Width  >> firstMip; if (topW == 0) topW = 1;
+        uint32_t topH = desc.Height >> firstMip; if (topH == 0) topH = 1;
+
         uint32_t usableMips = 0;
-        for (uint32_t i = 0; i < srcMipCount; i++) {
+        for (uint32_t i = firstMip; i < srcMipCount; i++) {
             uint32_t mipW = desc.Width  >> i; if (mipW == 0) mipW = 1;
             uint32_t mipH = desc.Height >> i; if (mipH == 0) mipH = 1;
             if (isBC && (mipW < 4 || mipH < 4)) break;
@@ -334,8 +858,8 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
         if (usableMips == 0) return ReadbackStatus::Failed;
 
         D3D11_TEXTURE2D_DESC stagingDesc = {};
-        stagingDesc.Width              = desc.Width;
-        stagingDesc.Height             = desc.Height;
+        stagingDesc.Width              = topW;
+        stagingDesc.Height             = topH;
         stagingDesc.MipLevels          = usableMips;
         stagingDesc.ArraySize          = 1;
         stagingDesc.Format             = desc.Format;
@@ -355,16 +879,18 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
 
         // Queue all copies; the D3D11 runtime holds a reference on both
         // resources until the commands execute, so the engine freeing the
-        // source texture later is safe.
+        // source texture later is safe. Source mips are offset by firstMip
+        // when the resolution cap dropped the top of the chain.
         for (uint32_t i = 0; i < usableMips; i++) {
-            ctx->CopySubresourceRegion(staging.Get(), i, 0, 0, 0, tex2D, i, nullptr);
+            ctx->CopySubresourceRegion(staging.Get(), i, 0, 0, 0, tex2D,
+                                       firstMip + i, nullptr);
         }
 
         PendingReadback pr;
         pr.staging        = staging;
         pr.format         = desc.Format;
-        pr.width          = desc.Width;
-        pr.height         = desc.Height;
+        pr.width          = topW;
+        pr.height         = topH;
         pr.mipCount       = usableMips;
         pr.lastTouchFrame = nowFrame;
         g_pendingReadbacks.emplace(cacheKey, std::move(pr));
@@ -448,32 +974,53 @@ static ReadbackStatus ReadbackAllMipsAsync(ID3D11Device* device,
     return outMips.empty() ? ReadbackStatus::Failed : ReadbackStatus::Ready;
 }
 
+// Runtime-format gamma test (defined with the LUT helpers below; needed here
+// so the decompressors can preserve the source's sRGB designation).
+namespace { bool IsSrgbColorFormat(DXGI_FORMAT f); }
+
 // ---------------------------------------------------------------------------
 // BC1/BC3 decode helpers — decompress a 4x4 block to RGBA8
 // ---------------------------------------------------------------------------
-static void DecodeBC1ColorBlock(const uint8_t* block, uint8_t out[4][4][4])
+// `forceFourColor`: BC2/BC3 color blocks are ALWAYS 4-color mode per the
+// D3D spec (the c0<=c1 3-color+transparent mode is BC1-only), and encoders
+// exploit that by emitting unordered endpoints -- decoding them with BC1
+// rules corrupts those blocks (wrong color3 + phantom transparency).
+static void DecodeBC1ColorBlock(const uint8_t* block, uint8_t out[4][4][4],
+                                bool forceFourColor = false)
 {
     uint16_t c0 = block[0] | (block[1] << 8);
     uint16_t c1 = block[2] | (block[3] << 8);
 
-    uint8_t colors[4][3];
+    uint8_t colors[4][4];
     colors[0][0] = ((c0 >> 11) & 0x1F) * 255 / 31;
     colors[0][1] = ((c0 >>  5) & 0x3F) * 255 / 63;
     colors[0][2] = ( c0        & 0x1F) * 255 / 31;
+    colors[0][3] = 255;
     colors[1][0] = ((c1 >> 11) & 0x1F) * 255 / 31;
     colors[1][1] = ((c1 >>  5) & 0x3F) * 255 / 63;
     colors[1][2] = ( c1        & 0x1F) * 255 / 31;
+    colors[1][3] = 255;
 
-    if (c0 > c1) {
+    if (forceFourColor || c0 > c1) {
         for (int i = 0; i < 3; i++) {
             colors[2][i] = (2 * colors[0][i] + colors[1][i] + 1) / 3;
             colors[3][i] = (colors[0][i] + 2 * colors[1][i] + 1) / 3;
         }
+        colors[2][3] = 255;
+        colors[3][3] = 255;
     } else {
+        // 1-bit-alpha mode: index 3 is TRANSPARENT black per the BC1 spec.
+        // Decoding it opaque (the pre-2026-07-10 behavior) turned every
+        // self-decoded BC1 cutout (foliage atlases through the bake paths)
+        // into solid black holes. Callers that synthesize their own alpha
+        // (DiffuseAlphaFromLuminance, BC2/BC3 explicit alpha) overwrite
+        // this anyway.
         for (int i = 0; i < 3; i++) {
             colors[2][i] = (colors[0][i] + colors[1][i]) / 2;
             colors[3][i] = 0;
         }
+        colors[2][3] = 255;
+        colors[3][3] = 0;
     }
 
     uint32_t indices = block[4] | (block[5] << 8) | (block[6] << 16) | (block[7] << 24);
@@ -484,7 +1031,7 @@ static void DecodeBC1ColorBlock(const uint8_t* block, uint8_t out[4][4][4])
             out[y][x][0] = colors[idx][0];
             out[y][x][1] = colors[idx][1];
             out[y][x][2] = colors[idx][2];
-            out[y][x][3] = 255;
+            out[y][x][3] = colors[idx][3];
         }
     }
 }
@@ -544,9 +1091,9 @@ static bool DecompressBC2(ExtractedTexture& tex)
                 alphas[y][3] = (hi >> 4)   | ((hi >> 4) << 4);
             }
 
-            // Next 8 bytes: BC1 color block
+            // Next 8 bytes: BC1-layout color block (always 4-color for BC2)
             uint8_t block[4][4][4];
-            DecodeBC1ColorBlock(src + 8, block);
+            DecodeBC1ColorBlock(src + 8, block, /*forceFourColor=*/true);
 
             // Combine color + alpha
             for (int y = 0; y < 4; y++) {
@@ -571,11 +1118,49 @@ static bool DecompressBC2(ExtractedTexture& tex)
     }
 
     tex.pixels = std::move(rgba);
-    tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // Preserve the source's gamma designation: the decoded bytes are still
+    // sRGB-encoded when the source was sRGB, and tagging them UNORM made
+    // Remix read them as linear (washed-out albedo on every decode path).
+    tex.dxgiFormat = IsSrgbColorFormat((DXGI_FORMAT)tex.dxgiFormat)
+        ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
     return true;
 }
 
-// Unified BC1/BC3/BC5 block decompression with per-pixel transform
+// Signed variant of the BC3/BC4 alpha-style block for BC5_SNORM: endpoints
+// and palette are int8, remapped to [0,255] with -127 -> 0, 127 -> 255 so
+// downstream v/255*2-1 math lands on the authored signed value. (Unsigned
+// decode of SNORM data produced garbage normals.)
+static void DecodeBC4SignedBlock(const uint8_t* block, uint8_t out[4][4])
+{
+    auto clampS8 = [](int v) { return v < -127 ? -127 : v; };  // -128 == -127 per spec
+    const int a0 = clampS8((int8_t)block[0]);
+    const int a1 = clampS8((int8_t)block[1]);
+    int palette[8];
+    palette[0] = a0;
+    palette[1] = a1;
+    if (a0 > a1) {
+        for (int i = 1; i <= 6; i++)
+            palette[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+    } else {
+        for (int i = 1; i <= 4; i++)
+            palette[i + 1] = ((5 - i) * a0 + i * a1) / 5;
+        palette[6] = -127;
+        palette[7] = 127;
+    }
+
+    uint64_t bits = 0;
+    for (int i = 2; i < 8; i++)
+        bits |= (uint64_t)block[i] << ((i - 2) * 8);
+
+    for (int y = 0; y < 4; y++)
+        for (int x = 0; x < 4; x++) {
+            const int s = palette[bits & 7];              // [-127, 127]
+            out[y][x] = (uint8_t)(((s + 127) * 255 + 127) / 254);
+            bits >>= 3;
+        }
+}
+
+// Unified BC1/BC3/BC4/BC5 block decompression with per-pixel transform
 enum class BCTransform { None, InvertRGB, NormalReconstructZ };
 
 static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
@@ -586,15 +1171,18 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
     bool isBC3 = (tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM ||
                   tex.dxgiFormat == DXGI_FORMAT_BC3_UNORM_SRGB ||
                   tex.dxgiFormat == DXGI_FORMAT_BC3_TYPELESS);
+    bool isBC4 = (tex.dxgiFormat == DXGI_FORMAT_BC4_UNORM ||
+                  tex.dxgiFormat == DXGI_FORMAT_BC4_TYPELESS);
     bool isBC5 = (tex.dxgiFormat == DXGI_FORMAT_BC5_UNORM ||
                   tex.dxgiFormat == DXGI_FORMAT_BC5_SNORM ||
                   tex.dxgiFormat == DXGI_FORMAT_BC5_TYPELESS);
+    const bool isBC5Signed = tex.dxgiFormat == DXGI_FORMAT_BC5_SNORM;
 
-    if (!isBC1 && !isBC3 && !isBC5) return false;
+    if (!isBC1 && !isBC3 && !isBC4 && !isBC5) return false;
 
     uint32_t bw = (tex.width + 3) / 4;
     uint32_t bh = (tex.height + 3) / 4;
-    uint32_t blockSize = isBC1 ? 8 : 16;
+    uint32_t blockSize = (isBC1 || isBC4) ? 8 : 16;
 
     std::vector<uint8_t> rgba(tex.width * tex.height * 4);
     const uint8_t* src = tex.pixels.data();
@@ -603,11 +1191,30 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
         for (uint32_t bx = 0; bx < bw; bx++) {
             uint8_t block[4][4][4]; // [y][x][rgba]
 
-            if (isBC5) {
+            if (isBC4) {
+                // BC4: one alpha-style block, single channel. Replicate to
+                // RGB (grayscale masks read the same from any channel).
+                uint8_t rChan[4][4];
+                DecodeBC3AlphaBlock(src, rChan);
+                for (int y = 0; y < 4; y++)
+                    for (int x = 0; x < 4; x++) {
+                        const uint8_t v = (transform == BCTransform::InvertRGB)
+                            ? (uint8_t)(255 - rChan[y][x]) : rChan[y][x];
+                        block[y][x][0] = v;
+                        block[y][x][1] = v;
+                        block[y][x][2] = v;
+                        block[y][x][3] = 255;
+                    }
+            } else if (isBC5) {
                 // BC5: two alpha-style blocks for R and G channels
                 uint8_t rChan[4][4], gChan[4][4];
-                DecodeBC3AlphaBlock(src, rChan);
-                DecodeBC3AlphaBlock(src + 8, gChan);
+                if (isBC5Signed) {
+                    DecodeBC4SignedBlock(src, rChan);
+                    DecodeBC4SignedBlock(src + 8, gChan);
+                } else {
+                    DecodeBC3AlphaBlock(src, rChan);
+                    DecodeBC3AlphaBlock(src + 8, gChan);
+                }
 
                 if (transform == BCTransform::InvertRGB) {
                     // R=specular, G=smoothness. Invert G to get roughness.
@@ -636,7 +1243,7 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
             } else if (isBC3) {
                 uint8_t alphas[4][4];
                 DecodeBC3AlphaBlock(src, alphas);
-                DecodeBC1ColorBlock(src + 8, block);
+                DecodeBC1ColorBlock(src + 8, block, /*forceFourColor=*/true);
                 for (int y = 0; y < 4; y++)
                     for (int x = 0; x < 4; x++)
                         block[y][x][3] = alphas[y][x];
@@ -646,8 +1253,8 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
             src += blockSize;
 
             // Write decoded pixels to output buffer
-            if (transform == BCTransform::InvertRGB && !isBC5) {
-                // Invert RGB for BC1/BC3 (BC5 already handled above)
+            if (transform == BCTransform::InvertRGB && !isBC5 && !isBC4) {
+                // Invert RGB for BC1/BC3 (BC4/BC5 already handled above)
                 for (int y = 0; y < 4; y++) {
                     uint32_t py = by * 4 + y;
                     if (py >= tex.height) continue;
@@ -662,7 +1269,7 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
                     }
                 }
             } else {
-                // No transform, or BC5 already transformed above
+                // No transform, or BC4/BC5 already transformed above
                 for (int y = 0; y < 4; y++) {
                     uint32_t py = by * 4 + y;
                     if (py >= tex.height) continue;
@@ -678,7 +1285,65 @@ static bool DecompressBC(ExtractedTexture& tex, BCTransform transform)
     }
 
     tex.pixels = std::move(rgba);
-    tex.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    // Preserve the source's gamma designation for COLOR decodes: the bytes
+    // stay sRGB-encoded when the source was sRGB, and the old unconditional
+    // UNORM tag made Remix read them as linear -> washed-out albedo on every
+    // tint/palette/lum-floor/cutout bake. Data decodes (roughness invert,
+    // normal reconstruct; BC4/BC5 sources are UNORM anyway) keep UNORM.
+    tex.dxgiFormat = (transform == BCTransform::None &&
+                      IsSrgbColorFormat((DXGI_FORMAT)tex.dxgiFormat))
+        ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+    return true;
+}
+
+// Decompress a BC7 texture to RGBA8 via the vendored bcdec decoder
+// (bcdec_bc7.h). BC7 used to be pass-through-only: it displays fine
+// compressed, but every per-pixel transform (palette LUT remap, tint bake,
+// smoothness->roughness inversion, octahedral normal encode, luminance
+// floor) DECLINED on it -- BC7 smoothness maps shipped un-inverted (shiny/
+// dull flipped) and BC7 diffuses lost their tints. Preserves the source's
+// sRGB designation like DecompressBC.
+static bool DecompressBC7(ExtractedTexture& tex)
+{
+    const bool isBC7 = (tex.dxgiFormat == DXGI_FORMAT_BC7_UNORM ||
+                        tex.dxgiFormat == DXGI_FORMAT_BC7_UNORM_SRGB ||
+                        tex.dxgiFormat == DXGI_FORMAT_BC7_TYPELESS);
+    if (!isBC7) return false;
+
+    const uint32_t bw = (tex.width + 3) / 4;
+    const uint32_t bh = (tex.height + 3) / 4;
+    std::vector<uint8_t> rgba((size_t)tex.width * tex.height * 4);
+    const uint8_t* src = tex.pixels.data();
+
+    for (uint32_t by = 0; by < bh; ++by) {
+        for (uint32_t bx = 0; bx < bw; ++bx, src += 16) {
+            if (bx * 4 + 4 <= tex.width && by * 4 + 4 <= tex.height) {
+                // Interior block: decode straight into the output rows.
+                uint8_t* dst = rgba.data() +
+                    ((size_t)by * 4 * tex.width + (size_t)bx * 4) * 4;
+                bcdec_bc7(src, dst, (int)(tex.width * 4));
+            } else {
+                // Edge block of a non-multiple-of-4 mip: bcdec writes full
+                // 4x4 rows, so decode into scratch and copy what's in range.
+                uint8_t scratch[4][4][4];
+                bcdec_bc7(src, scratch, 16);
+                for (uint32_t y = 0; y < 4; ++y) {
+                    const uint32_t py = by * 4 + y;
+                    if (py >= tex.height) break;
+                    for (uint32_t x = 0; x < 4; ++x) {
+                        const uint32_t px = bx * 4 + x;
+                        if (px >= tex.width) continue;
+                        memcpy(&rgba[((size_t)py * tex.width + px) * 4],
+                               scratch[y][x], 4);
+                    }
+                }
+            }
+        }
+    }
+
+    tex.pixels = std::move(rgba);
+    tex.dxgiFormat = IsSrgbColorFormat((DXGI_FORMAT)tex.dxgiFormat)
+        ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
     return true;
 }
 
@@ -1096,7 +1761,9 @@ int BsExtraction::SampleLookupColor(NiTexture* lut, ID3D11Device* device,
             m.dxgiFormat != DXGI_FORMAT_R8G8B8A8_UNORM_SRGB &&
             m.dxgiFormat != DXGI_FORMAT_B8G8R8A8_UNORM &&
             m.dxgiFormat != DXGI_FORMAT_B8G8R8A8_UNORM_SRGB) {
-            DecompressBC(m, BCTransform::None);
+            if (!DecompressBC(m, BCTransform::None)) {
+                DecompressBC7(m);  // BC7-compressed palette/hair LUTs
+            }
         }
         const bool rgba = (m.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM ||
                            m.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB);
@@ -1132,6 +1799,8 @@ int BsExtraction::SampleLookupColor(NiTexture* lut, ID3D11Device* device,
 // have been freed (cell detach) between polls. No C++ objects with destructors
 // in this frame so __try is legal; ID3D11Texture2D is released by hand.
 // ---------------------------------------------------------------------------
+// NOTE: returns the EFFECTIVE (MaxTextureDimension-capped) resident width --
+// the resolution this plugin would actually extract and upload at.
 uint32_t BsExtraction::GetMaterialDiffuseResidentWidth(void* material) {
     if (!material) return 0;
     uint32_t width = 0;
@@ -1156,7 +1825,87 @@ uint32_t BsExtraction::GetMaterialDiffuseResidentWidth(void* material) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         width = 0;
     }
-    return width;
+    return CapDim(width);
+}
+
+// ---------------------------------------------------------------------------
+// FaceGen morph refresh: live dynamicVertices snapshot + decode.
+//
+// During dialogue and ambient expressions, FO4 memcpy's freshly CPU-deformed
+// model-space positions into facegen BSDynamicTriShape::dynamicVertices. The
+// normal resolver snapshots the buffer once; these helpers let Tick detect a
+// changed buffer and re-upload just the positions.
+// ---------------------------------------------------------------------------
+namespace {
+
+bool ReadDynamicRawGuarded(void* geometry, uint8_t* dst, uint32_t dstCap,
+                           uint32_t* outSize, uint32_t* outNumVerts) {
+    __try {
+        const uintptr_t g = reinterpret_cast<uintptr_t>(geometry);
+        const uint32_t size = *reinterpret_cast<const volatile uint32_t*>(g + 0x170);
+        const uint16_t numVerts = *reinterpret_cast<const volatile uint16_t*>(g + 0x164);
+        uint8_t* src = *reinterpret_cast<uint8_t* const volatile*>(g + 0x180);
+        *outSize = size;
+        *outNumVerts = numVerts;
+        if (!src || size == 0 || size > 4u * 1024u * 1024u) return false;
+        if (dst) {
+            if (size > dstCap) return false;
+            memcpy(dst, src, size);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+} // namespace
+
+bool BsExtraction::SnapshotDynamicVertices(void* geometry,
+                                           std::vector<uint8_t>& outRaw,
+                                           uint32_t& outNumVertices) {
+    if (!geometry) return false;
+    uint32_t size = 0, nv = 0;
+    if (!ReadDynamicRawGuarded(geometry, nullptr, 0, &size, &nv)) return false;
+    outRaw.resize(size);
+    uint32_t size2 = 0, nv2 = 0;
+    if (!ReadDynamicRawGuarded(geometry, outRaw.data(),
+                               (uint32_t)outRaw.size(), &size2, &nv2) ||
+        size2 != size || nv2 != nv || nv == 0) {
+        return false;
+    }
+    outNumVertices = nv;
+    return true;
+}
+
+bool BsExtraction::DecodeDynamicPositions(const std::vector<uint8_t>& raw,
+                                          uint32_t numVertices,
+                                          std::vector<float>& outXyz) {
+    if (numVertices == 0 || raw.empty()) return false;
+    if (raw.size() % numVertices != 0) return false;
+    const uint32_t elem = (uint32_t)(raw.size() / numVertices);
+    if (elem < 8) return false;
+    outXyz.resize((size_t)numVertices * 3);
+    const uint8_t* p = raw.data();
+    if (elem <= 12) {
+        // Byte-verified facegen layout: half4 position
+        // (x, y, z, bitangentX) plus a 4-byte tail.
+        for (uint32_t i = 0; i < numVertices; ++i) {
+            const uint16_t* hp =
+                reinterpret_cast<const uint16_t*>(p + (size_t)i * elem);
+            outXyz[(size_t)i * 3 + 0] = HalfToFloat(hp[0]);
+            outXyz[(size_t)i * 3 + 1] = HalfToFloat(hp[1]);
+            outXyz[(size_t)i * 3 + 2] = HalfToFloat(hp[2]);
+        }
+    } else {
+        for (uint32_t i = 0; i < numVertices; ++i) {
+            const float* fp =
+                reinterpret_cast<const float*>(p + (size_t)i * elem);
+            outXyz[(size_t)i * 3 + 0] = fp[0];
+            outXyz[(size_t)i * 3 + 1] = fp[1];
+            outXyz[(size_t)i * 3 + 2] = fp[2];
+        }
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,11 +1940,27 @@ struct TextureConversionJob {
     bool     palTableValid  = false;
     bool     isDiffuseSlot  = false;      // debug-dump routing only
     std::string texName;                  // logging only
+    // Authored BA2 source jobs carry only metadata across the game-thread
+    // boundary. The worker reads/inflates the mip chain directly from disk,
+    // keeping the game renderer's reduced resident texture untouched.
+    bool ba2Source = false;
+    D3D11_TEXTURE2D_DESC ba2LiveDesc = {};
+    uint32_t ba2ExpectedWidth = 0;
+    uint32_t ba2ExpectedHeight = 0;
+    // Persistent disk cache (see the block comment above DiskCacheDir).
+    // diskLoadKey != 0: this job LOADS the converted chain from disk
+    // instead of converting (mips empty). diskWriteKey != 0: write the
+    // converted result to disk after a successful convert.
+    uint64_t diskLoadKey  = 0;
+    uint64_t diskWriteKey = 0;
 };
 
 struct CompletedTextureConversion {
     ExtractedTexture packed;   // pixels empty => conversion dropped/failed
     uint64_t doneFrame = 0;    // for the orphan TTL sweep
+    // BA2 lookup/read failure is not a bad texture. The game thread marks the
+    // resource name unavailable for this session and retries via GPU readback.
+    bool fallbackToLive = false;
 };
 
 static std::mutex                       g_texConvMutex;
@@ -1206,6 +1971,221 @@ static std::unordered_set<uint64_t>     g_texConvInflight;  // queued or convert
 static std::vector<std::thread>         g_texConvWorkers;
 static bool                             g_texConvStop = false;  // guarded by g_texConvMutex
 
+// Raw-mip bytes currently parked in g_texConvJobs (guarded by g_texConvMutex).
+// MaxPendingTextureReadbacks caps only CONCURRENT readbacks; slots turn over
+// every few ticks while the below-normal-priority workers starve exactly when
+// the game saturates all cores (streaming bursts), so without a bound the
+// conveyor's output -- hundreds of unique textures x several MiB of raw
+// chains -- accumulated outside every budget. Past the cap, jobs are dropped
+// and the caller's retry re-runs the readback later (bounded by the readback
+// cap), so the queue self-heals once the workers catch up.
+static size_t           g_texConvJobsBytes = 0;
+static constexpr size_t kMaxTexConvJobsBytes = 256ull << 20;  // 256 MiB
+static constexpr size_t kMaxTexConvJobs = 512;
+
+static size_t TexConvJobBytes(const TextureConversionJob& job) {
+    size_t n = 0;
+    for (const auto& mip : job.mips) n += mip.pixels.size();
+    return n;
+}
+
+// ---- Persistent disk cache of converted chains (2026-07-13) ----
+// The convert stage (BC decode + octahedral/invert/tint/palette bakes)
+// costs ~11ms per chain across ~2k unique chains in a fresh area -- the
+// pop-in floor once everything upstream went async. The output is
+// deterministic for a given content hash (name + resident-resolution fold
+// + variant params), so persist it: the first session converts and writes,
+// every later one streams the converted bytes back on the same worker
+// threads. The file key folds the SOURCE resource's desc on top of the
+// content hash, which catches texture-pack swaps that change dims, format
+// or mip count; a repaint with identical name AND desc is NOT caught --
+// documented with the [Materials] DiskTextureCache ini key (clear
+// %LOCALAPPDATA%\FO4Remix\texcache after swapping texture mods).
+// Threading: probe runs on the game thread; load/store/sweep run on the
+// decode workers. Directory init is call_once-guarded.
+struct DiskCacheHeader {
+    uint32_t magic;        // 'FRT1'
+    uint32_t version;
+    uint64_t key;
+    uint64_t hash;
+    uint32_t width;
+    uint32_t height;
+    uint32_t mipLevels;
+    uint32_t dxgiFormat;
+    uint64_t pixelBytes;
+};
+constexpr uint32_t kDiskCacheMagic   = 0x31545246u;  // 'FRT1'
+// v2 (2026-07-31): FaceGen parts no longer take the kType_Envmap albedo
+// luminance floor, so every cached eye/face texture baked with the old
+// lum-floored pixels must be re-converted rather than served from disk.
+// v3 (2026-07-31): the v2 exclusion never actually fired (IsFaceGenPart
+// matched the parent's RTTI class against what is really the node NAME), so
+// the v2 cache was refilled with lum-floored pixels. Bump again or the
+// corrected pipeline would be masked by its own stale cache.
+constexpr uint32_t kDiskCacheVersion = 3;            // bump on pipeline changes
+
+static std::once_flag g_diskCacheDirOnce;
+static char g_diskCacheDir[MAX_PATH] = {};
+static bool g_diskCacheDirOk = false;
+// Keys stat'ed and found absent this session (game thread only): the
+// resolver re-probes pending textures every 2 frames, and one stat per
+// probe per texture adds up during bursts.
+static std::unordered_set<uint64_t> g_diskProbeMissing;
+
+static const char* DiskCacheDir() {
+    std::call_once(g_diskCacheDirOnce, [] {
+        char base[MAX_PATH] = {};
+        if (!GetEnvironmentVariableA("LOCALAPPDATA", base, sizeof(base))) return;
+        char path[MAX_PATH];
+        sprintf_s(path, "%s\\FO4Remix", base);
+        CreateDirectoryA(path, nullptr);
+        sprintf_s(g_diskCacheDir, "%s\\FO4Remix\\texcache", base);
+        CreateDirectoryA(g_diskCacheDir, nullptr);
+        g_diskCacheDirOk =
+            GetFileAttributesA(g_diskCacheDir) != INVALID_FILE_ATTRIBUTES;
+        _MESSAGE("FO4RemixPlugin: [TexCache] disk cache %s at %s (cap %u GiB)",
+                 g_diskCacheDirOk ? "ready" : "UNAVAILABLE",
+                 g_diskCacheDir, g_config.diskTextureCacheGiB);
+    });
+    return g_diskCacheDirOk ? g_diskCacheDir : nullptr;
+}
+
+static bool DiskCachePath(uint64_t key, char out[MAX_PATH]) {
+    const char* dir = DiskCacheDir();
+    if (!dir) return false;
+    sprintf_s(out, MAX_PATH, "%s\\%016llX.tex", dir, (unsigned long long)key);
+    return true;
+}
+
+static uint64_t DiskCacheKeyFold(uint64_t hash, const D3D11_TEXTURE2D_DESC& sd) {
+    uint64_t k = FnvHashCombine(hash, 0xD15C0000u | kDiskCacheVersion);
+    k = FnvHashCombine(k, ((uint64_t)sd.Format << 48) |
+                          ((uint64_t)sd.MipLevels << 40) |
+                          ((uint64_t)sd.Width << 20) | sd.Height);
+    return k;
+}
+
+static bool DiskCacheLoad(uint64_t key, uint64_t expectHash, ExtractedTexture& out) {
+    char path[MAX_PATH];
+    if (!DiskCachePath(key, path)) return false;
+    HANDLE f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr,
+                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return false;
+    bool ok = false;
+    DiskCacheHeader h = {};
+    DWORD got = 0;
+    LARGE_INTEGER fileSize = {};
+    if (GetFileSizeEx(f, &fileSize) &&
+        ReadFile(f, &h, sizeof(h), &got, nullptr) && got == sizeof(h) &&
+        h.magic == kDiskCacheMagic && h.version == kDiskCacheVersion &&
+        h.key == key && h.hash == expectHash &&
+        h.pixelBytes > 0 && h.pixelBytes < (512ull << 20) &&
+        (uint64_t)fileSize.QuadPart == sizeof(h) + h.pixelBytes &&
+        h.width > 0 && h.width <= 16384 && h.height > 0 && h.height <= 16384) {
+        out.hash       = h.hash;
+        out.width      = h.width;
+        out.height     = h.height;
+        out.mipLevels  = h.mipLevels;
+        out.dxgiFormat = (DXGI_FORMAT)h.dxgiFormat;
+        out.pixels.resize((size_t)h.pixelBytes);
+        DWORD pgot = 0;
+        ok = ReadFile(f, out.pixels.data(), (DWORD)h.pixelBytes, &pgot, nullptr) &&
+             pgot == (DWORD)h.pixelBytes;
+    }
+    CloseHandle(f);
+    if (!ok) out = {};
+    return ok;
+}
+
+static void DiskCacheStore(uint64_t key, const ExtractedTexture& packed) {
+    char path[MAX_PATH];
+    if (!DiskCachePath(key, path)) return;
+    char tmp[MAX_PATH];
+    sprintf_s(tmp, "%s.tmp", path);
+    HANDLE f = CreateFileA(tmp, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DiskCacheHeader h = {};
+    h.magic      = kDiskCacheMagic;
+    h.version    = kDiskCacheVersion;
+    h.key        = key;
+    h.hash       = packed.hash;
+    h.width      = packed.width;
+    h.height     = packed.height;
+    h.mipLevels  = packed.mipLevels;
+    h.dxgiFormat = (uint32_t)packed.dxgiFormat;
+    h.pixelBytes = packed.pixels.size();
+    DWORD wrote = 0;
+    const bool ok =
+        WriteFile(f, &h, sizeof(h), &wrote, nullptr) && wrote == sizeof(h) &&
+        WriteFile(f, packed.pixels.data(), (DWORD)packed.pixels.size(),
+                  &wrote, nullptr) && wrote == (DWORD)packed.pixels.size();
+    CloseHandle(f);
+    if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileA(tmp);
+    }
+}
+
+// Size-cap sweep, once per session on a worker thread: delete oldest files
+// (by last write) until the folder is back under 90% of the cap.
+static void DiskCacheSweep() {
+    const char* dir = DiskCacheDir();
+    if (!dir) return;
+    struct Ent { std::string path; uint64_t size; FILETIME wt; };
+    std::vector<Ent> ents;
+    uint64_t total = 0;
+    char pat[MAX_PATH];
+    sprintf_s(pat, "%s\\*.tex", dir);
+    WIN32_FIND_DATAA fd = {};
+    HANDLE h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        Ent e;
+        e.path = std::string(dir) + "\\" + fd.cFileName;
+        e.size = ((uint64_t)fd.nFileSizeHigh << 32) | fd.nFileSizeLow;
+        e.wt   = fd.ftLastWriteTime;
+        total += e.size;
+        ents.push_back(std::move(e));
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
+    const uint64_t capBytes =
+        (uint64_t)(std::max)(1u, g_config.diskTextureCacheGiB) << 30;
+    if (total <= capBytes) return;
+    std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) {
+        return CompareFileTime(&a.wt, &b.wt) < 0;
+    });
+    const uint64_t target = capBytes / 10 * 9;
+    size_t deleted = 0;
+    for (const Ent& e : ents) {
+        if (total <= target) break;
+        if (DeleteFileA(e.path.c_str())) {
+            total -= e.size;
+            ++deleted;
+        }
+    }
+    _MESSAGE("FO4RemixPlugin: [TexCache] size sweep: deleted %zu oldest files, "
+             "now %llu MiB (cap %u GiB)",
+             deleted, (unsigned long long)(total >> 20),
+             g_config.diskTextureCacheGiB);
+}
+
+// Age-sweep completed decodes nobody consumed (drawable evicted mid-decode,
+// or the resolution fold changed the hash mid-flight). Each orphan pins a
+// fully decoded packed mip chain (~22 MiB at the 2048 cap) OUTSIDE every
+// budget (CpuTextureCacheMiB never sees it). Caller holds g_texConvMutex.
+static void SweepTexConvDoneLocked() {
+    if (g_texConvDone.empty()) return;
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    for (auto it = g_texConvDone.begin(); it != g_texConvDone.end();) {
+        if (now - it->second.doneFrame > 600) {
+            it = g_texConvDone.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 // The conversion tail moved out of ExtractMaterialTexture: pure function of
 // the job, runs on a worker thread. Returns the packed mip chain; empty
 // pixels signal "drop" (exactly the cases that returned 0 inline before).
@@ -1214,25 +2194,54 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     std::vector<ExtractedTexture>& mips = job.mips;
     const char* texName = job.texName.c_str();
     const TexturePostProcess postProcess = job.postProcess;
+    const bool textureDebug = g_config.diagEnabled && g_config.logTextures;
 
     // Per-mip pipeline: BC2 (DXT3) -> RGBA8, then any further BC decompression
     // handled by the post-process stage's BC5/BC1 decoders. Each step operates
     // on a single mip so the existing single-mip-aware functions need no
     // changes.
+    // Does this job apply any per-pixel work? Pass-through textures stay in
+    // their compressed source format (the runtime decodes BC natively and
+    // it is far smaller in VRAM); anything with a transform or bake needs
+    // real pixels.
+    const bool needsDecodedPixels =
+        postProcess != TexturePostProcess::None ||
+        job.palTableValid ||
+        job.tintRGB != 0xFFFFFFu ||
+        job.albedoLumFloor > 0;
+
     for (auto& mip : mips) {
         DecompressBC2(mip);
+        // BC4 has no remixapi format, so it can never pass through
+        // compressed -- decode to RGBA8 grayscale up front; the transform
+        // stages below then treat it like any uncompressed input.
+        if (mip.dxgiFormat == DXGI_FORMAT_BC4_UNORM ||
+            mip.dxgiFormat == DXGI_FORMAT_BC4_TYPELESS) {
+            DecompressBC(mip, BCTransform::None);
+        }
+        // BC7 decodes only when pixels are actually needed (2026-07-10).
+        // Every transform used to DECLINE on BC7 -- smoothness maps shipped
+        // un-inverted, octahedral normal encode never ran, tint/palette/
+        // floor bakes fell back to flat approximations.
+        if (needsDecodedPixels) {
+            DecompressBC7(mip);
+        }
     }
 
     // --- Debug dump: BC3 alpha cutout (right after readback) ---
     // See the black-merge investigation notes; fires for the first N BC3
     // diffuse extractions per process. Counters are atomics now that this
     // runs on worker threads (ticket races would at most skew a filename).
-    {
+    if (textureDebug) {
         static std::atomic<int> s_dumpBC3Alpha{0};
         static std::atomic<int> s_logDiffuseFormat{0};
         if (job.isDiffuseSlot) {
             const auto& mip0 = mips[0];
-            if (s_logDiffuseFormat.fetch_add(1, std::memory_order_relaxed) < 9999) {
+            // Gated on LogTextures + a small cap (was <9999 unconditional:
+            // effectively one log line per diffuse decode on the streaming
+            // hot path, from worker threads).
+            if (g_config.logTextures &&
+                s_logDiffuseFormat.fetch_add(1, std::memory_order_relaxed) < 64) {
                 _MESSAGE("FO4RemixPlugin: DEBUG diffuse-extract tex='%s' fmt=%u %ux%u mips=%zu pp=%d",
                          texName,
                          (unsigned)mip0.dxgiFormat,
@@ -1284,7 +2293,7 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     }
 
     // --- Debug dump: diffuse control (no post-processing) ---
-    if (postProcess == TexturePostProcess::None) {
+    if (textureDebug && postProcess == TexturePostProcess::None) {
         static std::atomic<int> s_dumpDiffuse{0};
         if (s_dumpDiffuse.load(std::memory_order_relaxed) < 2) {
             const int ticket = s_dumpDiffuse.fetch_add(1, std::memory_order_relaxed);
@@ -1308,7 +2317,7 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     }
 
     // --- Debug dump: raw BC5 decode (before post-processing) ---
-    {
+    if (textureDebug) {
         static std::atomic<int> s_dumpNormalRaw{0}, s_dumpRoughnessRaw{0};
         int ticket = -1;
         const char* rawName = nullptr;
@@ -1387,6 +2396,14 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
         bool remapped = false;
         if (job.palTableValid) {
             remapped = PaletteRemap_Apply(mip, job.palTable);
+            // The remap table's output bytes are ALWAYS sRGB-encoded
+            // (BuildPaletteRemapTable re-encodes with LinearToSrgb), so the
+            // tag must say so even when the grayscale SOURCE was a plain
+            // UNORM mask -- otherwise Remix linearizes already-gamma bytes
+            // and palette surfaces come out over-dark.
+            if (remapped && mip.dxgiFormat == DXGI_FORMAT_R8G8B8A8_UNORM) {
+                mip.dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+            }
         }
         // Skin/hair tint multiply composes AFTER the alpha stage (alpha
         // untouched -- hair cutouts survive) and BEFORE the luminance floor.
@@ -1402,7 +2419,7 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
     }
 
     // --- Debug dump: after post-processing (mip 0 only) ---
-    {
+    if (textureDebug) {
         static std::atomic<int> s_dumpNormalPost{0}, s_dumpRoughnessPost{0};
         int ticket = -1;
         const char* postName = nullptr;
@@ -1461,6 +2478,11 @@ static ExtractedTexture ConvertReadbackMips(TextureConversionJob& job)
 
 static void TextureConversionWorkerMain()
 {
+    // One-time disk-cache size sweep, off the game thread.
+    if (g_config.diskTextureCache) {
+        static std::once_flag s_diskSweepOnce;
+        std::call_once(s_diskSweepOnce, [] { DiskCacheSweep(); });
+    }
     for (;;) {
         TextureConversionJob job;
         {
@@ -1469,8 +2491,202 @@ static void TextureConversionWorkerMain()
             if (g_texConvStop) return;   // queued jobs dropped on shutdown, by design
             job = std::move(g_texConvJobs.front());
             g_texConvJobs.pop_front();
+            const size_t jobBytes = TexConvJobBytes(job);
+            g_texConvJobsBytes = g_texConvJobsBytes > jobBytes
+                ? g_texConvJobsBytes - jobBytes : 0;
         }
-        ExtractedTexture packed = ConvertReadbackMips(job);
+        // Direct authored-source job. BA2 inflation and archive I/O stay off
+        // the render thread; successful chains then use the exact same
+        // conversion/cache path as GPU readbacks and loose DDS files.
+        if (job.ba2Source) {
+            auto completeFallback = [&](Ba2TextureSource::Status status) {
+                static std::atomic<int> sBa2FallbackLogs{0};
+                const int n = sBa2FallbackLogs.fetch_add(
+                    1, std::memory_order_relaxed);
+                if (n < 64 || (g_config.logTextures && (n % 256) == 0)) {
+                    _MESSAGE("FO4RemixPlugin: [AuthoredTex] #%d BA2 FALLBACK "
+                             "\"%s\" reason=%s live=%ux%u/%u fmt=%u rd=%ux%u",
+                             n, job.texName.c_str(),
+                             Ba2TextureSource::StatusName(status),
+                             job.ba2LiveDesc.Width, job.ba2LiveDesc.Height,
+                             job.ba2LiveDesc.MipLevels,
+                             (unsigned)job.ba2LiveDesc.Format,
+                             job.ba2ExpectedWidth, job.ba2ExpectedHeight);
+                }
+                std::lock_guard<std::mutex> lk(g_texConvMutex);
+                CompletedTextureConversion completed;
+                completed.doneFrame = Diagnostics::CurrentFrameIndex();
+                completed.fallbackToLive = true;
+                g_texConvDone[job.hash] = std::move(completed);
+                g_texConvInflight.erase(job.hash);
+            };
+
+            // Exception fence. The archive index (up to 1M pending records
+            // + every DX10 resource path) and the per-chunk inflate buffers
+            // (bounded at 256 MiB) are the largest allocations this plugin
+            // makes, and they run ABOVE the conversion fence below -- a bare
+            // bad_alloc/length_error here would escape the thread proc into
+            // std::terminate and fast-fail the process (the same 2026-07-12
+            // WER 0xc0000409 class the convert fence was added for). A throw
+            // is just a source failure: fall back to the live resource.
+            try {
+
+            Ba2TextureSource::ReadInfo info;
+            Ba2TextureSource::Status status = Ba2TextureSource::Query(
+                job.texName.c_str(), job.ba2LiveDesc.Format,
+                job.ba2ExpectedWidth, job.ba2ExpectedHeight,
+                g_config.maxTextureDimension, info);
+            if (status != Ba2TextureSource::Status::Ready) {
+                completeFallback(status);
+                continue;
+            }
+
+            D3D11_TEXTURE2D_DESC authoredDesc = job.ba2LiveDesc;
+            authoredDesc.Width = info.uploadWidth;
+            authoredDesc.Height = info.uploadHeight;
+            authoredDesc.MipLevels = info.uploadMipCount;
+            authoredDesc.Format = info.format;
+            if (g_config.diskTextureCache) {
+                const uint64_t diskKey = DiskCacheKeyFold(job.hash, authoredDesc);
+                ExtractedTexture packed;
+                if (DiskCacheLoad(diskKey, job.hash, packed)) {
+                    static std::atomic<int> sBa2DiskHitLogs{0};
+                    const int n = sBa2DiskHitLogs.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (n < 8) {
+                        _MESSAGE("FO4RemixPlugin: [TexCache] authored BA2 hit #%d "
+                                 "hash=0x%016llX %ux%u mips=%u (%zu KiB)",
+                                 n, (unsigned long long)job.hash,
+                                 packed.width, packed.height, packed.mipLevels,
+                                 packed.pixels.size() >> 10);
+                    }
+                    std::lock_guard<std::mutex> lk(g_texConvMutex);
+                    g_texConvDone[job.hash] = {
+                        std::move(packed), Diagnostics::CurrentFrameIndex() };
+                    g_texConvInflight.erase(job.hash);
+                    continue;
+                }
+                job.diskWriteKey = diskKey;
+            }
+
+            // Cache miss: now pay the archive I/O + zlib cost. Read repeats
+            // the cheap metadata selection so it can own no borrowed index
+            // pointers across this call.
+            status = Ba2TextureSource::Read(
+                job.texName.c_str(), job.ba2LiveDesc.Format,
+                job.ba2ExpectedWidth, job.ba2ExpectedHeight,
+                g_config.maxTextureDimension, job.mips, info);
+            if (status != Ba2TextureSource::Status::Ready || job.mips.empty()) {
+                completeFallback(status);
+                continue;
+            }
+
+            static std::atomic<int> sBa2ReadyLogs{0};
+            const int n = sBa2ReadyLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 64 || (g_config.logTextures && (n % 256) == 0)) {
+                _MESSAGE("FO4RemixPlugin: [AuthoredTex] #%d BA2 \"%s\" "
+                         "archive=\"%s\" authored=%ux%u/%u mips "
+                         "upload=%ux%u/%zu fmt=%u live=%ux%u/%u fmt=%u",
+                         n, job.texName.c_str(), info.archiveName.c_str(),
+                         info.sourceWidth, info.sourceHeight,
+                         info.sourceMipCount, job.mips[0].width,
+                         job.mips[0].height, job.mips.size(),
+                         (unsigned)job.mips[0].dxgiFormat,
+                         job.ba2LiveDesc.Width, job.ba2LiveDesc.Height,
+                         job.ba2LiveDesc.MipLevels,
+                         (unsigned)job.ba2LiveDesc.Format);
+            }
+
+            } catch (...) {
+                static std::atomic<int> sBa2Throw{0};
+                const int n = sBa2Throw.fetch_add(1, std::memory_order_relaxed);
+                if (n < 16) {
+                    _MESSAGE("FO4RemixPlugin: [AuthoredTex] BA2 C++ exception #%d "
+                             "hash=0x%016llX \"%s\" -- falling back to live",
+                             n, (unsigned long long)job.hash,
+                             job.texName.c_str());
+                }
+                // completeFallback allocates too (map insert). If even that
+                // throws, drop the inflight marker so the hash isn't stranded
+                // pending forever -- the resolver then re-enqueues it.
+                try {
+                    completeFallback(Ba2TextureSource::Status::ReadFailed);
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(g_texConvMutex);
+                    g_texConvInflight.erase(job.hash);
+                }
+                continue;
+            }
+        }
+        // Disk-cache load job: no convert, just stream the chain back.
+        if (job.diskLoadKey != 0) {
+            ExtractedTexture packed;
+            if (DiskCacheLoad(job.diskLoadKey, job.hash, packed)) {
+                static std::atomic<int> sHitLogs{0};
+                const int n = sHitLogs.fetch_add(1, std::memory_order_relaxed);
+                if (n < 8) {
+                    _MESSAGE("FO4RemixPlugin: [TexCache] disk hit #%d "
+                             "hash=0x%016llX %ux%u mips=%u (%zu KiB)",
+                             n, (unsigned long long)job.hash,
+                             packed.width, packed.height, packed.mipLevels,
+                             packed.pixels.size() >> 10);
+                }
+                std::lock_guard<std::mutex> lk(g_texConvMutex);
+                g_texConvDone[job.hash] = { std::move(packed),
+                                            Diagnostics::CurrentFrameIndex() };
+                g_texConvInflight.erase(job.hash);
+            } else {
+                // Corrupt/stale file: delete it and post NOTHING -- an empty
+                // done entry would negative-cache the hash. With the file
+                // gone the resolver's next probe misses and takes the normal
+                // readback + convert path.
+                char path[MAX_PATH];
+                if (DiskCachePath(job.diskLoadKey, path)) DeleteFileA(path);
+                _MESSAGE("FO4RemixPlugin: [TexCache] BAD cache file for "
+                         "hash=0x%016llX -- deleted, re-converting",
+                         (unsigned long long)job.hash);
+                std::lock_guard<std::mutex> lk(g_texConvMutex);
+                g_texConvInflight.erase(job.hash);
+            }
+            continue;
+        }
+        // Exception fence (2026-07-12): this is the most allocation-heavy
+        // code the plugin owns (mip-chain vectors, BC7 RGBA expansion,
+        // palette remaps) and it used to run BARE on the worker -- one
+        // bad_alloc/length_error escaped the thread proc, hit
+        // std::terminate, and fast-failed the whole process (WER 0xc0000409
+        // at abort in this DLL). A failed decode now just drops the
+        // texture: an empty result routes through the existing
+        // conversion-dropped path (negative cache) downstream.
+        ExtractedTexture packed;
+        try {
+            packed = ConvertReadbackMips(job);
+        } catch (const std::exception& e) {
+            static std::atomic<int> sConvCatch{0};
+            const int n = sConvCatch.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [TexConvert] worker C++ exception #%d "
+                         "hash=0x%016llX what=%s -- texture dropped",
+                         n, (unsigned long long)job.hash, e.what());
+            }
+            packed = {};
+        } catch (...) {
+            static std::atomic<int> sConvCatchU{0};
+            const int n = sConvCatchU.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [TexConvert] worker unknown C++ exception "
+                         "#%d hash=0x%016llX -- texture dropped",
+                         n, (unsigned long long)job.hash);
+            }
+            packed = {};
+        }
+        // Persist the converted chain so later sessions skip the readback +
+        // convert entirely (see DiskCacheDir). Written before publishing so
+        // a consumer evicting the CPU-cache copy can't race the write.
+        if (job.diskWriteKey != 0 && g_config.diskTextureCache &&
+            !packed.pixels.empty()) {
+            DiskCacheStore(job.diskWriteKey, packed);
+        }
         {
             std::lock_guard<std::mutex> lk(g_texConvMutex);
             g_texConvDone[job.hash] = { std::move(packed),
@@ -1485,21 +2701,31 @@ static void EnqueueTextureConversion(TextureConversionJob&& job)
     std::lock_guard<std::mutex> lk(g_texConvMutex);
     if (g_texConvStop) return;
 
-    // Orphan sweep: a completed result whose caller stopped retrying (drawable
-    // evicted mid-flight, or the resident-resolution fold changed the hash)
-    // would pin its pixel buffer forever. Only walks once the map has grown
-    // past what a healthy pipeline keeps in flight.
-    if (g_texConvDone.size() > 64) {
-        const uint64_t now = Diagnostics::CurrentFrameIndex();
-        for (auto it = g_texConvDone.begin(); it != g_texConvDone.end();) {
-            if (now - it->second.doneFrame > 600) {
-                it = g_texConvDone.erase(it);
-            } else {
-                ++it;
-            }
+    // Orphan sweep (unconditional -- the old size()>64 gate meant up to 64
+    // orphans, ~1.4 GiB worst case, survived indefinitely once a streaming
+    // burst ended, and even past 64 only a fresh enqueue could reap them).
+    // The Tick sweep cadence also calls this via SweepTextureQueues.
+    SweepTexConvDoneLocked();
+
+    // Queue byte bound (see g_texConvJobsBytes): drop rather than park
+    // unbounded raw chains; the caller keeps reporting pending and its
+    // retry re-runs the readback once the workers have drained the queue.
+    const size_t jobBytes = TexConvJobBytes(job);
+    if (g_texConvJobs.size() >= kMaxTexConvJobs ||
+        g_texConvJobsBytes + jobBytes > kMaxTexConvJobsBytes) {
+        static std::atomic<int> sDropLogs{0};
+        const int n = sDropLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            _MESSAGE("FO4RemixPlugin: [TexConvert] queue full (%zu jobs, %zu MiB), "
+                     "dropping job #%d hash=0x%016llX (%zu KiB) -- retry "
+                     "re-reads it back",
+                     g_texConvJobs.size(), g_texConvJobsBytes >> 20, n,
+                     (unsigned long long)job.hash, jobBytes >> 10);
         }
+        return;
     }
 
+    g_texConvJobsBytes += jobBytes;
     g_texConvInflight.insert(job.hash);
     g_texConvJobs.push_back(std::move(job));
 
@@ -1551,12 +2777,25 @@ void BsExtraction::StopTextureConversionWorkers()
     _MESSAGE("FO4RemixPlugin: [TexConvert] texture decode workers stopped");
 }
 
+// Defined with the async mesh-parse front-end below (same Tick cadence:
+// parses whose drawable was evicted mid-decode age out like textures).
+static void SweepMeshParseQueues();
+
+void BsExtraction::SweepTextureQueues()
+{
+    {
+        std::lock_guard<std::mutex> lk(g_texConvMutex);
+        SweepTexConvDoneLocked();
+    }
+    SweepMeshParseQueues();
+}
+
 // ---------------------------------------------------------------------------
 // Generic texture extraction from any NiTexture slot
 // ---------------------------------------------------------------------------
 uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                        ID3D11Device* device,
-                                       std::vector<ExtractedTexture>& newTextures,
+                                       TextureSupply& newTextures,
                                        TexturePostProcess postProcess,
                                        uint8_t minRoughness,
                                        uint8_t albedoLumFloor,
@@ -1598,7 +2837,8 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
 
     // Stable hash from texture name so hashes are consistent across runs
     const char* texName = tex->name.c_str();
-    uint64_t hash = FnvHash(texName ? texName : "");
+    const uint64_t sourceNameHash = FnvHash(texName ? texName : "");
+    uint64_t hash = sourceNameHash;
     // Include post-processing mode so variants don't collide
     if (postProcess == TexturePostProcess::InvertRGB)                         hash = FnvHashCombine(hash, 1);
     if (postProcess == TexturePostProcess::Octahedral)                        hash = FnvHashCombine(hash, 2);
@@ -1625,6 +2865,13 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
         hash = FnvHashCombine(hash, FnvHash(lutName ? lutName : ""));
         hash = FnvHashCombine(hash, 10 | ((uint64_t)(uint8_t)(paletteRowV * 255.0f + 0.5f) << 8));
     }
+    // Keep authored-source output distinct from the old live-resource path,
+    // including persistent disk-cache files left by earlier builds. The salt
+    // also covers fallback output while the option is enabled so a transient
+    // source failure can never consume a stale unsalted low-mip cache entry.
+    if (g_config.authoredTextureSource) {
+        hash = FnvHashCombine(hash, 12);
+    }
     // Resident RESOLUTION variant (2026-07-08 re-capture-on-approach): FO4
     // streams textures in progressively, so `resource` is whatever mip level
     // is currently resident -- often reduced (1/2, 1/4) when the object first
@@ -1640,14 +2887,68 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // TextureUpgradeOnApproach): default OFF keeps the name-only key (and thus
     // byte-identical caching + no upgrade churn).
     const uint64_t preResolutionHash = hash;  // for superseded-variant eviction
-    if (g_config.textureUpgradeOnApproach) {
+    if (g_config.textureUpgradeOnApproach && !g_config.authoredTextureSource) {
         ID3D11Texture2D* t2d = nullptr;
         if (SUCCEEDED(resource->QueryInterface(
                 __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&t2d))) && t2d) {
             D3D11_TEXTURE2D_DESC rd; t2d->GetDesc(&rd);
             t2d->Release();
+            // Fold the CAPPED dims: two resident sizes that clamp to the
+            // same upload resolution must share one cache key, or the same
+            // capped pixels would upload twice under different hashes.
             if (rd.Width) hash = FnvHashCombine(
-                hash, 0xA00000000ULL | ((uint64_t)rd.Width << 16) | (rd.Height & 0xFFFFu));
+                hash, 0xA00000000ULL | ((uint64_t)CapDim(rd.Width) << 16) |
+                      (CapDim(rd.Height) & 0xFFFFu));
+        }
+    }
+
+    // ---- Live render-target detection (2026-07-18 Pip-Boy screen) ----
+    // A source with BIND_RENDER_TARGET is an engine compositing target whose
+    // pixels change at runtime (the Pip-Boy screen's Scaleform UI). Fold the
+    // live-texture generation into the hash BEFORE the cache check so a
+    // generation bump forces a fresh capture, and fold the surface identity
+    // (dims+format) so distinct unnamed RTs can't collide on a name hash.
+    bool isLiveRT = false;
+    {
+        ID3D11Texture2D* probe2d = nullptr;
+        if (SUCCEEDED(resource->QueryInterface(
+                __uuidof(ID3D11Texture2D),
+                reinterpret_cast<void**>(&probe2d))) && probe2d) {
+            D3D11_TEXTURE2D_DESC pd = {};
+            probe2d->GetDesc(&pd);
+            probe2d->Release();
+            if (pd.BindFlags & D3D11_BIND_RENDER_TARGET) {
+                isLiveRT = true;
+                g_liveRTFlagSticky = true;
+                // Registry for the overlay compositor's exclusion check.
+                // Bounded: live RTs are a handful per session; a runaway set
+                // (pointer churn) resets and re-learns from live extractions.
+                if (g_liveRTScreenSources.size() > 32)
+                    g_liveRTScreenSources.clear();
+                g_liveRTScreenSources.insert(probe2d);
+                hash = FnvHashCombine(hash,
+                    ((uint64_t)pd.Format << 40) |
+                    ((uint64_t)pd.Width << 24) | ((uint64_t)pd.Height << 8) | 9u);
+                const uint64_t baseHash = hash;
+                hash = FnvHashCombine(hash,
+                    11ull | ((uint64_t)g_liveTexGeneration << 8));
+                // One live CPU-cache entry per RT: evict the previous
+                // generation the moment a new one is keyed.
+                auto [lit, inserted] =
+                    g_liveTexLastVariant.try_emplace(baseHash, hash);
+                if (!inserted && lit->second != hash) {
+                    TextureCacheErase(lit->second);
+                    lit->second = hash;
+                }
+                static std::atomic<int> sLiveRtLogs{0};
+                if (sLiveRtLogs.fetch_add(1, std::memory_order_relaxed) < 8) {
+                    _MESSAGE("FO4RemixPlugin: [LiveTex] render-target source "
+                             "\"%s\" slot=%s %ux%u fmt=%u gen=%u",
+                             texName ? texName : "<unnamed>", slotName,
+                             pd.Width, pd.Height, (unsigned)pd.Format,
+                             g_liveTexGeneration);
+                }
+            }
         }
     }
 
@@ -1661,13 +2962,18 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // gate fails silently and the drawable can NEVER submit again (the
     // "player's area empty after loading a save" + submitFailed-retry-storm
     // symptom). Re-supply the cached pixels so SubmitDrawable recreates the
-    // handle; the copy only happens in the handle-missing case.
+    // handle; the supply is a shared_ptr alias of the cache entry (refcount,
+    // not a pixel copy), taken only in the handle-missing case.
+    if (g_texKnownBad.count(hash)) return 0;  // decode permanently dropped
+
     auto it = g_textureCache.find(hash);
     if (it != g_textureCache.end()) {
+        it->second.touch      = ++g_textureCacheTouchCounter;
+        it->second.touchFrame = Diagnostics::CurrentFrameIndex();
         // Probe mode never copies: the pixels are re-supplied by the caller's
         // supplying pass on the attempt that actually submits.
         if (supplyPixels && !RemixRenderer::HasTextureHandle(hash)) {
-            newTextures.push_back(it->second);
+            newTextures.push_back(it->second.tex);
         }
         return hash;
     }
@@ -1680,11 +2986,13 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     {
         ExtractedTexture packed;
         bool havePacked = false;
+        bool fallbackToLive = false;
         {
             std::lock_guard<std::mutex> lk(g_texConvMutex);
             auto dit = g_texConvDone.find(hash);
             if (dit != g_texConvDone.end()) {
                 packed = std::move(dit->second.packed);
+                fallbackToLive = dit->second.fallbackToLive;
                 g_texConvDone.erase(dit);
                 havePacked = true;
             } else if (g_texConvInflight.count(hash)) {
@@ -1692,8 +3000,18 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                 return 0;  // decode in flight; resolver retries next tick
             }
         }
+        if (havePacked && fallbackToLive) {
+            g_authoredDdsUnavailable.insert(sourceNameHash);
+            havePacked = false;
+        }
         if (havePacked) {
-            if (packed.pixels.empty()) return 0;  // conversion dropped (format mismatch)
+            if (packed.pixels.empty()) {
+                // Conversion dropped (format mismatch). Remember it so the
+                // resolver's retries short-circuit here instead of re-running
+                // the readback + decode forever.
+                g_texKnownBad.insert(hash);
+                return 0;
+            }
 
             if (g_config.logTextures) {
                 _MESSAGE("FO4RemixPlugin: Extracted %s texture \"%s\" %ux%u mips=%u fmt=%u hash=0x%016llX%s",
@@ -1710,25 +3028,26 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
             // ever had resident. Only when the resolution fold is active (hash
             // differs from the pre-fold hash); only supersede strictly-smaller
             // variants.
-            if (hash != preResolutionHash) {
+            if (hash != preResolutionHash && !isLiveRT) {
                 auto [vit, inserted] = g_texResVariantIndex.try_emplace(
                     preResolutionHash, hash, packed.width);
                 if (!inserted && vit->second.first != hash) {
                     if (packed.width > vit->second.second) {
-                        g_textureCache.erase(vit->second.first);
+                        TextureCacheErase(vit->second.first);
                         vit->second = { hash, packed.width };
                     }
                 }
             }
 
+            // One shared chain serves both the cache and (when supplying)
+            // the submit list -- the old path deep-copied the ~22MB chain
+            // here so the cache could keep one while the submit list took
+            // the other.
+            const auto& cached = TextureCacheInsert(hash, std::move(packed));
             if (supplyPixels) {
-                g_textureCache[hash] = packed;             // copy stays cached
-                newTextures.push_back(std::move(packed));  // moved to submit list
-            } else {
-                // Probe mode: park the decode in the cache without the extra
-                // copy; the supplying pass cache-hits it later.
-                g_textureCache[hash] = std::move(packed);
+                newTextures.push_back(cached);
             }
+            TextureCacheEnforceBudget();
             return hash;
         }
     }
@@ -1739,17 +3058,123 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
                                           reinterpret_cast<void**>(&tex2D));
     if (FAILED(hr) || !tex2D) return 0;
 
-    // Read every mip from the source D3D texture. Each entry is a single-mip
-    // ExtractedTexture so we can reuse the existing per-mip decompression and
-    // post-process functions unchanged. They get concatenated into a packed
-    // mip chain at the end.
-    //
-    // Async: the first attempt queues GPU copies and returns Pending; the
-    // resolver's retry loop calls back next tick(s) until the copies have
-    // landed. Returning 0 here is the existing "no texture yet" signal the
-    // resolver already handles by retrying -- no stalls on the game thread.
+    // Prefer the authored DDS chain when configured. This is deliberately
+    // attempted after live-RT classification: render targets and generated
+    // textures must preserve their live pixels. Failures are remembered by
+    // source name for the session and fall through to the proven GPU path.
     std::vector<ExtractedTexture> mips;
-    ReadbackStatus rbStatus = ReadbackAllMipsAsync(device, tex2D, hash, mips);
+    D3D11_TEXTURE2D_DESC srcDescForCache = {};
+    tex2D->GetDesc(&srcDescForCache);
+    const D3D11_TEXTURE2D_DESC liveDesc = srcDescForCache;
+    bool usedAuthoredSource = false;
+    auto populateConversionJob = [&](TextureConversionJob& job,
+                                     DXGI_FORMAT sourceFormat) {
+        job.hash           = hash;
+        job.postProcess    = postProcess;
+        job.minRoughness   = minRoughness;
+        job.albedoLumFloor = albedoLumFloor;
+        job.tintRGB        = tintRGB;
+        job.isDiffuseSlot  = slotName && std::strcmp(slotName, "diffuse") == 0;
+        job.texName        = texName ? texName : "";
+
+        if (paletteLut) {
+            const char* lutName = paletteLut->name.c_str();
+            const uint64_t lutKey = FnvHashCombine(
+                FnvHash(lutName ? lutName : ""), 0x1071ULL);
+            auto lit = g_lutCache.find(lutKey);
+            if (lit != g_lutCache.end() && !lit->second.rgba.empty()) {
+                job.palTableValid = BuildPaletteRemapTable(
+                    lit->second, paletteRowV,
+                    IsSrgbColorFormat(sourceFormat), job.palTable);
+            }
+        }
+    };
+    if (g_config.authoredTextureSource && !isLiveRT &&
+        !g_authoredDdsUnavailable.count(sourceNameHash)) {
+        AuthoredDdsInfo authoredInfo;
+        const AuthoredDdsStatus authoredStatus =
+            ReadAuthoredDdsMips(texName, srcDescForCache.Format, mips,
+                                authoredInfo);
+        if (authoredStatus == AuthoredDdsStatus::Ready) {
+            usedAuthoredSource = true;
+            srcDescForCache.Width = mips[0].width;
+            srcDescForCache.Height = mips[0].height;
+            srcDescForCache.MipLevels = static_cast<UINT>(mips.size());
+            srcDescForCache.Format = mips[0].dxgiFormat;
+
+            static std::atomic<int> sAuthoredReadyLogs{0};
+            const int n =
+                sAuthoredReadyLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 64 || (g_config.logTextures && (n % 256) == 0)) {
+                _MESSAGE("FO4RemixPlugin: [AuthoredTex] #%d slot=%s \"%s\" "
+                         "authored=%ux%u/%u mips upload=%ux%u/%zu fmt=%u "
+                         "live=%ux%u/%u fmt=%u rd=%ux%u",
+                         n, slotName ? slotName : "<null>",
+                         texName ? texName : "<unnamed>",
+                         authoredInfo.sourceWidth, authoredInfo.sourceHeight,
+                         authoredInfo.sourceMipCount,
+                         mips[0].width, mips[0].height, mips.size(),
+                         (unsigned)mips[0].dxgiFormat,
+                         liveDesc.Width, liveDesc.Height,
+                         liveDesc.MipLevels,
+                         (unsigned)liveDesc.Format,
+                         (unsigned)renderData->width,
+                         (unsigned)renderData->height);
+            }
+        } else {
+            // BSResourceNiBinaryStream exposes loose/generated DDS files but
+            // not ordinary DX10 BA2 texture entries. Let a worker resolve the
+            // archive entry; on failure its completion routes this same hash
+            // back through the proven live-resource readback path.
+            TextureConversionJob job;
+            populateConversionJob(job, liveDesc.Format);
+            job.ba2Source = true;
+            job.ba2LiveDesc = liveDesc;
+            job.ba2ExpectedWidth = renderData->width;
+            job.ba2ExpectedHeight = renderData->height;
+            EnqueueTextureConversion(std::move(job));
+            tex2D->Release();
+            if (outPending) *outPending = true;
+            return 0;
+        }
+    }
+
+    // Persistent disk cache probe: a prior session already converted this
+    // exact chain -- stream it back on a worker instead of paying readback
+    // + convert. For authored DDS input, srcDescForCache describes the capped
+    // authored chain rather than the reduced live resource. Probed at most
+    // once per hash per session (g_diskProbeMissing suppresses the per-retry
+    // stat; the resolver polls pending textures every 2 frames).
+    uint64_t diskKey = 0;
+    // Live RTs bypass the disk cache entirely: their pixels are per-frame
+    // runtime content, and per-generation keys would flood the folder.
+    if (g_config.diskTextureCache && !isLiveRT) {
+        diskKey = DiskCacheKeyFold(hash, srcDescForCache);
+        if (!g_diskProbeMissing.count(hash)) {
+            char cachePath[MAX_PATH];
+            if (DiskCachePath(diskKey, cachePath) &&
+                GetFileAttributesA(cachePath) != INVALID_FILE_ATTRIBUTES) {
+                TextureConversionJob loadJob;
+                loadJob.hash        = hash;
+                loadJob.diskLoadKey = diskKey;
+                loadJob.texName     = texName ? texName : "";
+                EnqueueTextureConversion(std::move(loadJob));
+                tex2D->Release();
+                if (outPending) *outPending = true;
+                return 0;
+            }
+            g_diskProbeMissing.insert(hash);
+        }
+    }
+
+    // If authored loading declined, read every mip from the current D3D
+    // texture. Each entry is a single-mip ExtractedTexture so both source
+    // paths share all decompression, material transforms, cache packing, and
+    // Remix upload behavior below.
+    ReadbackStatus rbStatus = ReadbackStatus::Ready;
+    if (!usedAuthoredSource) {
+        rbStatus = ReadbackAllMipsAsync(device, tex2D, hash, mips);
+    }
     tex2D->Release();
 
     if (rbStatus == ReadbackStatus::Pending) {
@@ -1764,33 +3189,8 @@ uint64_t BsExtraction::ExtractMaterialTexture(NiTexture* tex, const char* slotNa
     // block above a tick or two later. Everything the job needs is copied or
     // moved -- no engine pointers cross the thread boundary.
     TextureConversionJob job;
-    job.hash           = hash;
-    job.postProcess    = postProcess;
-    job.minRoughness   = minRoughness;
-    job.albedoLumFloor = albedoLumFloor;
-    job.tintRGB        = tintRGB;
-    job.isDiffuseSlot  = slotName && std::strcmp(slotName, "diffuse") == 0;
-    job.texName        = texName ? texName : "";
-
-    // Runtime gamma of the source resource, captured before any decompression
-    // (DecompressBC drops the _SRGB tag). Drives the palette remap's U decode:
-    // the engine samples the grayscale diffuse through THIS format's SRV.
-    const bool srcIsSrgb = IsSrgbColorFormat(mips[0].dxgiFormat);
-
-    // Grayscale-to-palette remap table: built here on the game thread (it
-    // reads g_lutCache, which is game-thread-only) and copied into the job.
-    // Requires the LUT to be decoded already -- the resolver's
-    // SampleLookupColor pending-gate guarantees that before the diffuse
-    // extraction runs.
-    if (paletteLut) {
-        const char* lutName = paletteLut->name.c_str();
-        const uint64_t lutKey = FnvHashCombine(FnvHash(lutName ? lutName : ""), 0x1071ULL);
-        auto lit = g_lutCache.find(lutKey);
-        if (lit != g_lutCache.end() && !lit->second.rgba.empty()) {
-            job.palTableValid = BuildPaletteRemapTable(lit->second, paletteRowV,
-                                                       srcIsSrgb, job.palTable);
-        }
-    }
+    populateConversionJob(job, mips[0].dxgiFormat);
+    job.diskWriteKey   = diskKey;  // 0 when the disk cache is off
 
     job.mips = std::move(mips);
     EnqueueTextureConversion(std::move(job));
@@ -1814,7 +3214,7 @@ BSLightingShaderMaterialBase* BsExtraction::GetLightingMaterial(BSTriShape* shap
 
 // Extract emissive data from a shape's shader property and material
 void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
-                                ID3D11Device* device, std::vector<ExtractedTexture>& newTextures,
+                                ID3D11Device* device, TextureSupply& newTextures,
                                 uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity,
                                 bool* outPending, bool supplyPixels)
 {
@@ -1896,11 +3296,50 @@ void BsExtraction::ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMateri
     }
 }
 
-// Parse vertices and indices from a BSTriShape. Returns false if the shape
-// should be skipped (effect shader, missing data, NaN positions, bad indices).
-// When logRejections is false, NaN/Inf and bad-index rejections are silent.
-bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections,
-                                      bool applyVertexColors, bool parseSkinning)
+// ---------------------------------------------------------------------------
+// Mesh parse, split for the async pipeline (2026-07-21).
+//
+// SnapshotShapeGeometry: GAME THREAD ONLY. Runs every live-memory gate the
+// old single-pass parse ran (effect shader, renderer data, stride) and then
+// memcpy's the raw VB/IB (and dynamicVertices) bytes into plugin-owned
+// storage. Bounded work -- the per-vertex decode does NOT happen here.
+// Callers run it under the resolver's SEH frame; nothing here follows a
+// pointer the gates didn't validate first.
+//
+// ParseSnapshotGeometry: ANY THREAD. Pure function of the snapshot -- the
+// per-vertex decode, skinning attributes, NaN/index validation, winding
+// flip. Touches no engine memory and no game-thread caches.
+//
+// BsExtraction::ParseShapeGeometry keeps the old synchronous contract as
+// snapshot+decode back-to-back (water resolver, AsyncMeshParse=0 fallback).
+// ---------------------------------------------------------------------------
+struct GeometrySnapshot {
+    std::vector<uint8_t> vb;      // numVertices * vertexSize bytes
+    std::vector<uint8_t> ib;      // numTriangles * 3 uint16 indices
+    std::vector<uint8_t> dynVb;   // dynamicVertices copy (dynamic shapes only)
+    uint64_t vertexDesc    = 0;
+    uint16_t vertexSize    = 0;
+    uint16_t dynVertexSize = 0;
+    uint32_t numVertices   = 0;
+    uint32_t numTriangles  = 0;
+    // RTTI-subclass flag (attrShift keys off the CLASS) vs "has dynamic
+    // data" (position source keys off the DATA) -- distinct on a
+    // BSDynamicTriShape with null dynamicVertices, same as the live parse.
+    bool     isDynShapeClass = false;
+    bool     isDynamic     = false;
+    bool     applyVertexColors = true;
+    bool     parseSkinning     = false;
+    char     name[96]      = "";  // rejection-log identity (copied, not live)
+    // Engine index-buffer identity for the occlusion signal (2026-07-21):
+    // the D3D11 IB pointer + byte offset the engine binds when it draws this
+    // shape. DrawCapture keys its per-frame visibility set on the same pair.
+    uint64_t engineIbPtr    = 0;
+    uint32_t engineIbOffset = 0;
+};
+
+static bool SnapshotShapeGeometry(BSTriShape* shape, GeometrySnapshot& snap,
+                                  bool logRejections,
+                                  bool applyVertexColors, bool parseSkinning)
 {
     if (!shape)
         return false;
@@ -1962,6 +3401,14 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         return false;
     }
 
+    // Occlusion key source (2026-07-21): the D3D11 index buffer this shape
+    // draws from, plus its byte offset within that (pooled) buffer. The
+    // engine binds exactly this pair via IASetIndexBuffer; DrawCapture's
+    // draw-side stamp reads the same pair, so a submitted drawable can be
+    // matched against "did the engine draw this geometry this frame".
+    snap.engineIbPtr    = reinterpret_cast<uint64_t>(gfxData->pIB->pBuffer);
+    snap.engineIbOffset = gfxData->pIB->DataOffset;
+
     uint64_t desc = shape->vertexDesc;
     uint16_t vertexSize = shape->GetVertexSize();
     if (vertexSize == 0) {
@@ -1969,11 +3416,68 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         return false;
     }
 
+    BSDynamicTriShape* dynShape = shape->GetAsBSDynamicTriShape();
+
+    // BSDynamicTriShape stores morphed positions outside the normal vertex
+    // buffer. Only take that path for the actual dynamic subclass
+    // (RTTI-checked): some plain BSTriShape vertex descriptors have the
+    // szVertex nibble set even though the object has no dynamicVertices
+    // field -- on those, reading +0x180 dereferences memory past the
+    // object (plain BSTriShape) or an unrelated field (subclass
+    // neighbors), and the resulting "positions" render as garbled or
+    // misplaced geometry. Cherry-picked from PR #1 (Kralich),
+    // user-verified 2026-07-07 as the PR's load-bearing fix.
+    uint8_t* dynVerts = nullptr;
+    uint16_t dynVertexSize = 0;
+    if (dynShape) {
+        dynVerts = dynShape->dynamicVertices;
+        dynVertexSize = dynShape->GetDynamicVertexSize();
+    }
+
+    // Everything below is bounded copies into plugin-owned storage; the
+    // per-vertex decode happens in ParseSnapshotGeometry (any thread).
+    const char* nm = shape->m_name.c_str();
+    if (nm) {
+        std::strncpy(snap.name, nm, sizeof(snap.name) - 1);
+        snap.name[sizeof(snap.name) - 1] = '\0';
+    }
+    snap.vertexDesc        = desc;
+    snap.vertexSize        = vertexSize;
+    snap.numVertices       = shape->numVertices;
+    snap.numTriangles      = shape->numTriangles;
+    snap.isDynShapeClass   = dynShape != nullptr;
+    snap.applyVertexColors = applyVertexColors;
+    snap.parseSkinning     = parseSkinning;
+    snap.vb.assign(vbData, vbData + (size_t)snap.numVertices * vertexSize);
+    snap.ib.assign(ibData, ibData + (size_t)snap.numTriangles * 3u * 2u);
+    if (dynVerts && dynVertexSize != 0) {
+        snap.isDynamic     = true;
+        snap.dynVertexSize = dynVertexSize;
+        snap.dynVb.assign(dynVerts,
+                          dynVerts + (size_t)snap.numVertices * dynVertexSize);
+    }
+    return true;
+}
+
+// Decode a snapshot into ParsedGeometry. Pure function of `snap` -- safe on
+// the mesh worker pool. Consumes the snapshot: the VB copy moves into
+// out.vbBytes so downstream readers (palette histogram, detail diagnostics)
+// get a copy coherent with the parsed vertices.
+static bool ParseSnapshotGeometry(GeometrySnapshot&& snap, ParsedGeometry& out,
+                                  bool logRejections)
+{
+    const uint64_t desc        = snap.vertexDesc;
+    const uint16_t vertexSize  = snap.vertexSize;
+    const uint32_t numVertices = snap.numVertices;
+    uint8_t* vbData = snap.vb.data();
+
+    // Carry the occlusion key through (pure copy, no engine access).
+    out.engineIbPtr    = snap.engineIbPtr;
+    out.engineIbOffset = snap.engineIbOffset;
+
     bool hasUVs     = (desc & BSGeometry::kFlag_UVs) != 0;
     bool hasNormals = (desc & BSGeometry::kFlag_Normals) != 0;
     bool hasColors  = (desc & BSGeometry::kFlag_VertexColors) != 0;
-
-    BSDynamicTriShape* dynShape = shape->GetAsBSDynamicTriShape();
 
     // Attribute offsets are ABSOLUTE dword offsets within the static vertex
     // record -- including on real dynamic shapes. The engine's facegen
@@ -1992,40 +3496,26 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     // PR#1 population of non-dynamic shapes carrying a junk n1 nibble keeps
     // its long-verified behavior.
     uint32_t szVertex = (desc >> 4) & 0xF;
-    const uint32_t attrShift = dynShape ? 0 : szVertex;
+    const uint32_t attrShift = snap.isDynShapeClass ? 0 : szVertex;
     uint32_t oUV     = (attrShift + ((desc >>  8) & 0xF)) * 4;
     uint32_t oNormal = (attrShift + ((desc >> 16) & 0xF)) * 4;
     uint32_t oColor  = (attrShift + ((desc >> 24) & 0xF)) * 4;
 
     bool posHalfFloat = !(desc & BSGeometry::kFlag_FullPrecision);
 
-    // BSDynamicTriShape stores morphed positions outside the normal vertex
-    // buffer. Only take that path for the actual dynamic subclass
-    // (RTTI-checked): some plain BSTriShape vertex descriptors have the
-    // szVertex nibble set even though the object has no dynamicVertices
-    // field -- on those, reading +0x180 dereferences memory past the
-    // object (plain BSTriShape) or an unrelated field (subclass
-    // neighbors), and the resulting "positions" render as garbled or
-    // misplaced geometry. Cherry-picked from PR #1 (Kralich),
-    // user-verified 2026-07-07 as the PR's load-bearing fix.
     uint8_t* posData = vbData;
     uint32_t posStride = vertexSize;
-    bool isDynamic = false;
-    if (dynShape) {
-        uint8_t* dynVerts = dynShape->dynamicVertices;
-        const uint16_t dynVertexSize = dynShape->GetDynamicVertexSize();
-        if (dynVerts && dynVertexSize != 0) {
-            posData = dynVerts;
-            posStride = dynVertexSize;
-            isDynamic = true;
-        }
+    const bool isDynamic = snap.isDynamic;
+    if (isDynamic) {
+        posData = snap.dynVb.data();
+        posStride = snap.dynVertexSize;
     }
 
     // Parse vertices
-    out.vertices.resize(shape->numVertices);
+    out.vertices.resize(numVertices);
 
-    for (uint16_t i = 0; i < shape->numVertices; i++) {
-        uint8_t* v = vbData + (uint32_t)i * vertexSize;
+    for (uint32_t i = 0; i < numVertices; i++) {
+        uint8_t* v = vbData + i * vertexSize;
         remixapi_HardcodedVertex& out_v = out.vertices[i];
         memset(&out_v, 0, sizeof(out_v));
 
@@ -2077,7 +3567,7 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         // Color. Gated on the shader property's SLSF2_Vertex_Colors flag
         // (threaded in by the caller): FO4 meshes often carry a painted
         // color stream the vanilla shader ignores unless the flag is set.
-        if (applyVertexColors && hasColors && oColor + 4 <= vertexSize) {
+        if (snap.applyVertexColors && hasColors && oColor + 4 <= vertexSize) {
             memcpy(&out_v.color, v + oColor, 4);
         } else {
             out_v.color = 0xFFFFFFFF;
@@ -2091,15 +3581,15 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     // engine's vertex shader consumes weights .xyz and reconstructs the 4th
     // as 1-(x+y+z); replicate that (the 4th stored half is not trusted).
     out.hasSkinning = false;
-    if (parseSkinning && (desc & BSGeometry::kFlag_Skinned)) {
+    if (snap.parseSkinning && (desc & BSGeometry::kFlag_Skinned)) {
         // attrShift, not szVertex: on converted facegen heads the skin
         // nibble is already rebased (3 -> byte 12 of the 24-byte record).
         const uint32_t oSkin = (attrShift + (uint32_t)((desc >> 28) & 0xF)) * 4;
         if (oSkin + 12 <= vertexSize) {
-            out.blendWeights.resize((size_t)shape->numVertices * 4);
-            out.blendIndices.resize((size_t)shape->numVertices * 4);
-            for (uint16_t i = 0; i < shape->numVertices; i++) {
-                const uint8_t* v = vbData + (uint32_t)i * vertexSize;
+            out.blendWeights.resize((size_t)numVertices * 4);
+            out.blendIndices.resize((size_t)numVertices * 4);
+            for (uint32_t i = 0; i < numVertices; i++) {
+                const uint8_t* v = vbData + i * vertexSize;
                 const uint16_t* wRaw = reinterpret_cast<const uint16_t*>(v + oSkin);
                 float w0 = HalfToFloat(wRaw[0]);
                 float w1 = HalfToFloat(wRaw[1]);
@@ -2134,14 +3624,13 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
         } else if (logRejections) {
             _MESSAGE("FO4RemixPlugin: [Skinning] shape \"%s\" skinned desc=%016llX but "
                      "oSkin=%u+12 > stride=%u -- skinning attributes skipped",
-                     shape->m_name.c_str() ? shape->m_name.c_str() : "",
-                     (unsigned long long)desc, oSkin, vertexSize);
+                     snap.name, (unsigned long long)desc, oSkin, vertexSize);
         }
     }
 
     // Validate vertex positions
-    const char* shapeName = shape->m_name.c_str();
-    for (uint16_t i = 0; i < shape->numVertices; i++) {
+    const char* shapeName = snap.name;
+    for (uint32_t i = 0; i < numVertices; i++) {
         const auto& pos = out.vertices[i].position;
         for (int j = 0; j < 3; j++) {
             if (std::isnan(pos[j]) || std::isinf(pos[j])) {
@@ -2164,15 +3653,15 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
     // terrain shells). Swapping the 2nd/3rd index of each triangle restores
     // the authored facing under the mirrored transform, and also makes
     // geometric normals (derived from winding) agree with the vertex normals.
-    uint32_t indexCount = shape->numTriangles * 3;
-    uint16_t* indices16 = reinterpret_cast<uint16_t*>(ibData);
+    uint32_t indexCount = snap.numTriangles * 3;
+    const uint16_t* indices16 = reinterpret_cast<const uint16_t*>(snap.ib.data());
     out.indices.resize(indexCount);
     for (uint32_t i = 0; i < indexCount; i++) {
         uint32_t idx = indices16[i];
-        if (idx >= shape->numVertices) {
+        if (idx >= numVertices) {
             if (logRejections)
                 _MESSAGE("FO4RemixPlugin: Rejecting mesh \"%s\" - index[%u]=%u >= numVertices=%u",
-                         shapeName ? shapeName : "<null>", i, idx, shape->numVertices);
+                         shapeName, i, idx, numVertices);
             return false;
         }
         // Destination slot swaps indices 1<->2 within each triangle.
@@ -2184,10 +3673,224 @@ bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bo
 
     out.vertexDesc = desc;
     out.vertexSize = vertexSize;
-    out.vbData = vbData;
-    out.isDynamic = isDynamic;
+    out.vbCount    = numVertices;
+    out.vbBytes    = std::move(snap.vb);
+    out.vbData     = out.vbBytes.data();
+    out.isDynamic  = isDynamic;
 
     return true;
+}
+
+// Parse vertices and indices from a BSTriShape. Returns false if the shape
+// should be skipped (effect shader, missing data, NaN positions, bad indices).
+// When logRejections is false, NaN/Inf and bad-index rejections are silent.
+// Synchronous: snapshot + decode back-to-back on the calling (game) thread.
+bool BsExtraction::ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections,
+                                      bool applyVertexColors, bool parseSkinning)
+{
+    GeometrySnapshot snap;
+    if (!SnapshotShapeGeometry(shape, snap, logRejections,
+                               applyVertexColors, parseSkinning)) {
+        return false;
+    }
+    return ParseSnapshotGeometry(std::move(snap), out, logRejections);
+}
+
+// ---------------------------------------------------------------------------
+// Mesh worker pool (2026-07-21). Shared by the async parse below and the
+// merge-chunk bake in lighting_static. Same shape as the texture decode
+// pool: lazy start, below-normal priority, cv-driven deque, drop-on-stop.
+//
+// Thread contract: jobs are opaque closures that must carry copies/moves of
+// everything they touch -- NO engine pointers, no game-thread caches. Each
+// feature owns its done-map + mutex; this pool only runs the closures.
+// ---------------------------------------------------------------------------
+static std::mutex                        g_meshWorkMutex;
+static std::condition_variable           g_meshWorkCv;
+static std::deque<std::function<void()>> g_meshWorkJobs;
+static std::vector<std::thread>          g_meshWorkWorkers;
+static bool                              g_meshWorkStop = false;  // guarded by g_meshWorkMutex
+// Job-count bound: parse jobs own a VB+IB copy (<= ~2.5 MiB each), bake
+// jobs own gathered chunk slices (a few MiB); 512 queued jobs is far past
+// any real burst and bounds worst-case memory to a comfortable level.
+static constexpr size_t kMaxMeshWorkJobs = 512;
+
+static void MeshWorkWorkerMain()
+{
+    std::unique_lock<std::mutex> lk(g_meshWorkMutex);
+    for (;;) {
+        g_meshWorkCv.wait(lk, [] {
+            return g_meshWorkStop || !g_meshWorkJobs.empty();
+        });
+        if (g_meshWorkStop) return;  // queued jobs dropped by design
+        std::function<void()> job = std::move(g_meshWorkJobs.front());
+        g_meshWorkJobs.pop_front();
+        lk.unlock();
+        // C++ fence, mirroring the texture workers: a bad_alloc/length_error
+        // escaping a thread proc is std::terminate -> process fast-fail.
+        // A caught failure just drops the job; the feature's inflight entry
+        // is cleared by the closure's own catch or ages out via its sweep.
+        try {
+            job();
+        } catch (const std::exception& e) {
+            static std::atomic<int> sLogs{0};
+            const int n = sLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [MeshWork] job threw #%d what=%s -- dropped",
+                         n, e.what());
+            }
+        } catch (...) {
+            static std::atomic<int> sLogs{0};
+            const int n = sLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 16) {
+                _MESSAGE("FO4RemixPlugin: [MeshWork] job threw #%d (non-std) -- dropped", n);
+            }
+        }
+        lk.lock();
+    }
+}
+
+bool BsExtraction::MeshWorkQueueSaturated()
+{
+    std::lock_guard<std::mutex> lk(g_meshWorkMutex);
+    return g_meshWorkStop || g_meshWorkJobs.size() >= kMaxMeshWorkJobs;
+}
+
+bool BsExtraction::EnqueueMeshWork(std::function<void()> job)
+{
+    std::lock_guard<std::mutex> lk(g_meshWorkMutex);
+    if (g_meshWorkStop || g_meshWorkJobs.size() >= kMaxMeshWorkJobs) return false;
+    g_meshWorkJobs.push_back(std::move(job));
+    if (g_meshWorkWorkers.empty()) {
+        // Two workers: parses are far lighter than BC7 decode and the point
+        // is overlap with the game thread, not throughput scaling; one
+        // worker could head-of-line-block a burst behind a monster merge
+        // bake, two keeps small parses flowing past it.
+        for (int i = 0; i < 2; ++i) {
+            g_meshWorkWorkers.emplace_back([] {
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+                MeshWorkWorkerMain();
+            });
+        }
+        _MESSAGE("FO4RemixPlugin: [MeshWork] started 2 mesh workers");
+    }
+    g_meshWorkCv.notify_one();
+    return true;
+}
+
+void BsExtraction::StopMeshWorkers()
+{
+    {
+        std::lock_guard<std::mutex> lk(g_meshWorkMutex);
+        if (g_meshWorkWorkers.empty()) return;
+        g_meshWorkStop = true;
+    }
+    g_meshWorkCv.notify_all();
+    for (auto& t : g_meshWorkWorkers) {
+        if (t.joinable()) t.join();
+    }
+    g_meshWorkWorkers.clear();
+    _MESSAGE("FO4RemixPlugin: [MeshWork] mesh workers stopped");
+}
+
+// ---------------------------------------------------------------------------
+// Async mesh parse front-end (2026-07-21). Keyed by the drawable's PassKey.
+// Generation counter: PassKeys are pointer-derived and the destination
+// world recycles those addresses, so results enqueued before a world swap
+// must never be consumed after it (ResetMeshParseQueues bumps the gen; a
+// worker publishing under a stale gen discards its result).
+// ---------------------------------------------------------------------------
+struct CompletedMeshParse {
+    bool ok = false;
+    ParsedGeometry parsed;
+    uint64_t doneFrame = 0;   // for the orphan TTL sweep
+};
+
+static std::mutex g_meshParseMutex;
+static std::unordered_map<uint64_t, CompletedMeshParse> g_meshParseDone;
+static std::unordered_set<uint64_t> g_meshParseInflight;  // queued or decoding
+static uint64_t g_meshParseGen = 0;    // guarded by g_meshParseMutex
+constexpr uint64_t kMeshParseDoneTTLFrames = 600;
+
+static void SweepMeshParseQueues()
+{
+    std::lock_guard<std::mutex> lk(g_meshParseMutex);
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    for (auto it = g_meshParseDone.begin(); it != g_meshParseDone.end();) {
+        if (now > it->second.doneFrame &&
+            now - it->second.doneFrame > kMeshParseDoneTTLFrames) {
+            it = g_meshParseDone.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+BsExtraction::MeshParseStatus BsExtraction::ParseShapeGeometryAsync(
+    BSTriShape* shape, uint64_t key, ParsedGeometry& out,
+    bool logRejections, bool applyVertexColors, bool parseSkinning)
+{
+    // Rendezvous first: a finished decode is consumed exactly once.
+    {
+        std::lock_guard<std::mutex> lk(g_meshParseMutex);
+        auto it = g_meshParseDone.find(key);
+        if (it != g_meshParseDone.end()) {
+            const bool ok = it->second.ok;
+            if (ok) out = std::move(it->second.parsed);
+            g_meshParseDone.erase(it);
+            return ok ? MeshParseStatus::kReady : MeshParseStatus::kFailed;
+        }
+        if (g_meshParseInflight.count(key)) return MeshParseStatus::kPending;
+    }
+
+    // Don't pay the snapshot memcpy for a job that would only be dropped;
+    // the caller keeps reporting pending and retries on its fast poll.
+    if (MeshWorkQueueSaturated()) return MeshParseStatus::kPending;
+
+    // Snapshot on this (game) thread under the caller's SEH frame. A gate
+    // failure here is exactly the sync parse returning false.
+    GeometrySnapshot snap;
+    if (!SnapshotShapeGeometry(shape, snap, logRejections,
+                               applyVertexColors, parseSkinning)) {
+        return MeshParseStatus::kFailed;
+    }
+
+    uint64_t gen;
+    {
+        std::lock_guard<std::mutex> lk(g_meshParseMutex);
+        gen = g_meshParseGen;
+        g_meshParseInflight.insert(key);
+    }
+    // MSVC's std::function requires copyable closures; share the snapshot.
+    auto snapHolder = std::make_shared<GeometrySnapshot>(std::move(snap));
+    const bool queued = EnqueueMeshWork(
+        [key, gen, snapHolder, logRejections] {
+            ParsedGeometry parsed;
+            const bool ok =
+                ParseSnapshotGeometry(std::move(*snapHolder), parsed, logRejections);
+            std::lock_guard<std::mutex> lk(g_meshParseMutex);
+            g_meshParseInflight.erase(key);
+            if (gen != g_meshParseGen) return;  // world swapped mid-decode
+            CompletedMeshParse done;
+            done.ok = ok;
+            done.parsed = std::move(parsed);
+            done.doneFrame = Diagnostics::CurrentFrameIndex();
+            g_meshParseDone[key] = std::move(done);
+        });
+    if (!queued) {
+        std::lock_guard<std::mutex> lk(g_meshParseMutex);
+        g_meshParseInflight.erase(key);
+    }
+    return MeshParseStatus::kPending;
+}
+
+void BsExtraction::ResetMeshParseQueues()
+{
+    std::lock_guard<std::mutex> lk(g_meshParseMutex);
+    ++g_meshParseGen;
+    g_meshParseDone.clear();
+    // Inflight entries clear themselves as their jobs finish; their
+    // publishes are discarded by the generation check.
 }
 
 // ---------------------------------------------------------------------------
@@ -2260,6 +3963,35 @@ void BsExtraction::ExtractAlphaState(BSGeometry* geo, ExtractedMesh& mesh) {
 }
 
 // ---------------------------------------------------------------------------
+// Live render-target texture generation (see the isLiveRT block in
+// ExtractMaterialTexture). Game thread only.
+// ---------------------------------------------------------------------------
+void BsExtraction::BumpLiveTextureGeneration()
+{
+    ++g_liveTexGeneration;
+}
+
+void BsExtraction::ResetLiveRTFlag()
+{
+    g_liveRTFlagSticky = false;
+}
+
+bool BsExtraction::LastExtractionSawLiveRT()
+{
+    return g_liveRTFlagSticky;
+}
+
+bool BsExtraction::IsLiveRTScreenSource(void* tex2d)
+{
+    return g_liveRTScreenSources.count(tex2d) != 0;
+}
+
+void BsExtraction::ClearLiveRTScreenSources()
+{
+    g_liveRTScreenSources.clear();
+}
+
+// ---------------------------------------------------------------------------
 // Return the player's current parent cell pointer (0 if unavailable)
 // ---------------------------------------------------------------------------
 uintptr_t BsExtraction::GetPlayerCellPtr()
@@ -2268,6 +4000,17 @@ uintptr_t BsExtraction::GetPlayerCellPtr()
     if (!ppPlayer || !*ppPlayer) return 0;
     uintptr_t player = *ppPlayer;
     return *reinterpret_cast<uintptr_t*>(player + OFF_REFR_PARENT_CELL);
+}
+
+// ---------------------------------------------------------------------------
+// Return PlayerCharacter::firstPersonSkeleton (0 if unavailable).
+// ---------------------------------------------------------------------------
+uintptr_t BsExtraction::GetPlayerFirstPersonRootPtr()
+{
+    uintptr_t* ppPlayer = reinterpret_cast<uintptr_t*>(s_g_player.GetPtr());
+    if (!ppPlayer || !*ppPlayer) return 0;
+    uintptr_t player = *ppPlayer;
+    return *reinterpret_cast<uintptr_t*>(player + OFF_PLAYER_FP_SKELETON);
 }
 
 // ---------------------------------------------------------------------------
@@ -2460,22 +4203,64 @@ std::vector<CellInfo> BsExtraction::GetLoadedCells()
     return result;
 }
 
+namespace {
+
+void ObserveTerrainNode(NiAVObject* obj, uint32_t depth, uint32_t& observed)
+{
+    if (!obj || depth > 32 || (obj->flags & NiAVObject::kFlagNotVisible)) return;
+
+    if (BSTriShape* tri = obj->GetAsBSTriShape()) {
+        if (SemanticCapture::ObserveTerrainGeometry(tri)) ++observed;
+        return;
+    }
+
+    NiNode* node = obj->GetAsNiNode();
+    if (!node) return;
+    const uint16_t childCount = node->m_children.m_emptyRunStart;
+    for (uint16_t i = 0; i < childCount; ++i) {
+        if (NiAVObject* child = node->m_children.m_data[i]) {
+            ObserveTerrainNode(child, depth + 1, observed);
+        }
+    }
+}
+
+} // namespace
+
+uint32_t BsExtraction::ObserveCellTerrain(uintptr_t cellPtr)
+{
+    if (!cellPtr) return 0;
+    const uintptr_t landPtr = *reinterpret_cast<uintptr_t*>(cellPtr + OFF_CELL_LAND);
+    if (!landPtr) return 0;
+    uintptr_t* quadrants = *reinterpret_cast<uintptr_t**>(
+        landPtr + OFF_LAND_QUADRANTS);
+    if (!quadrants) return 0;
+
+    uint32_t observed = 0;
+    for (int q = 0; q < LAND_QUADRANT_COUNT; ++q) {
+        ObserveTerrainNode(reinterpret_cast<NiAVObject*>(quadrants[q]), 0, observed);
+    }
+    return observed;
+}
+
 // ---------------------------------------------------------------------------
 // Clear the texture readback cache
 // ---------------------------------------------------------------------------
 void BsExtraction::ClearTextureCache()
 {
-    _MESSAGE("FO4RemixPlugin: ClearTextureCache - clearing %zu entries", g_textureCache.size());
+    _MESSAGE("FO4RemixPlugin: ClearTextureCache - clearing %zu entries (%zu MiB)",
+             g_textureCache.size(), g_textureCacheBytes / (1024u * 1024u));
     g_textureCache.clear();
     g_texResVariantIndex.clear();
+    g_textureCacheBytes = 0;
+    g_texKnownBad.clear();
 }
 
 bool BsExtraction::GetCachedTextureStats(uint64_t hash, uint32_t* outW, uint32_t* outH,
                                          uint32_t* outFmt, uint32_t outMeanRGBA[4])
 {
     auto it = g_textureCache.find(hash);
-    if (it == g_textureCache.end()) return false;
-    const ExtractedTexture& tex = it->second;
+    if (it == g_textureCache.end() || !it->second.tex) return false;
+    const ExtractedTexture& tex = *it->second.tex;
     if (outW) *outW = tex.width;
     if (outH) *outH = tex.height;
     if (outFmt) *outFmt = (uint32_t)tex.dxgiFormat;

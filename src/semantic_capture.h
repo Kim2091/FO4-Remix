@@ -9,6 +9,7 @@
 
 struct ID3D11Device;
 struct NiTransform;
+struct ExtractedTexture;   // bs_extraction.h (Pip-Boy screen feed texture)
 
 namespace SemanticCapture {
 
@@ -61,6 +62,14 @@ namespace SemanticCapture {
         uint64_t meshHash            = 0;        // == PassKey, used as Remix submission key
         uint64_t materialHash        = 0;        // index into g_materialCache
         bool     submittedToRemix    = false;
+        // VRAM-pressure parked (2026-07-20): the sweep released this entry's
+        // Remix resources while it sat behind the camera beyond the eviction
+        // distance under VRAM pressure. Still firing, so the entry stays in
+        // the map (a full erase would re-create + re-resolve + re-park every
+        // sweep = texture-upload churn); the resolver skips parked entries.
+        // The sweep un-parks when the entry re-enters the front hemisphere /
+        // close range, or when pressure clears (hysteresis).
+        bool     pressureParked      = false;
         // Merge-instanced expansion (2026-07-03): derived hashes of the extra
         // per-hardware-instance drawables submitted beyond meshHash (instance
         // 0 keeps meshHash). Same lifecycle: released wherever meshHash is
@@ -105,6 +114,17 @@ namespace SemanticCapture {
         uint32_t resolveAttempts     = 0;
         uint64_t nextRetryFrame      = 0;
 
+        // ---- Resolver crash blacklist (2026-07-21) ----
+        // SEH-caught resolver crashes for this key. At
+        // kResolverCrashBlacklistCount the key is blacklisted: the resolve
+        // loop skips it entirely instead of re-faulting through the guard
+        // every kCrashRetryDelayFrames forever (field log: CRASH CAUGHT #200
+        // with the same key as #100). Pardoned wholesale when a load screen
+        // ends -- the moment the engine rebuilds the world and a reused
+        // pointer value can legitimately become valid again.
+        uint8_t  resolveCrashCount   = 0;
+        bool     crashBlacklisted    = false;
+
         // ---- Live transform (animated statics) ----
         // Refreshed on every hook fire from BSGeometry::m_worldTransform
         // (offset 0x70 on NiAVObject). The engine evaluates scene-graph
@@ -130,6 +150,43 @@ namespace SemanticCapture {
         // walk only the ~dozens of chunk entries instead of the whole map.
         bool  isLODChunk               = false;
 
+        // ---- Live-RT texture refresh (2026-07-18 Pip-Boy screen) ----
+        // hasLiveTexture: set by the lighting resolver when extraction
+        // detected an RT-backed source texture (engine composites UI into
+        // it at runtime). Tick's poll then runs a SHADOW re-resolve every
+        // [ViewModel] ScreenRefreshFrames while the engine draws the
+        // drawable: the entry STAYS submitted (and rendering) while the new
+        // texture generation extracts asynchronously; when the resolver
+        // finally submits, SubmitDrawable swaps the instance's handles in
+        // place -- no release-first gap, no screen flicker.
+        bool    hasLiveTexture         = false;
+        bool    liveTexRefreshInFlight = false;
+        uint8_t liveTexRefreshAttempts = 0;
+
+        // Shadow-resolve door (2026-07-18 v2). TryResolveStatic early-
+        // returns on submitted entries; the shadow-refresh polls set this
+        // for exactly one resolver call so the re-resolve actually RUNS
+        // (without it every shadow attempt was a silent no-op -- the
+        // original 0c0c9e7 live-refresh never executed). Cleared by the
+        // resolver on entry.
+        bool    shadowResolveRequested = false;
+
+        // ---- Pip-Boy screen feed (2026-07-18 v2) ----
+        // isPipboyScreen: lighting resolver tags the 1P "Screen:0" leaf.
+        // pipboyFeedSeqSubmitted: feed sequence number baked into the
+        // currently-submitted screen texture; Tick schedules a shadow
+        // re-resolve whenever the live feed seq has moved past it.
+        bool     isPipboyScreen          = false;
+        uint64_t pipboyFeedSeqSubmitted  = 0;
+
+        // ---- 1st-person viewmodel (2026-07-18) ----
+        // Set by the lighting resolver when this geometry descends from
+        // PlayerCharacter::firstPersonSkeleton (guarded parent-chain walk).
+        // Mirrored into ExtractedMesh::isViewModel at submit so OnFrame can
+        // apply the synthetic-space -> render-world translation and the
+        // hidden-in-3rd-person skip. See ExtractedMesh::isViewModel.
+        bool  isViewModel              = false;
+
         // ---- Skinned-actor visibility (2026-07-08 hair-through-hats) ----
         // isSkinnedActor: set by the lighting resolver when this drawable
         // submitted as a skinned mesh; Tick maintains g_skinnedKeys from it.
@@ -142,6 +199,13 @@ namespace SemanticCapture {
         // is kept.
         bool  isSkinnedActor           = false;
         bool  engineCulled             = false;
+
+        // ---- FaceGen morph watch ----
+        // Set for skinned BSDynamicTriShape drawables. FO4 rewrites their
+        // dynamicVertices during facial animation; Tick fingerprints the live
+        // buffer and queues position-only mesh refreshes when it changes.
+        bool     faceMorphWatch        = false;
+        uint64_t faceMorphFingerprint  = 0;
 
         // ---- Merge-instanced capture upgrade (2026-07-04) ----
         // Set by the lighting resolver when a multi-segment merge shape had
@@ -159,6 +223,19 @@ namespace SemanticCapture {
         void*    mergeWatchSrv              = nullptr;
         uint32_t mergeWatchRecordCount      = 0;
         uint32_t mergeWatchSegTris[4]       = {};
+        // Release->re-resolve cycles spent on capture upgrades (successful
+        // bakes AND failed ones). Durable superset of DrawCapture's
+        // per-watch budgets, which are lost whenever the watch slot is
+        // recycled under pressure: without this cap a shape whose bakes
+        // never validate churns handle destroy/create + flicker forever.
+        uint32_t mergeUpgradeReleases       = 0;
+
+        // Cached merge-instanced classification (-1 unknown, 0 plain,
+        // 1 BSMergeInstancedTriShape). The RTTI leaf-class walk + strstr
+        // the lighting resolver used to run on EVERY attempt of EVERY
+        // non-skinned drawable is paid once per drawable now -- a live
+        // shape's leaf class can't change.
+        int8_t   mergeLeafKind              = -1;
 
         // Resolve deferrals spent waiting on the t7 table wrapper's
         // pending-upload counter (lighting resolver, take 13.1). Bounded:
@@ -199,6 +276,88 @@ namespace SemanticCapture {
     // or empty/null input. Requires Install() to have run (sets module base).
     void GetLeafClassName(void* obj, char* out, size_t outSize);
 
+    // ---- [ViewModel] 1st-person rendering (2026-07-18) ----
+    // The engine keeps the 1P graph in a synthetic origin-local space that is
+    // ROTATION-LOCKED to the camera (diag-proven: the body root stays fixed
+    // while the player looks around, and wanders with animation while the
+    // "Camera" bone sits frozen at (0,0,120.5) -- static BY CONSTRUCTION
+    // because the frame follows the camera). The camera bone is the
+    // synthetic-space pose the real cameraNode is derived from, so the
+    // synthetic->world map solves exactly:
+    //   cameraNode = camBone * S  =>  S = camBone^-1 * cameraNode
+    // OnFrame composes S onto every viewmodel instance/bone transform.
+    //
+    // Returns true while the viewmodel should render (1P root present, not
+    // app-culled, camera bone resolved + plausible) and fills the bone's
+    // full synthetic-space world transform (Beth row-vector rotation rows +
+    // translation + scale). Thread-safe snapshot (written on the game
+    // thread in Tick, read on the Remix thread in OnFrame).
+    struct ViewModelAnchor {
+        float rot[3][3];  // camera bone rotation rows (Beth, row-vector)
+        float pos[3];     // camera bone translation (Beth)
+        float scale;
+    };
+    bool GetViewModelAnchor(ViewModelAnchor& out);
+
+    // Resolver query (game thread): does this geometry descend from
+    // PlayerCharacter::firstPersonSkeleton? Guarded parent-chain walk,
+    // <=64 hops; false when the player/skeleton is unavailable.
+    bool IsViewModelGeometry(void* geometry);
+
+    // Register a live TESObjectLAND BSTriShape with the lighting resolver.
+    // The normal render-pass hook does not reliably fire for near terrain.
+    bool ObserveTerrainGeometry(void* geometry);
+
+    // Fill `out` with submitted viewmodel drawables whose capture entry has
+    // gone STALE (no GetRenderPasses fire for > maxAge frames). 1P shapes
+    // fire every frame while the engine shows them (log-proven age=1), so a
+    // stale entry is a 1P object the engine hid -- the lowered weapon while
+    // the Pip-Boy is up, holstered gear, swapped scope overlays. OnFrame
+    // skips these draws; they return within a frame of firing again.
+    void SnapshotViewModelStale(uint64_t currentFrame, uint64_t maxAge,
+                                std::unordered_set<uint64_t>& out);
+
+    // Same stale-fire snapshot over ALL submitted skinned drawables
+    // (g_skinnedKeys). Actors are animated geometry -- the engine rebuilds
+    // their render passes every frame they are shown -- so a skinned entry
+    // that stopped firing is one the engine hid: the player's 3rd-person
+    // body after a 3P->1P camera transition (which used to persist into
+    // first person forever), despawned/unloaded NPCs, equipment-suppressed
+    // parts. OnFrame skips these draws; they return within a frame of
+    // firing again.
+    void SnapshotSkinnedStale(uint64_t currentFrame, uint64_t maxAge,
+                              std::unordered_set<uint64_t>& out);
+
+    // ---- Pip-Boy screen feed (2026-07-18 v2) ----
+    // The Pip-Boy screen material's texture is NOT the Scaleform RT
+    // ([LiveTex] log-proven silent while "Screen:0" submits fine): the
+    // engine paints the UI onto the mesh via a draw the capture pipeline
+    // never sees. Route instead: hkPresent captures the Pip-Boy UI layer's
+    // pixels (multi-layer overlay machinery) and supplies them here; the
+    // lighting resolver overrides the tagged Screen:0 drawable's diffuse+
+    // emissive with the fed texture, re-submitted in place every
+    // [ViewModel] ScreenRefreshFrames. All calls are game-render-thread
+    // only (hkPresent / Tick / resolvers share that thread).
+    //
+    // Supply the latest UI layer pixels (RGBA8, PREMULTIPLIED alpha as the
+    // Scaleform target holds them). Composites over opaque black and bakes
+    // the [ViewModel] PipboyScreenTint so the fed texture is display-ready.
+    void SupplyPipboyScreenFeed(const uint8_t* rgba, uint32_t width,
+                                uint32_t height, uint32_t rowPitch);
+    // Monotonic sequence of supplied feeds (0 = never supplied).
+    uint64_t PipboyScreenFeedSeq();
+    // Latest display-ready feed texture (null before the first supply).
+    std::shared_ptr<const ExtractedTexture> GetPipboyScreenFeedTexture();
+    // Resolver callback: the lighting resolver tags the 1P Screen:0 leaf
+    // and registers its PassKey here so feed gating can find it.
+    void RegisterPipboyScreenDrawable(uint64_t key);
+    // present_hook gate: true while the fed pixels actually PRESENT on the
+    // mesh -- screen drawable registered + submitted + firing fresh AND the
+    // viewmodel is active. False in Power Armor (no 1P Screen:0), at
+    // terminals (viewmodel culled), and whenever the drawable is gone, so
+    // the full-screen composite fallback keeps the UI visible somewhere.
+    bool PipboyScreenFeedWanted();
+
     // Install the BSLightingShaderProperty render-pass-equivalent hook
     // (slot 0x2B at Fallout4.exe RVA 0x02172540) and start tracking
     // captured drawables in the DrawableMap.
@@ -235,6 +394,14 @@ namespace SemanticCapture {
     // 3600-frame failsafe clears a stuck flag (PostLoadGame never firing,
     // e.g. load aborted to main menu) so the world can't stay empty.
     void SetLoadingScreenActive(bool active);
+
+    // True while the gate above is up. Any caller that walks live engine
+    // pointers on the game thread (the hkPresent terrain poll) must check
+    // this for the same reason the resolve loop does: the world is being
+    // built/freed on the loader thread, and those walks are unguarded.
+    // Does NOT apply the Tick failsafe -- a stuck flag only suppresses
+    // polling, and Tick clears it within 3600 frames either way.
+    bool IsLoadingScreenActive();
 
     // Aggregate flag-bit counters over the set of drawables that pass the
     // active filter in SnapshotActiveDrawables. Diagnostic-only -- helps

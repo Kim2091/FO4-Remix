@@ -9,10 +9,23 @@ struct CameraState {
     float aspectRatio;
     float nearPlane;
     float farPlane;
+    // Vertical 1st-person FOV, degrees (fDefault1stPersonFOV converted
+    // horizontal->vertical at the live aspect). Feeds the VIEW_MODEL camera
+    // so the arms/weapon keep their own FOV independent of world-FOV
+    // changes (ADS zoom, FOV mods). Falls back to fovY when the setting is
+    // unreadable or insane.
+    float fov1stY;
     // Player world position in raw Bethesda coords (NOT swapped). Used by
     // the worldspace LOD chunk spatial filter so we can compare against
     // chunk world positions (which are in Beth coords) without re-swapping.
     float playerWorldPos[3];
+    // Raw Beth-space cameraNode world transform (NO axis swap): the engine's
+    // NiTransform rotation rows (row-vector basis) and translation as-is.
+    // Consumed by the viewmodel synthetic->world mapping, which solves
+    // S = camBone^-1 * cameraNode and needs the true NiTransform rather
+    // than the P-swapped direction vectors above.
+    float rawRot[3][3];
+    float rawPos[3];
     bool valid;
 };
 

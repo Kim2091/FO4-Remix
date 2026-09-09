@@ -18,3 +18,4 @@ Desktop.ini
 .claude/
 *.code-workspace
 CLAUDE.md
+build-tracy/

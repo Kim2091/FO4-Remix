@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_set>
 
 struct BSTriShape;
+struct BSLightingShaderMaterialBase;
 
 // ---------------------------------------------------------------------------
 // Skinned-mesh bone tracking (2026-07-08). Game-thread module: the lighting
@@ -62,12 +64,30 @@ namespace SkinnedMeshes {
     // caller wins; capped logging inside.
     void SetFaceProbe(uint64_t drawableHash);
 
+    // Register a human iris material as a live UV-animation source. Every
+    // changed transform is queued to RemixRenderer; when diagnostics are
+    // enabled, the first iris also gets the broader [EyeAnim] state probe.
+    void RegisterEyeAnimation(uint64_t drawableHash, BSTriShape* shape,
+                              void* shaderProperty,
+                              BSLightingShaderMaterialBase* material,
+                              uint32_t materialType,
+                              bool diagnostics);
+
     // Drop a drawable's bone tracking (wired into ReleaseDrawable).
     void OnDrawableReleased(uint64_t drawableHash);
 
+    // [ViewModel] diag probe: does a bone registry entry exist for this
+    // drawable (i.e. is UpdateAndQueue feeding it live bones)?
+    bool HasEntry(uint64_t drawableHash);
+
     // Read live bone transforms for every registered drawable and queue the
     // composed matrix sets to RemixRenderer. Game thread, once per Tick.
-    void UpdateAndQueue();
+    // skipHidden (optional): drawable hashes the renderer will skip anyway
+    // (engine app-culled / stale) — their bone reads and matrix composes are
+    // elided entirely; they keep their last queued pose and recompose the
+    // Tick after the engine unhides them. In a loaded urban cell this is
+    // typically the vast majority of registered actors (2026-07-20 perf).
+    void UpdateAndQueue(const std::unordered_set<uint64_t>* skipHidden = nullptr);
 
     // Drop everything (save load teardown).
     void Reset();

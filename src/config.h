@@ -64,18 +64,131 @@ struct PluginConfig {
     bool logTextures;        // Log extracted texture info
     bool logLights;          // Log extracted light info
     bool logBoneDiag;        // One-shot bone matrix diagnostic dump (first skinned mesh, bone 0)
-
-    // [Limits]
-    float maxExtent;         // Reject shapes with extent larger than this (default 10000)
+    // Diagnostic for the missing main menu. While NO UI render target is
+    // locked yet (the FO4 main menu, plus the brief pre-detection window of
+    // each load), log every RT clear (real color/format/usage/size) and every
+    // sole-bound RT on the hooked immediate context. The Scaleform overlay
+    // fingerprint (transparent-black clear of a full-screen R8G8B8A8_UNORM
+    // DEFAULT RT) matches NOTHING at the main menu -- this reveals what the
+    // menu actually renders. Dedup'd + capped; silent once gameplay locks the
+    // UI RT. Default false.
+    bool logMainMenuRT;
 
     // [Lights]
     bool  lightsEnabled;     // Master toggle for all extracted lights
     float lightIntensity;    // Multiplier for light radiance (default 1.0)
     float lightRadius;       // Multiplier for light radius (default 1.0)
     float lightColorStrength;// 0 = white, 1 = full game color (default 1.0)
+    // In-place light updates via remixapi UpdateLightDefinition (2026-07-18,
+    // BetaRT recipe). When a snapshot changes an existing light's derived
+    // params (position from the REFR at poll time, radius/radiance after
+    // config multipliers, spot shaping, near-camera flags), the definition is
+    // updated on the SAME handle+hash so the runtime's persistent RTXDI
+    // reservoirs survive (no re-seed boiling). Runtime without the entry
+    // point (or a failed update) falls back to destroy+recreate. Off = the
+    // legacy behavior: an existing hash keeps its creation-time params until
+    // the light leaves the snapshot entirely.
+    bool  lightsLiveUpdate;  // default true
+    // Lights within this many game units of the camera get
+    // ignoreViewModel + ignoreFirstPersonPlayerShadow so the 1st-person
+    // arms/weapon can't shadow the whole scene from a light at arm's reach
+    // (the classic flashlight-through-viewmodel artifact; BetaRT sets these
+    // on its held-torch light). Re-evaluated on every snapshot diff (~1Hz +
+    // cell changes) via the live-update path. 0 = disabled.
+    float lightsNearCameraIgnoreVMUnits;  // default 150
 
     // [Skinning]
     bool  skinningEnabled;   // Extract and animate skinned meshes (characters, creatures)
+    // FaceGen morph refresh: re-upload facegen head/mouth/eye meshes when
+    // FO4 rewrites BSDynamicTriShape::dynamicVertices for lip sync, blinks,
+    // and expressions. Interval is staggered by hash; maxPerTick caps mesh
+    // rebuilds queued from one game tick.
+    bool     faceMorphRefreshEnabled;
+    uint32_t faceMorphCheckIntervalFrames;
+    uint32_t faceMorphMaxPerTick;
+    // Human eye gaze is authored as a live material UV transform. Track it
+    // and refresh only the iris texcoords when the offset/scale changes.
+    bool     eyeUvAnimationEnabled;
+
+    bool  viewModelEnabled;  // Render the 1st-person arms/weapon/Pip-Boy (synthetic-space remap)
+    bool  viewModelBoneConventionFix;  // Camera bone is NIF-camera-convention {right,up,back} vs cameraNode {right,fwd,up}
+    // Submit a second SetupCamera of type VIEW_MODEL each frame (2026-07-18,
+    // BetaRT recipe): same pose as the world camera, but with the game's
+    // 1st-person FOV (fDefault1stPersonFOV, horizontal->vertical converted)
+    // and a small near plane. The runtime renders VIEW_MODEL-categorized
+    // geometry with this camera, so the arms/weapon keep their own FOV when
+    // the world FOV changes (ADS zoom, FOV mods) instead of distorting.
+    bool  viewModelSeparateCamera;     // default true
+    // Manual vertical-FOV override for the view-model camera, degrees.
+    // 0 = auto (fDefault1stPersonFOV converted at the live aspect).
+    float viewModelFovOverride;        // default 0
+    // Tag viewmodel draws with REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL so
+    // the runtime applies its view-model handling (separate camera above,
+    // rtx.viewModel.* options). Buckets are split by the flag so a mesh
+    // shared between a 1P part and a world object can't be mistagged.
+    bool  viewModelCategoryTag;        // default true
+    // Live render-target texture refresh period, in game frames (2026-07-18
+    // Pip-Boy screen). The screen mesh's texture is a render target the
+    // engine composites the Scaleform UI into at runtime; a one-shot capture
+    // shows whatever was in it at resolve time (blank). Drawables whose
+    // extraction detected an RT-backed texture get a SHADOW re-resolve every
+    // this-many frames while the engine is drawing them: a new texture
+    // generation extracts asynchronously while the old instance keeps
+    // rendering, then SubmitDrawable swaps the handles in place (no flicker).
+    // 0 = off (static capture, old behavior).
+    uint32_t viewModelScreenRefreshFrames;  // default 12
+
+    // Pip-Boy screen FEED (2026-07-18 v2). The screen material's texture is
+    // NOT the Scaleform RT (log-proven: [LiveTex] silent while Screen:0
+    // submits fine) -- the engine composites the UI onto the screen mesh
+    // via a separate draw the capture pipeline never sees. Instead, the
+    // overlay's multi-layer capture routes the Pip-Boy Scaleform layer's
+    // PIXELS onto the submitted "Screen:0" viewmodel drawable as its
+    // diffuse+emissive (the mesh's own UVs are the engine's mapping for
+    // exactly this content), refreshed every ScreenRefreshFrames via an
+    // in-place handle swap. The fed layer is dropped from the full-screen
+    // composite while the feed is live (the giant floating Pip-Boy UI).
+    bool  pipboyScreenFeed;           // default true
+    float pipboyScreenTintR;          // default 0.08 (vanilla fPipboyEffectColor)
+    float pipboyScreenTintG;          // default 1.00
+    float pipboyScreenTintB;          // default 0.09
+    float pipboyScreenEmissiveScale;  // default 1.5
+
+    // Readable panel for the fed Pip-Boy layer (2026-07-18 v2 field fix).
+    // The physical screen is ~100px tall at typical camera distance -- the
+    // viewmodel anchor glues the 1P rig to the camera, so the engine's
+    // pipboy-view camera zoom (what makes the screen readable in vanilla)
+    // never happens in the Remix render. Until that camera story exists,
+    // the fed layer ALSO composites as a centered panel scaled to this
+    // fraction of screen height (never upscaled past native). 0 = no panel
+    // (mesh only -- the v2 initial behavior, unusable in the field test).
+    float overlayPipboyPanelFrac;     // default 0.55
+
+    // [Overlay] Multi-layer UI capture (2026-07-18). FO4's Scaleform UI is
+    // NOT one surface: the HUD/interface RT, the main menu, the Pip-Boy,
+    // and terminals each composite into their OWN render target, so the
+    // single locked-RT capture only ever shipped the HUD layer. Every
+    // Scaleform target shares one fingerprint -- an R8G8B8A8 DEFAULT-usage
+    // texture cleared to transparent black at the start of its UI pass,
+    // then sole-bound and drawn. When enabled, ALL such layers are captured
+    // each frame and CPU-composited in clear order into the one overlay
+    // image DrawScreenOverlay ships; draws to any recognized layer also
+    // open the raster-suppression UI phase (fixes menus whose draws never
+    // touched the locked RT). 0 = legacy single-RT capture.
+    bool overlayMultiLayer;  // default true
+
+    // Capture the FO4 main menu (2026-07-22). The main menu's Scaleform
+    // target is a full-screen R8G8B8A8_UNORM DEFAULT RT identical to the HUD
+    // fingerprint EXCEPT it clears to OPAQUE black {0,0,0,1} instead of
+    // transparent {0,0,0,0} (field-verified), so the transparent-only gate
+    // rejected it: the menu was never detected, its draws never forwarded
+    // (fwdUI=0), and it rendered black. When on, opaque-black full-screen
+    // clears are accepted for UI-RT detection -- but ONLY while no UI RT is
+    // locked yet (the menu / each load's pre-detection window), so a gameplay
+    // scene/post buffer cleared to opaque black is never grabbed (by gameplay
+    // the transparent HUD/loading RT is already locked). 0 = legacy
+    // transparent-only detection (main menu stays black).
+    bool captureMainMenu;    // default true
 
     // [Emissive]
     bool  emissiveGlowMapsEnabled;  // Extract glow map textures from BSLightingShaderMaterialGlowmap
@@ -84,7 +197,7 @@ struct PluginConfig {
     bool  logEmissive;              // Log emissive extraction details
 
     // [Diagnostics]
-    bool diagEnabled;             // Master toggle for periodic diagnostic logging (default true)
+    bool diagEnabled;             // Master toggle for periodic diagnostic logging (default false)
 
     // [SemanticCapture]
     bool semanticCaptureEnabled;  // [Phase 1A] Install BSLightingShaderProperty event-capture hook (default false)
@@ -113,6 +226,141 @@ struct PluginConfig {
     // frame or two. Only applies while the 3D scene is actively firing, so
     // pause menus don't age chunks out of the Remix view.
     uint32_t cullingLodChunkStaleFrames;     // default 30
+    float    cullingLodChunkFarExtentRatio;  // default 0 (off); skip LOD chunk when
+                                             // box distance > extent * ratio
+
+    // VRAM-pressure force-eviction (2026-07-20). The drawable TTL
+    // (kTTLFrames=18000, ~5 min) never fires on a cross-country run, so
+    // drawables pin materials pin textures until the driver budget cliff
+    // (Sanctuary->Concord: 13.5/14.7 GiB, 1 fps). When process-local VRAM
+    // usage exceeds ForceEvictVramPct% of the DXGI budget, Tick's sweep
+    // force-evicts the oldest-seen submitted drawables (min age 300 frames,
+    // ForceEvictPerSweep per sweep) so the LRU cascade can reclaim.
+    uint32_t cullingForceEvictVramPct;       // default 88; 0 = off (tier-2 oldest-first fallback)
+    uint32_t cullingForceEvictPerSweep;      // default 512
+
+    // Tier-1 view-based parking (2026-07-20 rework): at this softer
+    // threshold, submitted drawables behind the camera and farther than
+    // ForceEvictBehindDistance are PARKED (Remix resources released, entry
+    // kept + resolver-skipped) furthest-first, before the oldest-first
+    // fallback above ever fires. Un-parks on view re-entry or when usage
+    // drops 5 points below the threshold.
+    uint32_t cullingForceEvictViewPct;       // default 60 (field-validated 2026-07-20:
+                                             // steadier fps, no visible downside); 0 = off
+    float    cullingForceEvictBehindDistance; // game units, default 8000 (~2 cells)
+    // Behind-camera drawables beyond THIS distance park unconditionally --
+    // no VRAM threshold. Ultra-far restores are rare and visually invisible
+    // (tiny on screen, horizon covered by LOD chunks), so keeping them
+    // resident buys nothing. 0 = off.
+    float    cullingForceEvictAlwaysBehindDistance; // game units, default 0 (off)
+    // Worldspace LOD chunks park unconditionally when behind the camera
+    // beyond THIS distance (0 = off). Chunks are multi-cell meshes with no
+    // per-entry extent in the capture map, so "behind" additionally requires
+    // the chunk ORIGIN to sit a fixed slack (~5 cells, internal constant)
+    // past the camera plane -- a plain hemisphere test would despawn chunks
+    // whose far edge still reaches into peripheral view.
+    // DEFAULT OFF (field verdict 2026-07-20: turn-around horizon re-stream
+    // is visually detrimental) -- an opt-in VRAM lever for low-end cards;
+    // 12000 is the recommended on-value.
+    float    cullingForceEvictLodBehindDistance; // game units, default 0 (off)
+
+    // Frustum culling (2026-07-21). OnFrame skips DrawInstance for
+    // drawables whose world-space AABB (mesh-local bounds x live transform)
+    // sits fully outside a margin-expanded view frustum AND beyond
+    // FrustumKeepRadius of the camera. Path-tracer-aware: everything within
+    // the keep radius renders regardless of view direction, so nearby
+    // off-screen geometry still contributes shadows/reflections/GI. Skipped
+    // drawables keep all Remix handles warm (nothing released -- distinct
+    // from the parking tiers above); the win is a smaller TLAS and fewer
+    // BLAS builds. Multi-member GPU-instanced buckets skip all-or-nothing
+    // so the runtime's batched-draw identity hash never churns.
+    bool     cullingFrustumEnabled;      // default true
+    float    cullingFrustumKeepRadius;   // game units, default 8192 (~2 cells)
+    // Guard band added to each frustum half-angle for the cull boundary;
+    // re-entry tests at half this margin (angular hysteresis, so edge
+    // jitter can't flap the decision). Raise if reflective surfaces show
+    // popping at the screen edge.
+    float    cullingFrustumFovMarginDeg; // default 12
+    // LOD chunks are exempt by default: they ARE the horizon in
+    // reflections (water especially), and the far cull + parking tiers
+    // already bound their cost. Opt-in for max TLAS savings.
+    bool     cullingFrustumLodChunks;    // default false
+
+    // Occlusion culling (2026-07-21). The engine still issues every scene
+    // draw each frame (we swallow them at the D3D11 hooks after observing),
+    // and FO4's previs occlusion is CPU-side, so the surviving draw stream
+    // is the engine's per-frame visibility verdict. OnFrame skips a
+    // drawable whose captured engine index-buffer key was drawn recently
+    // then went stale (occluded or engine-frustum-culled), reusing the
+    // frustum keep radius so nearby geometry is never occlusion-culled.
+    // Fail-safe: a drawable whose key was never observed (convention
+    // mismatch, unhooked draw path, merge-baked mesh) stays exempt, so the
+    // filter can only ever under-cull. Shares the frustum's exemptions +
+    // keep radius + all-or-nothing bucket skip.
+    bool     cullingOcclusionEnabled;    // default true
+    // Frames a geometry's engine draw must be absent before its bucket is
+    // culled. Higher = more conservative (later cull, less flicker risk on
+    // brief occlusions); lower = more aggressive.
+    uint32_t cullingOcclusionStaleFrames;  // default 30 (~0.5s @60fps)
+    // Scene-active floor: a real gameplay frame draws at least this many
+    // distinct index buffers. Below it (menus, load screens, UI-only, hook
+    // not yet warm) the draw map is not a trustworthy verdict and occlusion
+    // is suspended for the frame so nothing mass-culls.
+    uint32_t cullingOcclusionMinSceneDraws; // default 500
+
+    // Hierarchical-Z per-item occlusion (2026-07-21). A CPU software depth
+    // rasterizer (src/hzb_occlusion) renders large STATIC occluders into a
+    // small Hi-Z buffer each frame; a drawable whose world AABB is confidently
+    // behind that buffer for HzbCullDelayFrames consecutive frames is culled.
+    // This catches items individually hidden behind a wall INSIDE a cell that
+    // the engine's cell-granular previs still draws (the case draw-stream
+    // occlusion can't). Default OFF -- opt-in, field-unvalidated.
+    //
+    // NEVER-FALSE-CULL is structural: occluders are only meshes proven static
+    // (never seen in the per-frame dirty-pose set + aged past MinAgeFrames),
+    // opaque (alpha-test/blend excluded so foliage/fence holes are never
+    // treated as solid), and the buffer under-claims coverage at silhouettes
+    // (max-reduced pyramid). An AABB near the camera (inside the shared
+    // frustum keep radius) or crossing the near plane is never culled.
+    bool     cullingHzbEnabled;          // "HzbCull", default false
+    uint32_t cullingHzbWidth;            // "HzbWidth", default 256
+    uint32_t cullingHzbHeight;           // "HzbHeight", default 144
+    // Geometry within this distance of the camera is never Hi-Z-culled. MUCH
+    // smaller than the frustum keep radius on purpose: the frustum radius (8192)
+    // exists so off-screen-but-near geometry still shows in reflections/GI, but
+    // geometry behind a SOLID occluder is hidden from those secondary rays too,
+    // so occlusion can safely cull far closer to the camera. This is the primary
+    // effectiveness knob -- at 8192 almost everything indoors was exempt and
+    // kept rendering. Lower for more aggressive culling; raise if near geometry
+    // pops in reflections.
+    float    cullingHzbKeepRadius;       // "HzbKeepRadius", default 1024
+    // Min world-AABB largest dimension (game units) for a mesh to be trusted as
+    // an occluder. Small props make poor occluders and cost raster time.
+    float    cullingHzbOccluderMinSize;  // "HzbOccluderMinSize", default 512
+    // Consecutive fully-occluded frames before a drawable is actually culled;
+    // reset to 0 the instant it reads visible (instant un-cull). Absorbs the
+    // 1-frame transient when a static begins moving. Higher = safer/later.
+    uint32_t cullingHzbCullDelayFrames;  // "HzbCullDelayFrames", default 10
+    // Extra depth cushion (normalized-linear [0,1]) an occludee's nearest point
+    // must clear beyond the occluder before it counts as behind. 0 disables.
+    float    cullingHzbDepthMargin;      // "HzbDepthMargin", default 0.002
+    // Frames a submitted drawable must exist (and stay un-animated) before it is
+    // eligible as an occluder -- gives engine controllers time to reveal an
+    // animated static before it is ever trusted static.
+    uint32_t cullingHzbOccluderMinAge;   // "HzbOccluderMinAgeFrames", default 30
+    // Cost bounds per rebuild: at most this many occluders (nearest first) and
+    // at most this many total triangles rasterized.
+    uint32_t cullingHzbMaxOccluders;     // "HzbMaxOccluders", default 256
+    uint32_t cullingHzbMaxTris;          // "HzbMaxTris", default 200000
+    // Rebuild the Hi-Z every N frames (the buffer is reused between rebuilds).
+    // Occluder POSITIONS reuse exactly (occluders are proven static), but the
+    // buffer also bakes the BUILD-frame camera, so during camera motion the
+    // test runs against a 1..N-frame-old view -- a geometry emerging from
+    // behind a wall as you turn can read occluded for a few frames. That is the
+    // same corner-turn pop-in the draw-stream occlusion has; it self-resolves
+    // on the next rebuild. Keep HzbCullDelayFrames > HzbRebuildInterval so the
+    // stale window can never commit a cull on its own. Lower N = fresher view.
+    uint32_t cullingHzbRebuildInterval;  // "HzbRebuildInterval", default 2
 
     // [Materials]
     // Spec-gloss -> metal-rough conversion for FO4 environment-mapped
@@ -129,6 +377,12 @@ struct PluginConfig {
     // metallic still reads near-black -- the metallic constant fights the
     // floor). They are therefore opt-in, default OFF.
     bool  metalConversionEnabled;   // master toggle: classification + albedo floor (default true)
+    // Submit the eye "wet" shell (MaleEyesHumanWet / FemaleEyesHumanWet).
+    // Default OFF: it is a raster-era near-transparent envmap highlight whose
+    // diffuse is a flat grey swatch, and as an ordinary path-traced surface it
+    // just films over the iris. Remix gets the corneal highlight from the
+    // eyeball's own specular instead.
+    bool  eyeWetOverlay;            // (default false)
     bool  metalMetallicEnabled;     // apply derived metallicConstant (default false)
     bool  metalRoughnessEnabled;    // apply derived roughnessConstant (default false)
     float metalMetallic;            // metallic at fSmoothness=1; scaled down to 0.2x of this at fSmoothness=0 (default 0.85)
@@ -136,6 +390,7 @@ struct PluginConfig {
     float metalMinRoughness;        // floor on (1 - fSmoothness) so metals aren't mirrors (default 0.15)
     bool  roughnessMapsEnabled;     // extract _s.dds -> per-pixel roughness maps (default true; off = roughnessConstant fallback)
     float roughnessMapFloor;        // 0..1 floor on _s.dds-derived per-pixel roughness (default 0.15; decals clamp at >= 0.3)
+    bool  paletteVertexCorrectionEnabled; // approximate per-vertex grayscale-palette row variation (default true)
     // Re-capture-on-approach (2026-07-08): FO4 streams textures progressively,
     // so an object first resolved at distance captures a reduced mip and the
     // name-keyed texture cache locks that blurry version for the session. When
@@ -145,6 +400,13 @@ struct PluginConfig {
     // DEFAULT OFF: the release+re-resolve churn causes lag spikes while moving,
     // and the win is a progressive sharpen rather than immediate. Opt-in.
     bool  textureUpgradeOnApproach; // default false
+    // Prefer the complete authored DDS mip chain from Fallout's virtual
+    // resource filesystem over the currently resident D3D resource. This
+    // avoids locking a low streamed mip into the Remix texture cache without
+    // release/re-resolve churn. Unsupported/generated/live textures retain
+    // the existing GPU-readback fallback. Direct DX10 BA2 reads were verified
+    // in-game on Fallout 4 1.11.191.
+    bool  authoredTextureSource;    // default true
 
     // [Camera]
     // FOV source for the Remix camera (2026-07-03). Default true: read the
@@ -236,6 +498,16 @@ struct PluginConfig {
     // (equal-block split, else whole mesh x all records).
     bool mergeInstanceDrawCapture;
 
+    // Render merge-expanded precombine geometry double-sided (default true,
+    // the 2026-07-07 vanilla-faithful choice: baked kit content winding is
+    // not consistently front-facing under our decode). Set false for the
+    // single-sided experiment -- the inside-out evidence that forced
+    // double-siding predated the batchedMirrorBase fix, which may have been
+    // the real culprit; single-sided merges re-enable the per-instance
+    // mirrored-record winding flip and would be a path-tracing perf win if
+    // the content winding holds up.
+    bool mergeTwoSided;
+
     // Frame-rate target for the Remix render thread. The thread loop paces to
     // this by sleeping only the unused remainder of the frame budget after
     // OnFrame returns. 0 = uncapped (yield-only between frames).
@@ -266,6 +538,86 @@ struct PluginConfig {
     // throughput. Default 4.
     uint32_t decodeWorkerMax;
 
+    // Off-thread the mesh resolve parse and the merge-chunk bake
+    // ([Performance] AsyncMeshParse, default 1). The resolver snapshots the
+    // engine-side VB/IB bytes on the game thread (bounded memcpy) and runs
+    // the per-vertex decode / chunk-bake build pass on a 2-thread mesh
+    // worker pool -- these were the last big always-on game-thread costs of
+    // a resolve (35ms single-item [ResolveBudget] hitches on giant
+    // precombine merges). 0 = legacy inline parse (safety fallback; costs
+    // the full decode on the game render thread again).
+    bool asyncMeshParse;
+
+    // SOFT byte budget (MiB) for the CPU-side decoded-texture cache in
+    // bs_extraction (the name+resolution-keyed mip-chain cache that feeds
+    // SubmitDrawable re-supplies). Decoded RGBA chains are large (~22 MiB
+    // per 2048^2) and the cache previously grew without bound for the whole
+    // session (multi-hour play = unbounded RAM). Past the budget, entries
+    // untouched for kTexCacheColdFrames are evicted oldest-first; HOT
+    // entries are never evicted even over budget -- this cache is the live
+    // working set, and evicting hot entries triggers a re-readback/
+    // re-decode feedback loop (the 2026-07-10 crash-in-5-seconds
+    // deployment). 0 = unbounded (legacy).
+    uint32_t cpuTextureCacheMiB;
+
+    // Longest texture edge this plugin will extract and upload to Remix
+    // ([Materials] MaxTextureDimension, default 2048, 0 = uncapped). Larger
+    // resident textures upload from the first mip at or under the cap --
+    // the engine's own chain provides it, no resampling. Exists for texture
+    // mods: 4K packs resident at load put ~4x the bytes in the Remix
+    // material-texture pool (11.4 GiB observed, paging the process out of
+    // the adapter budget), plus 4x the readback/decode/CPU-cache cost.
+    // Vanilla content tops out at 2048, so the default only affects mods.
+    // Applied consistently to the resolution hash fold, the readback, and
+    // the upgrade-poll compare (see CapDim in bs_extraction.cpp).
+    uint32_t maxTextureDimension;
+
+    // Persistent disk cache of CONVERTED texture chains ([Materials]
+    // DiskTextureCache, default 1). The convert stage (BC decode +
+    // octahedral/invert/tint/palette bakes) costs ~11ms per chain across
+    // ~2k unique chains in a fresh area -- the pop-in floor once the rest
+    // of the pipeline went async. The output is deterministic per content
+    // hash, so it is written once to %LOCALAPPDATA%\FO4Remix\texcache and
+    // later sessions stream the converted bytes from disk instead.
+    // LIMITATION: the key folds the texture NAME + the source resource's
+    // desc, not the pixel content -- a texture-pack swap that keeps
+    // identical names, dims, format and mip counts serves stale pixels.
+    // Clear the folder (or disable this key) after swapping texture mods.
+    bool     diskTextureCache;
+    // Folder size cap in GiB ([Materials] DiskTextureCacheGiB, default 8).
+    // Checked once per session on a worker thread; oldest files (by last
+    // write) are deleted until the folder is back under 90% of the cap.
+    uint32_t diskTextureCacheGiB;
+
+    // Destroy parked Remix handles only during load screens (PreLoadGame
+    // drain request) and on shutdown, instead of every 30 frames
+    // ([Performance] DeferHandleDestroyToLoad, default 1). Mitigation for
+    // the AV-inside-api->CreateMesh session killer (2026-07-10/11): both
+    // incidents featured TexUpgrade churn with interleaved mid-gameplay
+    // destroys, and a create-vs-CS-side-destruction race inside the runtime
+    // is the live suspect. Parking is free plugin-side (handles are already
+    // erased from the caches; CancelParkedHandle rescues re-created content
+    // for as long as it stays parked); the VRAM held by parked handles is
+    // reported as parked= on the [VRAM] line, with an 8192-handle emergency
+    // drain valve. 0 = 30-frame cadence (A/B).
+    bool deferHandleDestroyToLoad;
+
+    // Suppress the game's own raster draws at the D3D11 hook layer
+    // (raster_suppress.h has the full design). The engine keeps running its
+    // complete CPU render loop -- GetRenderPasses detours, DrawCapture
+    // chunk observation, texture streaming, and readbacks all still work --
+    // but scene draw calls are not forwarded to the driver: game-side
+    // textures become WDDM-demotable instead of pinning VRAM against the
+    // path tracer (the modded-texture budget fight), and the raster GPU
+    // cost disappears. Still executed: the frame's UI PHASE (first UI-RT
+    // bind through end of frame -- Scaleform glyph atlases, filters, and
+    // the backbuffer composite live in intermediate targets, so the whole
+    // tail forwards; scene/shadow/post passes run before it and stay
+    // suppressed) and draws inside occlusion-query scopes. Wants
+    // [Overlay] HudOverlayEnabled=1. The game window shows live UI over a
+    // stale scene while this is on. Default 0.
+    bool suppressGameRaster;
+
     // Per-Tick wall-clock budget (milliseconds) for the semantic-capture
     // resolve loop (2026-07-09 hitching fix). Tick runs on the game render
     // thread inside hkPresent; a cell attach makes hundreds of drawables
@@ -278,6 +630,37 @@ struct PluginConfig {
     // tick so a single over-budget item can't stall progress. 0 = unbounded
     // (legacy burst behavior).
     float resolveBudgetMs;
+
+    // [Performance] MaxUploadMiBPerTick (default 48, 0 = uncapped). Hard cap
+    // on bytes handed to the runtime per tick (CreateTexture chains +
+    // CreateMesh geometry). Every byte becomes CS-chunk payload; the
+    // 2026-07-17 hang dump proved the failure mode when a burst outruns the
+    // CS thread's drain rate: CS-queue backpressure blocks the present
+    // thread inside FlushCsChunk while it holds the device spinlock, and
+    // the game thread spins unboundedly entering its next create call. The
+    // supply-pass zero-copy (5b5b956) removed the memcpys that had been
+    // accidentally rate-limiting exactly this.
+    uint32_t maxUploadMiBPerTick;
+
+    // [Window] (2026-07-18, BetaRT overlay-mode port). The plugin runs a
+    // dual-window setup: the game window renders raster (or live UI over a
+    // stale scene with SuppressGameRaster) while the plugin-created Remix
+    // window shows the path-traced output. OverlayMode turns the Remix
+    // window into a borderless, topmost, click-through overlay glued to the
+    // game window's client rect: keys and clicks pass through to the game
+    // window beneath, the game keeps focus, and the two windows read as one.
+    // When the Remix dev menu opens (GetUIState != NONE) the overlay becomes
+    // interactive and takes focus so ImGui gets the mouse; closing the menu
+    // restores click-through and refocuses the game. 0 = legacy free-
+    // floating window.
+    bool windowOverlayMode;      // default true
+    // Virtual-key code that toggles the Remix dev menu via SetUIState
+    // (0 = disabled). Polled with GetAsyncKeyState on the Remix thread, so
+    // it works regardless of which window has focus -- this makes the menu
+    // reachable even with [Overlay] RestoreLegacyInput=1, whose documented
+    // trade-off was losing the runtime's own raw-input hotkeys (Alt+X).
+    // Default 0x77 (VK_F8).
+    uint32_t windowMenuHotkey;
 };
 
 // Global config instance

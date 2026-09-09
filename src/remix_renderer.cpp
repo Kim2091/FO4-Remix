@@ -1,7 +1,12 @@
 #include "remix_renderer.h"
 #include "config.h"
+#include "crash_diag.h"
 #include "remix_api.h"
 #include "fo4_diagnostics.h"
+#include "fo4_tracy.h"
+#include "present_hook.h"     // GetVramBudgetSnapshot (pressure-tightened LRU grace)
+#include "draw_capture.h"     // EngineIbKey + SnapshotVisible (occlusion cull)
+#include "hzb_occlusion.h"    // CPU Hi-Z per-item occlusion (HzbCull)
 #include "semantic_capture.h"
 #include "skinned_meshes.h"
 #include "resolvers/lighting_static.h"  // Trace::SetStep + Trace::Step constants
@@ -14,14 +19,19 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>    // sinf/cosf/tanf/atanf (OnFrame frustum-cull plane build)
 #include <cstring>
+#include <memory>   // shared_ptr (occluder geometry lifetime tied to MeshRef)
 #include <mutex>
 #include <vector>
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
 #include <d3d11.h>
 #include <excpt.h>  // EXCEPTION_EXECUTE_HANDLER for SEH wrappers below
+#include <DbgHelp.h>  // MiniDumpWriteDump (guard-filter faulting-context dumps)
+#pragma comment(lib, "dbghelp.lib")
 
 // ---------------------------------------------------------------------------
 // DXGI -> remixapi_Format mapping
@@ -41,6 +51,19 @@ static remixapi_Format DxgiToRemixFormat(DXGI_FORMAT fmt) {
         case DXGI_FORMAT_B8G8R8A8_UNORM:    return REMIXAPI_FORMAT_B8G8R8A8_UNORM;
         case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB: return REMIXAPI_FORMAT_B8G8R8A8_SRGB;
         default: return (remixapi_Format)0;
+    }
+}
+
+// Map an sRGB remixapi_Format to its UNORM equivalent (pass-through for non-sRGB formats). Used to force
+// the ALBEDO/diffuse map to be sampled linearly (see the call site for why only albedo).
+static remixapi_Format ToUnormRemixFormat(remixapi_Format fmt) {
+    switch (fmt) {
+        case REMIXAPI_FORMAT_BC1_RGB_SRGB:  return REMIXAPI_FORMAT_BC1_RGB_UNORM;
+        case REMIXAPI_FORMAT_BC3_SRGB:      return REMIXAPI_FORMAT_BC3_UNORM;
+        case REMIXAPI_FORMAT_BC7_SRGB:      return REMIXAPI_FORMAT_BC7_UNORM;
+        case REMIXAPI_FORMAT_R8G8B8A8_SRGB: return REMIXAPI_FORMAT_R8G8B8A8_UNORM;
+        case REMIXAPI_FORMAT_B8G8R8A8_SRGB: return REMIXAPI_FORMAT_B8G8R8A8_UNORM;
+        default: return fmt;
     }
 }
 
@@ -94,6 +117,20 @@ static uint64_t ContentHashOf(const ExtractedMesh& m) {
     return h;
 }
 
+// Remix API handles in this fork are the caller-provided 64-bit hash value,
+// and CreateMesh registrations are immutable while that handle is live.  The
+// material therefore has to participate in the API-visible hash just as it
+// participates in MeshCacheKey: otherwise two material variants of identical
+// geometry alias one runtime mesh, which remains bound to whichever material
+// registered first.  FNV the material hash into the geometry hash to keep the
+// result stable across runs while giving every cache key its own handle.
+static uint64_t RuntimeMeshHashOf(const MeshCacheKey& key) {
+    uint64_t h = HashBytes(&key.materialHash, sizeof(key.materialHash), key.contentHash);
+    // A null hash is rejected as an invalid Remix handle.  This branch is
+    // astronomically unlikely, but keep the API contract deterministic.
+    return h != 0 ? h : 0xD6E8FEB86659FD93ULL;
+}
+
 // ---------------------------------------------------------------------------
 // First-N-catches-per-callsite logger for C++ exceptions out of dxvk-remix
 // API calls. We saw 3277 caught C++ exceptions out of SubmitDrawable in the
@@ -101,9 +138,6 @@ static uint64_t ContentHashOf(const ExtractedMesh& m) {
 // call site is enough to spot patterns and learn what's actually being thrown.
 // ---------------------------------------------------------------------------
 static std::atomic<int> g_cxxLogCount_SubmitDrawable{0};
-static std::atomic<int> g_cxxLogCount_ReleaseDrawableMesh{0};
-static std::atomic<int> g_cxxLogCount_ReleaseDrawableMaterial{0};
-static std::atomic<int> g_cxxLogCount_ReleaseDrawableTexture{0};
 static std::atomic<int> g_cxxLogCount_DrawInstance{0};
 static constexpr int kCxxLogCap = 16;
 
@@ -144,13 +178,15 @@ static int CallDrawInstanceCxxGuarded(remixapi_Interface* api,
     }
 }
 
+static LONG WriteGuardDumpFilter(EXCEPTION_POINTERS* xp);  // defined below
+
 static int CallDrawInstanceGuarded(remixapi_Interface* api,
                                    const remixapi_InstanceInfo* instance,
                                    remixapi_ErrorCode* outErr,
                                    unsigned long* outExceptionCode) {
     __try {
         return CallDrawInstanceCxxGuarded(api, instance, outErr);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (WriteGuardDumpFilter(GetExceptionInformation())) {
         *outExceptionCode = GetExceptionCode();
         return 1;
     }
@@ -171,8 +207,84 @@ static int CallDrawInstanceGuarded(remixapi_Interface* api,
 static std::atomic<int> g_remixGuardLogCount{0};
 static constexpr int kRemixGuardLogCap = 32;
 
+// ---------------------------------------------------------------------------
+// Minidump at the SEH filter (2026-07-12). The CreateMesh AV that kills
+// sessions happens INSIDE dxvk-remix (d3d9.dll) and leaves no trace: dxvk's
+// log is clean, and WER records nothing because the process dies moments
+// later on a DIFFERENT thread (the runtime's internals are left half-mutated
+// by the unwound-through fault). The only place the true faulting stack
+// exists is right here, in the filter, with the original context -- so write
+// the dump now. Capped at 2 per session; C++ exceptions (0xE06D7363) are
+// excluded (they carry no faulting context worth a dump and would burn the
+// budget on out_of_range noise).
+// ---------------------------------------------------------------------------
+static std::atomic<int> g_guardDumpCount{0};
+
+static LONG WriteGuardDumpFilter(EXCEPTION_POINTERS* xp) {
+    if (!xp || !xp->ExceptionRecord ||
+        xp->ExceptionRecord->ExceptionCode == 0xE06D7363UL) {
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    const int n = g_guardDumpCount.fetch_add(1, std::memory_order_relaxed);
+    if (n >= 2) return EXCEPTION_EXECUTE_HANDLER;
+
+    // Log the faulting site FIRST -- module-relative, so the crash location
+    // is recoverable from the log alone. Field lesson (2026-07-12 second
+    // crash): the first dump attempt died mid-MiniDumpWriteDump (0-byte
+    // file, no log line) because the heavyweight dump type gave the other
+    // poisoned runtime threads ~seconds to kill the process. The log write
+    // and a stacks-only dump fit inside the window.
+    void* addr = xp->ExceptionRecord->ExceptionAddress;
+    char modName[MAX_PATH] = "?";
+    uintptr_t modOff = 0;
+    HMODULE mod = nullptr;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &mod) && mod) {
+        GetModuleFileNameA(mod, modName, sizeof(modName));
+        modOff = (uintptr_t)addr - (uintptr_t)mod;
+    }
+    _MESSAGE("FO4RemixPlugin: [RemixGuard] SEH fault code=0x%08lX addr=%p "
+             "module=%s +0x%llX -- writing dump",
+             xp->ExceptionRecord->ExceptionCode, addr, modName,
+             (unsigned long long)modOff);
+
+    char dir[MAX_PATH] = {};
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) {
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+    char path[MAX_PATH];
+    sprintf_s(path, "%s\\CrashDumps\\FO4RemixGuard_%lu_%d.dmp",
+              dir, GetCurrentProcessId(), n);
+
+    HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION mei = {};
+        mei.ThreadId          = GetCurrentThreadId();
+        mei.ExceptionPointers = xp;
+        mei.ClientPointers    = FALSE;
+        // Stacks + modules only: a few MB written in tens of ms. The fat
+        // IndirectlyReferencedMemory dump never completed (above).
+        const BOOL ok = MiniDumpWriteDump(
+            GetCurrentProcess(), GetCurrentProcessId(), file,
+            (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo |
+                            MiniDumpWithUnloadedModules),
+            &mei, nullptr, nullptr);
+        FlushFileBuffers(file);
+        CloseHandle(file);
+        _MESSAGE("FO4RemixPlugin: [RemixGuard] dump %s: %s",
+                 ok ? "written" : "FAILED", path);
+    }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
 template <typename F>
 static int RemixCallCxxGuarded(const char* site, F& fn) {
+    // Tracy zone lives here, not in the SEH wrapper (RAII + __try = C2712).
+    // Dynamic name: one zone per guarded remixapi call site, giving the
+    // per-API-call cost table on the flame graph for free.
+    FO4_TRACY_SCOPE_DYN(site);
     try {
         fn();
         return 0;
@@ -182,21 +294,53 @@ static int RemixCallCxxGuarded(const char* site, F& fn) {
             _MESSAGE("FO4RemixPlugin: [RemixGuard] %s C++ exception #%d what=%s",
                      site, n, e.what());
         }
+        CrashDiag::LogLastCxxThrow(site);
         return 2;
     } catch (...) {
         int n = g_remixGuardLogCount.fetch_add(1, std::memory_order_relaxed);
         if (n < kRemixGuardLogCap) {
             _MESSAGE("FO4RemixPlugin: [RemixGuard] %s unknown C++ exception #%d", site, n);
         }
+        CrashDiag::LogLastCxxThrow(site);
         return 2;
     }
+}
+
+// Diagnostic dump with the CURRENT context (no exception pointers): all
+// thread stacks as they are right now. Used by the std::terminate handler --
+// abort() fast-fails through THIS module's static CRT, so our handler is the
+// one that runs, and the dump names the thread whose uncaught exception is
+// killing the process (the WER event only says "abort, this DLL").
+void RemixRenderer::WriteDiagDump(const char* tag) {
+    char dir[MAX_PATH] = {};
+    if (!GetEnvironmentVariableA("LOCALAPPDATA", dir, sizeof(dir))) return;
+    char path[MAX_PATH];
+    // Nothing else guarantees this folder exists (WER only creates it if
+    // LocalDumps ran); without it every CreateFileA below fails silently
+    // on a fresh install. Idempotent.
+    sprintf_s(path, "%s\\CrashDumps", dir);
+    CreateDirectoryA(path, nullptr);
+    sprintf_s(path, "%s\\CrashDumps\\FO4Remix_%s_%lu.dmp",
+              dir, tag, GetCurrentProcessId());
+    HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return;
+    const BOOL ok = MiniDumpWriteDump(
+        GetCurrentProcess(), GetCurrentProcessId(), file,
+        (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo |
+                        MiniDumpWithUnloadedModules),
+        nullptr, nullptr, nullptr);
+    FlushFileBuffers(file);
+    CloseHandle(file);
+    _MESSAGE("FO4RemixPlugin: [%s] dump %s: %s (thread=%lu)",
+             tag, ok ? "written" : "FAILED", path, GetCurrentThreadId());
 }
 
 template <typename F>
 static int RemixCallGuarded(const char* site, F&& fn) {
     __try {
         return RemixCallCxxGuarded(site, fn);
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (WriteGuardDumpFilter(GetExceptionInformation())) {
         int n = g_remixGuardLogCount.fetch_add(1, std::memory_order_relaxed);
         if (n < kRemixGuardLogCap) {
             _MESSAGE("FO4RemixPlugin: [RemixGuard] %s SEH exception #%d code=0x%08lX",
@@ -231,13 +375,6 @@ struct MaterialRef {
     uint64_t lastDrawnFrame = 0;
 };
 static std::unordered_map<uint64_t, MaterialRef> g_materialCache;
-
-// Per-hash Remix InstanceInfoBlendEXT, populated at SubmitDrawable time for
-// meshes that have any alpha state (test or blend). OnFrame's DrawInstance
-// loop chains the stored struct onto instance.pNext so Remix honors per-
-// instance alpha state. Keyed by the mesh's `hash` field (NOT material hash)
-// -- per-instance, not per-material.
-static std::unordered_map<uint64_t, remixapi_InstanceInfoBlendEXT> g_geometryAlphaState;
 
 // ---------------------------------------------------------------------------
 // Phase 1B: flat per-drawable map, keyed by PassKey/drawable hash.
@@ -281,6 +418,15 @@ namespace {
         // dxvk-remix's defaults are reasonable for any water surface.
         bool                         isWater       = false;
 
+        // 1st-person viewmodel tag (2026-07-18). Copied from ExtractedMesh
+        // at submit time. The 1P graph is authored in a synthetic origin-
+        // local space; OnFrame adds the per-frame camera delta (real camera
+        // minus the 1P skeleton's Camera bone, SemanticCapture::
+        // GetViewModelAnchor) to this instance's transform (rigid parts) or
+        // bone translations (skinned parts), and skips the draw entirely
+        // while the engine has the 1P root app-culled (3rd person, menus).
+        bool                         isViewModel   = false;
+
         // Alpha-blend state (2026-05-01). Copied from ExtractedMesh at submit
         // time. OnFrame chains a remixapi_InstanceInfoBlendEXT onto pNext when
         // alphaBlendEnabled is true; the material was built with
@@ -320,19 +466,79 @@ namespace {
         // model-space -- drawn boneless they'd T-pose at the world origin).
         bool                            isSkinned = false;
         std::vector<remixapi_Transform> boneTransforms;
+
+        // Frustum cull (2026-07-21). Mesh-local AABB copied from the mesh
+        // cache at submit; hasBounds false for skinned meshes (bind-pose
+        // bounds test the wrong spot -- bones carry the placement).
+        float boundMin[3] = {};
+        float boundMax[3] = {};
+        bool  hasBounds   = false;
+        // Per-drawable cull state for angular hysteresis: a culled entry
+        // re-enters through a TIGHTER (but still wider-than-view) frustum
+        // than the one that culled it, so camera jitter at the edge can't
+        // flap the decision frame-to-frame. Consumed at BUCKET granularity
+        // in the draw loop (see the all-or-nothing comment there).
+        bool  frustumCulled = false;
+
+        // Occlusion cull (2026-07-21). engineIbKey is the (IB pointer, byte
+        // offset) identity of the engine draw this geometry comes from; 0 =
+        // no key (exempt). OnFrame matches it against DrawCapture's per-frame
+        // "was drawn" map: a key drawn recently then stopped is occluded (or
+        // engine-frustum-culled). occlusionCulled carries the last verdict.
+        uint64_t engineIbKey    = 0;
+        bool     occlusionCulled = false;
+
+        // Hi-Z per-item occlusion (HzbCull, 2026-07-21). hzbCulled is the last
+        // committed verdict; hzbOccludedStreak counts consecutive frames the
+        // world AABB read fully behind the Hi-Z buffer and only commits the
+        // cull once it reaches HzbCullDelayFrames (reset to 0 the instant it
+        // reads visible -> instant un-cull). everAnimated is a sticky flag set
+        // the first frame this drawable appears in the dirty-pose set: an
+        // animated thing can NEVER be an occluder (the 1-frame-stale buffer is
+        // only false-cull-safe for geometry that provably does not move).
+        // firstFrame is the submit frame, for the occluder min-age gate.
+        bool     hzbCulled         = false;
+        uint32_t hzbOccludedStreak = 0;
+        bool     everAnimated      = false;
+        uint32_t firstFrame        = 0;
     };
 
     std::unordered_map<uint64_t, DrawableInstance> g_drawables;
 
     // Mesh-handle cache keyed by (contentHash, materialHash). Refcounted; a
     // SubmitDrawable that finds a matching key reuses the existing handle and
-    // bumps refCount, ReleaseDrawable drops it, on zero we DestroyMesh + erase.
+    // bumps refCount, ReleaseDrawable drops it, on zero we erase + park the
+    // handle in g_pendingDestroys for the Remix thread to destroy.
     // When g_config.gpuInstancingEnabled is false the cache key has the
     // drawable hash in `contentHash`, so each drawable lands in its own bucket
     // and no sharing happens -- preserves pre-instancing behavior for rollback.
+    // Immutable mesh-local geometry copy for the Hi-Z occlusion rasterizer:
+    // interleaved xyz positions + triangle indices. Held by shared_ptr from
+    // MeshRef so it outlives a mesh release if a build still references it.
+    struct OccluderGeom {
+        std::vector<float>    positions; // xyz triplets, mesh-local
+        std::vector<uint32_t> indices;
+    };
+
     struct MeshRef {
         remixapi_MeshHandle handle;
         uint32_t            refCount;
+        // Mesh-local AABB over the uploaded vertex array (frustum cull,
+        // 2026-07-21). Computed once on the cache-miss path and copied to
+        // every DrawableInstance that shares the handle. hasBounds stays
+        // false for skinned meshes: their verts are bind-pose model space
+        // and the bones carry the world placement, so a transformed bind
+        // AABB would test the wrong location.
+        float boundMin[3] = {};
+        float boundMax[3] = {};
+        bool  hasBounds   = false;
+        // Positions-only + index copy retained for the CPU Hi-Z occlusion
+        // rasterizer (HzbCull), populated at the cache-miss below only when the
+        // mesh is large enough to be a useful occluder. shared_ptr so an
+        // in-flight build keeps the geometry alive across a mesh release, and
+        // so the lifetime is auto-tied to this MeshRef (no separate store to
+        // keep in sync). Null when HzbCull is off or the mesh is too small.
+        std::shared_ptr<const OccluderGeom> occluderGeom;
     };
     std::unordered_map<MeshCacheKey, MeshRef, MeshCacheKeyHash> g_meshCache;
 
@@ -353,6 +559,11 @@ namespace {
     // and crash the iterating thread.
     std::mutex g_renderStateMutex;
 
+    // Per-tick runtime-ingest byte counter (see remix_renderer.h). Atomic
+    // only because the accessors are declared thread-safe; in practice
+    // SubmitDrawable and the resolve loop both live on the game thread.
+    std::atomic<size_t> g_uploadBytesTick{0};
+
     // Pending config writes queued by game-thread callers (QueueConfigVariable)
     // and drained at the top of OnFrame on the Remix thread. Last write per key
     // wins. Guarded by its own lightweight mutex -- held only for the map
@@ -372,7 +583,38 @@ namespace {
     std::mutex g_lightQueueMutex;
     bool g_lightSnapshotPending = false;
     std::vector<ExtractedLight> g_lightSnapshot;
-    std::unordered_map<uint64_t, remixapi_LightHandle> g_lights;  // Remix thread only
+    // Live light records (2026-07-18, BetaRT recipe). Beyond the handle,
+    // each record keeps the DERIVED params last submitted (post config
+    // multipliers, camera-proximity flags resolved) so a snapshot can be
+    // diffed against what the runtime actually has. A changed light is
+    // updated in place via UpdateLightDefinition on the SAME handle+hash --
+    // the runtime's persistent RTXDI reservoirs survive, so no re-seed
+    // boiling -- with destroy+recreate as the fallback when the entry point
+    // is missing or the update fails. Remix thread only.
+    struct LightRecord {
+        remixapi_LightHandle handle = nullptr;
+        float position[3] = {};
+        float radius = 0.0f;
+        float radiance[3] = {};
+        bool  isSpot = false;
+        float spotDirection[3] = {};
+        float spotConeAngle = 0.0f;
+        float spotSoftness = 0.0f;
+        bool  ignoreViewModel = false;  // near-camera flag, re-evaluated per snapshot
+
+        bool SameAs(const LightRecord& o) const {
+            return position[0] == o.position[0] && position[1] == o.position[1]
+                && position[2] == o.position[2] && radius == o.radius
+                && radiance[0] == o.radiance[0] && radiance[1] == o.radiance[1]
+                && radiance[2] == o.radiance[2] && isSpot == o.isSpot
+                && spotDirection[0] == o.spotDirection[0]
+                && spotDirection[1] == o.spotDirection[1]
+                && spotDirection[2] == o.spotDirection[2]
+                && spotConeAngle == o.spotConeAngle && spotSoftness == o.spotSoftness
+                && ignoreViewModel == o.ignoreViewModel;
+        }
+    };
+    std::unordered_map<uint64_t, LightRecord> g_lights;  // Remix thread only
 
     // Skinned bone sync (2026-07-08). The game thread queues composed
     // bind->world matrix sets per skinned drawable (QueueBoneTransforms from
@@ -381,6 +623,131 @@ namespace {
     // Remix thread and chains the bones ext on each skinned draw.
     std::mutex g_boneQueueMutex;
     std::unordered_map<uint64_t, std::vector<remixapi_Transform>> g_boneQueue;
+
+    // Deferred handle destruction (2026-07-10). Game-thread release paths
+    // (ReleaseDrawable / DecrementMeshCacheRef, driven by the Tick TTL sweep,
+    // the PreLoadGame release wave, and merge upgrades) must never call
+    // DestroyMesh/DestroyMaterial/DestroyTexture inline: the runtime
+    // serializes each API call internally, but a destroy that lands between
+    // OnFrame's DrawInstance records and the Present that consumes them
+    // erases a handle the in-flight frame still references -- the runtime's
+    // Present-side .at() then throws std::out_of_range on the Remix thread
+    // (the 0xc0000409 CTD that 3e763bd's RemixCallGuarded only papers over).
+    // Instead the handle is parked here (its cache entry is erased
+    // immediately, so plugin bookkeeping is unchanged) and OnFrame destroys
+    // it at the top of the NEXT frame -- on the Remix thread, after the
+    // previous Present returned and before any new draw is recorded -- so a
+    // destroy can never overlap a frame in flight.
+    // Guarded by g_renderStateMutex (every producer already holds it).
+    // g_hasPendingDestroys lets OnFrame skip the mutex in the common empty
+    // steady state -- the lock is exactly the one a game-thread release
+    // wave holds throughout a cell unload, so an unconditional per-frame
+    // acquisition would block the Remix thread during teardown storms for
+    // zero pending work.
+    struct PendingDestroys {
+        std::vector<remixapi_MeshHandle>     meshes;
+        std::vector<remixapi_MaterialHandle> materials;
+        std::vector<remixapi_TextureHandle>  textures;
+    };
+    PendingDestroys g_pendingDestroys;
+    std::atomic<bool> g_hasPendingDestroys{false};
+    // Parked-handle count mirror (updated under g_renderStateMutex at every
+    // park/cancel/drain; atomic so the drain gate and the [VRAM] log can
+    // read it without the lock).
+    std::atomic<size_t> g_pendingDestroyCount{0};
+    // Load-screen drain request ([Performance] DeferHandleDestroyToLoad):
+    // set from the PreLoadGame message, consumed by the next OnFrame.
+    std::atomic<bool> g_destroyDrainRequested{false};
+
+    // Live-texture refresh churn (2026-07-18 Pip-Boy screen): handles that
+    // turn over every refresh period (~each old screen texture is 2.4MB of
+    // VRAM) would blow far past the deferred-drain valve if parked with the
+    // rest. They get their own park list, drained EVERY frame -- tiny
+    // (<= 3 handles per refresh), and the destroys are the same top-of-
+    // frame Remix-thread timing as the normal drain. Same lock discipline
+    // (writers hold g_renderStateMutex).
+    PendingDestroys   g_eagerPendingDestroys;
+    std::atomic<bool> g_hasEagerDestroys{false};
+
+    // FaceGen morph refresh. CPU copies of private skinned face meshes let
+    // OnFrame rebuild only the changed positions when FO4 rewrites a live
+    // BSDynamicTriShape dynamicVertices buffer.
+    struct FaceMeshData {
+        std::vector<remixapi_HardcodedVertex> vertices;
+        std::vector<uint32_t> indices;
+        std::vector<float>    blendWeights;
+        std::vector<uint32_t> blendIndices;
+        std::vector<float>    eyeBaseTexcoords;
+        bool                  isAnimatedEye = false;
+    };
+    std::unordered_map<uint64_t, FaceMeshData> g_faceMeshData;
+    std::mutex g_faceMorphQueueMutex;
+    std::unordered_map<uint64_t, std::vector<float>> g_faceMorphQueue;
+    std::mutex g_eyeUvQueueMutex;
+    std::unordered_map<uint64_t, RemixRenderer::EyeUvTransform> g_eyeUvQueue;
+}
+
+void RemixRenderer::RequestDestroyDrain() {
+    g_destroyDrainRequested.store(true, std::memory_order_release);
+}
+
+size_t RemixRenderer::PendingDestroyCount() {
+    return g_pendingDestroyCount.load(std::memory_order_relaxed);
+}
+
+void RemixRenderer::ResetUploadBytesTick() {
+    g_uploadBytesTick.store(0, std::memory_order_relaxed);
+}
+
+size_t RemixRenderer::UploadBytesTick() {
+    return g_uploadBytesTick.load(std::memory_order_relaxed);
+}
+
+// Park a handle for deferred destruction. Caller holds g_renderStateMutex.
+template <typename H>
+static void ParkForDestroy(std::vector<H>& parked, H h) {
+    parked.push_back(h);
+    g_pendingDestroyCount.fetch_add(1, std::memory_order_relaxed);
+    g_hasPendingDestroys.store(true, std::memory_order_release);
+}
+
+// Pull a handle back out of the park list. Handles are HASH-VALUED in this
+// fork (rtx_remix_api.cpp reinterpret_casts info->hash into the handle, and
+// the runtime IGNORES repeated registrations of a live handle), so re-
+// creating content identical to something released-but-not-yet-drained
+// yields the SAME handle value -- if the parked destroy then ran, it would
+// unregister the live re-created resource (flicker/vanish on exactly the
+// churn paths the deferral serves: TTL eviction, merge/texture upgrades).
+// Called from SubmitDrawable's create sites under g_renderStateMutex.
+template <typename H>
+static size_t EraseParkedHandle(std::vector<H>& parked, H h) {
+    const size_t before = parked.size();
+    parked.erase(std::remove(parked.begin(), parked.end(), h), parked.end());
+    return before - parked.size();
+}
+
+template <typename H>
+static void CancelParkedHandle(std::vector<H>& parked, H h) {
+    const size_t removed = EraseParkedHandle(parked, h);
+    if (removed) {
+        g_pendingDestroyCount.fetch_sub(removed, std::memory_order_relaxed);
+    }
+}
+
+// Destroy a batch of parked handles on the Remix thread. Shared by the
+// OnFrame top-of-frame drain and Shutdown so both stay guarded -- a parked
+// handle is precisely the class most likely to throw out of the runtime
+// (see the 0xE06D7363 note above DecrementTextureRefs).
+static void DestroyParkedHandles(remixapi_Interface* api, PendingDestroys& doomed) {
+    for (remixapi_MeshHandle h : doomed.meshes) {
+        if (h) RemixCallGuarded("DestroyMesh(deferred)", [&] { api->DestroyMesh(h); });
+    }
+    for (remixapi_MaterialHandle h : doomed.materials) {
+        if (h) RemixCallGuarded("DestroyMaterial(deferred)", [&] { api->DestroyMaterial(h); });
+    }
+    for (remixapi_TextureHandle h : doomed.textures) {
+        if (h) RemixCallGuarded("DestroyTexture(deferred)", [&] { api->DestroyTexture(h); });
+    }
 }
 
 // Fallback triangle (keeps path tracing alive when no scene meshes are loaded)
@@ -488,9 +855,12 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
         const bool stale = (it->second.refCount == 0) && (age > ttlFrames);
         if (stale) {
             if (it->second.handle) {
-                remixapi_MaterialHandle h = it->second.handle;
-                RemixCallGuarded("DestroyMaterial(sweep)",
-                                 [&] { api->DestroyMaterial(h); });
+                // Sweeps run after this frame's DrawInstance calls.  Destroying
+                // inline here lets the runtime free a bindless slot before
+                // Present consumes preserved instances, and its generation bump
+                // is then swallowed by onFrameEnd.  Park it for the guarded
+                // top-of-frame drain, matching ReleaseDrawable.
+                ParkForDestroy(g_pendingDestroys.materials, it->second.handle);
             }
             it = g_materialCache.erase(it);
             ++result.staleMaterialCount;
@@ -527,7 +897,8 @@ RemixRenderer::StaleMaterialSweepResult RemixRenderer::SweepStaleMaterials(
 //   (2) Budget pass -- if currentMaterialTex is over budgetBytes, add the
 //       oldest non-stale textures (with min-age guardrail and per-sweep
 //       cap) to the eviction set.
-// Then defensive orphan-handle destruction (refCount == 0 guard).
+// Then defensive orphan-handle parking (refCount == 0 guard); the next
+// top-of-frame destroy drain performs the API release safely.
 // ---------------------------------------------------------------------------
 RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
         uint64_t currentFrameIndex,
@@ -592,9 +963,12 @@ RemixRenderer::StaleTextureSweepResult RemixRenderer::SweepStaleTextures(
             auto texIt = g_textureHandles.find(texHash);
             if (texIt != g_textureHandles.end() && texIt->second.refCount == 0) {
                 if (texIt->second.handle) {
-                    remixapi_TextureHandle h = texIt->second.handle;
-                    RemixCallGuarded("DestroyTexture(sweep)",
-                                     [&] { api->DestroyTexture(h); });
+                    // Do not release texture-table slots after draws have been
+                    // recorded.  The top-of-frame drain runs before any new
+                    // DrawInstance, so the runtime generation mismatch forces a
+                    // safe one-frame retranslation before preserved state can
+                    // sample the freed/recycled slot.
+                    ParkForDestroy(g_pendingDestroys.textures, texIt->second.handle);
                 }
                 g_textureHandles.erase(texIt);
                 ++result.orphanTexturesDestroyed;
@@ -636,43 +1010,49 @@ static void DecrementMaterialRef(uint64_t matHash) {
     }
 }
 
-// Drop a refCount on a g_meshCache entry. On zero we DestroyMesh and erase.
-// Same per-call try/catch idiom as the texture/material destroy paths so a
-// throw out of dxvk-remix is logged once and does not corrupt our state.
+// Drop a refCount on a g_meshCache entry. On zero we erase the entry and park
+// the handle for deferred destruction on the Remix thread (see
+// g_pendingDestroys) -- this runs on the game thread, where an inline
+// DestroyMesh can invalidate a handle the frame in flight still references.
+// eagerPark routes the handle to the every-frame drain list instead (live-
+// texture refresh churn; see g_eagerPendingDestroys).
 // Caller must hold g_renderStateMutex.
-static void DecrementMeshCacheRef(const MeshCacheKey& key) {
+static void DecrementMeshCacheRef(const MeshCacheKey& key, bool eagerPark = false) {
     auto it = g_meshCache.find(key);
     if (it == g_meshCache.end()) return;
     if (it->second.refCount > 0) --it->second.refCount;
     if (it->second.refCount != 0) return;
 
-    remixapi_Interface* api = RemixAPI::GetInterface();
-    if (api && it->second.handle) {
-        try {
-            api->DestroyMesh(it->second.handle);
-        } catch (const std::exception& e) {
-            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
-            if (n < kCxxLogCap) {
-                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh (cache) C++ exception #%d content=0x%llX mat=0x%llX what=%s",
-                         n, (unsigned long long)key.contentHash,
-                         (unsigned long long)key.materialHash, e.what());
+    if (it->second.handle) {
+        // RuntimeMeshHashOf normally makes handles unique per full cache key.
+        // Keep a defensive alias check for the vanishingly unlikely 64-bit hash
+        // collision: destroying one collision peer must not unregister another.
+        bool aliased = false;
+        for (const auto& [k, m] : g_meshCache) {
+            if (&m != &it->second && m.handle == it->second.handle) {
+                aliased = true;
+                break;
             }
-        } catch (...) {
-            int n = g_cxxLogCount_ReleaseDrawableMesh.fetch_add(1, std::memory_order_relaxed);
-            if (n < kCxxLogCap) {
-                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMesh (cache) unknown C++ exception #%d content=0x%llX mat=0x%llX",
-                         n, (unsigned long long)key.contentHash,
-                         (unsigned long long)key.materialHash);
+        }
+        if (!aliased) {
+            if (eagerPark) {
+                g_eagerPendingDestroys.meshes.push_back(it->second.handle);
+                g_hasEagerDestroys.store(true, std::memory_order_release);
+            } else {
+                ParkForDestroy(g_pendingDestroys.meshes, it->second.handle);
             }
         }
     }
     g_meshCache.erase(it);
 }
 
+// Defined below ReleaseDrawable; used by SubmitDrawable's in-place replace.
+static void ReleaseDrawableRefsLocked(uint64_t hash, bool eagerPark);
+
 RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         uint64_t hash,
         const ExtractedMesh& mesh,
-        const std::vector<ExtractedTexture>& newTextures) {
+        const TextureSupply& newTextures) {
 
     std::lock_guard<std::mutex> lock(g_renderStateMutex);
 
@@ -713,7 +1093,10 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
     // ---- Texture upload + cache ----
     // Per-texture upload + cache loop: refCount++ on hit, insert at refCount=1 on miss.
-    for (const auto& tex : newTextures) {
+    // Entries are shared_ptr views of the extraction cache's chains (see
+    // TextureSupply); the only remaining pixel copy is CreateTexture's own.
+    for (const auto& texPtr : newTextures) {
+        const ExtractedTexture& tex = *texPtr;
         // Dupe guard: the extraction cache re-supplies pixels whenever the
         // Remix-side handle is missing, so a drawable that references the
         // same texture in two slots (diffuse reused as glow map) can list
@@ -746,6 +1129,23 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
             continue;
         }
 
+        // Force ONLY the albedo/diffuse map to UNORM. Albedo is the single texture the path tracer runs its
+        // software gamma correction (gammaToLinear / pow 2.2) over, so if it is ALSO sRGB-decoded by the
+        // sampler it double-linearizes -> the washed-out-albedo bug. Submitting it UNORM leaves the shader's
+        // pow(2.2) as the only linearization.
+        //
+        // Everything else stays NATIVE and must NOT be touched:
+        //  - Normal maps are already linear (the game only promotes COLOR textures to sRGB, so normals keep
+        //    UNORM; octahedral-encoded normals are emitted R8G8B8A8_UNORM) and encode direction data.
+        //  - Roughness/smoothness reads correctly through its native format; forcing it linear roughly doubles
+        //    mid roughness (byte 128: sRGB 0.22 -> UNORM 0.50) and over-roughens everything (matte/flat/noisy,
+        //    rust reduced to plain brown).
+        //  - Emissive stays sRGB and is handled by the runtime's per-material sRGB gamma-skip
+        //    (rtx.linearizeSrgbTextures), so it is single-linearized without being converted here.
+        if (tex.hash == mesh.diffuseTextureHash) {
+            remixFmt = ToUnormRemixFormat(remixFmt);
+        }
+
         remixapi_TextureInfo texInfo = {};
         texInfo.sType     = REMIXAPI_STRUCT_TYPE_TEXTURE_INFO;
         texInfo.pNext     = nullptr;
@@ -758,18 +1158,41 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
         texInfo.data      = tex.pixels.data();
         texInfo.dataSize  = tex.pixels.size();
 
+        // RemixCallGuarded is LOAD-BEARING on every create in this function,
+        // not just log hygiene: SubmitDrawable holds g_renderStateMutex, and
+        // an AV inside the runtime that escapes to the resolver's outer SEH
+        // frame skips this scope's lock_guard destructor (/EHsc runs no
+        // destructors on hardware-exception unwinds) -- the mutex is then
+        // stranded owned-by-game-thread, every later lock throws
+        // system_error("resource deadlock would occur"), and the Remix
+        // thread blocks forever (the 2026-07-11 wedge; same signature as
+        // 07-10's "9000 exception storm"). Catching AT the call means no
+        // unwind ever crosses the lock scope; the create becomes a normal
+        // failure. dxvk-remix logged nothing at the observed CreateMesh AV,
+        // so [RemixGuard] site lines are also the only breadcrumb for
+        // root-causing the underlying runtime fault.
         remixapi_TextureHandle texHandle = nullptr;
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeTextureCreate);
-        remixapi_ErrorCode status = api->CreateTexture(&texInfo, &texHandle);
+        remixapi_ErrorCode status = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        const int texGuard = RemixCallGuarded("CreateTexture(submit)", [&] {
+            status = api->CreateTexture(&texInfo, &texHandle);
+        });
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterTextureCreate);
-        if (status != REMIXAPI_ERROR_CODE_SUCCESS || !texHandle) {
-            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to upload texture 0x%llX (error %d)",
-                     (unsigned long long)tex.hash, (int)status);
+        if (texGuard != 0 || status != REMIXAPI_ERROR_CODE_SUCCESS || !texHandle) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to upload texture 0x%llX "
+                     "(guard %d, error %d)",
+                     (unsigned long long)tex.hash, texGuard, (int)status);
             continue;
         }
 
+        // Hash-valued handle: if this same texture was released but its
+        // deferred destroy hasn't drained yet, that parked destroy would
+        // unregister the handle we just (re-)created -- pull it back out.
+        CancelParkedHandle(g_pendingDestroys.textures, texHandle);
+        EraseParkedHandle(g_eagerPendingDestroys.textures, texHandle);
         g_textureHandles[tex.hash] = { texHandle, 1, Diagnostics::CurrentFrameIndex() };
         inst.textureHashes.insert(tex.hash);
+        g_uploadBytesTick.fetch_add(tex.pixels.size(), std::memory_order_relaxed);
     }
 
     // ---- Validate texture upload completeness ----
@@ -1023,15 +1446,23 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
             remixapi_MaterialHandle newHandle = nullptr;
             Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeMaterialCreate);
-            remixapi_ErrorCode matStatus = api->CreateMaterial(&matInfo, &newHandle);
+            remixapi_ErrorCode matStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+            const int matGuard = RemixCallGuarded("CreateMaterial(submit)", [&] {
+                matStatus = api->CreateMaterial(&matInfo, &newHandle);
+            });
             Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterMaterialCreate);
-            if (matStatus != REMIXAPI_ERROR_CODE_SUCCESS || !newHandle) {
-                _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create material 0x%llX (error %d)",
-                         (unsigned long long)matHash, (int)matStatus);
+            if (matGuard != 0 || matStatus != REMIXAPI_ERROR_CODE_SUCCESS || !newHandle) {
+                _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create material 0x%llX "
+                         "(guard %d, error %d)",
+                         (unsigned long long)matHash, matGuard, (int)matStatus);
                 DecrementTextureRefs(inst.textureHashes);
                 return SubmitStatus::kFailed;
             }
 
+            // Hash-valued handle: cancel any not-yet-drained deferred
+            // destroy of this same material (see CancelParkedHandle).
+            CancelParkedHandle(g_pendingDestroys.materials, newHandle);
+            EraseParkedHandle(g_eagerPendingDestroys.materials, newHandle);
             g_materialCache[matHash] = { newHandle, 1, Diagnostics::CurrentFrameIndex() };
             matHandle = newHandle;
         }
@@ -1059,10 +1490,17 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     if (cacheIt != g_meshCache.end()) {
         cacheIt->second.refCount++;
         meshHandle = cacheIt->second.handle;
+        if (cacheIt->second.hasBounds) {
+            memcpy(inst.boundMin, cacheIt->second.boundMin, sizeof(inst.boundMin));
+            memcpy(inst.boundMax, cacheIt->second.boundMax, sizeof(inst.boundMax));
+            inst.hasBounds = true;
+        }
     } else {
-        // Cache miss -- create a new Remix mesh handle. Use the content hash
-        // as the Remix-side mesh hash so USD replacement matching is stable
-        // across game runs (instead of the per-drawable PassKey, which isn't).
+        // Cache miss -- create a new Remix mesh handle. The runtime stores the
+        // surface material on this immutable, hash-valued handle, so hash the
+        // complete (geometry, material) key rather than geometry alone. The
+        // derived value is deterministic, so each full key keeps a stable
+        // runtime identity instead of aliasing whichever variant arrived first.
         remixapi_MeshInfoSurfaceTriangles surface = {};
         surface.vertices_values = mesh.vertices.data();
         surface.vertices_count  = (uint32_t)mesh.vertices.size();
@@ -1087,28 +1525,106 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
 
         remixapi_MeshInfo meshInfo = {};
         meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
-        meshInfo.hash = meshKey.contentHash;
+        meshInfo.hash = RuntimeMeshHashOf(meshKey);
         meshInfo.surfaces_values = &surface;
         meshInfo.surfaces_count  = 1;
 
+        // CreateMeshBatched, NOT CreateMesh (2026-07-12, the four-crash
+        // night's root fix). The synchronous CreateMesh EmitCs's onto the
+        // device's CS chunk from THIS (game) thread under only the API
+        // bridge's s_mutex, while the Remix thread's Present flushes that
+        // same chunk under only the device lock -- two different locks, no
+        // exclusion, and the chunk pointer is momentarily null mid-swap
+        // inside the flush (dump-proven: AV in DxvkCsChunk::push,
+        // dxvk_cs.h:171, this=null, caller rtx_remix_api.cpp:1142).
+        // CreateMeshBatched copies the surfaces into runtime-owned storage
+        // and queues them under s_mutex; the render thread materializes
+        // pending creates at its next DrawInstance/Present, so the game
+        // thread never touches the CS chunk at all. Handle semantics are
+        // identical (caller hash cast). Fallback kept for older runtimes.
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_BeforeMeshCreate);
-        remixapi_ErrorCode meshStatus = api->CreateMesh(&meshInfo, &meshHandle);
+        remixapi_ErrorCode meshStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+        const bool haveBatched = api->CreateMeshBatched != nullptr;
+        const int meshGuard = RemixCallGuarded(
+            haveBatched ? "CreateMeshBatched(submit)" : "CreateMesh(submit)", [&] {
+            meshStatus = haveBatched
+                ? api->CreateMeshBatched(&meshInfo, &meshHandle)
+                : api->CreateMesh(&meshInfo, &meshHandle);
+        });
         Resolvers::Trace::SetStep(Resolvers::Trace::kSubmit_AfterMeshCreate);
-        if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
-            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create mesh content=0x%llX mat=0x%llX (error %d)",
+        if (meshGuard != 0 || meshStatus != REMIXAPI_ERROR_CODE_SUCCESS || !meshHandle) {
+            _MESSAGE("FO4RemixPlugin: [SubmitDrawable] Failed to create mesh content=0x%llX "
+                     "mat=0x%llX (guard %d, error %d)",
                      (unsigned long long)meshKey.contentHash,
-                     (unsigned long long)meshKey.materialHash, (int)meshStatus);
+                     (unsigned long long)meshKey.materialHash,
+                     meshGuard, (int)meshStatus);
             DecrementTextureRefs(inst.textureHashes);
             DecrementMaterialRef(matHash);
             return SubmitStatus::kFailed;
         }
 
-        g_meshCache[meshKey] = { meshHandle, 1 };
+        // Hash-valued handle: cancel any not-yet-drained deferred destroy
+        // of this same content (see CancelParkedHandle).
+        CancelParkedHandle(g_pendingDestroys.meshes, meshHandle);
+        EraseParkedHandle(g_eagerPendingDestroys.meshes, meshHandle);
+        MeshRef ref{};
+        ref.handle   = meshHandle;
+        ref.refCount = 1;
+        if (!mesh.hasSkinning) {
+            // O(verts) min/max, once per unique mesh -- noise next to the
+            // upload memcpy the runtime just did for the same array.
+            float mn[3] = {  3.4e38f,  3.4e38f,  3.4e38f };
+            float mx[3] = { -3.4e38f, -3.4e38f, -3.4e38f };
+            for (const remixapi_HardcodedVertex& v : mesh.vertices) {
+                for (int i = 0; i < 3; ++i) {
+                    mn[i] = (std::min)(mn[i], v.position[i]);
+                    mx[i] = (std::max)(mx[i], v.position[i]);
+                }
+            }
+            memcpy(ref.boundMin, mn, sizeof(mn));
+            memcpy(ref.boundMax, mx, sizeof(mx));
+            ref.hasBounds = true;
+            // Retain a mesh-local positions + index copy for the Hi-Z occlusion
+            // rasterizer, but only for meshes large enough to be worthwhile
+            // occluders (bounds the memory + per-frame raster cost). Whether a
+            // given instance is actually USED as an occluder is decided per
+            // frame in OnFrame (must also be proven static + opaque). Gated on
+            // HzbCull so there is zero cost when the feature is off.
+            if (g_config.cullingHzbEnabled && !mesh.indices.empty() &&
+                !mesh.vertices.empty()) {
+                const float maxDim = (std::max)(mx[0] - mn[0],
+                    (std::max)(mx[1] - mn[1], mx[2] - mn[2]));
+                if (maxDim >= g_config.cullingHzbOccluderMinSize) {
+                    auto geom = std::make_shared<OccluderGeom>();
+                    geom->positions.resize(mesh.vertices.size() * 3);
+                    for (size_t vi = 0; vi < mesh.vertices.size(); ++vi) {
+                        geom->positions[vi * 3 + 0] = mesh.vertices[vi].position[0];
+                        geom->positions[vi * 3 + 1] = mesh.vertices[vi].position[1];
+                        geom->positions[vi * 3 + 2] = mesh.vertices[vi].position[2];
+                    }
+                    geom->indices = mesh.indices;
+                    ref.occluderGeom = std::move(geom);
+                }
+            }
+        }
+        if (ref.hasBounds) {
+            memcpy(inst.boundMin, ref.boundMin, sizeof(inst.boundMin));
+            memcpy(inst.boundMax, ref.boundMax, sizeof(inst.boundMax));
+            inst.hasBounds = true;
+        }
+        g_meshCache[meshKey] = ref;
+        g_uploadBytesTick.fetch_add(
+            mesh.vertices.size() * sizeof(remixapi_HardcodedVertex) +
+            mesh.indices.size() * sizeof(uint32_t) +
+            mesh.blendWeights.size() * sizeof(float) +
+            mesh.blendIndices.size() * sizeof(uint32_t),
+            std::memory_order_relaxed);
     }
 
     inst.meshHandle     = meshHandle;
     inst.meshCacheKey   = meshKey;
     inst.lastDrawnFrame = Diagnostics::CurrentFrameIndex();
+    if (inst.firstFrame == 0) inst.firstFrame = inst.lastDrawnFrame; // occluder min-age gate
 
     // Save the world transform; the OnFrame draw loop reads it back per-frame.
     // Resolver-provided in row-major 3x4 layout matching remixapi_Transform.matrix.
@@ -1120,6 +1636,12 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.chunkOriginY = mesh.chunkOriginY;
     inst.chunkExtent  = mesh.chunkExtent;
     inst.isWater      = mesh.isWater;
+    inst.isViewModel  = mesh.isViewModel;
+
+    // Occlusion key (2026-07-21): fold the engine IB identity into the same
+    // hash DrawCapture stamps on the draw side. 0 stays 0 (exempt).
+    inst.engineIbKey  = DrawCapture::EngineIbKey(
+        reinterpret_cast<const void*>(mesh.engineIbPtr), mesh.engineIbOffset);
 
     // Alpha-blend + alpha-test state for the OnFrame InstanceInfoBlendEXT
     // chain (only consumed when alphaBlendEnabled=true; the material was
@@ -1137,6 +1659,33 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     inst.isTwoSided           = mesh.isTwoSided;
     inst.isSkinned            = mesh.hasSkinning;
 
+    // In-place replacement (2026-07-18 live-texture refresh): a shadow
+    // re-resolve re-submits an ALREADY-SUBMITTED hash with fresh handles.
+    // Release the outgoing instance's cache refcounts NOW -- after the new
+    // handles were created above, so shared textures (unchanged normal/
+    // roughness maps) keep refcount >= 1 straight through the swap and are
+    // never destroyed+re-uploaded. The freed per-generation handles (old
+    // screen texture, its material, its mesh) go to the eager park list:
+    // they turn over every refresh period and would blow past the deferred-
+    // drain valve (2.4MB VRAM each) if parked with the rest. Bone tracking
+    // is NOT dropped -- the resolver re-registered it during the shadow
+    // resolve.
+    if (g_drawables.count(hash)) {
+        ReleaseDrawableRefsLocked(hash, /*eagerPark=*/true);
+    }
+
+    if (mesh.hasSkinning &&
+        ((mesh.isFaceGenDynamic && g_config.faceMorphRefreshEnabled) ||
+         mesh.isAnimatedEye)) {
+        FaceMeshData fm;
+        fm.vertices     = mesh.vertices;
+        fm.indices      = mesh.indices;
+        fm.blendWeights = mesh.blendWeights;
+        fm.blendIndices = mesh.blendIndices;
+        fm.eyeBaseTexcoords = mesh.eyeBaseTexcoords;
+        fm.isAnimatedEye = mesh.isAnimatedEye;
+        g_faceMeshData[hash] = std::move(fm);
+    }
     g_drawables[hash] = std::move(inst);
     return SubmitStatus::kSubmitted;
     } catch (const std::exception& e) {
@@ -1156,53 +1705,49 @@ RemixRenderer::SubmitStatus RemixRenderer::SubmitDrawable(
     }
 }
 
-void RemixRenderer::ReleaseDrawable(uint64_t hash) {
-    // Drop bone tracking regardless of drawable presence (registration can
-    // outlive a failed submit).
-    SkinnedMeshes::OnDrawableReleased(hash);
-
-    std::lock_guard<std::mutex> lock(g_renderStateMutex);
-
+// Locked core of ReleaseDrawable: drop the instance's mesh/material/texture
+// cache refcounts (parking zero-refcount handles) and erase it from
+// g_drawables. Caller must hold g_renderStateMutex. eagerPark routes parked
+// handles to the every-frame drain (live-texture refresh; see
+// g_eagerPendingDestroys). Shared by the public ReleaseDrawable and
+// SubmitDrawable's in-place replacement.
+static void ReleaseDrawableRefsLocked(uint64_t hash, bool eagerPark) {
+    g_faceMeshData.erase(hash);
     auto it = g_drawables.find(hash);
     if (it == g_drawables.end()) return;
 
     DrawableInstance& inst = it->second;
 
-    remixapi_Interface* api = RemixAPI::GetInterface();
-
     // Drop our refCount on the cached mesh handle. DestroyMesh only fires when
-    // the last drawable using this (content, material) bucket releases. The
-    // alias in inst.meshHandle is cleared to avoid any double-touch later.
-    if (inst.meshHandle) {
-        DecrementMeshCacheRef(inst.meshCacheKey);
-        inst.meshHandle = nullptr;
-    }
+    // the last drawable using this (content, material) bucket releases.
+    // Keyed on meshCacheKey, NOT the meshHandle alias: OnFrame's guard paths
+    // null member meshHandles after a caught DrawInstance fault, and gating
+    // this decrement on the alias meant the cache entry's refCount never hit
+    // zero -- the runtime mesh (geometry + BLAS VRAM) leaked for the rest of
+    // the session, one whole working set per exception storm. Every drawable
+    // that reaches g_drawables was inserted with both fields set; a fault-
+    // nulled alias still holds its cache ref. (A default key would simply
+    // miss in g_meshCache.)
+    DecrementMeshCacheRef(inst.meshCacheKey, eagerPark);
+    inst.meshHandle = nullptr;
 
-    // Decrement material refcount; on zero, destroy the material handle.
-    // This is INDEPENDENT of the texture decrement below — material and texture
-    // lifecycles are tracked separately so shared resources are freed correctly.
-    // Per-call C++ catch around DestroyMaterial: refcount mutation + erase
-    // run regardless so we don't leak the cache entry when the API throws.
+    // Decrement material refcount; on zero, erase the entry and park the
+    // handle for deferred destruction (see g_pendingDestroys -- this is the
+    // game thread; an inline DestroyMaterial can invalidate a handle the
+    // frame in flight still references). This is INDEPENDENT of the texture
+    // decrement below — material and texture lifecycles are tracked
+    // separately so shared resources are freed correctly.
     if (inst.materialHash != 0) {
         auto matIt = g_materialCache.find(inst.materialHash);
         if (matIt != g_materialCache.end()) {
             if (matIt->second.refCount > 0) matIt->second.refCount--;
             if (matIt->second.refCount == 0) {
-                if (matIt->second.handle && api) {
-                    try {
-                        api->DestroyMaterial(matIt->second.handle);
-                    } catch (const std::exception& e) {
-                        int n = g_cxxLogCount_ReleaseDrawableMaterial.fetch_add(1, std::memory_order_relaxed);
-                        if (n < kCxxLogCap) {
-                            _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMaterial C++ exception #%d matHash=0x%llX what=%s",
-                                     n, (unsigned long long)inst.materialHash, e.what());
-                        }
-                    } catch (...) {
-                        int n = g_cxxLogCount_ReleaseDrawableMaterial.fetch_add(1, std::memory_order_relaxed);
-                        if (n < kCxxLogCap) {
-                            _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyMaterial unknown C++ exception #%d matHash=0x%llX",
-                                     n, (unsigned long long)inst.materialHash);
-                        }
+                if (matIt->second.handle) {
+                    if (eagerPark) {
+                        g_eagerPendingDestroys.materials.push_back(matIt->second.handle);
+                        g_hasEagerDestroys.store(true, std::memory_order_release);
+                    } else {
+                        ParkForDestroy(g_pendingDestroys.materials, matIt->second.handle);
                     }
                 }
                 g_materialCache.erase(matIt);
@@ -1217,33 +1762,20 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
     // alive (shared by another drawable). Nesting this inside the
     // refCount==0 block would leak one refcount per release that doesn't
     // destroy the material.
-    // Per-call C++ catch around DestroyTexture: refcount mutation + erase
-    // run regardless so we don't leak cache entries when the API throws.
-    if (api) {
-        for (uint64_t texHash : inst.textureHashes) {
-            auto texIt = g_textureHandles.find(texHash);
-            if (texIt != g_textureHandles.end()) {
-                if (texIt->second.refCount > 0) texIt->second.refCount--;
-                if (texIt->second.refCount == 0) {
-                    if (texIt->second.handle) {
-                        try {
-                            api->DestroyTexture(texIt->second.handle);
-                        } catch (const std::exception& e) {
-                            int n = g_cxxLogCount_ReleaseDrawableTexture.fetch_add(1, std::memory_order_relaxed);
-                            if (n < kCxxLogCap) {
-                                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyTexture C++ exception #%d texHash=0x%llX what=%s",
-                                         n, (unsigned long long)texHash, e.what());
-                            }
-                        } catch (...) {
-                            int n = g_cxxLogCount_ReleaseDrawableTexture.fetch_add(1, std::memory_order_relaxed);
-                            if (n < kCxxLogCap) {
-                                _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] DestroyTexture unknown C++ exception #%d texHash=0x%llX",
-                                         n, (unsigned long long)texHash);
-                            }
-                        }
+    for (uint64_t texHash : inst.textureHashes) {
+        auto texIt = g_textureHandles.find(texHash);
+        if (texIt != g_textureHandles.end()) {
+            if (texIt->second.refCount > 0) texIt->second.refCount--;
+            if (texIt->second.refCount == 0) {
+                if (texIt->second.handle) {
+                    if (eagerPark) {
+                        g_eagerPendingDestroys.textures.push_back(texIt->second.handle);
+                        g_hasEagerDestroys.store(true, std::memory_order_release);
+                    } else {
+                        ParkForDestroy(g_pendingDestroys.textures, texIt->second.handle);
                     }
-                    g_textureHandles.erase(texIt);
                 }
+                g_textureHandles.erase(texIt);
             }
         }
     }
@@ -1251,11 +1783,21 @@ void RemixRenderer::ReleaseDrawable(uint64_t hash) {
     g_drawables.erase(it);
 }
 
+void RemixRenderer::ReleaseDrawable(uint64_t hash) {
+    // Drop bone tracking regardless of drawable presence (registration can
+    // outlive a failed submit).
+    SkinnedMeshes::OnDrawableReleased(hash);
+
+    std::lock_guard<std::mutex> lock(g_renderStateMutex);
+    ReleaseDrawableRefsLocked(hash, /*eagerPark=*/false);
+}
+
 // ---------------------------------------------------------------------------
 // Per-frame rendering
 // ---------------------------------------------------------------------------
 void RemixRenderer::OnFrame(const CameraState& cam,
                             const OverlayData& overlay) {
+    FO4_TRACY_SCOPE("OnFrame");
     // Per-phase CPU timing, reported through the every-300-frame status log.
     // ~10 steady_clock reads per frame -- negligible. Static accumulators are
     // safe: OnFrame runs only on the Remix thread.
@@ -1265,6 +1807,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     };
     static uint64_t s_accLockWaitNs = 0, s_accSnapNs = 0, s_accBucketNs = 0,
                     s_accDrawNs = 0, s_accPresentNs = 0, s_accTotalNs = 0;
+    // Window maxima (2026-07-18, BetaRT perf-window pattern): the avg hides
+    // single-frame stalls entirely -- a 300ms lock convoy inside a 300-frame
+    // window moves the average by 1ms. Max columns are what catch them.
+    static uint64_t s_maxLockWaitNs = 0, s_maxPresentNs = 0, s_maxTotalNs = 0;
     static SemanticCapture::PerfCounters s_lastGameCounters = {};
     const PerfClock::time_point tEnter = PerfClock::now();
 
@@ -1278,6 +1824,99 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     remixapi_Interface* api = RemixAPI::GetInterface();
     if (!api) return;
 
+    // Destroy handles parked by game-thread release paths. This is the one
+    // point where a destroy provably cannot overlap a frame in flight: the
+    // previous Present has returned (same thread), no draw of the new frame
+    // has been recorded yet, and g_remixApiMutex is held.
+    // g_renderStateMutex is held ACROSS the destroy calls, not just a swap:
+    // handles are hash-valued, so a game-thread SubmitDrawable re-creating
+    // identical content between a swap-out and the destroy would produce
+    // the same handle value and the destroy would unregister the live
+    // resource. Under the mutex, SubmitDrawable either runs first (its
+    // CancelParkedHandle pulls the handle back out) or after the destroys
+    // (its create re-registers cleanly). The runtime's Destroy* only queues
+    // a CS command under its own lock -- no GPU wait -- so the hold is
+    // short, and it matches the old inline-destroy locking exactly.
+    //
+    // Drained on a CADENCE, not every frame (2026-07-10): each DestroyTexture
+    // bumps the runtime's texture-cache generation (the preserve-path fix for
+    // the stale-albedo-slot corruption), which sends the NEXT frame's draws
+    // down the dynamic path. A steady destroy trickle (TextureUpgradeOnApproach
+    // while moving) would keep the ~93-95% preserve win suppressed every
+    // frame; batching destroys to every kDestroyDrainPeriodFrames confines the
+    // re-translation cost to one frame per period. Longer parking is free --
+    // the handles are already erased from the plugin caches -- and it widens
+    // the CancelParkedHandle rescue window (re-created content avoids its
+    // destroy+re-upload entirely).
+    // Drain policy (2026-07-12): with [Performance] DeferHandleDestroyToLoad
+    // (default), parked handles are destroyed ONLY during load screens
+    // (PreLoadGame requests a drain; the runtime is quiescent then) plus an
+    // emergency valve, instead of the 30-frame cadence. Motivation: both
+    // sessions that died on an AV inside api->CreateMesh (07-10, 07-11)
+    // featured TexUpgrade churn with interleaved destroys -- a create-vs-
+    // CS-side-destruction race inside the runtime is the live suspect, and
+    // parking longer is free (handles are already erased from the plugin
+    // caches; CancelParkedHandle rescues re-creates for as long as they stay
+    // parked). VRAM held by parked handles is monitored via parked= on the
+    // [VRAM] line. Set the key to 0 to restore the 30-frame cadence for A/B.
+    constexpr uint64_t kDestroyDrainPeriodFrames = 30;
+    constexpr size_t   kEmergencyDrainParked = 8192;
+    static uint64_t s_lastDrainFrame = 0;
+    const uint64_t drainNow = Diagnostics::CurrentFrameIndex();
+    if (g_hasPendingDestroys.load(std::memory_order_acquire)) {
+        bool wantDrain;
+        if (g_config.deferHandleDestroyToLoad) {
+            wantDrain = g_destroyDrainRequested.exchange(
+                false, std::memory_order_acq_rel);
+            if (!wantDrain &&
+                g_pendingDestroyCount.load(std::memory_order_relaxed) >=
+                    kEmergencyDrainParked) {
+                _MESSAGE("FO4RemixPlugin: [DeferredDestroy] emergency drain: "
+                         "%zu handles parked",
+                         g_pendingDestroyCount.load(std::memory_order_relaxed));
+                wantDrain = true;
+            }
+        } else {
+            wantDrain = drainNow - s_lastDrainFrame >= kDestroyDrainPeriodFrames;
+        }
+        if (wantDrain) {
+            g_hasPendingDestroys.store(false, std::memory_order_release);
+            s_lastDrainFrame = drainNow;
+            std::lock_guard<std::mutex> rsLock(g_renderStateMutex);
+            DestroyParkedHandles(api, g_pendingDestroys);
+            g_pendingDestroyCount.store(0, std::memory_order_relaxed);
+            g_pendingDestroys.meshes.clear();
+            g_pendingDestroys.materials.clear();
+            g_pendingDestroys.textures.clear();
+        }
+    }
+
+    // Live-texture refresh churn (Pip-Boy screen): drain of the eager park
+    // list. Same top-of-frame Remix-thread timing as the normal drain
+    // (previous Present returned, no new draw recorded); the list is <= a
+    // handful of handles per refresh period, and each old screen texture
+    // holds ~2.4MB of VRAM -- deferring them to a load screen would leak
+    // hundreds of MB per minute of Pip-Boy use.
+    // Batched to a 30-frame cadence (2026-07-20, was every frame): each
+    // DestroyTexture bumps the runtime's texture-cache generation, which
+    // fails the preserve gate and sends ALL external draws down the full
+    // dynamic path for a frame. An every-frame drain while the Pip-Boy
+    // refreshes meant the whole scene ran dynamic the whole time the
+    // Pip-Boy was up. At 30 frames the parked backlog is <= ~3 screen
+    // textures (~7MB) and the re-translation cost is 1 frame in 30.
+    constexpr uint64_t kEagerDrainPeriodFrames = 30;
+    static uint64_t s_lastEagerDrainFrame = 0;
+    if (g_hasEagerDestroys.load(std::memory_order_acquire) &&
+        drainNow - s_lastEagerDrainFrame >= kEagerDrainPeriodFrames) {
+        s_lastEagerDrainFrame = drainNow;
+        std::lock_guard<std::mutex> rsLock(g_renderStateMutex);
+        g_hasEagerDestroys.store(false, std::memory_order_release);
+        DestroyParkedHandles(api, g_eagerPendingDestroys);
+        g_eagerPendingDestroys.meshes.clear();
+        g_eagerPendingDestroys.materials.clear();
+        g_eagerPendingDestroys.textures.clear();
+    }
+
     // Apply config writes queued by game-thread callers (weather bridge et
     // al). Swap the map out under the queue mutex so the Remix API calls run
     // without it -- QueueConfigVariable on the game thread only ever waits
@@ -1288,10 +1927,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             std::lock_guard<std::mutex> qlock(g_configQueueMutex);
             pending.swap(g_pendingConfigVars);
         }
-        for (const auto& [key, value] : pending) {
-            const bool ok = api->SetConfigVariable &&
-                api->SetConfigVariable(key.c_str(), value.c_str()) == REMIXAPI_ERROR_CODE_SUCCESS;
-            if (!ok) {
+        for (const auto& kv : pending) {
+            const std::string& key = kv.first;
+            const std::string& value = kv.second;
+            // Guarded like every other frame-path call into d3d9.dll: an
+            // SEH fault in the runtime's option-registry write would skip
+            // the thread-level C++ backstop entirely (/EHsc catch(...)
+            // doesn't see hardware exceptions) and kill the process with no
+            // [RemixGuard] breadcrumb.
+            remixapi_ErrorCode cfgErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+            if (api->SetConfigVariable) {
+                RemixCallGuarded("SetConfigVariable", [&] {
+                    cfgErr = api->SetConfigVariable(key.c_str(), value.c_str());
+                });
+            }
+            if (cfgErr != REMIXAPI_ERROR_CODE_SUCCESS) {
                 std::lock_guard<std::mutex> qlock(g_configQueueMutex);
                 if (g_configFailedKeys.insert(key).second) {
                     _MESSAGE("FO4RemixPlugin: [ConfigQueue] SetConfigVariable failed for "
@@ -1332,6 +1982,42 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     camInfo.type = REMIXAPI_CAMERA_TYPE_WORLD;
     RemixCallGuarded("SetupCamera", [&] { api->SetupCamera(&camInfo); });
 
+    // View-model camera (2026-07-18, BetaRT recipe): same pose, 1st-person
+    // FOV, small near plane. The runtime renders VIEW_MODEL-categorized
+    // instances with this camera, decoupling the arms/weapon from world-FOV
+    // changes (ADS zoom, FOV mods). Submitted every frame like the world
+    // camera; cheap (one struct copy + one guarded call).
+    if (g_config.viewModelEnabled && g_config.viewModelSeparateCamera && cam.valid) {
+        remixapi_CameraInfoParameterizedEXT vmParams = camParams;
+        vmParams.fovYInDegrees = g_config.viewModelFovOverride > 0.0f
+            ? g_config.viewModelFovOverride
+            : (cam.fov1stY > 0.0f ? cam.fov1stY : camParams.fovYInDegrees);
+        vmParams.nearPlane = (std::min)(camParams.nearPlane, 1.0f);
+        if (vmParams.farPlane <= vmParams.nearPlane) {
+            vmParams.farPlane = vmParams.nearPlane + 1024.0f;
+        }
+        remixapi_CameraInfo vmInfo = {};
+        vmInfo.sType = REMIXAPI_STRUCT_TYPE_CAMERA_INFO;
+        vmInfo.pNext = &vmParams;
+        vmInfo.type = REMIXAPI_CAMERA_TYPE_VIEW_MODEL;
+        RemixCallGuarded("SetupCamera(viewModel)", [&] { api->SetupCamera(&vmInfo); });
+
+        // Master switch for the runtime's view-model machinery (2026-07-18):
+        // rtx.viewModel.enable defaults FALSE and createViewModelInstances
+        // early-outs without it -- the whole external VM path (the camera
+        // above + the category tag at draw time) shipped silently inert.
+        // Queued once per session; also persisted in the game-dir rtx.conf,
+        // but this survives a runtime-side settings rewrite dropping the
+        // line. Drained later this frame on this thread under the API mutex.
+        if (g_config.viewModelCategoryTag) {
+            static bool s_vmEnableQueued = false;
+            if (!s_vmEnableQueued) {
+                s_vmEnableQueued = true;
+                QueueConfigVariable("rtx.viewModel.enable", "True");
+            }
+        }
+    }
+
     bool hasAnyMeshes = false;
 
     // The full-map "engine-active" snapshot that used to live here is gone.
@@ -1367,6 +2053,24 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         freshBones.swap(g_boneQueue);
     }
 
+    // Drain face morph position updates before taking g_renderStateMutex.
+    static std::unordered_map<uint64_t, std::vector<float>> faceUpdates;
+    faceUpdates.clear();
+    {
+        std::lock_guard<std::mutex> faceLock(g_faceMorphQueueMutex);
+        faceUpdates.swap(g_faceMorphQueue);
+    }
+
+    // Drain live iris UV transforms alongside FaceGen positions. Both streams
+    // target the same private dynamic-mesh copy and are coalesced below into
+    // one stable-handle geometry refresh per drawable.
+    static std::unordered_map<uint64_t, RemixRenderer::EyeUvTransform> eyeUvUpdates;
+    eyeUvUpdates.clear();
+    {
+        std::lock_guard<std::mutex> eyeLock(g_eyeUvQueueMutex);
+        eyeUvUpdates.swap(g_eyeUvQueue);
+    }
+
     // Stale-chunk filter inputs. The engine fires GetRenderPasses every frame
     // for geometry that survives its culling and HIDES worldspace LOD chunks
     // when their cells attach at full detail -- so a chunk whose fire age
@@ -1392,6 +2096,132 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     skinnedCulled.clear();
     SemanticCapture::SnapshotSkinnedCulled(skinnedCulled);
 
+    // [ViewModel] synthetic-space -> render-world mapping (2026-07-18).
+    // 1st-person geometry is authored in a synthetic space that is
+    // ROTATION-LOCKED to the camera; its "Camera" bone is the pose the real
+    // cameraNode is derived from, so the map solves exactly (Beth
+    // row-vector affine):
+    //   cameraNode = camBone * S
+    //   =>  S_rot = camBoneRot^T/scale * camRot,  S_t = camPos - camBonePos*S_rot
+    // Composed here into two 3x4 affine composers applied at draw time:
+    //   vmBethA  = [S_rot^T | S_t]          for skinned BONE transforms
+    //              (Beth column-form; their instance base is the bare
+    //              mirror P applied on top)
+    //   vmRemixA = [P*S_rot^T*P | P*S_t]    for rigid instance transforms
+    //              (already Remix-form, P = the Beth->Remix X/Y swap)
+    // vmActive false = the engine has the 1P root app-culled (3rd person,
+    // menus): viewmodel draws are skipped but keep their handles warm.
+    SemanticCapture::ViewModelAnchor vmAnchor = {};
+    const bool vmActive =
+        SemanticCapture::GetViewModelAnchor(vmAnchor) && cam.valid;
+
+    // [ViewModel] hidden-object filter (2026-07-18 Pip-Boy overlay report):
+    // the engine hides lowered/swapped 1P objects (the weapon while the
+    // Pip-Boy is up, holstered gear, scope overlays) by simply not issuing
+    // render passes for them -- but our submitted instances kept drawing,
+    // stacking the weapon under the raised Pip-Boy. 1P shapes fire EVERY
+    // frame while shown (log-proven age=1), so a viewmodel entry stale for
+    // a few frames is one the engine hid: skip its draw. Gated on
+    // sceneFiring so pause states (which stop ALL fires) don't blank the
+    // arms mid-menu.
+    // Both stale sets are STICKY while the scene is not firing: pause
+    // states freeze fire ages, and clearing the verdicts there would
+    // resurrect every hidden object (lowered weapon, 3P body) behind the
+    // pause menu. Recomputed fresh on every firing frame.
+    constexpr uint64_t kViewModelStaleAgeFrames = 4;
+    static std::unordered_set<uint64_t> vmStale;
+    if (sceneFiring && vmActive) {
+        vmStale.clear();
+        SemanticCapture::SnapshotViewModelStale(Diagnostics::CurrentFrameIndex(),
+                                                kViewModelStaleAgeFrames, vmStale);
+    }
+
+    // Skinned-actor stale-fire filter (2026-07-18, 3P-body-persists report):
+    // actors are animated geometry, so the engine rebuilds their render
+    // passes EVERY frame they are shown -- a skinned drawable that stopped
+    // firing is one the engine hid. The canonical case: zoom to 3rd person
+    // (3P body fires, gets captured + submitted), zoom back in (engine
+    // stops firing it) -- without this filter the 3P body kept drawing in
+    // first person forever. Also covers despawned NPCs and equipment-
+    // suppressed parts. Wider threshold than the viewmodel's: an actor
+    // briefly skipped by engine culling flickering back is worse than a
+    // half-second of lingering body on a camera transition. Same
+    // sceneFiring gate so pause states hide nothing.
+    // 8 -> 4 (2026-07-18): user-verified working but "a bit slow to
+    // despawn" at low fps; matches the viewmodel threshold, which has
+    // shown no false-positive flicker.
+    constexpr uint64_t kSkinnedStaleAgeFrames = 4;
+    static std::unordered_set<uint64_t> skinnedStale;
+    if (sceneFiring) {
+        skinnedStale.clear();
+        SemanticCapture::SnapshotSkinnedStale(Diagnostics::CurrentFrameIndex(),
+                                              kSkinnedStaleAgeFrames, skinnedStale);
+    }
+    float vmBethA[3][4] = {};
+    float vmRemixA[3][4] = {};
+    if (vmActive) {
+        // Bone->camera convention twist (SYNC-DUMP PROVEN 2026-07-18: two
+        // exact same-frame samples, menu + gameplay, every element matching
+        // to 3 decimals). The Camera bone uses the NIF camera convention
+        // {row0=right, row1=up, row2=backward}; the cameraNode convention
+        // is {row0=right, row1=forward, row2=up}. Exact mapping:
+        //   right = b0,  forward = -b2,  up = b1
+        // i.e. R_true = Q * boneRot with Q = [[1,0,0],[0,0,-1],[0,1,0]]
+        // (a 90-degree twist about the shared right axis, det +1). With the
+        // true convention the bone pose EQUALS the camera pose in the
+        // observed steady state, so S degenerates to a pure translation --
+        // while the general solve stays exact if the synthetic frame ever
+        // rotates (swim/workshop/scene states).
+        float bRot[3][3];
+        for (int c = 0; c < 3; ++c) {
+            if (g_config.viewModelBoneConventionFix) {
+                bRot[0][c] = vmAnchor.rot[0][c];
+                bRot[1][c] = -vmAnchor.rot[2][c];
+                bRot[2][c] = vmAnchor.rot[1][c];
+            } else {
+                bRot[0][c] = vmAnchor.rot[0][c];
+                bRot[1][c] = vmAnchor.rot[1][c];
+                bRot[2][c] = vmAnchor.rot[2][c];
+            }
+        }
+        // S_rot = ((Q*boneRot)^T / scale) * camRot   (row-vector rows)
+        float sRot[3][3];
+        const float inv = 1.0f / vmAnchor.scale;  // publisher range-guards
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                sRot[r][c] = (bRot[0][r] * cam.rawRot[0][c] +
+                              bRot[1][r] * cam.rawRot[1][c] +
+                              bRot[2][r] * cam.rawRot[2][c]) * inv;
+            }
+        }
+        // S_t = camPos - camBonePos * S_rot   (row-vector application)
+        float sT[3];
+        for (int c = 0; c < 3; ++c) {
+            sT[c] = cam.rawPos[c] - (vmAnchor.pos[0] * sRot[0][c] +
+                                     vmAnchor.pos[1] * sRot[1][c] +
+                                     vmAnchor.pos[2] * sRot[2][c]);
+        }
+        static const int perm[3] = { 1, 0, 2 };
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 3; ++c) {
+                vmBethA[r][c]  = sRot[c][r];
+                vmRemixA[r][c] = sRot[perm[c]][perm[r]];
+            }
+            vmBethA[r][3]  = sT[r];
+            vmRemixA[r][3] = sT[perm[r]];
+        }
+    }
+    // out = A o B for 3x4 affines in column-vector semantics.
+    auto vmCompose = [](const float A[3][4], const float B[3][4],
+                        float out[3][4]) {
+        for (int r = 0; r < 3; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                out[r][c] = A[r][0] * B[0][c] + A[r][1] * B[1][c] +
+                            A[r][2] * B[2][c] + (c == 3 ? A[r][3] : 0.0f);
+            }
+        }
+    };
+
     const PerfClock::time_point tSnap1 = PerfClock::now();
     PerfClock::duration dBucket{}, dDraw{};
 
@@ -1407,11 +2237,229 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     size_t skippedInactive = 0;
     size_t skippedChunkPlayerInside = 0;
     size_t skippedChunkStale = 0;
+    size_t skippedChunkFar = 0;
+    size_t skippedViewModel = 0;
+    size_t skippedFrustum = 0;           // drawables in fully-culled buckets
+    size_t skippedFrustumBuckets = 0;    // whole buckets skipped (pure frustum)
+    size_t skippedOcclusion = 0;         // drawables in occlusion-culled buckets
+    size_t skippedOcclusionBuckets = 0;  // whole buckets skipped (occlusion)
+    size_t skippedHzb = 0;               // drawables in Hi-Z-culled buckets
+    size_t skippedHzbBuckets = 0;        // whole buckets skipped (Hi-Z occlusion)
+    // Last Hi-Z build's occluder + triangle counts (persist across frames so the
+    // status log shows them even on non-collect frames). Function scope so the
+    // periodic log below the lock block can read them.
+    static thread_local uint32_t s_hzbBuildOccluders = 0;
+    static thread_local uint32_t s_hzbBuildTris = 0;
+    size_t vmDrawn = 0;
     {
+        // Zone opens BEFORE the lock so lock-wait time shows inside it.
+        FO4_TRACY_SCOPE("OnFrame.bucketsAndDraw");
         std::lock_guard<std::mutex> lock(g_renderStateMutex);
         const PerfClock::time_point tBucket0 = PerfClock::now();
         const uint64_t currentFrame = Diagnostics::CurrentFrameIndex();
         drawableCount = g_drawables.size();
+
+        // ---- FaceGen morph refresh v3 ----
+        // v1 re-created the mesh under the SAME hash as the still-live handle
+        // and then destroyed the old one; heads/mouths/hair vanished, because
+        // handles here are hash-valued: the runtime ignored the re-registration
+        // (so no new geometry) and the DestroyMesh then unregistered the live
+        // mesh. v2 fixed the vanishing by salting each replacement with a fresh
+        // hash -- but that traded it for ghosting. The mesh handle IS the hash,
+        // and the runtime feeds it into both ExternalDrawState::
+        // computeExternalDrawIdentityHash and the spatial-map hash, so a new
+        // hash per refresh handed the scene manager a brand-new object every
+        // couple of frames: a fresh RtInstance with no previous-frame
+        // correspondence, i.e. no motion vectors and no denoiser history.
+        //
+        // v3 keeps the hash STABLE and asks the runtime to swap the geometry
+        // underneath it (remixapi_MeshInfoRefreshGeometryEXT). The runtime
+        // carries the previous topology/layout hashes across and leaves
+        // VertexPosition fresh, so the draw-call cache keeps the same BlasEntry
+        // and processGeometryInfo takes its kUpdateBVH path. That path copies
+        // the complete interleaved vertex payload, including changed iris UVs,
+        // while position changes get history-buffer ping-pong and real motion
+        // vectors. Nothing to swap or destroy here: the handle, g_meshCache
+        // entry, and drawable all stay as they are.
+        {
+            static std::atomic<int> sFaceLogs{0};
+            static std::atomic<int> sEyeLogs{0};
+            std::unordered_set<uint64_t> refreshes;
+            std::unordered_set<uint64_t> faceDirty;
+            std::unordered_set<uint64_t> eyeDirty;
+            refreshes.reserve(faceUpdates.size() + eyeUvUpdates.size());
+            faceDirty.reserve(faceUpdates.size());
+            eyeDirty.reserve(eyeUvUpdates.size());
+
+            for (auto& [fhash, xyz] : faceUpdates) {
+                auto dIt = g_drawables.find(fhash);
+                auto mIt = g_faceMeshData.find(fhash);
+                if (dIt == g_drawables.end() || mIt == g_faceMeshData.end())
+                    continue;
+
+                DrawableInstance& inst = dIt->second;
+                FaceMeshData& fm = mIt->second;
+                if (!inst.meshHandle || xyz.size() != fm.vertices.size() * 3) {
+                    const int fn = sFaceLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (fn < 12) {
+                        _MESSAGE("FO4RemixPlugin: [FaceMorph] drop hash=0x%llX "
+                                 "verts=%zu xyz=%zu handle=%p",
+                                 (unsigned long long)fhash, fm.vertices.size(),
+                                 xyz.size() / 3, (void*)inst.meshHandle);
+                    }
+                    continue;
+                }
+
+                for (size_t i = 0; i < fm.vertices.size(); ++i) {
+                    fm.vertices[i].position[0] = xyz[i * 3 + 0];
+                    fm.vertices[i].position[1] = xyz[i * 3 + 1];
+                    fm.vertices[i].position[2] = xyz[i * 3 + 2];
+                }
+                faceDirty.insert(fhash);
+                refreshes.insert(fhash);
+            }
+
+            for (const auto& [fhash, transform] : eyeUvUpdates) {
+                auto dIt = g_drawables.find(fhash);
+                auto mIt = g_faceMeshData.find(fhash);
+                if (dIt == g_drawables.end() || mIt == g_faceMeshData.end())
+                    continue;
+
+                DrawableInstance& inst = dIt->second;
+                FaceMeshData& fm = mIt->second;
+                if (!inst.meshHandle || !fm.isAnimatedEye ||
+                    fm.eyeBaseTexcoords.size() != fm.vertices.size() * 2) {
+                    const int en = sEyeLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (en < 12) {
+                        _MESSAGE("FO4RemixPlugin: [EyeAnim] UV drop hash=0x%llX "
+                                 "verts=%zu baseUvs=%zu handle=%p animated=%d",
+                                 (unsigned long long)fhash, fm.vertices.size(),
+                                 fm.eyeBaseTexcoords.size() / 2,
+                                 (void*)inst.meshHandle,
+                                 fm.isAnimatedEye ? 1 : 0);
+                    }
+                    continue;
+                }
+
+                for (size_t i = 0; i < fm.vertices.size(); ++i) {
+                    fm.vertices[i].texcoord[0] =
+                        fm.eyeBaseTexcoords[i * 2 + 0] * transform.scale[0] +
+                        transform.offset[0];
+                    fm.vertices[i].texcoord[1] =
+                        fm.eyeBaseTexcoords[i * 2 + 1] * transform.scale[1] +
+                        transform.offset[1];
+                }
+                eyeDirty.insert(fhash);
+                refreshes.insert(fhash);
+            }
+
+            for (uint64_t fhash : refreshes) {
+                auto dIt = g_drawables.find(fhash);
+                auto mIt = g_faceMeshData.find(fhash);
+                if (dIt == g_drawables.end() || mIt == g_faceMeshData.end())
+                    continue;
+
+                DrawableInstance& inst = dIt->second;
+                FaceMeshData& fm = mIt->second;
+                auto matIt = g_materialCache.find(inst.materialHash);
+                if (matIt == g_materialCache.end() || !matIt->second.handle)
+                    continue;
+
+                remixapi_MeshInfoSurfaceTriangles surface = {};
+                surface.vertices_values = fm.vertices.data();
+                surface.vertices_count  = (uint32_t)fm.vertices.size();
+                surface.indices_values  = fm.indices.empty() ? nullptr
+                                                             : fm.indices.data();
+                surface.indices_count   = (uint32_t)fm.indices.size();
+                surface.skinning_hasvalue = 0;
+                if (fm.blendWeights.size() == fm.vertices.size() * 4 &&
+                    fm.blendIndices.size() == fm.vertices.size() * 4) {
+                    surface.skinning_hasvalue = 1;
+                    surface.skinning_value.bonesPerVertex      = 4;
+                    surface.skinning_value.blendWeights_values = fm.blendWeights.data();
+                    surface.skinning_value.blendWeights_count  = (uint32_t)fm.blendWeights.size();
+                    surface.skinning_value.blendIndices_values = fm.blendIndices.data();
+                    surface.skinning_value.blendIndices_count  = (uint32_t)fm.blendIndices.size();
+                }
+                surface.material = matIt->second.handle;
+
+                // Re-register under the EXISTING handle. Handles are hash-valued
+                // in this fork, so the handle value is the hash the runtime
+                // registered this mesh under -- reusing it verbatim is what
+                // keeps the instance identity (and therefore the temporal
+                // history) intact across the swap.
+                remixapi_MeshInfoRefreshGeometryEXT refreshExt = {};
+                refreshExt.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT;
+
+                remixapi_MeshInfo meshInfo = {};
+                meshInfo.sType = REMIXAPI_STRUCT_TYPE_MESH_INFO;
+                meshInfo.pNext = &refreshExt;
+                meshInfo.hash  = (uint64_t)inst.meshHandle;
+                meshInfo.surfaces_values = &surface;
+                meshInfo.surfaces_count  = 1;
+
+                remixapi_MeshHandle sameHandle = nullptr;
+                remixapi_ErrorCode meshStatus = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+                RemixCallGuarded("CreateMesh(dynamicMeshRefresh)",
+                                 [&] { meshStatus = api->CreateMesh(&meshInfo, &sameHandle); });
+                if (meshStatus != REMIXAPI_ERROR_CODE_SUCCESS) {
+                    if (faceDirty.count(fhash)) {
+                        const int fn = sFaceLogs.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (fn < 12) {
+                            _MESSAGE("FO4RemixPlugin: [FaceMorph] refresh failed "
+                                     "hash=0x%llX err=%d -- keeping previous pose",
+                                     (unsigned long long)fhash, (int)meshStatus);
+                        }
+                    }
+                    if (eyeDirty.count(fhash)) {
+                        const int en = sEyeLogs.fetch_add(
+                            1, std::memory_order_relaxed);
+                        if (en < 12) {
+                            _MESSAGE("FO4RemixPlugin: [EyeAnim] UV refresh failed "
+                                     "hash=0x%llX err=%d",
+                                     (unsigned long long)fhash, (int)meshStatus);
+                        }
+                    }
+                    continue;
+                }
+
+                // Cap raised 24 -> 400 (2026-07-31): at 24 the log filled with
+                // whichever drawable morphs most (the head) and said nothing
+                // about the rest, which made an unlisted drawable look like it
+                // never refreshed. Distinguishing "FO4 does not rewrite this
+                // buffer" from "it scrolled off the log" needs the headroom --
+                // correlate the hashes against [Skinning] registered / HeadDiag.
+                if (faceDirty.count(fhash)) {
+                    const int fn = sFaceLogs.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (fn < 400) {
+                        _MESSAGE("FO4RemixPlugin: [FaceMorph] #%d refreshed hash=0x%llX "
+                                 "meshHash=0x%llX verts=%zu stable=%d",
+                                 fn, (unsigned long long)fhash,
+                                 (unsigned long long)meshInfo.hash,
+                                 fm.vertices.size(),
+                                 sameHandle == inst.meshHandle ? 1 : 0);
+                    }
+                }
+                auto eyeIt = eyeUvUpdates.find(fhash);
+                if (eyeDirty.count(fhash) && eyeIt != eyeUvUpdates.end()) {
+                    const int en = sEyeLogs.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (en < 160) {
+                        _MESSAGE("FO4RemixPlugin: [EyeAnim] UV #%d refreshed "
+                                 "hash=0x%llX off=(%.6f,%.6f) "
+                                 "scale=(%.6f,%.6f) stable=%d",
+                                 en, (unsigned long long)fhash,
+                                 eyeIt->second.offset[0],
+                                 eyeIt->second.offset[1],
+                                 eyeIt->second.scale[0],
+                                 eyeIt->second.scale[1],
+                                 sameHandle == inst.meshHandle ? 1 : 0);
+                    }
+                }
+            }
+        }
 
         // Worldspace LOD chunk spatial filter: skip drawing chunks whose
         // coverage area contains the player. The in-cell static refs render
@@ -1422,12 +2470,202 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         const float playerX = cam.playerWorldPos[0];
         const float playerY = cam.playerWorldPos[1];
 
+        // Frustum + keep-radius cull precompute (2026-07-21). Rationale: in
+        // a path tracer, off-screen geometry still matters (shadows,
+        // reflections, GI from behind the camera), so a classic frustum cull
+        // would visibly break lighting. Split the difference: everything
+        // within FrustumKeepRadius of the camera renders regardless of view
+        // direction (the local neighborhood that actually shows up in
+        // secondary rays), and only OUTSIDE that sphere do we drop
+        // drawables whose world AABB sits fully outside a margin-expanded
+        // view frustum. Skipped drawables keep every Remix handle warm --
+        // unlike the pressure-parking tiers nothing is released, so
+        // re-entry on a camera turn costs one DrawInstance, not a
+        // re-resolve. The win is a smaller TLAS (fewer instances every ray
+        // traverses) and fewer BLAS builds for off-screen streaming.
+        //
+        // Two plane sets for angular hysteresis: the OUTER set (half-angles
+        // + full margin) flips visible->culled; the INNER set (+half
+        // margin) flips culled->visible. Between the boundaries an entry
+        // keeps its previous state, so edge jitter can't flap bucket
+        // membership (same idea as the pressure-parking angular margin).
+        // Both sets are wider than the real frustum -- nothing on screen is
+        // ever culled. 5 planes each: near + 4 sides; a far plane is
+        // deliberately absent (distance is the far-cull / parking tiers'
+        // job).
+        struct CullPlane { float nx, ny, nz, d; };
+        CullPlane cullOuter[5], cullInner[5];
+        bool frustumCullActive = false;
+        float keepRadiusSq = 0.0f;
+        if (g_config.cullingFrustumEnabled && cam.valid && cam.fovY > 1.0f) {
+            const float kDegToRad = 3.14159265358979323846f / 180.0f;
+            const float halfV0 = 0.5f * cam.fovY * kDegToRad;
+            const float aspect = (cam.aspectRatio > 0.01f) ? cam.aspectRatio
+                                                           : (16.0f / 9.0f);
+            const float halfH0 = atanf(tanf(halfV0) * aspect);
+            const float marginOuter =
+                (std::max)(g_config.cullingFrustumFovMarginDeg, 1.0f) * kDegToRad;
+            const auto buildPlanes = [&](float margin, CullPlane out[5]) {
+                // Half-angles saturate just under 90 degrees; at the cap the
+                // corresponding planes stop culling anything (a >=180-degree
+                // "frustum" has no outside on that axis), which fails safe.
+                const float kMaxHalf = 1.55f;  // ~88.8 deg
+                const float hv = (std::min)(halfV0 + margin, kMaxHalf);
+                const float hh = (std::min)(halfH0 + margin, kMaxHalf);
+                const float* F = cam.forward;
+                const float* U = cam.up;
+                const float* R = cam.right;
+                // Inward-pointing unit normals through the camera position:
+                // near = forward; sides tilt forward by sin(half-angle).
+                const float n[5][3] = {
+                    { F[0], F[1], F[2] },
+                    { F[0]*sinf(hv) - U[0]*cosf(hv), F[1]*sinf(hv) - U[1]*cosf(hv), F[2]*sinf(hv) - U[2]*cosf(hv) },  // top
+                    { F[0]*sinf(hv) + U[0]*cosf(hv), F[1]*sinf(hv) + U[1]*cosf(hv), F[2]*sinf(hv) + U[2]*cosf(hv) },  // bottom
+                    { F[0]*sinf(hh) - R[0]*cosf(hh), F[1]*sinf(hh) - R[1]*cosf(hh), F[2]*sinf(hh) - R[2]*cosf(hh) },  // right
+                    { F[0]*sinf(hh) + R[0]*cosf(hh), F[1]*sinf(hh) + R[1]*cosf(hh), F[2]*sinf(hh) + R[2]*cosf(hh) },  // left
+                };
+                for (int p = 0; p < 5; ++p) {
+                    out[p].nx = n[p][0];
+                    out[p].ny = n[p][1];
+                    out[p].nz = n[p][2];
+                    out[p].d  = -(n[p][0] * cam.position[0] +
+                                  n[p][1] * cam.position[1] +
+                                  n[p][2] * cam.position[2]);
+                }
+            };
+            buildPlanes(marginOuter, cullOuter);
+            buildPlanes(0.5f * marginOuter, cullInner);
+            keepRadiusSq = g_config.cullingFrustumKeepRadius *
+                           g_config.cullingFrustumKeepRadius;
+            frustumCullActive = true;
+        }
+
+        // Occlusion cull precompute (2026-07-21). The engine's own per-frame
+        // draw stream (captured by DrawCapture before raster suppression) is
+        // its visibility verdict: geometry it stopped drawing is occluded or
+        // engine-frustum-culled. We copy the "drawn recently" map once here
+        // (lock-free lookups below) and decide per drawable whether its
+        // engine-IB key has gone stale. Two hard fail-safes: (1) a key never
+        // seen is ABSENT from the map -> exempt, so a key-convention mismatch
+        // makes the feature inert, never wrong; (2) if the engine barely drew
+        // anything this frame (pause menu, load screen, UI-only), the whole
+        // pass is suspended so nothing mass-culls. Occlusion still respects
+        // the frustum keep radius -- geometry near the camera is never
+        // occlusion-culled, since it can show up in secondary rays.
+        // Copied on a cadence, not every OnFrame: the map can hold thousands
+        // of entries and copying it under lock every frame is real Remix-
+        // thread cost. A copy up to kVisSnapInterval frames stale is provably
+        // safe -- the interval is far below OcclusionStaleFrames, so a
+        // geometry the engine just redrew still reads as recent (age <
+        // interval < threshold) and is never wrongly culled; a cull is merely
+        // delayed a few frames. Persists across OnFrames on the Remix thread.
+        static thread_local std::unordered_map<uint64_t, uint32_t> s_visMap;
+        static thread_local uint32_t s_visFrame = 0;
+        static thread_local uint32_t s_visDrawCount = 0;
+        static thread_local uint32_t s_visSnapCountdown = 0;
+        constexpr uint32_t kVisSnapInterval = 4;
+        // Keep the draw-side stamping in lock-step with the config flag. Set
+        // unconditionally (cheap atomic) so the "was drawn" map is already
+        // warm by the time the cull below reads it, and stops accumulating
+        // the moment the feature is toggled off.
+        DrawCapture::SetOcclusionEnabled(g_config.cullingOcclusionEnabled);
+        bool  occlusionCullActive = false;
+        uint32_t occlStaleFrames = 0;
+        // Occlusion needs the keep sphere too; reuse the frustum radius (both
+        // are "the local neighborhood that matters to ray tracing").
+        float occlKeepRadiusSq = keepRadiusSq;
+        if (occlKeepRadiusSq <= 0.0f) {
+            occlKeepRadiusSq = g_config.cullingFrustumKeepRadius *
+                               g_config.cullingFrustumKeepRadius;
+        }
+        if (g_config.cullingOcclusionEnabled && cam.valid) {
+            if (s_visSnapCountdown == 0) {
+                DrawCapture::SnapshotVisible(s_visMap, s_visFrame, s_visDrawCount);
+                s_visSnapCountdown = kVisSnapInterval;
+            }
+            --s_visSnapCountdown;
+            // Scene-active gate: a real gameplay frame draws thousands of
+            // distinct index buffers. Well below that (menus, loads, the
+            // occlusion hook not yet warmed) means the "drawn" map is not a
+            // trustworthy visibility verdict -- suspend rather than mass-cull.
+            occlusionCullActive =
+                s_visDrawCount >= g_config.cullingOcclusionMinSceneDraws;
+            occlStaleFrames = g_config.cullingOcclusionStaleFrames;
+        } else {
+            s_visSnapCountdown = 0;  // re-snapshot immediately when re-enabled
+        }
+        const uint32_t visFrame = s_visFrame;
+
+        // Hi-Z per-item occlusion precompute (2026-07-21). The depth pyramid
+        // built from the PREVIOUS collect frame's static occluders is what we
+        // test this frame's occludees against (the accepted 1-frame staleness;
+        // exact for static occluders). The snapshot feeding the NEXT build is
+        // gathered inside the per-drawable loop below on collect frames. Persist
+        // one buffer across frames on this (Remix) thread.
+        struct OccluderRef {
+            std::shared_ptr<const OccluderGeom> geom;
+            float    xf[3][4];
+            float    distSq;
+        };
+        static thread_local HzbOcclusion::Hzb s_hzb;
+        static thread_local bool     s_hzbInited = false;
+        static thread_local uint32_t s_hzbCountdown = 0;
+        std::vector<OccluderRef> hzbOccluders;
+        bool     hzbCullActive = false; // test occludees this frame
+        bool     hzbCollect    = false; // gather + rebuild this frame
+        uint32_t hzbDelay      = 0;
+        float    hzbMargin     = 0.0f;
+        float    hzbKeepRadiusSq = g_config.cullingHzbKeepRadius *
+                                   g_config.cullingHzbKeepRadius;
+        if (g_config.cullingHzbEnabled && cam.valid) {
+            const int hw = static_cast<int>(
+                (std::min)((std::max)(g_config.cullingHzbWidth, 16u), 1024u));
+            const int hh = static_cast<int>(
+                (std::min)((std::max)(g_config.cullingHzbHeight, 16u), 1024u));
+            if (!s_hzbInited || s_hzb.Width() != hw || s_hzb.Height() != hh) {
+                s_hzb.Init(hw, hh);
+                s_hzbInited = true;
+                s_hzbCountdown = 0; // rebuild immediately after a (re)Init
+            }
+            hzbCullActive = s_hzb.Ready(); // only once a build exists
+            hzbDelay      = g_config.cullingHzbCullDelayFrames;
+            hzbMargin     = g_config.cullingHzbDepthMargin;
+            if (s_hzbCountdown == 0) {
+                hzbCollect = true;
+                s_hzbCountdown = (std::max)(1u, g_config.cullingHzbRebuildInterval);
+                hzbOccluders.reserve(g_config.cullingHzbMaxOccluders + 16u);
+            }
+            --s_hzbCountdown;
+        } else {
+            s_hzbCountdown = 0; // rebuild promptly when re-enabled
+        }
+
         struct DrawBucket {
             std::vector<DrawableInstance*> members;
             std::vector<remixapi_Transform> transforms;  // built only for batched path
         };
-        std::unordered_map<remixapi_MeshHandle, DrawBucket> buckets;
+        // Bucket key folds the viewmodel flag next to the mesh handle so a
+        // mesh shared between a 1P part and a world placement (same weapon
+        // lying on a table) can't land in one bucket and mistag the world
+        // copy with the VIEW_MODEL category. With CategoryTag off the flag
+        // is constant false and bucketing degenerates to the old
+        // handle-only behavior.
+        struct BucketKey {
+            remixapi_MeshHandle mesh;
+            bool vm;
+            bool operator==(const BucketKey& o) const noexcept {
+                return mesh == o.mesh && vm == o.vm;
+            }
+        };
+        struct BucketKeyHash {
+            size_t operator()(const BucketKey& k) const noexcept {
+                return std::hash<uintptr_t>{}(reinterpret_cast<uintptr_t>(k.mesh))
+                     ^ (k.vm ? 0x9E3779B97F4A7C15ull : 0ull);
+            }
+        };
+        std::unordered_map<BucketKey, DrawBucket, BucketKeyHash> buckets;
         buckets.reserve(g_drawables.size());
+        const bool vmCategoryTag = g_config.viewModelEnabled && g_config.viewModelCategoryTag;
 
         // [HeadDiag] hold accounting (2026-07-08 missing-heads): a skinned
         // drawable that was submitted but whose bone set never queues sits
@@ -1438,6 +2676,18 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
         for (auto& [drawHash, inst] : g_drawables) {
             if (!inst.meshHandle) continue;
+            // 1st-person instances render only while the engine shows the
+            // 1P graph (vmActive); skip otherwise but keep handles warm --
+            // they return the moment the player re-enters 1st person.
+            if (inst.isViewModel && !vmActive) { ++skippedViewModel; continue; }
+            // Engine hid this 1P object (stopped firing passes for it):
+            // lowered weapon under the Pip-Boy, holstered gear, swapped
+            // scope parts. Returns within a frame of firing again.
+            if (inst.isViewModel && vmStale.count(drawHash)) {
+                ++skippedViewModel;
+                continue;
+            }
+            if (inst.isViewModel) ++vmDrawn;
             // (Engine-active filter removed 2026-07-02 -- with the window at
             // TTL it never skipped anything; skippedInactive stays in the
             // status log as a tombstone and always reads 0.)
@@ -1447,14 +2697,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // the current pose. Drawables without a live transform fall back
             // to the baked transform from SubmitDrawable.
             auto poseIt = livePoses.find(drawHash);
-            if (poseIt != livePoses.end() && !inst.isSkinned) {
-                // Skinned instances keep their bare mirror-P base: bone
-                // matrices carry all motion, and the shape's own transform
-                // (what livePoses holds) must not stomp it.
-                const auto& pose = poseIt->second;
-                for (int r = 0; r < 3; ++r) {
-                    for (int c = 0; c < 4; ++c) {
-                        inst.worldTransform[r][c] = pose[r * 4 + c];
+            if (poseIt != livePoses.end()) {
+                // This drawable's transform changed at least once -> it moves,
+                // so it can NEVER serve as a Hi-Z occluder (the 1-frame-stale
+                // buffer is only false-cull-safe for provably static geometry).
+                // Sticky: once animated, always excluded while this handle lives.
+                inst.everAnimated = true;
+                if (!inst.isSkinned) {
+                    // Skinned instances keep their bare mirror-P base: bone
+                    // matrices carry all motion, and the shape's own transform
+                    // (what livePoses holds) must not stomp it.
+                    const auto& pose = poseIt->second;
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 4; ++c) {
+                            inst.worldTransform[r][c] = pose[r * 4 + c];
+                        }
                     }
                 }
             }
@@ -1468,6 +2725,10 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 // gore parts) -- skip the draw but keep the handle; it
                 // returns the moment the engine unhides it.
                 if (skinnedCulled.count(drawHash)) { ++skinnedHidden; continue; }
+                // Engine stopped issuing passes for this actor geometry
+                // (3P body after a camera transition, despawns) -- same
+                // skip-but-keep-warm treatment.
+                if (skinnedStale.count(drawHash)) { ++skinnedHidden; continue; }
                 // No bone set yet: bind-pose verts are model-space and would
                 // render T-posed at the world origin -- hold the draw until
                 // the first game-thread bone update lands (next Tick).
@@ -1498,11 +2759,201 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                         ++skippedChunkPlayerInside;
                         continue;
                     }
+                    // Far cull (2026-07-20, GPU traversal load): skip a
+                    // chunk once its nearest box distance exceeds
+                    // extent * LodChunkFarExtentRatio -- an angular-size
+                    // rule, so fine near-ring chunks drop at range while
+                    // coarse 16/32-cell horizon chunks survive to the
+                    // skyline. The whole distant world lived in the TLAS
+                    // (2612 LOD drawables, hundreds of MB of BLAS every
+                    // ray traverses); this bounds that mass with a single
+                    // look-preserving knob. 0 disables.
+                    if (g_config.cullingLodChunkFarExtentRatio > 0.0f) {
+                        const float dx = (std::max)((std::max)(
+                            inst.chunkOriginX - playerX,
+                            playerX - chunkMaxX), 0.0f);
+                        const float dy = (std::max)((std::max)(
+                            inst.chunkOriginY - playerY,
+                            playerY - chunkMaxY), 0.0f);
+                        const float farDist =
+                            inst.chunkExtent * g_config.cullingLodChunkFarExtentRatio;
+                        if (dx * dx + dy * dy > farDist * farDist) {
+                            ++skippedChunkFar;
+                            continue;
+                        }
+                    }
                 }
             }
-            buckets[inst.meshHandle].members.push_back(&inst);
+            // Frustum + occlusion cull decision (2026-07-21). Per-DRAWABLE
+            // decision recorded here; the skip is applied per-BUCKET in the
+            // draw loop below -- see the all-or-nothing comment there for why
+            // (batched-draw identity hashing). Shared exemptions: viewmodels
+            // (own camera path), skinned (no valid bounds -- bones carry the
+            // placement), LOD chunks unless opted in (they ARE the horizon in
+            // reflections and the far cull already bounds them). Both filters
+            // share one world-AABB build and one keep-sphere test.
+            const bool wasFrustumCulled = inst.frustumCulled;
+            inst.frustumCulled   = false;
+            inst.occlusionCulled = false;
+            inst.hzbCulled       = false;
+            const bool cullEligible = inst.hasBounds &&
+                !inst.isViewModel && !inst.isSkinned &&
+                (g_config.cullingFrustumLodChunks || !inst.isLODChunk);
+            if (cullEligible && (frustumCullActive || occlusionCullActive ||
+                                 hzbCullActive || hzbCollect)) {
+                // Local AABB -> world-space center + extents through the
+                // live worldTransform (post-livePoses, so animated statics
+                // test their current pose).
+                const float (&M)[3][4] = inst.worldTransform;
+                float lc[3], le[3], wc[3], we[3];
+                for (int i = 0; i < 3; ++i) {
+                    lc[i] = 0.5f * (inst.boundMin[i] + inst.boundMax[i]);
+                    le[i] = 0.5f * (inst.boundMax[i] - inst.boundMin[i]);
+                }
+                for (int r = 0; r < 3; ++r) {
+                    wc[r] = M[r][3] + M[r][0]*lc[0] + M[r][1]*lc[1] + M[r][2]*lc[2];
+                    we[r] = fabsf(M[r][0])*le[0] + fabsf(M[r][1])*le[1] + fabsf(M[r][2])*le[2];
+                }
+                // Closest-point distance camera -> world AABB (shared keep
+                // sphere: geometry this near always renders regardless of
+                // view direction or engine-visibility, since it can show up
+                // in secondary rays).
+                const float gx = (std::max)(fabsf(cam.position[0] - wc[0]) - we[0], 0.0f);
+                const float gy = (std::max)(fabsf(cam.position[1] - wc[1]) - we[1], 0.0f);
+                const float gz = (std::max)(fabsf(cam.position[2] - wc[2]) - we[2], 0.0f);
+                const float nearDistSq = gx * gx + gy * gy + gz * gz;
+
+                if (frustumCullActive) {
+                    if (nearDistSq <= keepRadiusSq) {
+                        inst.frustumCulled = false;
+                    } else {
+                        // Hysteresis: currently-culled entries test against
+                        // the tighter INNER set (re-enter early), visible
+                        // entries against the wider OUTER set (leave late).
+                        const CullPlane* planes = wasFrustumCulled ? cullInner
+                                                                   : cullOuter;
+                        bool outside = false;
+                        for (int p = 0; p < 5 && !outside; ++p) {
+                            const float dist = planes[p].nx * wc[0] +
+                                               planes[p].ny * wc[1] +
+                                               planes[p].nz * wc[2] + planes[p].d;
+                            const float rad  = fabsf(planes[p].nx) * we[0] +
+                                               fabsf(planes[p].ny) * we[1] +
+                                               fabsf(planes[p].nz) * we[2];
+                            if (dist < -rad) outside = true;
+                        }
+                        inst.frustumCulled = outside;
+                    }
+                }
+
+                // Occlusion: the engine's own draw verdict for this geometry.
+                // A key drawn recently then gone stale (age past the
+                // threshold) is occluded/engine-culled; a key absent from the
+                // map was never drawn since submit -> EXEMPT (fail-safe: a
+                // key-convention mismatch can only under-cull). No plane
+                // hysteresis needed -- "drawn" is binary and authoritative, so
+                // age resets to 0 the instant the engine redraws it.
+                if (occlusionCullActive && inst.engineIbKey != 0 &&
+                    nearDistSq > occlKeepRadiusSq) {
+                    auto vit = s_visMap.find(inst.engineIbKey);
+                    if (vit != s_visMap.end()) {
+                        const uint32_t age = (visFrame > vit->second)
+                            ? (visFrame - vit->second) : 0;
+                        inst.occlusionCulled = age > occlStaleFrames;
+                    }
+                }
+
+                // Hi-Z occludee test: is the world AABB confidently behind the
+                // static-occluder depth pyramid? Same keep-sphere clearance as
+                // occlusion (near geometry can appear in secondary rays). A cull
+                // commits only after HzbCullDelayFrames consecutive occluded
+                // frames; the streak resets the instant it reads visible, so the
+                // handle re-appears with no latency.
+                if (hzbCullActive && nearDistSq > hzbKeepRadiusSq) {
+                    const float amin[3] = { wc[0]-we[0], wc[1]-we[1], wc[2]-we[2] };
+                    const float amax[3] = { wc[0]+we[0], wc[1]+we[1], wc[2]+we[2] };
+                    if (s_hzb.IsOccluded(amin, amax, hzbMargin)) {
+                        if (inst.hzbOccludedStreak < 0xffffffffu) ++inst.hzbOccludedStreak;
+                    } else {
+                        inst.hzbOccludedStreak = 0;
+                    }
+                    const uint32_t need = (hzbDelay == 0) ? 1u : hzbDelay;
+                    inst.hzbCulled = inst.hzbOccludedStreak >= need;
+                } else {
+                    inst.hzbOccludedStreak = 0;
+                }
+
+                // Occluder collection (collect frames only): a drawable proven
+                // static (never animated), opaque (alpha-test/blend excluded so
+                // fence/foliage holes are never treated as solid), aged past the
+                // min-age gate, and large enough in world space, whose mesh kept
+                // an occluder-geometry copy. Its baked worldTransform is its
+                // final placement (livePoses never touches a static).
+                if (hzbCollect && !inst.isLODChunk && !inst.isWater &&
+                    !inst.everAnimated && !inst.alphaBlendEnabled &&
+                    !inst.alphaTestEnabled &&
+                    (currentFrame - inst.firstFrame) >= g_config.cullingHzbOccluderMinAge) {
+                    const float wsize =
+                        2.0f * (std::max)(we[0], (std::max)(we[1], we[2]));
+                    if (wsize >= g_config.cullingHzbOccluderMinSize) {
+                        auto mit = g_meshCache.find(inst.meshCacheKey);
+                        if (mit != g_meshCache.end() && mit->second.occluderGeom) {
+                            OccluderRef oref;
+                            oref.geom = mit->second.occluderGeom;
+                            memcpy(oref.xf, inst.worldTransform, sizeof(oref.xf));
+                            oref.distSq = nearDistSq;
+                            hzbOccluders.push_back(std::move(oref));
+                        }
+                    }
+                }
+            }
+            buckets[BucketKey{inst.meshHandle, vmCategoryTag && inst.isViewModel}]
+                .members.push_back(&inst);
         }
         bucketCount = buckets.size();
+
+        // Rebuild the Hi-Z from this collect frame's static occluders (used by
+        // NEXT frame's occludee tests). Nearest-first, capped by the occluder
+        // and total-triangle budgets so the synchronous raster stays bounded.
+        // Runs on the Remix thread for v1 simplicity (no cross-thread races);
+        // if the CPU timer shows it too costly, move to the mesh worker pool
+        // (the shared_ptr geometry already makes that a mechanical change).
+        if (hzbCollect && s_hzbInited) {
+            std::sort(hzbOccluders.begin(), hzbOccluders.end(),
+                      [](const OccluderRef& a, const OccluderRef& b) {
+                          return a.distSq < b.distSq;
+                      });
+            HzbOcclusion::CameraParams hcam{};
+            memcpy(hcam.position, cam.position, sizeof(hcam.position));
+            memcpy(hcam.forward,  cam.forward,  sizeof(hcam.forward));
+            memcpy(hcam.up,       cam.up,       sizeof(hcam.up));
+            memcpy(hcam.right,    cam.right,    sizeof(hcam.right));
+            hcam.fovYDeg   = cam.fovY;
+            hcam.aspect    = cam.aspectRatio;
+            hcam.nearPlane = cam.nearPlane;
+            hcam.farPlane  = cam.farPlane;
+            s_hzb.Reset(hcam);
+            uint32_t builtOcc = 0, builtTris = 0;
+            const uint32_t maxOcc  = g_config.cullingHzbMaxOccluders;
+            const uint32_t maxTris = g_config.cullingHzbMaxTris;
+            for (const OccluderRef& o : hzbOccluders) {
+                if (builtOcc >= maxOcc || builtTris >= maxTris) break;
+                if (!o.geom || o.geom->indices.size() < 3) continue;
+                HzbOcclusion::OccluderMesh om;
+                om.positionBase   = o.geom->positions.data();
+                om.positionStride = sizeof(float) * 3;
+                om.vertexCount    = o.geom->positions.size() / 3;
+                om.indices        = o.geom->indices.data();
+                om.indexCount     = o.geom->indices.size();
+                memcpy(om.worldTransform, o.xf, sizeof(om.worldTransform));
+                s_hzb.RasterizeOccluder(om);
+                ++builtOcc;
+                builtTris += static_cast<uint32_t>(o.geom->indices.size() / 3);
+            }
+            s_hzb.BuildMips();
+            s_hzbBuildOccluders = builtOcc;
+            s_hzbBuildTris = builtTris;
+        }
         if (skinnedHeldNoBones > 0 || skinnedHidden > 0) {
             // First occurrence logs immediately, then every ~300 frames,
             // capped for the session. OnFrame is single-threaded.
@@ -1519,13 +2970,86 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         const PerfClock::time_point tBucket1 = PerfClock::now();
         dBucket = tBucket1 - tBucket0;
 
-        for (auto& [meshHandle, bucket] : buckets) {
+        // Scratch bone set for skinned viewmodel draws (adjusted copy per
+        // draw; reused across buckets, alive through each DrawInstance).
+        std::vector<remixapi_Transform> vmBoneScratch;
+
+        for (auto& [bucketKey, bucket] : buckets) {
             if (bucket.members.empty()) continue;
+
+            // Frustum + occlusion cull, applied at BUCKET granularity: skip
+            // only when EVERY member is culled (by frustum OR occlusion). The
+            // runtime folds the whole per-instance transform array (content
+            // AND order) into the batched-draw identity hash
+            // (computeExternalDrawIdentityHash), so submitting a batch minus
+            // its off-screen members would re-key the batch on every
+            // membership change -- a full processDrawCallState retranslation
+            // per affected bucket, every frame the camera turns (the exact
+            // CS-thread storm the preserve path exists to prevent).
+            // All-or-nothing keeps every identity byte-stable; a
+            // partially-visible batch rides along whole, costing only TLAS
+            // residency for its off-screen members. Fully-hidden buckets (the
+            // common case behind the camera or behind a wall) drop entirely.
+            if (frustumCullActive || occlusionCullActive || hzbCullActive) {
+                bool allCulled = true;
+                bool allFrustum = true;      // attribution ladder: frustum ...
+                bool allFrustOrOccl = true;  // ... then occlusion, else Hi-Z
+                for (const DrawableInstance* m : bucket.members) {
+                    if (!m->frustumCulled && !m->occlusionCulled && !m->hzbCulled) {
+                        allCulled = false;
+                        break;
+                    }
+                    if (!m->frustumCulled) allFrustum = false;
+                    if (!m->frustumCulled && !m->occlusionCulled) allFrustOrOccl = false;
+                }
+                if (allCulled) {
+                    if (allFrustum) {
+                        skippedFrustum += bucket.members.size();
+                        ++skippedFrustumBuckets;
+                    } else if (allFrustOrOccl) {
+                        skippedOcclusion += bucket.members.size();
+                        ++skippedOcclusionBuckets;
+                    } else {
+                        skippedHzb += bucket.members.size();
+                        ++skippedHzbBuckets;
+                    }
+                    // Keep skipped members' resources LRU-live at a spread
+                    // cadence (~1/60 of members per frame; grace is 600, and
+                    // 75 under pressure-tightening, so 60 clears both). A
+                    // frustum-culled drawable is still logically present --
+                    // letting the texture LRU cascade it away would turn
+                    // every camera swing into re-resolve churn. VRAM under
+                    // pressure stays the parking tiers' call: parked entries
+                    // leave g_drawables and stop being stamped here.
+                    for (DrawableInstance* m : bucket.members) {
+                        // Addition, not XOR: (P + frame) walks every residue
+                        // mod 60, guaranteeing exactly one stamp per member
+                        // per 60-frame window.
+                        if (((reinterpret_cast<uintptr_t>(m) >> 4) + currentFrame) % 60 != 0) {
+                            continue;
+                        }
+                        m->lastDrawnFrame = currentFrame;
+                        if (m->materialHash != 0) {
+                            auto matIt = g_materialCache.find(m->materialHash);
+                            if (matIt != g_materialCache.end()) {
+                                matIt->second.lastDrawnFrame = currentFrame;
+                            }
+                        }
+                        for (uint64_t texHash : m->textureHashes) {
+                            auto texIt = g_textureHandles.find(texHash);
+                            if (texIt != g_textureHandles.end()) {
+                                texIt->second.lastDrawnFrame = currentFrame;
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
 
             remixapi_InstanceInfo instance = {};
             instance.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO;
             instance.pNext = nullptr;
-            instance.mesh = meshHandle;
+            instance.mesh = bucketKey.mesh;
             // Backface culling (2026-07-02). Previously hardcoded
             // doubleSided=1, which defeated backface culling in ray traversal
             // for the whole scene -- extra hit evaluations on every opaque
@@ -1561,6 +3085,16 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             // instead of fighting for the same depth.
             if (!bucket.members.empty() && bucket.members[0]->isDecal) {
                 instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_DECAL_STATIC;
+            }
+
+            // View-model tag (2026-07-18): routes the draw through the
+            // runtime's view-model path (VIEW_MODEL camera + vm handling).
+            // Requires the fork-added category bit (extern/remix_c.h is
+            // refreshed from the fork at configure time); runtimes without
+            // the mapping ignore unknown bits, so this degrades to the
+            // previous behavior (world camera) rather than breaking.
+            if (bucketKey.vm) {
+                instance.categoryFlags |= REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL;
             }
 
             remixapi_InstanceInfoGpuInstancingEXT  gpuExt   = {};
@@ -1620,6 +3154,19 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                         instance.transform.matrix[r][c] = member->worldTransform[r][c];
                     }
                 }
+                // Rigid viewmodel part: compose the synthetic->world map
+                // onto the synthetic transform (Remix-form composer).
+                // Applied to the LOCAL copy only -- inst.worldTransform
+                // stays the raw synthetic value the capture hook maintains.
+                if (member->isViewModel && !member->isSkinned) {
+                    float adj[3][4];
+                    vmCompose(vmRemixA, member->worldTransform, adj);
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 4; ++c) {
+                            instance.transform.matrix[r][c] = adj[r][c];
+                        }
+                    }
+                }
                 // pNext: blendExt directly, or nullptr if not needed.
                 instance.pNext = needBlendExt ? (void*)&blendExt : nullptr;
                 // Skinned draw: chain the per-instance bone set. The base
@@ -1631,8 +3178,25 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 if (member->isSkinned && !member->boneTransforms.empty()) {
                     bonesExt.sType = REMIXAPI_STRUCT_TYPE_INSTANCE_INFO_BONE_TRANSFORMS_EXT;
                     bonesExt.pNext = instance.pNext;
-                    bonesExt.boneTransforms_values = member->boneTransforms.data();
-                    bonesExt.boneTransforms_count  = (uint32_t)member->boneTransforms.size();
+                    if (member->isViewModel) {
+                        // Skinned viewmodel (arms/1P body): compose the map
+                        // onto the BONE transforms in Beth column-form (the
+                        // instance base is the bare mirror P, applied on
+                        // top). Copied to a scratch set per draw so the raw
+                        // bones in boneTransforms are never double-adjusted
+                        // on frames without a fresh bone queue.
+                        vmBoneScratch.resize(member->boneTransforms.size());
+                        for (size_t b = 0; b < member->boneTransforms.size(); ++b) {
+                            vmCompose(vmBethA,
+                                      member->boneTransforms[b].matrix,
+                                      vmBoneScratch[b].matrix);
+                        }
+                        bonesExt.boneTransforms_values = vmBoneScratch.data();
+                        bonesExt.boneTransforms_count  = (uint32_t)vmBoneScratch.size();
+                    } else {
+                        bonesExt.boneTransforms_values = member->boneTransforms.data();
+                        bonesExt.boneTransforms_count  = (uint32_t)member->boneTransforms.size();
+                    }
                     instance.pNext = &bonesExt;
                 }
             } else {
@@ -1669,11 +3233,21 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                 const bool mirrorBase = g_config.batchedMirrorBase;
                 bucket.transforms.reserve(bucket.members.size());
                 for (const DrawableInstance* member : bucket.members) {
+                    // Rigid viewmodel part sharing a mesh handle (e.g.
+                    // duplicated Pip-Boy sub-meshes): compose the map first,
+                    // then apply the mirror-base row swap to the adjusted
+                    // matrix so the base P recovers the true placement.
+                    float adj[3][4];
+                    const float (*src)[4] = member->worldTransform;
+                    if (member->isViewModel) {
+                        vmCompose(vmRemixA, member->worldTransform, adj);
+                        src = adj;
+                    }
                     remixapi_Transform xform = {};
                     for (int r = 0; r < 3; ++r) {
                         const int srcRow = mirrorBase ? (r == 0 ? 1 : (r == 1 ? 0 : 2)) : r;
                         for (int c = 0; c < 4; ++c) {
-                            xform.matrix[r][c] = member->worldTransform[srcRow][c];
+                            xform.matrix[r][c] = src[srcRow][c];
                         }
                     }
                     bucket.transforms.push_back(xform);
@@ -1709,7 +3283,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             if (guardRc == 1) {
                 _MESSAGE("FO4RemixPlugin: [OnFrame] SEH CRASH CAUGHT in DrawInstance "
                          "meshHandle=%p batchSize=%zu exception=0x%08lX -- nulling member meshHandles to skip permanently",
-                         (void*)meshHandle, bucket.members.size(), drawExcCode);
+                         (void*)bucketKey.mesh, bucket.members.size(), drawExcCode);
                 for (DrawableInstance* member : bucket.members) member->meshHandle = nullptr;
                 continue;
             }
@@ -1745,6 +3319,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     s_accSnapNs     += nsSince(tSnap0, tSnap1);
     s_accBucketNs   += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dBucket).count();
     s_accDrawNs     += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(dDraw).count();
+    s_maxLockWaitNs  = (std::max)(s_maxLockWaitNs, nsSince(tEnter, tLocked));
 
     // Periodic status log (every ~5 seconds)
     static uint32_t s_frameCounter = 0;
@@ -1759,11 +3334,18 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                                                  kActiveAgeFrames, statsScratch,
                                                  &activeStats, nullptr);
         _MESSAGE("FO4RemixPlugin: OnFrame status - drawables=%zu buckets=%zu batched=%zu skippedInactive=%zu "
-                 "skippedChunkPlayerInside=%zu skippedChunkStale=%zu chunks=%zu "
+                 "skippedChunkPlayerInside=%zu skippedChunkStale=%zu skippedChunkFar=%zu chunks=%zu "
+                 "skippedFrustum=%zu (%zu buckets) skippedOccl=%zu (%zu buckets) "
+                 "skippedHzb=%zu (%zu buckets) hzbOccluders=%u hzbTris=%u "
+                 "vmDrawn=%zu skippedVM=%zu "
                  "active=%u isLod=%u fadedIn=%u notVisible=%u lodFadingOut=%u forcedFadeOut=%u "
                  "player=(%.0f,%.0f,%.0f)",
                  drawableCount, bucketCount, batchedBucketCount, skippedInactive,
-                 skippedChunkPlayerInside, skippedChunkStale, lodChunkAges.size(),
+                 skippedChunkPlayerInside, skippedChunkStale, skippedChunkFar, lodChunkAges.size(),
+                 skippedFrustum, skippedFrustumBuckets,
+                 skippedOcclusion, skippedOcclusionBuckets,
+                 skippedHzb, skippedHzbBuckets, s_hzbBuildOccluders, s_hzbBuildTris,
+                 vmDrawn, skippedViewModel,
                  activeStats.total, activeStats.isLod, activeStats.fadedIn,
                  activeStats.notVisible, activeStats.lodFadingOut, activeStats.forcedFadeOut,
                  cam.playerWorldPos[0], cam.playerWorldPos[1], cam.playerWorldPos[2]);
@@ -1780,6 +3362,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
         s_lastGameCounters = game;
         _MESSAGE("FO4RemixPlugin: OnFrame perf (avg us/frame over 300) - "
                  "lockWait=%llu snap=%llu bucket=%llu draw=%llu present=%llu total=%llu | "
+                 "max us: lockWait=%llu present=%llu total=%llu | "
                  "game thread: fires/frame=%llu fireUs/frame=%llu tickUs/frame=%llu gameFrames=%llu",
                  (unsigned long long)(s_accLockWaitNs / 300 / 1000),
                  (unsigned long long)(s_accSnapNs     / 300 / 1000),
@@ -1787,12 +3370,32 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                  (unsigned long long)(s_accDrawNs     / 300 / 1000),
                  (unsigned long long)(s_accPresentNs  / 300 / 1000),
                  (unsigned long long)(s_accTotalNs    / 300 / 1000),
+                 (unsigned long long)(s_maxLockWaitNs / 1000),
+                 (unsigned long long)(s_maxPresentNs  / 1000),
+                 (unsigned long long)(s_maxTotalNs    / 1000),
                  (unsigned long long)(dTicks ? dFires  / dTicks        : 0),
                  (unsigned long long)(dTicks ? dFireNs / dTicks / 1000 : 0),
                  (unsigned long long)(dTicks ? dTickNs / dTicks / 1000 : 0),
                  (unsigned long long)dTicks);
         s_accLockWaitNs = s_accSnapNs = s_accBucketNs = 0;
         s_accDrawNs = s_accPresentNs = s_accTotalNs = 0;
+        s_maxLockWaitNs = s_maxPresentNs = s_maxTotalNs = 0;
+
+        // Remix-side VRAM on the same cadence: pairs with present_hook's
+        // process-wide [VRAM] line to split "the path tracer's budget" from
+        // "what the game's raster path pins" during the SuppressGameRaster
+        // A/B runs.
+        VramStats vram{};
+        if (GetVramStats(&vram)) {
+            _MESSAGE("FO4RemixPlugin: [VRAM] remix allocated=%llu MiB used=%llu MiB "
+                     "materialTex=%llu MiB buffers=%llu MiB accel=%llu MiB parked=%zu",
+                     (unsigned long long)(vram.totalAllocatedBytes >> 20),
+                     (unsigned long long)(vram.totalUsedBytes >> 20),
+                     (unsigned long long)(vram.usedMaterialTextureBytes >> 20),
+                     (unsigned long long)(vram.usedBufferBytes >> 20),
+                     (unsigned long long)(vram.usedAccelerationStructureBytes >> 20),
+                     g_pendingDestroyCount.load(std::memory_order_relaxed));
+        }
     }
 
     if (!hasAnyMeshes && g_fallbackMesh) {
@@ -1826,6 +3429,7 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // analytical lights are per-frame submissions like instances.
     // ------------------------------------------------------------------
     {
+        FO4_TRACY_SCOPE("OnFrame.lights");
         bool haveSnapshot = false;
         std::vector<ExtractedLight> snapshot;
         {
@@ -1844,8 +3448,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
 
             for (auto it = g_lights.begin(); it != g_lights.end();) {
                 if (desired.find(it->first) == desired.end()) {
-                    if (it->second) {
-                        remixapi_LightHandle h = it->second;
+                    if (it->second.handle) {
+                        remixapi_LightHandle h = it->second.handle;
                         RemixCallGuarded("DestroyLight",
                                          [&] { api->DestroyLight(h); });
                     }
@@ -1854,33 +3458,23 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     ++it;
                 }
             }
-            static std::atomic<int> sLightLogs{0};
-            uint32_t created = 0, failed = 0;
-            for (const auto& [lhash, lp] : desired) {
-                if (g_lights.find(lhash) != g_lights.end()) continue;
-                const ExtractedLight& light = *lp;
 
-                remixapi_LightInfoSphereEXT sphere = {};
-                sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
-                sphere.position = { light.position[0], light.position[1],
-                                    light.position[2] };
+            // Derive the submitted params for one extracted light: config
+            // multipliers, spot shaping, and the near-camera ignoreViewModel
+            // flag (a light within arm's reach must not let the 1P arms/
+            // weapon shadow the whole scene). Camera position is in the same
+            // swapped space as light.position.
+            const float nearVMUnits = g_config.lightsNearCameraIgnoreVMUnits;
+            const auto deriveRecord = [&](const ExtractedLight& light,
+                                          LightRecord& rec) {
+                rec.position[0] = light.position[0];
+                rec.position[1] = light.position[1];
+                rec.position[2] = light.position[2];
                 // Emitter size, not falloff: FO4's radius is the falloff
                 // range; a small emitter sphere scaled from it keeps shadows
                 // soft in proportion (0.025 = the retired pipeline's tuning).
-                sphere.radius = (std::max)(light.radius * 0.025f *
-                                           g_config.lightRadius, 0.5f);
-                sphere.volumetricRadianceScale = 1.0f;
-                if (light.isSpotLight && light.spotFOV > 0.0f) {
-                    sphere.shaping_hasvalue = true;
-                    sphere.shaping_value.direction = { light.spotDirection[0],
-                                                       light.spotDirection[1],
-                                                       light.spotDirection[2] };
-                    // FO4 FOV is the full cone angle.
-                    sphere.shaping_value.coneAngleDegrees = light.spotFOV * 0.5f;
-                    sphere.shaping_value.coneSoftness = light.spotSoftness;
-                    sphere.shaping_value.focusExponent = 0.0f;
-                }
-
+                rec.radius = (std::max)(light.radius * 0.025f *
+                                        g_config.lightRadius, 0.5f);
                 float r = light.radiance[0], g = light.radiance[1],
                       b = light.radiance[2];
                 const float cs = g_config.lightColorStrength;
@@ -1890,50 +3484,142 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                     g = avg + (g - avg) * cs;
                     b = avg + (b - avg) * cs;
                 }
+                rec.radiance[0] = r * g_config.lightIntensity;
+                rec.radiance[1] = g * g_config.lightIntensity;
+                rec.radiance[2] = b * g_config.lightIntensity;
+                rec.isSpot = light.isSpotLight && light.spotFOV > 0.0f;
+                if (rec.isSpot) {
+                    rec.spotDirection[0] = light.spotDirection[0];
+                    rec.spotDirection[1] = light.spotDirection[1];
+                    rec.spotDirection[2] = light.spotDirection[2];
+                    // FO4 FOV is the full cone angle.
+                    rec.spotConeAngle = light.spotFOV * 0.5f;
+                    rec.spotSoftness  = light.spotSoftness;
+                } else {
+                    rec.spotDirection[0] = rec.spotDirection[1] = rec.spotDirection[2] = 0.0f;
+                    rec.spotConeAngle = 0.0f;
+                    rec.spotSoftness  = 0.0f;
+                }
+                rec.ignoreViewModel = false;
+                if (nearVMUnits > 0.0f && cam.valid) {
+                    const float dx = light.position[0] - cam.position[0];
+                    const float dy = light.position[1] - cam.position[1];
+                    const float dz = light.position[2] - cam.position[2];
+                    rec.ignoreViewModel =
+                        (dx * dx + dy * dy + dz * dz) < nearVMUnits * nearVMUnits;
+                }
+            };
 
-                remixapi_LightInfo info = {};
+            // Fill the remixapi structs from a derived record. sphere must
+            // outlive the call (info.pNext chains it).
+            const auto fillInfo = [](uint64_t lhash, const LightRecord& rec,
+                                     remixapi_LightInfo& info,
+                                     remixapi_LightInfoSphereEXT& sphere) {
+                sphere = {};
+                sphere.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO_SPHERE_EXT;
+                sphere.position = { rec.position[0], rec.position[1], rec.position[2] };
+                sphere.radius = rec.radius;
+                sphere.volumetricRadianceScale = 1.0f;
+                if (rec.isSpot) {
+                    sphere.shaping_hasvalue = true;
+                    sphere.shaping_value.direction = { rec.spotDirection[0],
+                                                       rec.spotDirection[1],
+                                                       rec.spotDirection[2] };
+                    sphere.shaping_value.coneAngleDegrees = rec.spotConeAngle;
+                    sphere.shaping_value.coneSoftness = rec.spotSoftness;
+                    sphere.shaping_value.focusExponent = 0.0f;
+                }
+                info = {};
                 info.sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
                 info.pNext = &sphere;
                 info.hash = lhash;
-                info.radiance = { r * g_config.lightIntensity,
-                                  g * g_config.lightIntensity,
-                                  b * g_config.lightIntensity };
+                info.radiance = { rec.radiance[0], rec.radiance[1], rec.radiance[2] };
                 info.isDynamic = false;
-                info.ignoreViewModel = false;
+                info.ignoreViewModel = rec.ignoreViewModel;
+            };
 
+            static std::atomic<int> sLightLogs{0};
+            uint32_t created = 0, failed = 0, updated = 0;
+            const bool canLiveUpdate =
+                g_config.lightsLiveUpdate && api->UpdateLightDefinition != nullptr;
+            for (const auto& [lhash, lp] : desired) {
+                const ExtractedLight& light = *lp;
+
+                LightRecord next = {};
+                deriveRecord(light, next);
+
+                auto existing = g_lights.find(lhash);
+                if (existing != g_lights.end()) {
+                    LightRecord& cur = existing->second;
+                    if (!g_config.lightsLiveUpdate || !cur.handle || next.SameAs(cur)) {
+                        continue;  // unchanged (or legacy mode): keep as-is
+                    }
+                    if (canLiveUpdate) {
+                        // In-place update on the same handle+hash: persistent
+                        // RTXDI reservoirs survive, no boiling.
+                        remixapi_LightInfo info;
+                        remixapi_LightInfoSphereEXT sphere;
+                        fillInfo(lhash, next, info, sphere);
+                        remixapi_ErrorCode updErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
+                        remixapi_LightHandle h = cur.handle;
+                        RemixCallGuarded("UpdateLightDefinition",
+                                         [&] { updErr = api->UpdateLightDefinition(h, &info); });
+                        if (updErr == REMIXAPI_ERROR_CODE_SUCCESS) {
+                            next.handle = cur.handle;
+                            cur = next;
+                            ++updated;
+                            continue;
+                        }
+                        // Fall through to destroy+recreate on failure.
+                    }
+                    // No UpdateLightDefinition in this runtime (or it
+                    // failed): recreate. Same hash, so the reservoir cost is
+                    // the pre-2026-07-18 status quo, paid only on change.
+                    remixapi_LightHandle h = cur.handle;
+                    RemixCallGuarded("DestroyLight", [&] { api->DestroyLight(h); });
+                    g_lights.erase(existing);
+                    // continues into the create path below
+                }
+
+                remixapi_LightInfo info;
+                remixapi_LightInfoSphereEXT sphere;
+                fillInfo(lhash, next, info, sphere);
                 remixapi_LightHandle handle = nullptr;
                 remixapi_ErrorCode lightErr = REMIXAPI_ERROR_CODE_GENERAL_FAILURE;
                 RemixCallGuarded("CreateLight",
                                  [&] { lightErr = api->CreateLight(&info, &handle); });
                 if (lightErr == REMIXAPI_ERROR_CODE_SUCCESS && handle) {
-                    g_lights.emplace(lhash, handle);
+                    next.handle = handle;
+                    g_lights[lhash] = next;
                     ++created;
                     const int ln = sLightLogs.fetch_add(1,
                                        std::memory_order_relaxed);
                     if (ln < 12) {
                         _MESSAGE("FO4RemixPlugin: [Lights] #%d hash=0x%llX "
                                  "pos=(%.0f,%.0f,%.0f) radius=%.1f "
-                                 "radiance=(%.1f,%.1f,%.1f) spot=%d",
+                                 "radiance=(%.1f,%.1f,%.1f) spot=%d ignoreVM=%d",
                                  ln, (unsigned long long)lhash,
                                  light.position[0], light.position[1],
                                  light.position[2], sphere.radius,
                                  info.radiance.x, info.radiance.y,
                                  info.radiance.z,
-                                 light.isSpotLight ? 1 : 0);
+                                 light.isSpotLight ? 1 : 0,
+                                 next.ignoreViewModel ? 1 : 0);
                     }
                 } else {
                     ++failed;
                 }
             }
-            if (created || failed) {
+            if (created || failed || updated) {
                 _MESSAGE("FO4RemixPlugin: [Lights] snapshot applied: %zu total, "
-                         "%u created, %u failed, %zu live",
-                         snapshot.size(), created, failed, g_lights.size());
+                         "%u created, %u updated, %u failed, %zu live%s",
+                         snapshot.size(), created, updated, failed, g_lights.size(),
+                         canLiveUpdate ? "" : " (no UpdateLightDefinition; recreate on change)");
             }
         }
-        for (const auto& [lhash, handle] : g_lights) {
-            if (handle) {
-                remixapi_LightHandle h = handle;
+        for (const auto& [lhash, rec] : g_lights) {
+            if (rec.handle) {
+                remixapi_LightHandle h = rec.handle;
                 RemixCallGuarded("DrawLightInstance",
                                  [&] { api->DrawLightInstance(h); });
             }
@@ -1962,9 +3648,9 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     // LRU sweeps. Run every cullingTextureLRUSweepPeriod frames.
     //
     //   (1) Material sweep -- the LEVER: materials hold Rc<DxvkImageView>
-    //       refs to textures, so cascade-evicting stale materials is what
-    //       actually drops texture VRAM for shared sets. Gated by budget;
-    //       below budget, no eviction (TTL-only mode skips this gate).
+    //       refs to textures, so parking stale materials for the next guarded
+    //       destroy drain is what drops texture VRAM for shared sets. Gated by
+    //       budget; below budget, no eviction (TTL-only mode skips this gate).
     //
     //   (2) Texture sweep -- the BACKSTOP: catches textures whose cache
     //       entry survives their material. Cheap; runs on the same cadence.
@@ -1983,10 +3669,30 @@ void RemixRenderer::OnFrame(const CameraState& cam,
             }
             const uint64_t budgetBytes = static_cast<uint64_t>(g_config.cullingTextureBudgetMiB) << 20;
 
+            // Under VRAM pressure (same signal as SemCapture's force-eviction)
+            // the standard grace periods would sit on the refcounts that the
+            // drawable eviction just released for ~10s before parking anything.
+            // Tighten 8x so the cascade reclaims within a couple of sweeps
+            // (2026-07-20, Sanctuary->Concord VRAM pileup). Keyed on the
+            // SOFTER of the two thresholds (tier-1 view parking starts at
+            // ForceEvictViewPct) so the cascade accelerates as soon as any
+            // pressure reclamation is active.
+            uint64_t vramUsedMiB = 0, vramBudgetMiB = 0;
+            uint32_t evictPct = g_config.cullingForceEvictVramPct;
+            const uint32_t viewPct = g_config.cullingForceEvictViewPct;
+            if (viewPct > 0 && (evictPct == 0 || viewPct < evictPct)) {
+                evictPct = viewPct;
+            }
+            const bool vramPressure = evictPct > 0 &&
+                PresentHook::GetVramBudgetSnapshot(&vramUsedMiB, &vramBudgetMiB) &&
+                vramUsedMiB * 100u > static_cast<uint64_t>(evictPct) * vramBudgetMiB;
+
             if (g_config.cullingMaterialLRUGraceFrames > 0) {
+                uint64_t matGrace = g_config.cullingMaterialLRUGraceFrames;
+                if (vramPressure && matGrace > 8) matGrace /= 8;
                 auto matResult = RemixRenderer::SweepStaleMaterials(
                     currentFrameIndex,
-                    g_config.cullingMaterialLRUGraceFrames,
+                    matGrace,
                     budgetBytes,
                     currentMaterialTexBytes);
                 _MESSAGE("FO4RemixPlugin: [LRU] Material sweep: %u/%u stale, %u cells evicted",
@@ -1995,22 +3701,20 @@ void RemixRenderer::OnFrame(const CameraState& cam,
                          matResult.cellsEvicted);
             }
 
-            // Re-query VRAM after the material sweep so the texture sweep's
-            // budget gate sees the freed bytes.
-            if (g_config.cullingTextureBudgetMiB > 0) {
-                VramStats vramStatsAfter{};
-                if (RemixRenderer::GetVramStats(&vramStatsAfter)) {
-                    currentMaterialTexBytes = vramStatsAfter.usedMaterialTextureBytes;
-                }
-            }
+            // Material victims are only parked here; their runtime references
+            // are released by a later top-of-frame drain. Keep the pre-sweep
+            // VRAM reading for the texture budget pass instead of pretending
+            // the queued releases have already reclaimed memory.
 
             if (g_config.cullingTextureLRUGraceFrames > 0) {
+                uint64_t texGrace = g_config.cullingTextureLRUGraceFrames;
+                if (vramPressure && texGrace > 8) texGrace /= 8;
                 auto texResult = RemixRenderer::SweepStaleTextures(
                     currentFrameIndex,
-                    g_config.cullingTextureLRUGraceFrames,
+                    texGrace,
                     budgetBytes,
                     currentMaterialTexBytes);
-                _MESSAGE("FO4RemixPlugin: [LRU] Texture sweep: %u/%u stale, %u cells evicted, %u budget, %u orphans",
+                _MESSAGE("FO4RemixPlugin: [LRU] Texture sweep: %u/%u stale, %u cells evicted, %u budget, %u orphans parked",
                          texResult.staleTextureCount,
                          texResult.textureHandleCount,
                          texResult.cellsEvicted,
@@ -2029,6 +3733,8 @@ void RemixRenderer::OnFrame(const CameraState& cam,
     const PerfClock::time_point tEnd = PerfClock::now();
     s_accPresentNs += nsSince(tPresent0, tEnd);
     s_accTotalNs   += nsSince(tEnter, tEnd);
+    s_maxPresentNs  = (std::max)(s_maxPresentNs, nsSince(tPresent0, tEnd));
+    s_maxTotalNs    = (std::max)(s_maxTotalNs, nsSince(tEnter, tEnd));
 }
 
 void RemixRenderer::Shutdown() {
@@ -2036,10 +3742,30 @@ void RemixRenderer::Shutdown() {
 
     remixapi_Interface* api = RemixAPI::GetInterface();
 
+    g_faceMeshData.clear();
+    {
+        std::lock_guard<std::mutex> faceLock(g_faceMorphQueueMutex);
+        g_faceMorphQueue.clear();
+    }
+    {
+        std::lock_guard<std::mutex> eyeLock(g_eyeUvQueueMutex);
+        g_eyeUvQueue.clear();
+    }
+
     // Drop drawable entries first; their meshHandle members alias g_meshCache,
     // so we don't DestroyMesh here -- the cache loop below does that once per
     // unique handle.
     g_drawables.clear();
+
+    // Handles parked for deferred destruction were already erased from the
+    // caches, so the loops below won't see them -- destroy them here (same
+    // guarded helper as the OnFrame drain: a parked handle is the class most
+    // likely to throw, and an unguarded throw here would crash on exit).
+    if (api) {
+        DestroyParkedHandles(api, g_pendingDestroys);
+    }
+    g_pendingDestroys = {};
+    g_hasPendingDestroys.store(false, std::memory_order_release);
 
     // Destroy all cached meshes, materials, and textures.
     if (api) {
@@ -2060,8 +3786,8 @@ void RemixRenderer::Shutdown() {
     }
 
     if (api) {
-        for (auto& [hash, handle] : g_lights) {
-            if (handle) api->DestroyLight(handle);
+        for (auto& [hash, rec] : g_lights) {
+            if (rec.handle) api->DestroyLight(rec.handle);
         }
         g_lights.clear();
     }
@@ -2104,6 +3830,20 @@ void RemixRenderer::QueueBoneTransforms(
         for (auto& kv : bones) {
             g_boneQueue[kv.first] = std::move(kv.second);
         }
+    }
+}
+
+void RemixRenderer::QueueFaceMorphPositions(uint64_t drawableHash,
+                                            std::vector<float>&& xyz) {
+    std::lock_guard<std::mutex> lock(g_faceMorphQueueMutex);
+    g_faceMorphQueue[drawableHash] = std::move(xyz);
+}
+
+void RemixRenderer::QueueEyeUvTransforms(
+    std::unordered_map<uint64_t, EyeUvTransform>&& transforms) {
+    std::lock_guard<std::mutex> lock(g_eyeUvQueueMutex);
+    for (auto& item : transforms) {
+        g_eyeUvQueue[item.first] = item.second;
     }
 }
 

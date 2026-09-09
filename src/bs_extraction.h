@@ -4,6 +4,8 @@
 #include <vector>
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 #include <d3d11.h>
 
@@ -19,14 +21,25 @@ struct ExtractedTexture {
                                   // and post-process this is RGBA8 for BC source textures).
 };
 
+// Texture supply list for SubmitDrawable (2026-07-14). Entries SHARE the CPU
+// pixel cache's chains instead of copying them: a 2048^2 chain is ~22 MiB and
+// the old value-vector paid that memcpy once per supplied slot per submit --
+// the dominant per-submit cost after the parse (10-35ms big-merge submits).
+// shared_ptr rather than a raw borrow because the cache can erase an entry
+// while a supply list is alive in the same tick (superseded-resolution
+// variant eviction fires from a sibling slot's decode landing mid-pass);
+// shared ownership keeps the pixels valid through SubmitDrawable regardless.
+// All producers/consumers are game-thread; refcounting is atomic anyway.
+using TextureSupply = std::vector<std::shared_ptr<const ExtractedTexture>>;
+
 struct ExtractedMesh {
-    uint64_t hash;
+    uint64_t hash = 0;
     std::vector<remixapi_HardcodedVertex> vertices;
     std::vector<uint32_t> indices;
-    float worldTransform[3][4]; // row-major 3x4 for remixapi_Transform
-    uint64_t diffuseTextureHash;    // 0 = no texture
-    uint64_t normalTextureHash;     // 0 = no texture
-    uint64_t roughnessTextureHash;  // 0 = no texture (FO4 smoothness/spec mask)
+    float worldTransform[3][4] = {}; // row-major 3x4 for remixapi_Transform
+    uint64_t diffuseTextureHash = 0;    // 0 = no texture
+    uint64_t normalTextureHash = 0;     // 0 = no texture
+    uint64_t roughnessTextureHash = 0;  // 0 = no texture (FO4 smoothness/spec mask)
     uint64_t emissiveTextureHash = 0;   // 0 = no glow map (from BSLightingShaderMaterialGlowmap)
     float emissiveColorR = 0.0f;        // Emissive color R from BSLightingShaderProperty (0-1)
     float emissiveColorG = 0.0f;        // Emissive color G
@@ -50,6 +63,19 @@ struct ExtractedMesh {
     // DECAL_STATIC into the instance categoryFlags so dxvk-remix applies decal
     // depth-offset Z-fight prevention.
     bool isDecal = false;
+
+    // 1st-person viewmodel tag (2026-07-18, set by lighting_static when the
+    // geometry descends from PlayerCharacter::firstPersonSkeleton). The 1P
+    // graph lives in a SYNTHETIC origin-local space (player-at-origin, world-
+    // aligned axes; diag-proven: body z~3, Pip-Boy z~89, weapon z~100 while
+    // the player stood at (-79683,90060,7827)); submitting its transforms
+    // raw renders the arms at the map origin -- the "viewmodels invisible"
+    // bug. OnFrame maps the space into the render world per frame by adding
+    // delta = realCameraPos - camBoneSyntheticPos (SemanticCapture::
+    // GetViewModelAnchor) to the instance transform (rigid parts) or the
+    // bone translations (skinned parts), and hides these instances entirely
+    // while the engine has the 1P root app-culled (3rd person, menus).
+    bool isViewModel = false;
 
     // Two-sided tag (set by lighting_static resolver from BSShaderProperty
     // flag bit 36, kTwoSided per CommonLibF4; sanity-anchored by kOwnEmit=22
@@ -120,6 +146,28 @@ struct ExtractedMesh {
     uint32_t boneCount = 0;
     std::vector<float>    blendWeights;
     std::vector<uint32_t> blendIndices;
+
+    // Engine index-buffer identity for the occlusion signal (2026-07-21).
+    // 0 = no key captured (merge-baked meshes, water, fallbacks) -> the
+    // drawable is EXEMPT from occlusion culling. See DrawCapture::EngineIbKey.
+    uint64_t engineIbPtr    = 0;
+    uint32_t engineIbOffset = 0;
+
+    // FaceGen morph refresh. True for skinned BSDynamicTriShape drawables
+    // whose dynamicVertices buffer can be rewritten by FO4 during lip sync,
+    // blinks, and expressions. The renderer keeps a CPU copy so only
+    // positions need to be re-uploaded when that live buffer changes.
+    bool isFaceGenDynamic = false;
+
+    // Human iris animation. FO4 drives gaze through the lighting material's
+    // live texture-coordinate transform rather than rewriting the eye mesh.
+    // The resolver keeps immutable source UVs and bakes the current transform
+    // into vertices for initial submission; later changes are refreshed under
+    // the same mesh handle by RemixRenderer.
+    bool isAnimatedEye = false;
+    std::vector<float> eyeBaseTexcoords;
+    float eyeUvOffset[2] = {};
+    float eyeUvScale[2] = { 1.0f, 1.0f };
 };
 
 struct CellInfo {
@@ -193,7 +241,16 @@ struct ParsedGeometry {
     std::vector<uint32_t> indices;
     uint64_t vertexDesc;
     uint16_t vertexSize;
-    uint8_t* vbData;        // raw vertex buffer pointer (for blend weight reading)
+    // Owned copy of the raw vertex buffer bytes; vbData points at
+    // vbBytes.data() (2026-07-21 async parse: consumers -- palette
+    // histogram, detail diagnostics -- used to read the LIVE engine VB
+    // through this pointer; with the parse snapshotted the copy is what's
+    // coherent with the parsed vertices, and reading it can't race engine
+    // frees). vbCount is the vertex count the copy was sized for -- index
+    // with it, never with the live shape's numVertices.
+    std::vector<uint8_t> vbBytes;
+    uint8_t* vbData;        // == vbBytes.data() (kept for existing readers)
+    uint32_t vbCount = 0;
     bool isDynamic;
 
     // Skinning attributes (filled only when parseSkinning is requested AND
@@ -208,6 +265,12 @@ struct ParsedGeometry {
     bool hasSkinning = false;
     std::vector<float>    blendWeights;   // numVertices * 4
     std::vector<uint32_t> blendIndices;   // numVertices * 4 (u8 widened)
+
+    // Engine index-buffer identity for the occlusion signal (2026-07-21):
+    // (D3D11 IB pointer, byte offset) the engine binds to draw this shape.
+    // Carried snapshot -> parsed -> ExtractedMesh -> DrawableInstance.
+    uint64_t engineIbPtr    = 0;
+    uint32_t engineIbOffset = 0;
 };
 
 // Forward declarations for F4SE types used in shared function signatures
@@ -225,12 +288,23 @@ namespace BsExtraction {
     // Outputs are left unchanged (default 0) when player is unavailable.
     void GetPlayerPosition(float& outX, float& outY, float& outZ);
 
+    // Returns PlayerCharacter::firstPersonSkeleton (+0xB78, STATIC_ASSERT-
+    // anchored by playerEquipData/tints asserts in F4SE GameReferences.h),
+    // or 0 when the player singleton is absent. The root NiNode of the
+    // 1st-person scene graph (arms / weapon / Pip-Boy).
+    uintptr_t GetPlayerFirstPersonRootPtr();
+
     // Lightweight check: player exists, parentCell loaded, cell has objects,
     // and player's 3D root node is present.  Cheap enough to call every frame.
     bool IsPlayerCellReady();
 
     // Returns all cells currently loaded by the engine (from DataHandler::cellList).
     std::vector<CellInfo> GetLoadedCells();
+
+    // Walk the four TESObjectLAND quadrant nodes for one loaded cell and
+    // register their BSTriShape leaves with semantic capture. Game thread
+    // only; returns the number of live terrain leaves observed.
+    uint32_t ObserveCellTerrain(uintptr_t cellPtr);
 
     // Extract all placed LIGH-reference lights from the given cell.
     // Game thread only (raw reads of the cell's object list).
@@ -243,6 +317,12 @@ namespace BsExtraction {
     // ExtractMaterialTexture's decode pipeline). Queued jobs are dropped.
     // Call once at plugin shutdown; safe to call when no worker ever started.
     void StopTextureConversionWorkers();
+
+    // Age-sweep completed async decodes nobody consumed (drawable evicted
+    // mid-decode, resolution fold changed the hash). Called from the Tick
+    // sweep cadence: enqueue-time sweeping alone leaves orphans pinned
+    // (~22 MiB each, outside every budget) once a streaming burst ends.
+    void SweepTextureQueues();
 
     // Diagnostic (2026-07-06 black-merge investigation): content statistics
     // of a cached extracted texture. Returns false on cache miss. meanRGBA is
@@ -265,8 +345,56 @@ namespace BsExtraction {
     bool ParseShapeGeometry(BSTriShape* shape, ParsedGeometry& out, bool logRejections = true,
                             bool applyVertexColors = true, bool parseSkinning = false);
 
+    // ---- Async mesh parse (2026-07-21) ----
+    // Off-threads the per-vertex decode of ParseShapeGeometry: the first
+    // call snapshots the engine-side VB/IB bytes on the GAME thread (bounded
+    // memcpy under the resolver's SEH frame) and enqueues the decode on the
+    // mesh worker pool; later calls rendezvous the finished ParsedGeometry
+    // by `key` (the drawable's PassKey). kPending maps onto the resolver's
+    // kPendingDefer fast-poll exactly like an in-flight texture decode.
+    // kFailed covers both snapshot-gate failures (same set of bails as the
+    // sync parse) and decode rejections (NaN positions, bad indices) --
+    // callers treat it exactly like ParseShapeGeometry returning false.
+    enum class MeshParseStatus { kReady, kPending, kFailed };
+    MeshParseStatus ParseShapeGeometryAsync(BSTriShape* shape, uint64_t key,
+                                            ParsedGeometry& out,
+                                            bool logRejections = true,
+                                            bool applyVertexColors = true,
+                                            bool parseSkinning = false);
+
+    // Generic mesh worker pool (shared by the async parse above and the
+    // merge-chunk bake in lighting_static). Jobs must carry copies/moves of
+    // everything they touch -- NO engine pointers, no game-thread caches.
+    // EnqueueMeshWork returns false when the queue is saturated or the pool
+    // is stopped (caller keeps reporting pending and retries later);
+    // MeshWorkQueueSaturated lets callers skip building an expensive job
+    // when it would only be dropped. StopMeshWorkers joins at shutdown.
+    bool EnqueueMeshWork(std::function<void()> job);
+    bool MeshWorkQueueSaturated();
+    void StopMeshWorkers();
+
+    // Drop completed-but-unconsumed async parses and bump the parse
+    // generation so in-flight jobs from the outgoing world can't be
+    // consumed after a world swap (PassKeys are pointer-derived and the
+    // destination world recycles those addresses). Called from
+    // ClearDrawableMap on PreLoadGame.
+    void ResetMeshParseQueues();
+
     // Get the BSLightingShaderMaterialBase from a shape, or nullptr
     BSLightingShaderMaterialBase* GetLightingMaterial(BSTriShape* shape);
+
+    // SEH-guarded snapshot of a live BSDynamicTriShape dynamicVertices
+    // buffer (+0x170 size, +0x180 pointer). Returns raw bytes plus the live
+    // vertex count, or false when the pointer chain is stale/unreadable.
+    bool SnapshotDynamicVertices(void* geometry, std::vector<uint8_t>& outRaw,
+                                 uint32_t& outNumVertices);
+
+    // Decode a SnapshotDynamicVertices buffer into model-space float3
+    // positions. Elements <= 12 bytes decode as the byte-verified half4
+    // facegen layout; 16-byte elements decode as float3 defensively.
+    bool DecodeDynamicPositions(const std::vector<uint8_t>& raw,
+                                uint32_t numVertices,
+                                std::vector<float>& outXyz);
 
     // Current resident WIDTH (px) of a lighting material's diffuse D3D
     // texture, SEH-guarded (0 on null/fault/non-Texture2D). FO4 streams
@@ -345,16 +473,42 @@ namespace BsExtraction {
     //
     // supplyPixels (2026-07-09): false = "probe" mode -- fill hashes, start
     // any not-yet-started readback/decode, consume finished decodes into the
-    // internal cache, but NEVER copy pixel buffers into newTextures. True =
+    // internal cache, but NEVER add pixel buffers to newTextures. True =
     // full behavior (pixels re-supplied whenever the Remix-side handle is
     // missing). The resolver probes all slots first and only runs a
-    // supplying pass on the attempt that actually submits, so each
-    // texture's pixels are copied exactly once instead of on every retry
-    // (~22MB per slot per retry while a sibling slot was still decoding --
-    // the 2026-07-09 "slower pop-in" report).
+    // supplying pass on the attempt that actually submits. Supplied entries
+    // are shared_ptr views of the cache's chains (see TextureSupply) --
+    // supplying costs a refcount, not a ~22MB memcpy.
+    // ---- Live render-target textures (2026-07-18 Pip-Boy screen) ----
+    // ExtractMaterialTexture detects source resources with
+    // D3D11_BIND_RENDER_TARGET (the engine composites UI/Scaleform content
+    // into them at runtime -- Pip-Boy screen, scope displays) and folds a
+    // global GENERATION counter into their hash, so bumping the generation
+    // makes the next extraction a cache miss that re-captures the live
+    // pixels. RT-backed textures bypass the disk cache and evict their
+    // previous generation from the CPU cache. Game thread only.
+    void BumpLiveTextureGeneration();
+    // Sticky per-resolve flag: set whenever any ExtractMaterialTexture call
+    // since the last Reset detected an RT-backed source. The resolver
+    // resets before its extraction passes and checks after, tagging the
+    // drawable for the Tick's shadow-refresh poll.
+    void ResetLiveRTFlag();
+    bool LastExtractionSawLiveRT();
+    // Overlay-compositor exclusion: true if this ID3D11Texture2D pointer was
+    // ever seen as an RT-backed MATERIAL source (Pip-Boy screen, terminals).
+    // Such Scaleform targets present on their mesh, so the screen-overlay
+    // composite must skip them or the UI appears full-screen over the world
+    // as well. Identity compare only -- callers pass unowned pointers.
+    // Render/game thread only, like the rest of the live-RT state.
+    bool IsLiveRTScreenSource(void* tex2d);
+    // Dropped on load resets (engine recreates its RTs; a recycled pointer
+    // must not exclude a legit full-screen layer). Re-learns on the next
+    // extraction of each screen material.
+    void ClearLiveRTScreenSources();
+
     uint64_t ExtractMaterialTexture(NiTexture* tex, const char* slotName,
                                     ID3D11Device* device,
-                                    std::vector<ExtractedTexture>& newTextures,
+                                    TextureSupply& newTextures,
                                     TexturePostProcess postProcess = TexturePostProcess::None,
                                     uint8_t minRoughness = 0,
                                     uint8_t albedoLumFloor = 0,
@@ -368,7 +522,7 @@ namespace BsExtraction {
     // outPending / supplyPixels forward to the glow-map slot's
     // ExtractMaterialTexture call (see above).
     void ExtractEmissiveData(BSTriShape* shape, BSLightingShaderMaterialBase* lightingMat,
-                             ID3D11Device* device, std::vector<ExtractedTexture>& newTextures,
+                             ID3D11Device* device, TextureSupply& newTextures,
                              uint64_t& outTexHash, float& outR, float& outG, float& outB, float& outIntensity,
                              bool* outPending = nullptr, bool supplyPixels = true);
 

@@ -5,6 +5,14 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# Tracy profiler instrumentation (2026-07-18, BetaRT port). OFF by default:
+# the shipped DLL carries zero instrumentation cost. Enable for perf hunts:
+#   cmake -B build -DFO4REMIX_ENABLE_TRACY=ON
+# then connect the Tracy profiler to port 8086 (BetaRT uses 8087; distinct
+# so both can profile side by side).
+option(FO4REMIX_ENABLE_TRACY "Enable Tracy profiling zones" OFF)
+set(FO4REMIX_TRACY_PORT "8086" CACHE STRING "Tracy data port")
+
 # F4SE SDK paths
 set(F4SE_SDK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../f4se-0.7.7")
 
@@ -17,26 +25,61 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
+# Fallout 4 DX10 BA2 texture chunks use zlib compression. The authored
+# texture path reads those chunks directly instead of asking the game's
+# streamer to make every high-resolution mip resident in D3D memory.
+set(ZLIB_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(SKIP_INSTALL_ALL ON CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    zlib
+    GIT_REPOSITORY https://github.com/madler/zlib.git
+    GIT_TAG        v1.3.1
+)
+FetchContent_MakeAvailable(zlib)
+
 # Copy remix_c.h from a dxvk-remix source. Prefer the in-source RTX Remix Plus
 # checkout (dxvk-remix/) over the legacy sibling (../dxvk-remix-gmod/). Always
 # refresh the snapshot at configure time so an upstream ABI change picked up
 # via 'git pull' is reflected on the next build without manual cache deletion.
 set(REMIX_HEADER_DST "${CMAKE_CURRENT_SOURCE_DIR}/extern/remix/remix_c.h")
 set(REMIX_HEADER_SRC "")
-foreach(REMIX_CANDIDATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/dxvk-remix/public/include/remix/remix_c.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix/public/include/remix/remix_c.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../dxvk-remix/public/include/remix/remix_c.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../../../dxvk-remix/public/include/remix/remix_c.h"
-        "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix-gmod/public/include/remix/remix_c.h")
-    if(EXISTS "${REMIX_CANDIDATE}")
-        set(REMIX_HEADER_SRC "${REMIX_CANDIDATE}")
-        break()
+set(FO4REMIX_REMIX_HEADER "" CACHE FILEPATH
+    "Explicit remix_c.h from the matching dxvk-remix runtime checkout")
+if(FO4REMIX_REMIX_HEADER)
+    if(NOT EXISTS "${FO4REMIX_REMIX_HEADER}")
+        message(FATAL_ERROR
+            "FO4REMIX_REMIX_HEADER does not exist: ${FO4REMIX_REMIX_HEADER}")
     endif()
-endforeach()
+    set(REMIX_HEADER_SRC "${FO4REMIX_REMIX_HEADER}")
+else()
+    foreach(REMIX_CANDIDATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/dxvk-remix/public/include/remix/remix_c.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix/public/include/remix/remix_c.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../dxvk-remix/public/include/remix/remix_c.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../dxvk-remix/public/include/remix/remix_c.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../dxvk-remix-gmod/public/include/remix/remix_c.h")
+        if(EXISTS "${REMIX_CANDIDATE}")
+            set(REMIX_HEADER_SRC "${REMIX_CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+endif()
 if(REMIX_HEADER_SRC)
-    file(COPY "${REMIX_HEADER_SRC}" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/extern/remix/")
-    message(STATUS "Refreshed remix_c.h from ${REMIX_HEADER_SRC}")
+    file(READ "${REMIX_HEADER_SRC}" REMIX_HEADER_CONTENT)
+    string(FIND "${REMIX_HEADER_CONTENT}"
+        "REMIXAPI_INSTANCE_CATEGORY_BIT_VIEW_MODEL" REMIX_VIEW_MODEL_CATEGORY_POS)
+    string(FIND "${REMIX_HEADER_CONTENT}"
+        "REMIXAPI_STRUCT_TYPE_MESH_INFO_REFRESH_GEOMETRY_EXT"
+        REMIX_REFRESH_GEOMETRY_POS)
+    if(NOT REMIX_VIEW_MODEL_CATEGORY_POS EQUAL -1 AND
+       NOT REMIX_REFRESH_GEOMETRY_POS EQUAL -1)
+        file(COPY "${REMIX_HEADER_SRC}" DESTINATION "${CMAKE_CURRENT_SOURCE_DIR}/extern/remix/")
+        message(STATUS "Refreshed remix_c.h from ${REMIX_HEADER_SRC}")
+    else()
+        message(WARNING
+            "remix_c.h at ${REMIX_HEADER_SRC} lacks required Remix Plus extensions; "
+            "using the cached Remix Plus snapshot at ${REMIX_HEADER_DST}")
+    endif()
 else()
     message(WARNING "remix_c.h source not found; using cached snapshot at ${REMIX_HEADER_DST}")
 endif()
@@ -45,8 +88,10 @@ endif()
 # We use our own compatibility header (f4se_compat.h) instead of xse::common
 add_library(f4se_minimal STATIC
     "${F4SE_SDK_DIR}/f4se_common/Relocation.cpp"
+    "${F4SE_SDK_DIR}/f4se/GameAPI.cpp"
     "${F4SE_SDK_DIR}/f4se/GameCamera.cpp"
     "${F4SE_SDK_DIR}/f4se/GameForms.cpp"
+    "${F4SE_SDK_DIR}/f4se/GameStreams.cpp"
 )
 target_include_directories(f4se_minimal PUBLIC
     "${F4SE_SDK_DIR}"
@@ -63,6 +108,8 @@ add_library(FO4RemixPlugin SHARED
     src/main.cpp
     src/config.h
     src/config.cpp
+    src/crash_diag.h
+    src/crash_diag.cpp
     src/present_hook.h
     src/present_hook.cpp
     src/remix_api.h
@@ -73,8 +120,14 @@ add_library(FO4RemixPlugin SHARED
     src/camera.cpp
     src/bs_extraction.h
     src/bs_extraction.cpp
+    src/ba2_texture_source.h
+    src/ba2_texture_source.cpp
     src/draw_capture.h
     src/draw_capture.cpp
+    src/hzb_occlusion.h
+    src/hzb_occlusion.cpp
+    src/raster_suppress.h
+    src/raster_suppress.cpp
     src/fo4_diagnostics.h
     src/fo4_diagnostics.cpp
     src/startup_diag.h
@@ -89,6 +142,8 @@ add_library(FO4RemixPlugin SHARED
     src/resolvers/water.cpp
     src/weather_bridge.h
     src/weather_bridge.cpp
+    src/window_manager.h
+    src/window_manager.cpp
     src/f4se_compat.h
 )
 
@@ -101,6 +156,7 @@ target_include_directories(FO4RemixPlugin PRIVATE
 target_link_libraries(FO4RemixPlugin PRIVATE
     f4se_minimal
     minhook
+    zlibstatic
     d3d9
     d3d11
     dxgi
@@ -112,6 +168,20 @@ target_link_libraries(FO4RemixPlugin PRIVATE
 target_compile_definitions(FO4RemixPlugin PRIVATE
     RUNTIME_VERSION=RUNTIME_VERSION_1_11_191
 )
+
+if(FO4REMIX_ENABLE_TRACY)
+    # Separate lib: TracyClient.cpp includes winsock2, which conflicts with
+    # the plugin target's force-included f4se_compat.h (Windows.h first).
+    add_library(tracy_client STATIC extern/tracy/public/TracyClient.cpp)
+    target_include_directories(tracy_client PUBLIC
+        "${CMAKE_CURRENT_SOURCE_DIR}/extern/tracy/public")
+    target_compile_definitions(tracy_client PUBLIC
+        TRACY_ENABLE
+        TRACY_PORT=${FO4REMIX_TRACY_PORT}
+    )
+    target_link_libraries(FO4RemixPlugin PRIVATE tracy_client)
+    target_compile_definitions(FO4RemixPlugin PRIVATE FO4REMIX_ENABLE_TRACY)
+endif()
 
 # Force-include compatibility header
 target_compile_options(FO4RemixPlugin PRIVATE /FI"f4se_compat.h")
@@ -125,7 +195,14 @@ target_link_options(FO4RemixPlugin PRIVATE
     "$<$<CONFIG:Release>:/DEBUG>"
     "$<$<CONFIG:Release>:/OPT:REF>"
     "$<$<CONFIG:Release>:/OPT:ICF>"
+    # Linker map: WER fault offsets (module+0xNNNNN in Event Viewer) resolve
+    # to functions without debugger tooling on the box.
+    "$<$<CONFIG:Release>:/MAP>"
 )
+
+# External exit-code watchdog (see src/watchdog_main.cpp + crash_diag.cpp).
+# Installed next to the plugin DLL; spawned at plugin load with the game PID.
+add_executable(FO4RemixWatchdog WIN32 src/watchdog_main.cpp)
 
 # Output name without lib prefix
 set_target_properties(FO4RemixPlugin PROPERTIES

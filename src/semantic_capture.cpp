@@ -5,6 +5,7 @@
 #include "fo4_diagnostics.h"
 #include "resolvers/lighting_static.h"
 #include "resolvers/water.h"
+#include "present_hook.h"     // GetVramBudgetSnapshot (pressure force-eviction)
 #include "remix_renderer.h"
 #include "skinned_meshes.h"
 
@@ -12,16 +13,19 @@
 #include <windows.h>
 
 #include "f4se/PluginAPI.h"  // _MESSAGE
+#include "f4se/BSGeometry.h" // BSTriShape (terrain observation)
 #include "f4se/NiTypes.h"    // NiTransform, NiMatrix33, NiPoint3
 #include "f4se/NiObjects.h"  // NiAVObject (skinned-visibility name read)
 #include "MinHook.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -192,12 +196,35 @@ std::unordered_set<PassKey> g_lodChunkKeys;
 // SnapshotSkinnedCulled feeds OnFrame's hidden-geometry skip.
 std::unordered_set<PassKey> g_skinnedKeys;
 
+// Keys of submitted VIEWMODEL drawables (DrawableState::isViewModel); same
+// lifecycle/locking. SnapshotViewModelStale walks it for OnFrame's
+// hidden-1P-object skip (lowered weapon while the Pip-Boy is up, etc.).
+std::unordered_set<PassKey> g_viewModelKeys;
+
 // SEH-guarded qword read for the live NiAVObject flags refresh: geometry
 // pointers can go stale between the engine freeing an actor and the TTL
 // sweep evicting the entry. POD-only locals (SEH + C++ unwinding conflict).
 static bool PeekQwordGuarded(uintptr_t src, uint64_t* out) {
     __try {
         *out = *reinterpret_cast<const volatile uint64_t*>(src);
+        return true;
+    } __except (1) {
+        return false;
+    }
+}
+
+// SEH-guarded copy of a NiAVObject's m_name for the skinned-visibility
+// diagnostic: g_skinnedKeys entries survive up to kTTLFrames after the
+// actor's geometry is freed (despawn without a load screen), and the name
+// walk dereferences both the object and its StringCache entry. POD-only
+// locals (SEH + C++ unwinding conflict).
+static bool PeekNameGuarded(void* geometry, char* out, size_t cap) {
+    __try {
+        const char* nm = static_cast<NiAVObject*>(geometry)->m_name.c_str();
+        if (!nm) return false;
+        size_t i = 0;
+        for (; i + 1 < cap && nm[i]; ++i) out[i] = nm[i];
+        out[i] = 0;
         return true;
     } __except (1) {
         return false;
@@ -222,6 +249,11 @@ constexpr uint64_t    kLoadingGateFailsafeFrames = 3600;  // ~60s: clear a stuck
 // texture-heavy drawable's pop-in.
 constexpr uint64_t kMaxRetryDelayFrames   = 512;
 constexpr uint64_t kCrashRetryDelayFrames = 120;
+// Crash-catch count at which a key stops being retried until the next
+// load-screen exit (see the blacklist notes in attemptResolve). 5 catches
+// at the 120-frame backoff means >=10s of persistent faulting -- well past
+// any transient mid-load race.
+constexpr uint32_t kResolverCrashBlacklistCount = 5;
 
 static uint64_t RetryDelayFrames(uint32_t attempts) {
     if (attempts <= 8) return 1;
@@ -230,16 +262,473 @@ static uint64_t RetryDelayFrames(uint32_t attempts) {
     return delay < kMaxRetryDelayFrames ? delay : kMaxRetryDelayFrames;
 }
 
-// SEH wrapper for the resolver call. C++ destructors cannot live in a
-// __try scope (MSVC C2712), so we isolate the call in a non-throwing helper
-// with C-style locals only. Returns 0 on normal completion (resolver
-// returned, success or not), 1 if SEH was caught (access violation etc).
-// On SEH catch, *outExceptionCode receives GetExceptionCode().
-static int CallResolverGuarded(SemanticCapture::DrawableState* state,
-                               uint64_t key,
-                               ID3D11Device* device,
-                               unsigned long* outExceptionCode) {
+// -------- [ViewModel] first-person pipeline diagnostic (2026-07-18) --------
+// User report: 1st-person arms/weapon are COMPLETELY INVISIBLE in the Remix
+// window, yet the log proves the capture pipeline sees *1stPerson shapes at
+// least once (skin registrations at load). This walks the player's
+// 1st-person scene graph (PlayerCharacter::firstPersonSkeleton) once every
+// ~2s on the game thread and cross-references every BSTriShape leaf against
+// g_drawableMap, answering per shape: does the hook still fire for it
+// (lastSeen age), did it resolve+submit, is it engine-app-culled (leaf flag
+// or anywhere on the ancestor path), does it have live bones queued, and
+// where is it in Beth world space relative to the player. One summary line
+// per pass; leaf detail dumped on the first populated pass, then whenever
+// the leaf count changes (weapon draw/holster) and every 10th pass.
+
+// SEH-guarded bulk read (engine pointers can be mid-teardown). POD-only.
+static bool PeekBytesGuarded(uintptr_t src, void* dst, size_t n) {
     __try {
+        memcpy(dst, reinterpret_cast<const void*>(src), n);
+        return true;
+    } __except (1) {
+        return false;
+    }
+}
+
+struct VmLeaf {
+    void*    geom       = nullptr;
+    uint64_t flags      = 0;      // NiAVObject flags qword; bit0 = app-culled
+    float    pos[3]     = {};     // m_worldTransform.pos (Beth coords)
+    bool     culledPath = false;  // any ANCESTOR carried the app-culled bit
+    bool     hasSkin    = false;  // +0x140 skinInstance non-null
+    char     cls[48]    = {};
+    char     name[64]   = {};
+};
+
+// Breadth-first walk of the 1P subtree. Ordinary C++ (vectors fine) -- every
+// engine deref goes through the guarded peeks above, and class/name reads go
+// through the already-guarded RTTI/name helpers.
+static void WalkFpSubtree(uintptr_t root, std::vector<VmLeaf>& outLeaves,
+                          uint32_t& outNodes) {
+    struct QEntry { uintptr_t obj; bool culledPath; };
+    constexpr size_t   kMaxNodes    = 1024;
+    constexpr uint32_t kMaxChildren = 4096;
+    std::vector<QEntry> queue;
+    queue.reserve(64);
+    queue.push_back({root, false});
+    size_t head = 0;
+    outNodes = 0;
+    while (head < queue.size() && outNodes < kMaxNodes) {
+        const QEntry qe = queue[head++];
+        if (!qe.obj) continue;
+        ++outNodes;
+
+        uint64_t flags = 0;
+        PeekQwordGuarded(qe.obj + 0x108, &flags);
+        const bool culledHere = (flags & 1ull) != 0;
+
+        char cls[48] = {};
+        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(qe.obj),
+                                          cls, sizeof(cls));
+
+        if (std::strstr(cls, "TriShape")) {
+            VmLeaf leaf;
+            leaf.geom       = reinterpret_cast<void*>(qe.obj);
+            leaf.flags      = flags;
+            leaf.culledPath = qe.culledPath;
+            std::memcpy(leaf.cls, cls, sizeof(leaf.cls));
+            // NiTransform at +0x70: NiMatrix43 (0x30) then NiPoint3 pos.
+            PeekBytesGuarded(qe.obj + 0x70 + 0x30, leaf.pos, sizeof(leaf.pos));
+            uintptr_t skin = 0;
+            PeekBytesGuarded(qe.obj + 0x140, &skin, sizeof(skin));
+            leaf.hasSkin = skin != 0;
+            PeekNameGuarded(leaf.geom, leaf.name, sizeof(leaf.name));
+            outLeaves.push_back(leaf);
+            continue;  // BSTriShape has no children worth walking
+        }
+
+        // Recurse into anything node-like (NiNode/BSFadeNode/
+        // BSFlattenedBoneTree/...). NiNode::m_children NiTArray at +0x120:
+        // m_data +0x128, m_emptyRunStart +0x132 (sparse -- skip nulls).
+        if (std::strstr(cls, "Node") || std::strstr(cls, "Tree")) {
+            uintptr_t data = 0;
+            uint16_t emptyRunStart = 0;
+            if (PeekBytesGuarded(qe.obj + 0x128, &data, sizeof(data)) && data &&
+                PeekBytesGuarded(qe.obj + 0x132, &emptyRunStart,
+                                 sizeof(emptyRunStart)) &&
+                emptyRunStart <= kMaxChildren) {
+                for (uint16_t i = 0; i < emptyRunStart; ++i) {
+                    uintptr_t child = 0;
+                    if (PeekBytesGuarded(data + (uintptr_t)i * 8, &child,
+                                         sizeof(child)) && child) {
+                        queue.push_back({child, qe.culledPath || culledHere});
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- [ViewModel] anchor tracking (2026-07-18) ----
+// Diag pass 1-40 (this session's log) proved the full 1P pipeline works --
+// capture fires every frame, resolves submit, bones queue -- but the whole
+// graph lives in a synthetic origin-local space (body z~3, Pip-Boy z~89,
+// weapon z~100 while the player stood at (-79683,90060,7827)), so the arms
+// rendered at the map origin. The 1P skeleton's "Camera" bone marks the eye
+// position in that space; Tick tracks it here and OnFrame adds
+// delta = realCameraPos - camBonePos to every viewmodel translation.
+// The mapping is a PURE TRANSLATION: the synthetic space is world-axis-
+// aligned (the weapon sits along the real camera yaw in synthetic coords;
+// aim/pitch is baked into the bone poses by the engine's animation).
+std::mutex g_vmAnchorMx;
+struct {
+    bool active = false;
+    SemanticCapture::ViewModelAnchor xf = {};
+} g_vmAnchor;
+
+// ---- Pip-Boy screen feed state (2026-07-18 v2) ----
+// See semantic_capture.h. Game-render-thread only (hkPresent supplies, Tick
+// schedules, resolver consumes -- one thread); g_pipboyScreenKey is also
+// read by feedWanted alongside the drawable map. Definitions of the API
+// functions live near ClearDrawableMap below.
+uint64_t g_pipboyScreenKey = 0;   // PassKey of the tagged Screen:0
+uint64_t g_pipboyFeedSeq   = 0;
+std::shared_ptr<const ExtractedTexture> g_pipboyFeedTex;
+
+// POD mirror of NiTransform for the guarded bulk read (rot NiMatrix43
+// [3][4], pos, scale) -- same layout skinned_meshes.cpp anchors on.
+struct VmPodXf {
+    float rot[3][4];
+    float pos[3];
+    float scale;
+};
+static_assert(sizeof(VmPodXf) == 0x40, "must mirror NiTransform layout");
+static uintptr_t g_vmCachedRoot      = 0;  // fpRoot the cached bone belongs to
+static uintptr_t g_vmCamBone         = 0;  // cached camera bone (NiNode*)
+static uint32_t  g_vmRevalidateTick  = 0;
+static bool      g_vmNoCamBoneLogged = false;
+
+// BFS the 1P subtree for the camera bone: exact name "Camera" preferred,
+// first name containing "camera" (CI) as fallback. Bounded like the diag
+// walk; every deref guarded.
+static uintptr_t FindFpCameraBone(uintptr_t root) {
+    constexpr size_t   kMaxNodes    = 1024;
+    constexpr uint32_t kMaxChildren = 4096;
+    std::vector<uintptr_t> queue;
+    queue.reserve(64);
+    queue.push_back(root);
+    size_t head = 0, visited = 0;
+    uintptr_t partial = 0;
+    while (head < queue.size() && visited < kMaxNodes) {
+        const uintptr_t obj = queue[head++];
+        if (!obj) continue;
+        ++visited;
+
+        char name[64] = {};
+        if (PeekNameGuarded(reinterpret_cast<void*>(obj), name, sizeof(name)) &&
+            name[0]) {
+            if (_stricmp(name, "Camera") == 0) return obj;
+            if (!partial && NameHasCI(name, "camera")) partial = obj;
+        }
+
+        char cls[48] = {};
+        SemanticCapture::GetLeafClassName(reinterpret_cast<void*>(obj),
+                                          cls, sizeof(cls));
+        if (std::strstr(cls, "Node") || std::strstr(cls, "Tree")) {
+            uintptr_t data = 0;
+            uint16_t emptyRunStart = 0;
+            if (PeekBytesGuarded(obj + 0x128, &data, sizeof(data)) && data &&
+                PeekBytesGuarded(obj + 0x132, &emptyRunStart,
+                                 sizeof(emptyRunStart)) &&
+                emptyRunStart <= kMaxChildren) {
+                for (uint16_t i = 0; i < emptyRunStart; ++i) {
+                    uintptr_t child = 0;
+                    if (PeekBytesGuarded(data + (uintptr_t)i * 8, &child,
+                                         sizeof(child)) && child) {
+                        queue.push_back(child);
+                    }
+                }
+            }
+        }
+    }
+    return partial;
+}
+
+// Once per Tick (game thread): refresh the anchor snapshot OnFrame reads.
+static void UpdateViewModelAnchor() {
+    const uintptr_t fpRoot = BsExtraction::GetPlayerFirstPersonRootPtr();
+    bool active = false;
+    SemanticCapture::ViewModelAnchor anchor = {};
+    if (fpRoot) {
+        uint64_t rootFlags = 0;
+        const bool flagsOk = PeekQwordGuarded(fpRoot + 0x108, &rootFlags);
+        // Root app-culled = the engine is not showing the 1P graph
+        // (3rd person, furniture, scenes) -> viewmodel hidden.
+        if (flagsOk && (rootFlags & 1ull) == 0) {
+            bool needSearch = g_vmCamBone == 0 || g_vmCachedRoot != fpRoot;
+            // Periodic revalidation: the cached pointer could be recycled
+            // into a different object without the root changing.
+            if (!needSearch && ++g_vmRevalidateTick >= 300) {
+                g_vmRevalidateTick = 0;
+                char nm[64] = {};
+                if (!PeekNameGuarded(reinterpret_cast<void*>(g_vmCamBone),
+                                     nm, sizeof(nm)) ||
+                    !NameHasCI(nm, "camera")) {
+                    needSearch = true;
+                }
+            }
+            if (needSearch) {
+                g_vmCamBone = FindFpCameraBone(fpRoot);
+                g_vmCachedRoot = fpRoot;
+                if (g_vmCamBone) {
+                    char nm[64] = {};
+                    PeekNameGuarded(reinterpret_cast<void*>(g_vmCamBone),
+                                    nm, sizeof(nm));
+                    _MESSAGE("FO4RemixPlugin: [ViewModel] camera bone \"%s\" "
+                             "at %p under fpRoot=%p",
+                             nm, (void*)g_vmCamBone, (void*)fpRoot);
+                } else if (!g_vmNoCamBoneLogged) {
+                    g_vmNoCamBoneLogged = true;
+                    _MESSAGE("FO4RemixPlugin: [ViewModel] no camera bone found "
+                             "in the 1P skeleton -- viewmodel stays hidden "
+                             "(modded skeleton without a Camera node?)");
+                }
+            }
+            VmPodXf bone = {};
+            if (g_vmCamBone &&
+                PeekBytesGuarded(g_vmCamBone + 0x70, &bone, sizeof(bone))) {
+                // Plausibility gate: a recycled pointer usually fails long
+                // before a garbage matrix reaches the composed transform.
+                bool ok = bone.scale > 1.0e-4f && bone.scale < 1.0e3f;
+                for (int r = 0; ok && r < 3; ++r) {
+                    for (int c = 0; c < 3; ++c) {
+                        if (!(bone.rot[r][c] > -4.0f && bone.rot[r][c] < 4.0f)) {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if (!(bone.pos[r] > -1.0e7f && bone.pos[r] < 1.0e7f)) ok = false;
+                }
+                if (ok) {
+                    for (int r = 0; r < 3; ++r) {
+                        for (int c = 0; c < 3; ++c) {
+                            anchor.rot[r][c] = bone.rot[r][c];
+                        }
+                        anchor.pos[r] = bone.pos[r];
+                    }
+                    anchor.scale = bone.scale;
+                    active = true;
+                } else {
+                    g_vmCamBone = 0;  // recycled object -> re-search next tick
+                }
+            } else {
+                g_vmCamBone = 0;  // stale pointer -> re-search next tick
+            }
+        }
+    }
+    std::lock_guard<std::mutex> lk(g_vmAnchorMx);
+    g_vmAnchor.active = active;
+    g_vmAnchor.xf = anchor;
+}
+
+// [ViewModel] rigid-part pose freshness (2026-07-18 lag report): rigid 1P
+// transforms used to update only at GetRenderPasses fire time -- that is
+// state from the frame being RENDERED, while the camera snapshot hkPresent
+// takes reads the LIVE cameraNode, which the engine's overlapped main-
+// thread update may already have advanced to the next frame. Net effect:
+// the weapon/Pip-Boy (rigid) trailed the camera by up to a frame while the
+// arms (bones read at Tick) did not. Re-read every rigid viewmodel
+// transform HERE, at the same moment the camera and anchor reads happen,
+// so all camera-glued state is sampled together. ~40 guarded reads/tick.
+static void RefreshViewModelRigidPoses() {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    for (const PassKey key : g_viewModelKeys) {
+        auto it = g_drawableMap.find(key);
+        if (it == g_drawableMap.end()) continue;
+        SemanticCapture::DrawableState& st = it->second;
+        if (st.isSkinnedActor || !st.geometry) continue;
+        VmPodXf xf = {};
+        if (!PeekBytesGuarded(reinterpret_cast<uintptr_t>(st.geometry) + 0x70,
+                              &xf, sizeof(xf))) {
+            continue;
+        }
+        float live[3][4];
+        SemanticCapture::BuildRemixTransform(
+            *reinterpret_cast<const NiTransform*>(&xf), live);
+        if (!st.liveTransformValid ||
+            std::memcmp(st.liveWorldTransform, live, sizeof(live)) != 0) {
+            std::memcpy(st.liveWorldTransform, live, sizeof(live));
+            st.liveTransformValid = true;
+            if (!st.poseDirty) {
+                st.poseDirty = true;
+                g_dirtyPoses.push_back(key);
+            }
+        }
+    }
+}
+
+static void ViewModelDiagTick(uint64_t currentFrame) {
+    constexpr uint32_t kPeriodTicks   = 120;  // ~2s
+    constexpr uint32_t kMaxPasses     = 90;
+    constexpr uint32_t kMaxDetailLines = 240;
+    static uint32_t s_sinceLast   = kPeriodTicks;  // first eligible tick logs
+    static uint32_t s_passes      = 0;
+    static uint32_t s_detailLines = 0;
+    static uint32_t s_lastLeafCount = UINT32_MAX;
+    static bool     s_noRootLogged  = false;
+
+    if (s_passes >= kMaxPasses) return;
+    if (++s_sinceLast < kPeriodTicks) return;
+    s_sinceLast = 0;
+
+    const uintptr_t fpRoot = BsExtraction::GetPlayerFirstPersonRootPtr();
+    if (!fpRoot) {
+        if (!s_noRootLogged) {
+            s_noRootLogged = true;
+            _MESSAGE("FO4RemixPlugin: [ViewModel] firstPersonSkeleton unavailable "
+                     "(main menu?) -- will keep polling silently");
+        }
+        return;
+    }
+    ++s_passes;
+
+    uint64_t rootFlags = 0;
+    PeekQwordGuarded(fpRoot + 0x108, &rootFlags);
+    float rootPos[3] = {};
+    PeekBytesGuarded(fpRoot + 0x70 + 0x30, rootPos, sizeof(rootPos));
+
+    static std::vector<VmLeaf> leaves;
+    leaves.clear();
+    uint32_t nodes = 0;
+    WalkFpSubtree(fpRoot, leaves, nodes);
+
+    // Cross-reference against the capture map by geometry pointer.
+    struct MapInfo {
+        uint64_t key = 0;
+        uint32_t fireCount = 0;
+        uint64_t lastSeenFrame = 0;
+        int      lastGate = 0;
+        bool     submitted = false;
+        bool     engineCulled = false;
+        bool     isSkinnedActor = false;
+        bool     isViewModel = false;
+    };
+    std::unordered_map<void*, MapInfo> geomToInfo;
+    {
+        std::lock_guard<std::mutex> lock(g_drawableMutex);
+        geomToInfo.reserve(g_drawableMap.size());
+        for (const auto& [key, st] : g_drawableMap) {
+            if (!st.geometry) continue;
+            MapInfo mi;
+            mi.key            = key;
+            mi.fireCount      = st.fireCount;
+            mi.lastSeenFrame  = st.lastSeenFrame;
+            mi.lastGate       = st.lastFailedResolverStep;
+            mi.submitted      = st.submittedToRemix;
+            mi.engineCulled   = st.engineCulled;
+            mi.isSkinnedActor = st.isSkinnedActor;
+            mi.isViewModel    = st.isViewModel;
+            geomToInfo[st.geometry] = mi;
+        }
+    }
+
+    uint32_t inMap = 0, fresh = 0, submitted = 0, culledLeaf = 0,
+             culledPath = 0, withBones = 0, tagged = 0;
+    for (const VmLeaf& leaf : leaves) {
+        if (leaf.flags & 1ull) ++culledLeaf;
+        if (leaf.culledPath) ++culledPath;
+        auto it = geomToInfo.find(leaf.geom);
+        if (it == geomToInfo.end()) continue;
+        ++inMap;
+        const MapInfo& mi = it->second;
+        if (currentFrame - mi.lastSeenFrame <= 2) ++fresh;
+        if (mi.submitted) ++submitted;
+        if (mi.isViewModel) ++tagged;
+        if (SkinnedMeshes::HasEntry(mi.key)) ++withBones;
+    }
+
+    float playerPos[3] = {};
+    BsExtraction::GetPlayerPosition(playerPos[0], playerPos[1], playerPos[2]);
+
+    bool vmActive = false;
+    SemanticCapture::ViewModelAnchor vmXf = {};
+    {
+        std::lock_guard<std::mutex> lk(g_vmAnchorMx);
+        vmActive = g_vmAnchor.active;
+        vmXf = g_vmAnchor.xf;
+    }
+
+    _MESSAGE("FO4RemixPlugin: [ViewModel] pass=%u fpRoot=%p rootCulled=%d "
+             "rootPos=(%.0f,%.0f,%.0f) playerPos=(%.0f,%.0f,%.0f) nodes=%u "
+             "tris=%u inMap=%u fresh=%u submitted=%u tagged=%u bones=%u "
+             "culledLeaf=%u culledPath=%u vmActive=%d camBone=%p "
+             "camBonePos=(%.1f,%.1f,%.1f)",
+             s_passes, (void*)fpRoot, (int)(rootFlags & 1ull),
+             rootPos[0], rootPos[1], rootPos[2],
+             playerPos[0], playerPos[1], playerPos[2],
+             nodes, (uint32_t)leaves.size(), inMap, fresh, submitted, tagged,
+             withBones, culledLeaf, culledPath,
+             vmActive ? 1 : 0, (void*)g_vmCamBone,
+             vmXf.pos[0], vmXf.pos[1], vmXf.pos[2]);
+
+    // SYNCHRONIZED camera-bone vs cameraNode rotation dump (every 10th
+    // pass): same-frame samples so the constant convention twist between
+    // the two bases can be read directly off one line (async [Camera] lines
+    // made the 2026-07-18 twist derivation needlessly indirect).
+    if ((s_passes % 10) == 1) {
+        const CameraState camNow = Camera::Get();
+        _MESSAGE("FO4RemixPlugin: [ViewModel]   sync boneRot=[%.3f %.3f %.3f | "
+                 "%.3f %.3f %.3f | %.3f %.3f %.3f] s=%.3f "
+                 "camRawRot=[%.3f %.3f %.3f | %.3f %.3f %.3f | %.3f %.3f %.3f]",
+                 vmXf.rot[0][0], vmXf.rot[0][1], vmXf.rot[0][2],
+                 vmXf.rot[1][0], vmXf.rot[1][1], vmXf.rot[1][2],
+                 vmXf.rot[2][0], vmXf.rot[2][1], vmXf.rot[2][2],
+                 vmXf.scale,
+                 camNow.rawRot[0][0], camNow.rawRot[0][1], camNow.rawRot[0][2],
+                 camNow.rawRot[1][0], camNow.rawRot[1][1], camNow.rawRot[1][2],
+                 camNow.rawRot[2][0], camNow.rawRot[2][1], camNow.rawRot[2][2]);
+    }
+
+    const bool dumpDetail =
+        (uint32_t)leaves.size() != s_lastLeafCount || (s_passes % 10) == 1;
+    s_lastLeafCount = (uint32_t)leaves.size();
+    if (!dumpDetail) return;
+    for (const VmLeaf& leaf : leaves) {
+        if (s_detailLines >= kMaxDetailLines) break;
+        ++s_detailLines;
+        auto it = geomToInfo.find(leaf.geom);
+        if (it == geomToInfo.end()) {
+            _MESSAGE("FO4RemixPlugin: [ViewModel]   geom=%p \"%s\" cls=%s "
+                     "culled=%d path=%d skin=%d pos=(%.1f,%.1f,%.1f) "
+                     "NOT-IN-MAP",
+                     leaf.geom, leaf.name, leaf.cls,
+                     (int)(leaf.flags & 1ull), leaf.culledPath ? 1 : 0,
+                     leaf.hasSkin ? 1 : 0,
+                     leaf.pos[0], leaf.pos[1], leaf.pos[2]);
+            continue;
+        }
+        const MapInfo& mi = it->second;
+        _MESSAGE("FO4RemixPlugin: [ViewModel]   geom=%p \"%s\" cls=%s "
+                 "culled=%d path=%d skin=%d pos=(%.1f,%.1f,%.1f) "
+                 "MAP{vm=%d fires=%u age=%llu sub=%d gate=%s engCull=%d "
+                 "skinActor=%d bones=%d}",
+                 leaf.geom, leaf.name, leaf.cls,
+                 (int)(leaf.flags & 1ull), leaf.culledPath ? 1 : 0,
+                 leaf.hasSkin ? 1 : 0,
+                 leaf.pos[0], leaf.pos[1], leaf.pos[2],
+                 mi.isViewModel ? 1 : 0,
+                 mi.fireCount,
+                 (unsigned long long)(currentFrame - mi.lastSeenFrame),
+                 mi.submitted ? 1 : 0,
+                 Resolvers::Trace::StepName(mi.lastGate),
+                 mi.engineCulled ? 1 : 0,
+                 mi.isSkinnedActor ? 1 : 0,
+                 SkinnedMeshes::HasEntry(mi.key) ? 1 : 0);
+    }
+}
+
+// Resolver exception fence. A C++ exception is implemented as SEH on MSVC;
+// letting the outer __except catch 0xE06D7363 bypasses /EHsc unwinding and can
+// strand mutex lock_guards owned by the resolver. Catch C++ exceptions in an
+// ordinary C++ frame first, then use the tiny outer SEH frame only for true
+// access violations and similar faults.
+static constexpr unsigned long kMsvcCppExceptionCode = 0xE06D7363UL;
+
+static int CallResolverCxxGuarded(SemanticCapture::DrawableState* state,
+                                  uint64_t key,
+                                  ID3D11Device* device,
+                                  unsigned long* outExceptionCode) {
+    try {
         switch (state->resolverKind) {
             case SemanticCapture::ResolverKind::Lighting:
                 Resolvers::Lighting::TryResolveStatic(*state, key, device);
@@ -249,6 +738,33 @@ static int CallResolverGuarded(SemanticCapture::DrawableState* state,
                 break;
         }
         return 0;
+    } catch (const std::exception& e) {
+        static std::atomic<int> sCxxLogs{0};
+        const int n = sCxxLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            _MESSAGE("FO4RemixPlugin: [Resolver] C++ exception #%d key=0x%llX what=%s",
+                     n, (unsigned long long)key, e.what());
+        }
+        *outExceptionCode = kMsvcCppExceptionCode;
+        return 2;
+    } catch (...) {
+        static std::atomic<int> sCxxLogs{0};
+        const int n = sCxxLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            _MESSAGE("FO4RemixPlugin: [Resolver] unknown C++ exception #%d key=0x%llX",
+                     n, (unsigned long long)key);
+        }
+        *outExceptionCode = kMsvcCppExceptionCode;
+        return 2;
+    }
+}
+
+static int CallResolverGuarded(SemanticCapture::DrawableState* state,
+                               uint64_t key,
+                               ID3D11Device* device,
+                               unsigned long* outExceptionCode) {
+    __try {
+        return CallResolverCxxGuarded(state, key, device, outExceptionCode);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         *outExceptionCode = GetExceptionCode();
         return 1;
@@ -259,11 +775,31 @@ static int CallResolverGuarded(SemanticCapture::DrawableState* state,
 // std::lock_guard, so we cannot put __try inside it (C2712). Instead the
 // caller wraps the entire call. Returns 0 on normal completion, 1 if SEH
 // was caught with *outExceptionCode filled.
+static int CallReleaseDrawableCxxGuarded(uint64_t meshHash,
+                                         unsigned long* outExceptionCode) {
+    try {
+        RemixRenderer::ReleaseDrawable(meshHash);
+        return 0;
+    } catch (const std::exception& e) {
+        static std::atomic<int> sCxxLogs{0};
+        const int n = sCxxLogs.fetch_add(1, std::memory_order_relaxed);
+        if (n < 16) {
+            _MESSAGE("FO4RemixPlugin: [ReleaseDrawable] C++ exception #%d "
+                     "hash=0x%llX what=%s", n,
+                     (unsigned long long)meshHash, e.what());
+        }
+        *outExceptionCode = kMsvcCppExceptionCode;
+        return 2;
+    } catch (...) {
+        *outExceptionCode = kMsvcCppExceptionCode;
+        return 2;
+    }
+}
+
 static int CallReleaseDrawableGuarded(uint64_t meshHash,
                                       unsigned long* outExceptionCode) {
     __try {
-        RemixRenderer::ReleaseDrawable(meshHash);
-        return 0;
+        return CallReleaseDrawableCxxGuarded(meshHash, outExceptionCode);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         *outExceptionCode = GetExceptionCode();
         return 1;
@@ -396,6 +932,75 @@ void SemanticCapture::GetLeafClassName(void* obj, char* out, size_t outSize) {
     GetLeafClassNameGuarded(obj, g_moduleBase, out, outSize);
 }
 
+bool SemanticCapture::GetViewModelAnchor(ViewModelAnchor& out) {
+    std::lock_guard<std::mutex> lk(g_vmAnchorMx);
+    out = g_vmAnchor.xf;
+    return g_vmAnchor.active;
+}
+
+bool SemanticCapture::IsViewModelGeometry(void* geometry) {
+    if (!geometry) return false;
+    const uintptr_t fpRoot = BsExtraction::GetPlayerFirstPersonRootPtr();
+    if (!fpRoot) return false;
+    uintptr_t obj = reinterpret_cast<uintptr_t>(geometry);
+    for (int i = 0; i < 64 && obj; ++i) {
+        if (obj == fpRoot) return true;
+        uintptr_t parent = 0;
+        if (!PeekBytesGuarded(obj + 0x28, &parent, sizeof(parent))) return false;
+        obj = parent;
+    }
+    return false;
+}
+
+bool SemanticCapture::ObserveTerrainGeometry(void* geometry) {
+    if (!geometry) return false;
+
+    NiAVObject* obj = static_cast<NiAVObject*>(geometry);
+    BSTriShape* tri = obj->GetAsBSTriShape();
+    if (!tri || !tri->shaderProperty) return false;
+
+    void* property = tri->shaderProperty;
+    void* material = *reinterpret_cast<void**>(
+        reinterpret_cast<uintptr_t>(property) + 0x58);
+    if (!material) return false;
+
+    void* parent1 = tri->m_parent;
+    void* parent2 = parent1 ? static_cast<NiAVObject*>(parent1)->m_parent : nullptr;
+    const PassKey key = ComputePassKey(tri, property, material);
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    float liveXf[3][4] = {};
+    BuildRemixTransform(tri->m_worldTransform, liveXf);
+
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    auto& state = g_drawableMap[key];
+    if (state.firstSeenFrame == 0) {
+        state.firstSeenFrame = now;
+        state.geometry = tri;
+        state.property = property;
+        state.material = material;
+        state.initialFlags = tri->flags;
+        state.parent1 = parent1;
+        state.parent2 = parent2;
+        state.resolverKind = ResolverKind::Lighting;
+    }
+    // No isTerrain tag: the resolver keys every terrain-specific decision off
+    // the material type (kType_Landscape), which is authoritative and covers
+    // shapes that reach the resolver through the render-pass hook too.
+    state.lastSeenFrame = now;
+    state.lastFlags = tri->flags;
+    ++state.fireCount;
+    if (!state.liveTransformValid ||
+        std::memcmp(state.liveWorldTransform, liveXf, sizeof(liveXf)) != 0) {
+        std::memcpy(state.liveWorldTransform, liveXf, sizeof(liveXf));
+        state.liveTransformValid = true;
+        if (!state.poseDirty) {
+            state.poseDirty = true;
+            g_dirtyPoses.push_back(key);
+        }
+    }
+    return true;
+}
+
 namespace { // reopen anonymous namespace
 
 // Shared detour body. The per-target wrappers above pass their compile-time
@@ -470,7 +1075,7 @@ static void* DetourGetRenderPassesShared(void* self,
         capturedPosX < -kFarFromOriginThreshold ||
         capturedPosY >  kFarFromOriginThreshold ||
         capturedPosY < -kFarFromOriginThreshold;
-    if (geometry && g_moduleBase && farFromOrigin &&
+    if (g_config.diagEnabled && geometry && g_moduleBase && farFromOrigin &&
         g_parentChainLogs.load(std::memory_order_relaxed) < kParentChainLogCap) {
         const uint64_t logN = g_parentChainLogs.fetch_add(1, std::memory_order_relaxed);
         // Re-check after the increment: two threads can pass the pre-check
@@ -493,6 +1098,13 @@ static void* DetourGetRenderPassesShared(void* self,
             state.parent1 = p1;
             state.parent2 = p2;
             state.resolverKind = kind;  // tag once on first-seen
+            // First-person geometry lives in camera-local coordinates, so
+            // world-distance ranking would otherwise place it behind every
+            // world drawable. Tag it before the first resolve attempt; the
+            // resolver mirrors this into ExtractedMesh after submission.
+            state.isViewModel =
+                kind == SemanticCapture::ResolverKind::Lighting &&
+                SemanticCapture::IsViewModelGeometry(geometry);
         }
         state.lastSeenFrame      = now;
         state.lastFlags          = niFlags;
@@ -687,39 +1299,42 @@ bool SemanticCapture::Install() {
         return false;
     }
 
-    // Diagnostic hooks (best-effort; never abort the install path).
-    g_addrSetupGeo = reinterpret_cast<LPVOID>(
-        reinterpret_cast<uintptr_t>(hMod) + kSetupGeometryRVA);
-    if (MH_CreateHook(g_addrSetupGeo,
-                      reinterpret_cast<LPVOID>(&DetourSetupGeometry_Lighting),
-                      reinterpret_cast<LPVOID*>(&g_origSetupGeo)) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo create failed (RVA 0x%llX)",
-                 (unsigned long long)kSetupGeometryRVA);
-        g_addrSetupGeo = nullptr;
-    } else if (MH_EnableHook(g_addrSetupGeo) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo enable failed");
-        MH_RemoveHook(g_addrSetupGeo);
-        g_addrSetupGeo = nullptr;
-    } else {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] installed SetupGeo diag hook at RVA 0x%llX",
-                 (unsigned long long)kSetupGeometryRVA);
-    }
+    // Diagnostic hooks are both very hot engine paths. Do not pay their
+    // trampoline, atomics, guarded reads, or startup logging in normal runs.
+    if (g_config.diagEnabled) {
+        g_addrSetupGeo = reinterpret_cast<LPVOID>(
+            reinterpret_cast<uintptr_t>(hMod) + kSetupGeometryRVA);
+        if (MH_CreateHook(g_addrSetupGeo,
+                          reinterpret_cast<LPVOID>(&DetourSetupGeometry_Lighting),
+                          reinterpret_cast<LPVOID*>(&g_origSetupGeo)) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo create failed (RVA 0x%llX)",
+                     (unsigned long long)kSetupGeometryRVA);
+            g_addrSetupGeo = nullptr;
+        } else if (MH_EnableHook(g_addrSetupGeo) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: SetupGeo enable failed");
+            MH_RemoveHook(g_addrSetupGeo);
+            g_addrSetupGeo = nullptr;
+        } else {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] installed SetupGeo diag hook at RVA 0x%llX",
+                     (unsigned long long)kSetupGeometryRVA);
+        }
 
-    g_addrWriteXform = reinterpret_cast<LPVOID>(
-        reinterpret_cast<uintptr_t>(hMod) + kWriteWorldXformRVA);
-    if (MH_CreateHook(g_addrWriteXform,
-                      reinterpret_cast<LPVOID>(&DetourWriteWorldXform),
-                      reinterpret_cast<LPVOID*>(&g_origWriteXform)) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite create failed (RVA 0x%llX)",
-                 (unsigned long long)kWriteWorldXformRVA);
-        g_addrWriteXform = nullptr;
-    } else if (MH_EnableHook(g_addrWriteXform) != MH_OK) {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite enable failed");
-        MH_RemoveHook(g_addrWriteXform);
-        g_addrWriteXform = nullptr;
-    } else {
-        _MESSAGE("FO4RemixPlugin: [SemCapture] installed CBWrite diag hook at RVA 0x%llX",
-                 (unsigned long long)kWriteWorldXformRVA);
+        g_addrWriteXform = reinterpret_cast<LPVOID>(
+            reinterpret_cast<uintptr_t>(hMod) + kWriteWorldXformRVA);
+        if (MH_CreateHook(g_addrWriteXform,
+                          reinterpret_cast<LPVOID>(&DetourWriteWorldXform),
+                          reinterpret_cast<LPVOID*>(&g_origWriteXform)) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite create failed (RVA 0x%llX)",
+                     (unsigned long long)kWriteWorldXformRVA);
+            g_addrWriteXform = nullptr;
+        } else if (MH_EnableHook(g_addrWriteXform) != MH_OK) {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] WARN: CBWrite enable failed");
+            MH_RemoveHook(g_addrWriteXform);
+            g_addrWriteXform = nullptr;
+        } else {
+            _MESSAGE("FO4RemixPlugin: [SemCapture] installed CBWrite diag hook at RVA 0x%llX",
+                     (unsigned long long)kWriteWorldXformRVA);
+        }
     }
 
     g_installed.store(true);
@@ -812,6 +1427,31 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         }
     }
 
+    // Crash-blacklist pardon (2026-07-21): the gate's falling edge is the
+    // one moment a blacklisted key can legitimately become resolvable again
+    // -- the engine rebuilds the world behind load screens and reuses the
+    // exact pointer values the PassKeys are derived from. Pardoning here
+    // keeps the blacklist from ever permanently killing a drawable across
+    // loads (the failure mode that ruled out a permanent blacklist; see the
+    // notes above attemptResolve).
+    {
+        static bool s_prevLoadingGate = false;
+        if (s_prevLoadingGate && !loadingGate) {
+            uint32_t pardoned = 0;
+            std::lock_guard<std::mutex> lock(g_drawableMutex);
+            for (auto& [key, st] : g_drawableMap) {
+                if (st.crashBlacklisted) ++pardoned;
+                st.crashBlacklisted  = false;
+                st.resolveCrashCount = 0;
+            }
+            if (pardoned) {
+                _MESSAGE("FO4RemixPlugin: [Resolver] load-screen exit -- "
+                         "pardoned %u crash-blacklisted keys", pardoned);
+            }
+        }
+        s_prevLoadingGate = loadingGate;
+    }
+
     // ---- Skinned bone updates (2026-07-08) ----
     // Once per Tick (== once per game frame), read every registered skinned
     // drawable's live bone world transforms, compose bind->world matrices,
@@ -820,7 +1460,28 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     // skeletons the registry points into (the reads are SEH-guarded, but a
     // half-freed skeleton can read as plausible garbage).
     if (!loadingGate && g_config.skinningEnabled) {
-        SkinnedMeshes::UpdateAndQueue();
+        // Perf (2026-07-20): elide bone reads/composes for drawables the
+        // renderer will skip anyway. Same culled+stale predicates OnFrame
+        // uses for its skinnedHidden skip (kSkinnedStaleAgeFrames=4 there);
+        // in a loaded urban cell this removes the vast majority of the
+        // per-Tick skeleton work (e.g. 350 of 367 actors engine-hidden).
+        static std::unordered_set<uint64_t> s_skinnedHidden;
+        s_skinnedHidden.clear();
+        SnapshotSkinnedCulled(s_skinnedHidden);
+        SnapshotSkinnedStale(currentFrame, 4, s_skinnedHidden);
+        SkinnedMeshes::UpdateAndQueue(&s_skinnedHidden);
+    }
+
+    // [ViewModel] anchor refresh (every tick; OnFrame consumes the snapshot)
+    // + pipeline probe (rate-limited + capped inside; ~2s cadence).
+    if (!loadingGate) {
+        if (g_config.viewModelEnabled) {
+            UpdateViewModelAnchor();
+            RefreshViewModelRigidPoses();
+        }
+        if (g_config.diagEnabled) {
+            ViewModelDiagTick(currentFrame);
+        }
     }
 
     // ---- Resolve loop: every call, attempt one resolve per unsubmitted drawable ----
@@ -855,26 +1516,119 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // (The 2026-07-01 COUNT cap of 4 starved streaming because it also
         // counted near-free Pending polls; a TIME budget lets dozens of
         // cheap polls through and only defers the expensive decodes.)
-        const double budgetMs = (double)g_config.resolveBudgetMs;
+        double budgetMs = (double)g_config.resolveBudgetMs;
         const auto tResolve0 = std::chrono::steady_clock::now();
         auto resolveElapsedMs = [&tResolve0]() {
             return std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - tResolve0).count();
         };
 
+        // ---- Runtime-congestion pacing (2026-07-17 hang dump) ----
+        // The runtime's ingest is NOT free-flowing: every CreateTexture /
+        // CreateMesh becomes CS-chunk payload, and when a burst outruns the
+        // CS thread's drain rate the queue's backpressure blocks the Remix
+        // present thread inside FlushCsChunk WHILE IT HOLDS the device
+        // spinlock -- and this thread then spins unboundedly trying to enter
+        // its next create call (dump-proven 3-thread convoy: CS thread
+        // waiting on GPU-side command-list recycling, present thread parked
+        // in FlushCsChunk holding devLock, game thread in
+        // RecursiveSpinlock::lock under SubmitDrawable). Two layers:
+        //   (1) byte cap per tick (MaxUploadMiBPerTick) keeps the CS queue
+        //       shallow so the backpressure stall never forms;
+        //   (2) if a single attempt still stalls (devLock convoy already in
+        //       progress), stop feeding the runtime for a cooldown window
+        //       so the pipeline can drain.
+        // The supply-pass zero-copy (5b5b956) removed ~20ms of memcpy per
+        // supplying attempt that had been rate-limiting exactly this path.
+        static uint64_t s_congestedUntilFrame = 0;
+        const size_t uploadCapBytes = (size_t)g_config.maxUploadMiBPerTick * 1024u * 1024u;
+        RemixRenderer::ResetUploadBytesTick();
+        auto uploadCapHit = [&]() {
+            return uploadCapBytes != 0 &&
+                   RemixRenderer::UploadBytesTick() >= uploadCapBytes;
+        };
+        constexpr double  kCongestedAttemptMs   = 150.0;
+        constexpr uint64_t kCongestionCooldownFrames = 60;
+
         // Phase A: collect due keys. Cheap predicates only -- the lock is
         // held for a linear map scan (sub-ms), not the resolve work.
-        std::vector<PassKey> dueNew;    // unsubmitted, inside window, retry-due
-        std::vector<PassKey> duePolls;  // submitted, upgrade-poll slot hit
+        // static + clear(): Tick is single-threaded on the game thread, so
+        // reusing capacity avoids two heap allocations per Tick during
+        // streaming.
+        static std::vector<PassKey> dueNew;    // unsubmitted, inside window, retry-due
+        static std::vector<PassKey> duePolls;  // submitted, upgrade-poll slot hit
+        // (rank, key) staging for the nearest-in-view-first sort below.
+        static std::vector<std::pair<float, PassKey>> dueRanked;
+        dueNew.clear();
+        duePolls.clear();
+        dueRanked.clear();
+        // Camera snapshot for the priority ranking (engine reads on the same
+        // thread hkPresent already calls Camera::Get from).
+        const CameraState resolveCam = Camera::Get();
+        uint32_t faceRefreshesThisTick = 0;
         {
             std::lock_guard<std::mutex> lock(g_drawableMutex);
             for (auto& [key, state] : g_drawableMap) {
                 if (state.submittedToRemix) {
+                    // FaceGen morph watch: FO4 rewrites BSDynamicTriShape
+                    // dynamicVertices during lip sync/blinks/expressions.
+                    // Hash the live buffer on a staggered cadence and queue
+                    // decoded positions only when the content changes.
+                    if (state.faceMorphWatch &&
+                        g_config.faceMorphRefreshEnabled &&
+                        faceRefreshesThisTick < g_config.faceMorphMaxPerTick &&
+                        (g_config.faceMorphCheckIntervalFrames <= 1 ||
+                         ((currentFrame ^ key) %
+                          g_config.faceMorphCheckIntervalFrames) == 0)) {
+                        static std::vector<uint8_t> s_faceRaw;
+                        static std::vector<float>   s_faceXyz;
+                        uint32_t liveVerts = 0;
+                        if (BsExtraction::SnapshotDynamicVertices(state.geometry,
+                                                                  s_faceRaw,
+                                                                  liveVerts)) {
+                            uint64_t fp = 0xCBF29CE484222325ULL;
+                            for (uint8_t b : s_faceRaw) {
+                                fp ^= b;
+                                fp *= 0x100000001B3ULL;
+                            }
+                            if (fp == 0) fp = 1;  // 0 = no baseline yet
+                            if (state.faceMorphFingerprint == 0) {
+                                state.faceMorphFingerprint = fp;
+                            } else if (fp != state.faceMorphFingerprint) {
+                                state.faceMorphFingerprint = fp;
+                                if (BsExtraction::DecodeDynamicPositions(
+                                        s_faceRaw, liveVerts, s_faceXyz)) {
+                                    RemixRenderer::QueueFaceMorphPositions(
+                                        state.meshHash,
+                                        std::vector<float>(s_faceXyz));
+                                    ++faceRefreshesThisTick;
+                                }
+                            }
+                        }
+                    }
+
                     if ((state.mergeCaptureUpgradePending &&
                          ((currentFrame ^ key) & 63) == 0) ||
                         (g_config.textureUpgradeOnApproach &&
                          state.submittedDiffuseWidth != 0 &&
-                         ((currentFrame ^ key) & 127) == 0)) {
+                         ((currentFrame ^ key) & 127) == 0) ||
+                        // Live-RT texture refresh (Pip-Boy screen): due on
+                        // its period tick, and on EVERY tick while a shadow
+                        // refresh is in flight (the async readback/decode
+                        // needs the polls; each is a cheap pending probe).
+                        (g_config.viewModelScreenRefreshFrames != 0 &&
+                         state.hasLiveTexture &&
+                         (state.liveTexRefreshInFlight ||
+                          (currentFrame %
+                           g_config.viewModelScreenRefreshFrames) == 0)) ||
+                        // Pip-Boy screen feed (2026-07-18 v2): a newer fed
+                        // UI frame exists than the one baked into the
+                        // submitted screen texture.
+                        (g_config.viewModelScreenRefreshFrames != 0 &&
+                         state.isPipboyScreen && g_pipboyFeedTex &&
+                         state.pipboyFeedSeqSubmitted != g_pipboyFeedSeq &&
+                         (currentFrame %
+                          g_config.viewModelScreenRefreshFrames) == 0)) {
                         duePolls.push_back(key);
                     }
                     continue;
@@ -898,13 +1652,90 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 // by the CallResolverGuarded SEH backstop below -- bounded
                 // risk, and the window is ini-tunable ([SemanticCapture]
                 // ResolveRetryWindowFrames).
+                //
+                // VRAM-pressure parked (2026-07-20): resources deliberately
+                // released while the entry sits far behind the camera; the
+                // sweep un-parks it on re-entering the view (or when
+                // pressure clears), which re-admits it here.
+                if (state.pressureParked) continue;
+                // Crash-blacklisted: proven to fault through the SEH guard
+                // repeatedly; skipped until the load-screen pardon below.
+                if (state.crashBlacklisted) continue;
                 const uint64_t age = (currentFrame > state.lastSeenFrame)
                     ? (currentFrame - state.lastSeenFrame) : 0;
                 if (age > g_config.resolveRetryWindowFrames) continue;
                 // Backoff gate: a prior failure scheduled this entry's next
                 // attempt; skip until due. See DrawableState::resolveAttempts.
                 if (currentFrame < state.nextRetryFrame) continue;
-                dueNew.push_back(key);
+                // Rank for the nearest-in-view-first sort below: behind-the-
+                // camera geometry pays a large offset so the visible field
+                // always submits first; distance orders within each class;
+                // unknown transforms sort to the very back.
+                float rank = 1.0e18f;
+                if (state.isViewModel) {
+                    // Camera-local transforms are not comparable with world
+                    // coordinates. Resolve 1P arms/weapons first so a busy
+                    // cell-attach backlog cannot make them disappear.
+                    rank = -1.0e18f;
+                } else if (resolveCam.valid && state.liveTransformValid) {
+                    const float dx =
+                        state.liveWorldTransform[0][3] - resolveCam.position[0];
+                    const float dy =
+                        state.liveWorldTransform[1][3] - resolveCam.position[1];
+                    const float dz =
+                        state.liveWorldTransform[2][3] - resolveCam.position[2];
+                    const float facing = dx * resolveCam.forward[0] +
+                                         dy * resolveCam.forward[1] +
+                                         dz * resolveCam.forward[2];
+                    rank = dx * dx + dy * dy + dz * dz +
+                           (facing < 0.0f ? 1.0e12f : 0.0f);
+                }
+                dueRanked.push_back({ rank, key });
+            }
+        }
+
+        // Nearest-in-view-first (2026-07-13). dueNew used to be map
+        // iteration order -- effectively random -- so a streaming burst
+        // filled in geometry BEHIND the player at the same rate as what the
+        // camera was pointed at. The expensive part of the burst (big merge
+        // submits at 10-35ms each) is a fixed total cost either way; paying
+        // it for on-screen objects first changes how "loaded" the scene
+        // FEELS by an order of magnitude.
+        std::sort(dueRanked.begin(), dueRanked.end(),
+                  [](const std::pair<float, PassKey>& a,
+                     const std::pair<float, PassKey>& b) {
+                      return a.first < b.first;
+                  });
+        for (const auto& rk : dueRanked) dueNew.push_back(rk.second);
+
+        // Burst budget (2026-07-13): with the merge readbacks and texture
+        // decodes async, a typical attempt costs ~0.1ms and the fixed
+        // budget became the throughput ceiling exactly when a deep backlog
+        // is waiting (fresh cell attach, a 360 look-around). Triple the
+        // budget while the backlog is deep -- a few extra ms of frame time
+        // during bursts (still far under the 20-45ms the old blocking
+        // readbacks cost per tick) in exchange for draining ~3x faster.
+        // Back to the ini value the moment the queue shrinks.
+        if (budgetMs > 0.0 && dueNew.size() > 150) {
+            budgetMs *= 3.0;
+        }
+
+        // Overrun-debt carry-over (2026-07-20): the budget check runs
+        // between items only, so the LAST admitted item can run unbounded
+        // (logged: 57.7ms spent on a 3.0ms budget — one merge submit stuck
+        // in the runtime's CS-backpressure convoy). The overshoot can't be
+        // prevented mid-item; repay it instead: while debt remains, skip
+        // the resolve phase entirely and retire one budget quantum per
+        // tick, amortizing a spike into several quiet ticks instead of
+        // letting back-to-back monster items pile onto consecutive frames.
+        static double s_budgetDebtMs = 0.0;
+        bool debtCooldown = false;
+        if (budgetMs > 0.0 && s_budgetDebtMs > 0.0) {
+            s_budgetDebtMs -= budgetMs;
+            if (s_budgetDebtMs > 0.0) {
+                debtCooldown = true;
+            } else {
+                s_budgetDebtMs = 0.0;
             }
         }
 
@@ -915,13 +1746,21 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         //
         // SEH-guarded: stale geometry pointers (freed while the entry sat
         // inside the retry window) can dereference freed memory. Catch the
-        // AV and back off HARD -- but do NOT permanently blacklist the key.
-        // The engine reuses those exact pointer values when it rebuilds the
-        // world (same PassKey), so a permanent skip turned one transient
-        // mid-load race into "this drawable can never render again this
-        // session" (the missing-destination-cell-after-load report). If the
-        // geometry stays dead, its fires stop and the retry-window gate
-        // retires the entry naturally.
+        // AV and back off HARD. Blacklist rules (2026-07-21): an UNBOUNDED
+        // permanent skip is off the table -- the engine reuses those exact
+        // pointer values when it rebuilds the world (same PassKey), so a
+        // permanent skip turned one transient mid-load race into "this
+        // drawable can never render again this session" (the missing-
+        // destination-cell-after-load report). But the opposite failure is
+        // real too: a persistently-dead key kept firing and re-faulted
+        // through the guard every 120-frame backoff for the whole session
+        // (field: CRASH CAUGHT #200 with the same key as #100). Compromise:
+        // after kResolverCrashBlacklistCount catches (>=10s of persistent
+        // faulting) the key is blacklisted, and ALL blacklists are pardoned
+        // when a load screen ends -- world rebuilds happen behind loads, so
+        // that is exactly when a reused pointer value can become valid
+        // again. If the geometry stays dead, its fires stop and the
+        // retry-window gate retires the entry naturally.
         auto attemptResolve = [&](PassKey key,
                                   SemanticCapture::DrawableState& state) -> bool {
             // Re-check the gates under the lock: the fire hook / a poll
@@ -952,6 +1791,19 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 }
                 state.resolveAttempts++;
                 state.nextRetryFrame = currentFrame + kCrashRetryDelayFrames;
+                if (++state.resolveCrashCount >= kResolverCrashBlacklistCount &&
+                    !state.crashBlacklisted) {
+                    state.crashBlacklisted = true;
+                    static std::atomic<int> sBlacklistLogs{0};
+                    const int bn = sBlacklistLogs.fetch_add(1, std::memory_order_relaxed);
+                    if (bn < 40) {
+                        _MESSAGE("FO4RemixPlugin: [Resolver] #%d key=0x%llX "
+                                 "blacklisted after %u crashes -- skipping "
+                                 "until next load-screen exit",
+                                 bn, (unsigned long long)key,
+                                 (unsigned)state.resolveCrashCount);
+                    }
+                }
             }
 
             // Diagnostic: log every water entry's post-resolver state so we
@@ -976,9 +1828,23 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 state.lastFailedResolverStep =
                     Resolvers::Trace::LastStep();
                 if (!crashed) {
-                    state.resolveAttempts++;
-                    state.nextRetryFrame =
-                        currentFrame + RetryDelayFrames(state.resolveAttempts);
+                    if (state.lastFailedResolverStep ==
+                        Resolvers::Trace::kPendingDefer) {
+                        // Async work in flight (texture decode, slice
+                        // readback, draw capture) -- completion is
+                        // expected, so poll fast and do NOT climb the
+                        // exponential backoff. Pre-2026-07-13 a decoded
+                        // texture could sit for up to 512 frames waiting
+                        // for its drawable's next backoff slot: the
+                        // "takes forever to FINISH loading" tail. Attempt
+                        // count is left alone so the phase-1 cache stays
+                        // alive across the whole wait.
+                        state.nextRetryFrame = currentFrame + 2;
+                    } else {
+                        state.resolveAttempts++;
+                        state.nextRetryFrame =
+                            currentFrame + RetryDelayFrames(state.resolveAttempts);
+                    }
                 }
             } else {
                 // Side indexes over submitted entries only -- unsubmitted
@@ -986,6 +1852,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 // across retries.
                 if (state.isLODChunk)     g_lodChunkKeys.insert(key);
                 if (state.isSkinnedActor) g_skinnedKeys.insert(key);
+                if (state.isViewModel)    g_viewModelKeys.insert(key);
             }
             return true;
         };
@@ -998,10 +1865,15 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // resolve can't stall the queue forever.
         size_t attempted = 0;
         bool   budgetHit = false;
+        bool   congestionTripped = false;
         int    upgradesThisTick = 0;  // texture re-capture storm cap
+        bool   liveGenBumped = false; // one generation bump per trigger tick
 
+        const bool congestedCooldown = currentFrame < s_congestedUntilFrame;
+        if (!congestedCooldown && !debtCooldown)
         for (const PassKey key : dueNew) {
-            if (budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs) {
+            if ((budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs) ||
+                uploadCapHit()) {
                 budgetHit = true;
                 break;
             }
@@ -1009,12 +1881,24 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             auto it = g_drawableMap.find(key);
             if (it == g_drawableMap.end()) continue;      // evicted meanwhile
             if (it->second.submittedToRemix) continue;    // resolved meanwhile
+            const double tAttempt0 = resolveElapsedMs();
             if (attemptResolve(key, it->second)) ++attempted;
+            if (resolveElapsedMs() - tAttempt0 >= kCongestedAttemptMs) {
+                // One attempt stalled way past any honest CPU cost: it sat
+                // in a runtime lock convoy. Feeding more creates now only
+                // deepens the CS backlog the convoy is waiting out.
+                s_congestedUntilFrame = currentFrame + kCongestionCooldownFrames;
+                congestionTripped = true;
+                budgetHit = true;
+                break;
+            }
         }
 
+        if (!congestedCooldown && !congestionTripped && !debtCooldown)
         for (const PassKey key : duePolls) {
             if (budgetHit ||
-                (budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs)) {
+                (budgetMs > 0.0 && attempted > 0 && resolveElapsedMs() >= budgetMs) ||
+                uploadCapHit()) {
                 budgetHit = true;
                 break;
             }
@@ -1025,6 +1909,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             if (!state.submittedToRemix) continue;  // released meanwhile
 
             bool doReresolve = false;
+            bool doShadowResolve = false;
 
             // Merge capture upgrade poll (2026-07-04): this merge shape
             // submitted with a fallback partition because the engine
@@ -1034,7 +1919,14 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             // release the fallback and re-resolve: Query finds the
             // completed watch and the exact baked geometry replaces
             // the fallback via the normal resolve path.
+            // Durable churn cap: DrawCapture's per-watch budgets reset when
+            // a watch slot is recycled under pressure, so a shape whose
+            // bakes never validate could release/re-resolve forever. This
+            // counter lives with the drawable and counts EVERY upgrade
+            // release (success or failed bake).
+            constexpr uint32_t kMaxMergeUpgradeReleases = 12;
             if (state.mergeCaptureUpgradePending &&
+                state.mergeUpgradeReleases < kMaxMergeUpgradeReleases &&
                 ((currentFrame ^ key) & 63) == 0 &&
                 DrawCapture::EnsureWatch(state.mergeWatchBuf,
                                          state.mergeWatchSrv, key,
@@ -1057,13 +1949,17 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 state.submittedToRemix = false;
                 state.resolveAttempts = 0;
                 state.nextRetryFrame = 0;
-                // The geometry is provably alive (the engine just drew
-                // it, and this state holds a +1 NiPointer ref); touch
-                // lastSeenFrame so the freshness gate doesn't retire the
-                // re-resolve of a long-ago-attached shape.
+                // The capture landing means the engine drew this cluster
+                // within the hunt window -- but DrawableState holds only
+                // RAW pointers (no NiPointer refs), so the re-resolve must
+                // treat them as potentially stale; the resolver SEH guard
+                // is the only net. Touch lastSeenFrame so the freshness
+                // gate doesn't retire the re-resolve of a long-ago-
+                // attached shape.
                 state.lastSeenFrame = currentFrame;
                 // The resolver re-sets this if it has to fall back again.
                 state.mergeCaptureUpgradePending = false;
+                ++state.mergeUpgradeReleases;
                 static std::atomic<int> sUpgradeLogs{0};
                 const int un = sUpgradeLogs.fetch_add(1, std::memory_order_relaxed);
                 if (un < 40) {
@@ -1086,15 +1982,17 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             // downgrades), so walking away can't blur a sharp capture; once
             // at the streamed max, live == submitted and it stops firing.
             // submittedDiffuseWidth is 0 for non-lighting drawables (water),
-            // so this branch never touches them. Capped at 3 upgrades per
-            // Tick on top of the time budget (each re-resolve allocates
-            // full-res RGBA mip chains; the uncapped storm was the
-            // 2026-07-08/09 fail-fast crashes). Skipped drawables re-qualify
-            // on their next 128-frame slot, so the backlog drains within
-            // seconds.
+            // so this branch never touches them. Capped at 1 upgrade per
+            // Tick on top of the time budget (each re-resolve is a full
+            // resolver re-run — mesh re-extract + full-res RGBA mip chains;
+            // at the old cap of 3 the sustained upgrade storm alone held
+            // Tick at ~30ms+ during streaming, and the uncapped storm was
+            // the 2026-07-08/09 fail-fast crashes). Skipped drawables
+            // re-qualify on their next 128-frame slot, so the backlog still
+            // drains — just spread across more ticks.
             else if (g_config.textureUpgradeOnApproach &&
                      state.submittedDiffuseWidth != 0 &&
-                     upgradesThisTick < 3 &&
+                     upgradesThisTick < 1 &&
                      ((currentFrame ^ key) & 127) == 0) {
                 const uint32_t liveW =
                     BsExtraction::GetMaterialDiffuseResidentWidth(state.material);
@@ -1130,7 +2028,62 @@ void SemanticCapture::Tick(ID3D11Device* device) {
                 }
             }
 
-            if (!doReresolve) continue;
+            // Live-RT texture refresh (2026-07-18 Pip-Boy screen): SHADOW
+            // re-resolve. Unlike the release-first upgrade paths above, the
+            // drawable STAYS submitted and rendering while the new texture
+            // generation runs the async readback+decode pipeline; when the
+            // resolver finally reaches SubmitDrawable, the instance's
+            // handles are replaced in place (no gap = no screen flicker).
+            // One generation bump per trigger tick serves every live-RT
+            // drawable; the in-flight pipeline works against a stable hash
+            // until the next period. Attempts are bounded per cycle -- a
+            // permanently failing capture (format drop) gives up until the
+            // next period tick instead of spinning every tick forever.
+            else if (g_config.viewModelScreenRefreshFrames != 0 &&
+                     state.hasLiveTexture) {
+                constexpr uint8_t kMaxLiveTexAttemptsPerCycle = 64;
+                if (!state.liveTexRefreshInFlight &&
+                    (currentFrame % g_config.viewModelScreenRefreshFrames) == 0 &&
+                    currentFrame - state.lastSeenFrame <= 4) {
+                    // Engine is drawing it (Pip-Boy raised): start a cycle.
+                    if (!liveGenBumped) {
+                        liveGenBumped = true;
+                        BsExtraction::BumpLiveTextureGeneration();
+                    }
+                    state.liveTexRefreshInFlight = true;
+                    state.liveTexRefreshAttempts = 0;
+                }
+                if (state.liveTexRefreshInFlight) {
+                    if (++state.liveTexRefreshAttempts >
+                        kMaxLiveTexAttemptsPerCycle) {
+                        state.liveTexRefreshInFlight = false;
+                    } else {
+                        // Open the resolver's shadow door (2026-07-18 v2):
+                        // TryResolveStatic early-returns on submitted
+                        // entries, so without this flag every shadow
+                        // attempt was a silent no-op and the 0c0c9e7
+                        // live-refresh never actually ran.
+                        state.shadowResolveRequested = true;
+                        doShadowResolve = true;
+                    }
+                }
+            }
+            // Pip-Boy screen feed refresh (2026-07-18 v2): a newer fed UI
+            // frame exists than the one the submitted screen texture was
+            // baked from. Shadow re-resolve exactly like the live-RT path
+            // above -- the drawable stays submitted and rendering; the
+            // resolver overrides its diffuse/emissive with the fed texture
+            // and SubmitDrawable swaps the handles in place.
+            else if (g_config.viewModelScreenRefreshFrames != 0 &&
+                     state.isPipboyScreen && g_pipboyFeedTex &&
+                     state.pipboyFeedSeqSubmitted != g_pipboyFeedSeq &&
+                     (currentFrame % g_config.viewModelScreenRefreshFrames) == 0 &&
+                     currentFrame - state.lastSeenFrame <= 4) {
+                state.shadowResolveRequested = true;
+                doShadowResolve = true;
+            }
+
+            if (!doReresolve && !doShadowResolve) continue;
             // Resolve immediately with the upgraded input -- same lock hold
             // as the release above, so the handle gap is one resolve, never
             // a budget-break away.
@@ -1141,14 +2094,38 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // resolve phase ran long or deferred work, so hitching reports can
         // be checked against exactly what this tick did.
         const double spentMs = resolveElapsedMs();
+        // Accrue overrun debt (see debtCooldown above). Only genuine
+        // overruns (2x budget) accrue — the routine "hit at 3.1ms on a
+        // 3.0ms budget" case is the budget working as designed. Congestion
+        // trips are excluded: their own 60-tick cooldown already pauses
+        // resolves, and stacking debt on top would double-punish. Capped at
+        // 8 quanta so one monster item costs at most ~8 quiet ticks.
+        if (budgetMs > 0.0 && !congestionTripped && spentMs > budgetMs * 2.0) {
+            s_budgetDebtMs = (std::min)(spentMs - budgetMs, budgetMs * 8.0);
+        }
+        if (congestionTripped) {
+            static std::atomic<int> sCongestLogs{0};
+            const int n = sCongestLogs.fetch_add(1, std::memory_order_relaxed);
+            if (n < 40) {
+                _MESSAGE("FO4RemixPlugin: [ResolveBudget] CONGESTED #%d -- attempt "
+                         "stalled %.0fms+ in the runtime (CS backpressure convoy); "
+                         "pausing resolves for %llu ticks (uploadMiB=%.1f)",
+                         n, kCongestedAttemptMs,
+                         (unsigned long long)kCongestionCooldownFrames,
+                         RemixRenderer::UploadBytesTick() / (1024.0 * 1024.0));
+            }
+        }
         if (budgetHit || spentMs > 8.0) {
             static uint64_t s_lastSpikeLogFrame = 0;
             if (currentFrame - s_lastSpikeLogFrame >= 120) {
                 s_lastSpikeLogFrame = currentFrame;
                 _MESSAGE("FO4RemixPlugin: [ResolveBudget] tick spent %.1fms "
-                         "(budget %.1fms%s) attempted=%zu dueNew=%zu duePolls=%zu",
+                         "(budget %.1fms%s) attempted=%zu dueNew=%zu duePolls=%zu "
+                         "uploadMiB=%.1f%s",
                          spentMs, budgetMs, budgetHit ? ", HIT -- deferring rest" : "",
-                         attempted, dueNew.size(), duePolls.size());
+                         attempted, dueNew.size(), duePolls.size(),
+                         RemixRenderer::UploadBytesTick() / (1024.0 * 1024.0),
+                         congestedCooldown ? " [cooldown]" : "");
             }
         }
     }
@@ -1164,7 +2141,13 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     // (engineCulled stays false); the OnFrame skip is dormant until the
     // signal is identified. Reads SEH-guarded (stale pointers between free
     // and TTL eviction).
-    {
+    // Gated on Diagnostics.Enabled AND its own log budget: the walk (mutex
+    // hold + name substring scans + guarded peeks, every Tick) exists only
+    // to produce these capped log lines, so once the budget is spent -- or
+    // diagnostics are off -- skip it entirely.
+    constexpr int kCullLogCap = 80;
+    static std::atomic<int> sCullLogs{0};
+    if (g_config.diagEnabled && sCullLogs.load(std::memory_order_relaxed) < kCullLogCap) {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
         // Change-detection state local to this diagnostic (hash -> last
         // {flags, ageStale}); avoids touching DrawableState::lastFlags, which
@@ -1177,9 +2160,12 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             if (it == g_drawableMap.end()) continue;
             SemanticCapture::DrawableState& st = it->second;
             if (!st.geometry) continue;
-            const char* nm = static_cast<NiAVObject*>(st.geometry)->m_name.c_str();
-            const bool nameHair = nm && (NameHasCI(nm, "hair") || NameHasCI(nm, "head") ||
-                                         NameHasCI(nm, "hat")  || NameHasCI(nm, "helm"));
+            char nameBuf[96];
+            if (!PeekNameGuarded(st.geometry, nameBuf, sizeof(nameBuf)))
+                continue;  // stale pointer: keep last state
+            const char* nm = nameBuf;
+            const bool nameHair = NameHasCI(nm, "hair") || NameHasCI(nm, "head") ||
+                                  NameHasCI(nm, "hat")  || NameHasCI(nm, "helm");
             if (!nameHair) continue;
             uint64_t fl = 0;
             if (!PeekQwordGuarded(
@@ -1193,8 +2179,7 @@ void SemanticCapture::Tick(ID3D11Device* device) {
             const bool changed = fIt == s_lastVisFlags.end() || fIt->second != fl ||
                                  sIt == s_wasStale.end() || sIt->second != stale;
             if (changed) {
-                static std::atomic<int> sCullLogs{0};
-                if (sCullLogs.fetch_add(1, std::memory_order_relaxed) < 80) {
+                if (sCullLogs.fetch_add(1, std::memory_order_relaxed) < kCullLogCap) {
                     _MESSAGE("FO4RemixPlugin: [HeadDiag] skinvis \"%s\" hash=%016llX "
                              "flags=%016llX age=%llu",
                              nm ? nm : "", (unsigned long long)key,
@@ -1211,10 +2196,18 @@ void SemanticCapture::Tick(ID3D11Device* device) {
     if (counter < kSweepPeriodFrames) return;
     g_sweepCounter.store(0, std::memory_order_relaxed);
 
+    // Reap orphaned async texture decodes on the same cadence (enqueue-time
+    // sweeping alone can't run once a streaming burst ends). Async mesh
+    // parses sweep inside SweepTextureQueues; merge-chunk bakes here.
+    BsExtraction::SweepTextureQueues();
+    Resolvers::SweepAsyncBakes(currentFrame);
+
     const uint64_t now = currentFrame;
     uint32_t evicted = 0;
     uint32_t submittedCount = 0;
     uint32_t pendingCount = 0;
+    uint32_t parkedCount = 0;
+    uint32_t blacklistedCount = 0;
     size_t   unique  = 0;
     size_t   distinctGeoPtrs = 0;
     size_t   entriesWithGeo = 0;
@@ -1236,34 +2229,303 @@ void SemanticCapture::Tick(ID3D11Device* device) {
 
     {
         std::lock_guard<std::mutex> lock(g_drawableMutex);
+
+        // Release one entry's Remix-side resources and erase it from the map
+        // (+ every side index). Returns the next iterator. Shared by the TTL
+        // loop and the VRAM-pressure pass below.
+        auto evictEntry = [&](auto it) {
+            if (it->second.submittedToRemix && it->second.meshHash != 0) {
+                unsigned long excCode = 0;
+                if (CallReleaseDrawableGuarded(it->second.meshHash, &excCode) != 0) {
+                    _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
+                             "hash=0x%llX exception=0x%08lX -- continuing eviction; "
+                             "Remix-side handles may leak",
+                             (unsigned long long)it->second.meshHash, excCode);
+                }
+                // Merge-instanced extras share the base drawable's lifecycle.
+                for (uint64_t xh : it->second.extraMeshHashes) {
+                    if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                        _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
+                                 "(instance extra) hash=0x%llX exception=0x%08lX",
+                                 (unsigned long long)xh, excCode);
+                    }
+                }
+            }
+            g_lodChunkKeys.erase(it->first);
+            g_skinnedKeys.erase(it->first);
+            g_viewModelKeys.erase(it->first);
+            // Free any DrawCapture watch keyed to this drawable: after
+            // this erase nothing will ever poll it again, and a stranded
+            // upgrade-hunt watch would pin a slot + keep the bind scan
+            // hot for the rest of the session (cell-churn staleness).
+            DrawCapture::Drop(it->first);
+            return g_drawableMap.erase(it);
+        };
+
+        // ---- VRAM-pressure reclamation (2026-07-20, tiered rework) ----
+        // The frame-based TTL below (kTTLFrames = 18000, ~5 min @60fps and
+        // longer as fps degrades) never fires on a cross-country run:
+        // Sanctuary->Concord pinned ~10K drawables -> materials -> textures
+        // until process VRAM hit the driver budget (13.5/14.7 GiB) and fps
+        // collapsed to 1.
+        //
+        // Tier 1 (ForceEvictViewPct, softer threshold): PARK submitted
+        //   drawables that sit behind the camera beyond
+        //   ForceEvictBehindDistance, furthest first -- release their Remix
+        //   resources but KEEP the map entry flagged pressureParked. They
+        //   are usually still firing (the engine renders a wide radius), so
+        //   a full erase would re-create -> re-resolve -> re-park every
+        //   sweep: a texture-upload churn loop. The resolver skips parked
+        //   entries; the un-park pass below re-admits them when they enter
+        //   the front hemisphere / close range or when pressure clears
+        //   (5%-point hysteresis).
+        // Tier 2 (ForceEvictVramPct, harder threshold, the FALLBACK): the
+        //   original oldest-lastSeen hard eviction, for entries that are
+        //   not classifiable by view (no live transform) or when tier 1
+        //   alone cannot get usage back under control.
+        // Runs before the TTL loop so the status counters below reflect
+        // the post-reclamation map.
+        uint32_t pressureParkedNow = 0, pressureUnparked = 0, pressureEvicted = 0;
+        {
+            uint64_t vramUsedMiB = 0, vramBudgetMiB = 0;
+            const bool haveVram =
+                PresentHook::GetVramBudgetSnapshot(&vramUsedMiB, &vramBudgetMiB);
+            const auto overPct = [&](uint32_t pct) {
+                return pct > 0 && haveVram &&
+                       vramUsedMiB * 100u > static_cast<uint64_t>(pct) * vramBudgetMiB;
+            };
+            const uint32_t viewPct   = g_config.cullingForceEvictViewPct;
+            const uint32_t oldestPct = g_config.cullingForceEvictVramPct;
+
+            const CameraState cam = Camera::Get();
+            const float minDist = g_config.cullingForceEvictBehindDistance;
+            const float alwaysDist = g_config.cullingForceEvictAlwaysBehindDistance;
+            const float lodDist = g_config.cullingForceEvictLodBehindDistance;
+            const float minDist2 = minDist * minDist;
+            const float alwaysDist2 = alwaysDist * alwaysDist;
+            const float lodDist2 = lodDist * lodDist;
+            // LOD chunks are multi-cell meshes and the map has no per-entry
+            // extent, so their behind test needs the chunk ORIGIN a fixed
+            // slack past the camera plane (a plain hemisphere test despawns
+            // chunks whose far edge still reaches peripheral view). Un-park
+            // at half the slack for hysteresis.
+            constexpr float kLodBehindSlackPark   = 20000.0f;  // ~5 cells
+            constexpr float kLodBehindSlackUnpark = 10000.0f;
+
+            // Camera-relative probe. Both liveWorldTransform and CameraState
+            // are Remix coords.
+            struct ViewProbe { bool valid; float proj; float d2; };
+            const auto probe = [&](const SemanticCapture::DrawableState& st) -> ViewProbe {
+                if (!cam.valid || !st.liveTransformValid) return { false, 0.0f, 0.0f };
+                const float dx = st.liveWorldTransform[0][3] - cam.position[0];
+                const float dy = st.liveWorldTransform[1][3] - cam.position[1];
+                const float dz = st.liveWorldTransform[2][3] - cam.position[2];
+                const float proj = dx * cam.forward[0] + dy * cam.forward[1] +
+                                   dz * cam.forward[2];
+                return { true, proj, dx * dx + dy * dy + dz * dz };
+            };
+            // Park classification, with an angular hysteresis margin: PARK
+            // requires ~6 degrees past the 90-degree plane (proj < -0.1*dist,
+            // tested squared), while un-park triggers on any front-hemisphere
+            // reading (proj >= 0) -- otherwise an object sitting exactly
+            // abeam would flap park/release every sweep as the camera
+            // jitters, churning resolve + texture uploads.
+            //   0 = not parkable, 1 = pressure tier (behind + minDist),
+            //   2 = always tier (behind + alwaysDist, no VRAM gate).
+            const auto parkClass = [&](const ViewProbe& p) -> int {
+                if (!p.valid) return 0;
+                if (p.proj >= 0.0f || p.proj * p.proj < 0.01f * p.d2) return 0;
+                if (alwaysDist > 0.0f && p.d2 > alwaysDist2) return 2;
+                if (p.d2 > minDist2) return 1;
+                return 0;
+            };
+
+            // Un-park pass first: camera turned around, entry got close, or
+            // (pressure tier only) usage dropped below (viewPct - 5). The
+            // always tier holds parked regardless of pressure while the
+            // entry stays behind + ultra-far. The resolver's nearest-in-
+            // view-first ranking then restores what the player is actually
+            // looking at before the rest.
+            const uint32_t clearPct = (viewPct > 5) ? (viewPct - 5) : viewPct;
+            const bool pressureCleared = !overPct(clearPct);
+            for (auto& [key, st] : g_drawableMap) {
+                if (!st.pressureParked) continue;
+                const ViewProbe p = probe(st);
+                bool stayParked = p.valid && p.proj < 0.0f &&
+                    ((alwaysDist > 0.0f && p.d2 > alwaysDist2) ||
+                     (!pressureCleared && p.d2 > minDist2));
+                // LOD tier holds parked (no VRAM gate) while the chunk
+                // origin stays behind by the un-park slack.
+                if (!stayParked && p.valid && lodDist > 0.0f &&
+                    p.proj < -kLodBehindSlackUnpark && p.d2 > lodDist2 &&
+                    g_lodChunkKeys.count(key) != 0) {
+                    stayParked = true;
+                }
+                if (!stayParked) {
+                    st.pressureParked = false;
+                    ++pressureUnparked;
+                }
+            }
+
+            uint32_t cap = g_config.cullingForceEvictPerSweep;
+            if (cap == 0) cap = 512;
+            size_t viewCandidates = 0;
+
+            // Park pass: the always tier (behind + ultra-far) collects with
+            // no VRAM gate; the pressure tier (behind + minDist) only while
+            // over the view threshold. Furthest first either way.
+            const bool viewPressure = overPct(viewPct);
+            if (viewPressure || alwaysDist > 0.0f || lodDist > 0.0f) {
+                std::vector<std::pair<float, PassKey>> byDist;  // (dist2, key)
+                byDist.reserve(256);
+                for (const auto& [key, st] : g_drawableMap) {
+                    if (!st.submittedToRemix || st.pressureParked) continue;
+                    // Never park the always-near / special-lifecycle sets:
+                    // view models, the Pip-Boy screen, live-RT textures, and
+                    // skinned actors (they move on their own; their VRAM
+                    // share is small next to the static mass).
+                    if (g_viewModelKeys.count(key)) continue;
+                    if (key == g_pipboyScreenKey) continue;
+                    if (st.hasLiveTexture) continue;
+                    if (g_skinnedKeys.count(key)) continue;
+                    const ViewProbe p = probe(st);
+                    int cls = parkClass(p);
+                    // Tier 3: worldspace LOD chunk, behind by the full park
+                    // slack, beyond lodDist -- no VRAM gate.
+                    if (cls != 2 && p.valid && lodDist > 0.0f &&
+                        p.proj < -kLodBehindSlackPark && p.d2 > lodDist2 &&
+                        g_lodChunkKeys.count(key) != 0) {
+                        cls = 3;
+                    }
+                    if (cls == 0) continue;
+                    if (cls == 1 && !viewPressure) continue;
+                    byDist.emplace_back(p.d2, key);
+                }
+                viewCandidates = byDist.size();
+                const size_t take = (std::min)(static_cast<size_t>(cap), byDist.size());
+                if (take > 0) {
+                    std::partial_sort(
+                        byDist.begin(), byDist.begin() + take, byDist.end(),
+                        [](const std::pair<float, PassKey>& a,
+                           const std::pair<float, PassKey>& b) {
+                            return a.first > b.first;  // furthest first
+                        });
+                    for (size_t i = 0; i < take; ++i) {
+                        auto mapIt = g_drawableMap.find(byDist[i].second);
+                        if (mapIt == g_drawableMap.end()) continue;
+                        auto& st = mapIt->second;
+                        unsigned long excCode = 0;
+                        if (st.meshHash != 0) {
+                            if (CallReleaseDrawableGuarded(st.meshHash, &excCode) != 0) {
+                                _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in "
+                                         "ReleaseDrawable (park) hash=0x%llX exception=0x%08lX",
+                                         (unsigned long long)st.meshHash, excCode);
+                            }
+                            for (uint64_t xh : st.extraMeshHashes) {
+                                if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
+                                    _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in "
+                                             "ReleaseDrawable (park extra) hash=0x%llX "
+                                             "exception=0x%08lX",
+                                             (unsigned long long)xh, excCode);
+                                }
+                            }
+                        }
+                        st.extraMeshHashes.clear();
+                        st.textureHashes.clear();
+                        st.meshHash              = 0;
+                        st.materialHash          = 0;
+                        st.submittedToRemix      = false;
+                        st.submittedDiffuseWidth = 0;
+                        st.lastFailedResolverStep = 0;
+                        st.resolveAttempts       = 0;
+                        st.nextRetryFrame        = 0;
+                        st.pressureParked        = true;
+                        DrawCapture::Drop(mapIt->first);
+                        ++pressureParkedNow;
+                    }
+                }
+            }
+
+            // Tier 2 fallback: oldest-lastSeen hard eviction. Parked entries
+            // are skipped (they hold no Remix resources; erasing them would
+            // just re-admit the churn loop tier 1 exists to prevent).
+            if (overPct(oldestPct) && pressureParkedNow < cap) {
+                constexpr uint64_t kPressureMinAgeFrames = 300;  // ~5s @60fps
+                std::vector<std::pair<uint64_t, PassKey>> byAge;  // (lastSeen, key)
+                byAge.reserve(g_drawableMap.size());
+                for (const auto& [key, st] : g_drawableMap) {
+                    if (st.pressureParked) continue;
+                    const uint64_t age = (now > st.lastSeenFrame)
+                        ? (now - st.lastSeenFrame) : 0;
+                    if (age < kPressureMinAgeFrames) continue;
+                    byAge.emplace_back(st.lastSeenFrame, key);
+                }
+                const size_t take = (std::min)(
+                    static_cast<size_t>(cap - pressureParkedNow), byAge.size());
+                if (take > 0) {
+                    std::partial_sort(byAge.begin(), byAge.begin() + take, byAge.end());
+                    for (size_t i = 0; i < take; ++i) {
+                        auto mapIt = g_drawableMap.find(byAge[i].second);
+                        if (mapIt == g_drawableMap.end()) continue;
+                        evictEntry(mapIt);
+                        ++pressureEvicted;
+                    }
+                }
+            }
+
+            // Drain request (2026-07-20 evening, VRAM-ratchet fix): parking
+            // RELEASES handles but with DeferHandleDestroyToLoad=1 they sit
+            // on the parked-destroy list still holding their VRAM until a
+            // load screen -- on a long no-load wander the sweep parked
+            // thousands of drawables while the driver budget kept climbing,
+            // the 90% resolve gate closed, and no new geometry could load
+            // for the rest of the session. While actually reclaiming under
+            // pressure (or still above the hysteresis-clear threshold with
+            // a meaningful parked backlog), ask OnFrame to run the drain --
+            // same top-of-frame safe point as the load-screen drain, so the
+            // mid-gameplay-destroy deferral still holds for normal play.
+            bool drainRequested = false;
+            if ((pressureParkedNow || pressureEvicted || overPct(clearPct)) &&
+                RemixRenderer::PendingDestroyCount() >= 64) {
+                RemixRenderer::RequestDestroyDrain();
+                drainRequested = true;
+            }
+
+            if (pressureParkedNow || pressureUnparked || pressureEvicted ||
+                overPct(viewPct)) {
+                _MESSAGE("FO4RemixPlugin: [SemCapture] PRESSURE vram=%llu/%llu MiB "
+                         "parked=%u (viewCandidates=%zu, >%u%%) unparked=%u "
+                         "evictedOldest=%u (>%u%%) drainReq=%d pendingDestroys=%zu",
+                         (unsigned long long)vramUsedMiB,
+                         (unsigned long long)vramBudgetMiB,
+                         pressureParkedNow, viewCandidates, viewPct,
+                         pressureUnparked, pressureEvicted, oldestPct,
+                         drainRequested ? 1 : 0,
+                         RemixRenderer::PendingDestroyCount());
+            }
+        }
+        evicted += pressureEvicted;
+
         for (auto it = g_drawableMap.begin(); it != g_drawableMap.end();) {
             const uint64_t age = (now > it->second.lastSeenFrame)
                 ? (now - it->second.lastSeenFrame) : 0;
             if (age > kTTLFrames) {
-                if (it->second.submittedToRemix && it->second.meshHash != 0) {
-                    unsigned long excCode = 0;
-                    if (CallReleaseDrawableGuarded(it->second.meshHash, &excCode) != 0) {
-                        _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
-                                 "hash=0x%llX exception=0x%08lX -- continuing eviction; "
-                                 "Remix-side handles may leak",
-                                 (unsigned long long)it->second.meshHash, excCode);
-                    }
-                    // Merge-instanced extras share the base drawable's lifecycle.
-                    for (uint64_t xh : it->second.extraMeshHashes) {
-                        if (CallReleaseDrawableGuarded(xh, &excCode) != 0) {
-                            _MESSAGE("FO4RemixPlugin: [Sweep] CRASH CAUGHT in ReleaseDrawable "
-                                     "(instance extra) hash=0x%llX exception=0x%08lX",
-                                     (unsigned long long)xh, excCode);
-                        }
-                    }
-                }
-                g_lodChunkKeys.erase(it->first);
-                g_skinnedKeys.erase(it->first);
-                it = g_drawableMap.erase(it);
+                it = evictEntry(it);
                 ++evicted;
             } else {
-                if (it->second.submittedToRemix) {
+                if (it->second.pressureParked) {
+                    // Parked entries hold no Remix resources and are
+                    // resolver-skipped -- counting them as "pending" would
+                    // skew the per-gate breakdown (they'd all land in
+                    // notResolved).
+                    ++parkedCount;
+                } else if (it->second.submittedToRemix) {
                     ++submittedCount;
+                } else if (it->second.crashBlacklisted) {
+                    // Resolver-skipped until the load-screen pardon; keeping
+                    // them out of "pending" keeps the per-gate breakdown
+                    // honest (they'd all pile into one stale bucket).
+                    ++blacklistedCount;
                 } else {
                     ++pendingCount;
                     using Resolvers::Trace::Step;
@@ -1290,27 +2552,30 @@ void SemanticCapture::Tick(ID3D11Device* device) {
         // geometry pointer. >0 means the same BSGeometry is being submitted
         // under multiple PassKeys (different property/material variants),
         // which would render N times -- a candidate cause for the "two
-        // versions of the same object" overlap symptom.
-        std::unordered_set<void*> distinct;
-        distinct.reserve(g_drawableMap.size());
-        for (const auto& [k, st] : g_drawableMap) {
-            if (st.geometry) {
-                distinct.insert(st.geometry);
-                ++entriesWithGeo;
+        // versions of the same object" overlap symptom. Diagnostic-only
+        // (feeds the log line below), so skipped when diagnostics are off.
+        if (g_config.diagEnabled) {
+            std::unordered_set<void*> distinct;
+            distinct.reserve(g_drawableMap.size());
+            for (const auto& [k, st] : g_drawableMap) {
+                if (st.geometry) {
+                    distinct.insert(st.geometry);
+                    ++entriesWithGeo;
+                }
             }
+            distinctGeoPtrs = distinct.size();
         }
-        distinctGeoPtrs = distinct.size();
     }
 
     const size_t geoDups = (entriesWithGeo > distinctGeoPtrs)
         ? (entriesWithGeo - distinctGeoPtrs) : 0;
     _MESSAGE("FO4RemixPlugin: [SemCapture] uniqueDrawables=%zu totalFires=%llu "
-             "evictedThisSweep=%u submitted=%u pending=%u "
-             "distinctGeoPtrs=%zu entriesWithGeo=%zu geoDups=%zu",
+             "evictedThisSweep=%u submitted=%u pending=%u parked=%u "
+             "blacklisted=%u distinctGeoPtrs=%zu entriesWithGeo=%zu geoDups=%zu",
              unique,
              (unsigned long long)g_totalFires.load(std::memory_order_relaxed),
-             evicted, submittedCount, pendingCount,
-             distinctGeoPtrs, entriesWithGeo, geoDups);
+             evicted, submittedCount, pendingCount, parkedCount,
+             blacklistedCount, distinctGeoPtrs, entriesWithGeo, geoDups);
 
     _MESSAGE("FO4RemixPlugin: [SemCapture] pendingByGate "
              "notResolved=%u notTriShape=%u skinned=%u lod=%u "
@@ -1331,14 +2596,94 @@ void SemanticCapture::SetLoadingScreenActive(bool active) {
              active ? "ON (resolves suspended)" : "OFF (resolves resumed)");
 }
 
+bool SemanticCapture::IsLoadingScreenActive() {
+    return g_loadingScreenActive.load(std::memory_order_relaxed);
+}
+
+// ---------------------------------------------------------------------------
+// Pip-Boy screen feed (2026-07-18 v2). See semantic_capture.h. All state is
+// game-render-thread only (hkPresent supplies, Tick schedules, the resolver
+// consumes -- one thread), except g_pipboyScreenKey which feedWanted reads
+// alongside the drawable map under g_drawableMutex.
+// ---------------------------------------------------------------------------
+void SemanticCapture::SupplyPipboyScreenFeed(const uint8_t* rgba,
+                                             uint32_t width, uint32_t height,
+                                             uint32_t rowPitch) {
+    if (!rgba || width == 0 || height == 0) return;
+    auto tex = std::make_shared<ExtractedTexture>();
+    tex->width = width;
+    tex->height = height;
+    tex->dxgiFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
+    tex->mipLevels = 1;
+    tex->pixels.resize((size_t)width * height * 4);
+    // Source is PREMULTIPLIED (Scaleform draws SrcAlpha over {0,0,0,0}), so
+    // compositing over an opaque black screen is just the premultiplied RGB.
+    // Bake the Pip-Boy tint here: the engine applies its screen color when
+    // it paints the RT onto the mesh; raw Scaleform pixels are white/gray.
+    const float tr = g_config.pipboyScreenTintR;
+    const float tg = g_config.pipboyScreenTintG;
+    const float tb = g_config.pipboyScreenTintB;
+    uint8_t* dst = tex->pixels.data();
+    for (uint32_t y = 0; y < height; ++y) {
+        const uint8_t* srow = rgba + (size_t)y * rowPitch;
+        uint8_t* drow = dst + (size_t)y * width * 4;
+        for (uint32_t x = 0; x < width; ++x) {
+            drow[x * 4 + 0] = (uint8_t)(srow[x * 4 + 0] * tr + 0.5f);
+            drow[x * 4 + 1] = (uint8_t)(srow[x * 4 + 1] * tg + 0.5f);
+            drow[x * 4 + 2] = (uint8_t)(srow[x * 4 + 2] * tb + 0.5f);
+            drow[x * 4 + 3] = 255;
+        }
+    }
+    ++g_pipboyFeedSeq;
+    // Per-seq hash so every refresh creates a fresh runtime texture and the
+    // in-place SubmitDrawable swap releases the outgoing one.
+    tex->hash = 0xF0F0B0B0500EEDull ^ (g_pipboyFeedSeq * 0x9E3779B97F4A7C15ull);
+    g_pipboyFeedTex = std::move(tex);
+}
+
+uint64_t SemanticCapture::PipboyScreenFeedSeq() {
+    return g_pipboyFeedSeq;
+}
+
+std::shared_ptr<const ExtractedTexture> SemanticCapture::GetPipboyScreenFeedTexture() {
+    return g_pipboyFeedTex;
+}
+
+void SemanticCapture::RegisterPipboyScreenDrawable(uint64_t key) {
+    if (g_pipboyScreenKey != key) {
+        g_pipboyScreenKey = key;
+        _MESSAGE("FO4RemixPlugin: [PipFeed] Screen:0 drawable registered key=0x%llX",
+                 (unsigned long long)key);
+    }
+}
+
+bool SemanticCapture::PipboyScreenFeedWanted() {
+    if (!g_config.pipboyScreenFeed || g_pipboyScreenKey == 0) return false;
+    // Viewmodel must be live (arm on screen). Terminals cull the 1P root;
+    // Power Armor never registers a Screen:0 -- both keep the full-screen
+    // composite fallback.
+    {
+        std::lock_guard<std::mutex> lk(g_vmAnchorMx);
+        if (!g_vmAnchor.active) return false;
+    }
+    const uint64_t now = Diagnostics::CurrentFrameIndex();
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    auto it = g_drawableMap.find(g_pipboyScreenKey);
+    if (it == g_drawableMap.end()) return false;
+    const auto& st = it->second;
+    if (!st.submittedToRemix) return false;
+    const uint64_t age = (now > st.lastSeenFrame) ? (now - st.lastSeenFrame) : 0;
+    return age <= 30;
+}
+
 void SemanticCapture::ClearDrawableMap() {
     std::lock_guard<std::mutex> lock(g_drawableMutex);
 
     const size_t totalCount = g_drawableMap.size();
     size_t submittedCount = 0;
 
-    // Release Remix-side handles for every submitted entry first. ~NiPointer
-    // below will only release engine refs; it doesn't know about g_drawables
+    // Release Remix-side handles for every submitted entry first -- the map
+    // clear below only drops our records; it doesn't know about g_drawables
     // / g_meshCache / g_materialCache / g_textureHandles.
     for (auto& [key, state] : g_drawableMap) {
         if (state.submittedToRemix && state.meshHash != 0) {
@@ -1360,13 +2705,30 @@ void SemanticCapture::ClearDrawableMap() {
         }
     }
 
-    // ~DrawableState -> ~NiPointer -> DecRef on every entry. For drawables
-    // where the engine's already released its refs (refcount == 1, just us),
-    // the engine destructor runs inline here and frees the BSGeometry.
+    // DrawableState holds RAW engine pointers only (no NiPointer members),
+    // so this clear releases no engine refs -- it just drops our records.
+    // The engine owns the BSGeometry lifetimes outright.
     g_drawableMap.clear();
     g_dirtyPoses.clear();
     g_lodChunkKeys.clear();
     g_skinnedKeys.clear();
+    g_viewModelKeys.clear();
+
+    // Pip-Boy screen feed: the tagged drawable is gone with the map, and a
+    // stale fed frame from the outgoing world must not survive the load.
+    g_pipboyScreenKey = 0;
+    g_pipboyFeedSeq = 0;
+    g_pipboyFeedTex.reset();
+
+    // Async merge-readback slices are keyed by buffer identity; the
+    // destination world recycles those addresses, so stale entries could
+    // serve old-world bytes to a new-world bake. Same reasoning for the
+    // async parse/bake result maps (keyed by pointer-derived PassKeys):
+    // bump their generations so nothing from the outgoing world can
+    // rendezvous with a recycled key in the destination world.
+    Resolvers::ResetSliceCache();
+    Resolvers::ResetAsyncBakes();
+    BsExtraction::ResetMeshParseQueues();
 
     _MESSAGE("FO4RemixPlugin: [Reload] cleared %zu drawables (%zu submitted) on PreLoadGame",
              totalCount, submittedCount);
@@ -1413,6 +2775,32 @@ void SemanticCapture::SnapshotSkinnedCulled(std::unordered_set<uint64_t>& out) {
         auto it = g_drawableMap.find(key);
         if (it == g_drawableMap.end()) continue;
         if (it->second.engineCulled) out.insert(key);
+    }
+}
+
+void SemanticCapture::SnapshotViewModelStale(uint64_t currentFrame,
+                                             uint64_t maxAge,
+                                             std::unordered_set<uint64_t>& out) {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    for (const PassKey key : g_viewModelKeys) {
+        auto it = g_drawableMap.find(key);
+        if (it == g_drawableMap.end()) continue;
+        const uint64_t seen = it->second.lastSeenFrame;
+        const uint64_t age = (currentFrame > seen) ? (currentFrame - seen) : 0;
+        if (age > maxAge) out.insert(key);
+    }
+}
+
+void SemanticCapture::SnapshotSkinnedStale(uint64_t currentFrame,
+                                           uint64_t maxAge,
+                                           std::unordered_set<uint64_t>& out) {
+    std::lock_guard<std::mutex> lock(g_drawableMutex);
+    for (const PassKey key : g_skinnedKeys) {
+        auto it = g_drawableMap.find(key);
+        if (it == g_drawableMap.end()) continue;
+        const uint64_t seen = it->second.lastSeenFrame;
+        const uint64_t age = (currentFrame > seen) ? (currentFrame - seen) : 0;
+        if (age > maxAge) out.insert(key);
     }
 }
 

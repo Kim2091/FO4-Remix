@@ -135,6 +135,7 @@ static CameraState MakeFallback() {
     state.right[1] = 0.0f;
     state.right[2] = 0.0f;
     state.fovY = 70.0f;
+    state.fov1stY = 70.0f;
     state.aspectRatio = 16.0f / 9.0f;
     state.nearPlane = 1.0f;
     state.farPlane = 100000.0f;
@@ -176,6 +177,16 @@ CameraState Camera::Get() {
     state.up[1]      = xform.rot.data[2][0];
     state.up[2]      = xform.rot.data[2][2];
 
+    // Raw Beth-space transform for the viewmodel mapping (no swap).
+    for (int r = 0; r < 3; ++r) {
+        for (int c = 0; c < 3; ++c) {
+            state.rawRot[r][c] = xform.rot.data[r][c];
+        }
+    }
+    state.rawPos[0] = xform.pos.x;
+    state.rawPos[1] = xform.pos.y;
+    state.rawPos[2] = xform.pos.z;
+
     // FOV source ladder (see the NiCamera comment block above):
     //   1. Live NiCamera view frustum -- exact vertical FOV + aspect + near/
     //      far, tracks ADS zoom and FOV mods per frame.
@@ -198,6 +209,22 @@ CameraState Camera::Get() {
             : hFov;  // legacy passthrough
         state.nearPlane = 5.0f;
         state.farPlane = 100000.0f;
+    }
+
+    // 1st-person FOV for the VIEW_MODEL camera. Same horizontal->vertical
+    // conversion as the world fallback path: fDefault1stPersonFOV is the
+    // game's horizontal convention (default 80). Sanity-gated; falls back
+    // to the world FOV so a bad read can never distort the viewmodel more
+    // than the legacy single-camera behavior did.
+    {
+        state.fov1stY = state.fovY;
+        const float hFov1st = playerCam->fDefault1stPersonFOV;
+        if (hFov1st >= 10.0f && hFov1st <= 170.0f && state.aspectRatio > 0.1f) {
+            const float v = HorizontalToVerticalFov(hFov1st, state.aspectRatio);
+            if (v >= 5.0f && v <= 160.0f) {
+                state.fov1stY = v;
+            }
+        }
     }
 
     // Snapshot player world position (Beth coords, not swapped) for the
