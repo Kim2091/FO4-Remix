@@ -5,6 +5,9 @@ loaded scene geometry, textures, and lights from the running game, and submits
 them to the [RTX Remix](https://github.com/NVIDIAGameWorks/rtx-remix) C API for
 path-traced rendering in a separate window.
 
+## Discord server:
+https://discord.gg/X6HHRGFCex
+
 ## Status
 
 Pre-release / experimental. Core extraction (statics, terrain, lights, water,
